@@ -9,10 +9,14 @@
     };
   };
   
-  outputs = { nixpkgs, home-manager, ... }: {
-    homeConfigurations.default = home-manager.lib.homeManagerConfiguration {
-      pkgs = nixpkgs.legacyPackages.x86_64-darwin; # Change to x86_64-linux for Linux  
-      modules = [ ./home.nix ];
+  outputs = { nixpkgs, home-manager, ... }: 
+    let
+      # Auto-detect system or default to x86_64-linux
+      system = builtins.currentSystem or "x86_64-linux";
+    in {
+      homeConfigurations.default = home-manager.lib.homeManagerConfiguration {
+        pkgs = nixpkgs.legacyPackages.${system};
+        modules = [ ./home.nix ];
+      };
     };
-  };
 }

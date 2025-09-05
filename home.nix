@@ -1,7 +1,11 @@
-{ pkgs, ... }: {
+{ pkgs, lib, ... }:
+let 
+  username = builtins.getEnv "USER";
+  homeDirectory = builtins.getEnv "HOME";
+in {
   home = {
-    username = "rolson";  # Update this to your username
-    homeDirectory = "/Users/rolson";  # Update this to your home directory
+    inherit username;
+    inherit homeDirectory;
     stateVersion = "25.05";
   };
 
