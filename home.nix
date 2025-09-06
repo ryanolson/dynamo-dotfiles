@@ -12,7 +12,7 @@ in {
   imports = [
     # Import team base configuration from GitHub (using specific commit hash)
     "${builtins.fetchTarball {
-      url = "https://github.com/ryanolson/dynamo-nix/archive/9edfc4f.tar.gz";
+      url = "https://github.com/ryanolson/dynamo-nix/archive/2122c34.tar.gz";
     }}/team-base.nix"
   ];
   
