@@ -61,7 +61,7 @@ symbol = "⬢ "
 style = "bold green"
 
 [python]
-format = "via [$symbol$pyenv_prefix($version )(\($virtualenv\) )]($style)"
+format = "via [$symbol$pyenv_prefix($version )($virtualenv )]($style)"
 symbol = "🐍 "
 style = "bold yellow"
 
