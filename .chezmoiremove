@@ -1,20 +1,17 @@
 # Files to remove from target directory
 # These files will be deleted when chezmoi applies
 
+# For now, no files to remove by default
+# Uncomment lines below as needed:
+
 # Legacy Nix files (if migrating from Nix setup)
-{{- if .remove_nix_files }}
-.nix-*
-.config/nixpkgs/
-{{- end }}
+# .nix-*
+# .config/nixpkgs/
 
 # Old configuration files that are replaced
-{{- if .clean_old_configs }}
-.bashrc.backup*
-.zshrc.backup*
-.profile.backup*
-{{- end }}
+# .bashrc.backup*
+# .zshrc.backup*
+# .profile.backup*
 
 # Broken symlinks
-{{- if .remove_broken_links }}
-.local/bin/broken-*
-{{- end }}
+# .local/bin/broken-*

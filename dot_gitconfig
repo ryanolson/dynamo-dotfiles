@@ -1,0 +1,60 @@
+# Git configuration - Dynamo team setup
+# Update the user section with your personal information
+
+[user]
+    name = Your Name  # Replace with your name
+    email = your.email@company.com  # Replace with your email
+
+[core]
+    editor = hx
+    autocrlf = input
+    safecrlf = true
+    excludesfile = ~/.gitignore_global
+
+[init]
+    defaultBranch = "main"
+
+[pull]
+    rebase = true
+
+[push]
+    autoSetupRemote = true
+    default = current
+
+[rebase]
+    autostash = true
+
+[merge]
+    tool = hx
+    conflictstyle = diff3
+
+[diff]
+    algorithm = histogram
+    colorMoved = default
+
+[log]
+    date = relative
+
+[format]
+    pretty = format:%C(yellow)%h%Creset -%C(red)%d%Creset %s %C(dim green)(%an %ar)%Creset
+
+[alias]
+    # Team-standard aliases
+    st = status
+    co = checkout
+    br = branch
+    ci = commit
+    df = diff
+    lg = log --graph --pretty=format:'%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr) %C(bold blue)<%an>%Creset' --abbrev-commit
+    
+    # Useful shortcuts
+    unstage = reset HEAD --
+    last = log -1 HEAD
+    visual = !gitk
+    
+    # Branch management
+    delete-merged = "!git branch --merged | grep -v '\\*' | xargs -n 1 git branch -d"
+
+# URL rewrites for faster cloning
+[url "git@github.com:"]
+    insteadOf = "https://github.com/"
