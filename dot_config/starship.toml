@@ -145,10 +145,10 @@ disabled = false
 
 # Shell indicator
 [shell]
-fish_indicator = "🐠"
-bash_indicator = "bash"
-zsh_indicator = "zsh"
-disabled = false
+fish_indicator = ""
+bash_indicator = ""
+zsh_indicator = ""
+disabled = true
 
 # Host information (useful for remote connections)
 [hostname]
