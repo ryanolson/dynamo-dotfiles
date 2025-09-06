@@ -1,0 +1,64 @@
+theme = "catppuccin_mocha"
+
+[editor]
+mouse = true
+line-number = "relative"
+end-of-line-diagnostics = "hint"
+bufferline = "always"
+
+[editor.cursor-shape]
+insert = "bar"
+normal = "block"
+select = "underline"
+
+[editor.file-picker]
+hidden = false
+
+[editor.lsp]
+enable = true
+display-messages = true
+display-progress-messages = true
+auto-signature-help = true
+display-inlay-hints = true
+display-signature-help-docs = true
+snippets = true
+goto-reference-include-declaration = true
+
+[editor.inline-diagnostics]
+cursor-line = "disable" # show warnings and errors on the cursorline inline
+
+[keys.normal]
+C-s = ":w" # Maps Ctrl-s to the typable command :w which is an alias for :write (save file)
+Cmd-s = ":w" # Maps Ctrl-s to the typable command :w which is an alias for :write (save file)
+C-m = ":run-shell-command make"
+Cmd-m = ":run-shell-command make"
+C-b = ":run-shell-command cargo build"
+Cmd-b = ":run-shell-command cargo build"
+C-t = ":run-shell-command cargo test"
+Cmd-t = ":run-shell-command cargo test"
+Cmd-g = [":new", ":insert-output lazygit", ":buffer-close!", ":redraw"]
+C-y = ":sh zellij run -f -x 10% -y 10% --width 80% --height 80% -- bash ~/.config/helix/yazi-picker.sh"
+Cmd-y = ":sh zellij run -f -x 10% -y 10% --width 80% --height 80% -- bash ~/.config/helix/yazi-picker.sh"
+
+[keys.normal.space.i]
+# these are the type hints
+t = ":toggle lsp.display-inlay-hints"
+s = ":toggle soft-wrap.enable"
+
+# The allowed values for cursor-line and other-lines are: error, warning, info, hint.
+e = ":toggle inline-diagnostics.cursor-line error disable"
+w = ":toggle inline-diagnostics.cursor-line warning disable"
+i = ":toggle inline-diagnostics.cursor-line info disable"
+h = ":toggle inline-diagnostics.cursor-line hint disable"
+
+[keys.normal.space.o]
+e = ":toggle inline-diagnostics.other-lines error disable"
+w = ":toggle inline-diagnostics.other-lines warning disable"
+i = ":toggle inline-diagnostics.other-lines info disable"
+h = ":toggle inline-diagnostics.other-lines hint disable"
+
+[keys.normal.space.l]
+e = ":toggle end-of-line-diagnostics error disable"
+w = ":toggle end-of-line-diagnostics warning disable"
+i = ":toggle end-of-line-diagnostics info disable"
+h = ":toggle end-of-line-diagnostics hint disable"

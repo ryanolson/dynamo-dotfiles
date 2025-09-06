@@ -33,6 +33,27 @@ if command -v mise >/dev/null
     mise activate fish | source
 end
 
+# Install npm tools for AI development on first run
+if command -v npm >/dev/null
+    # Check and install ccmanager (Claude Code session manager)
+    if not command -v ccmanager >/dev/null
+        echo "🔧 Installing ccmanager (Claude Code session manager)..."
+        npm install -g ccmanager >/dev/null 2>&1
+    end
+    
+    # Check and install Claude Code CLI
+    if not command -v claude >/dev/null
+        echo "🔧 Installing Claude Code CLI..."
+        npm install -g @anthropic-ai/claude-code >/dev/null 2>&1
+    end
+    
+    # Check and install ruler (AI agent configuration manager)
+    if not command -v ruler >/dev/null
+        echo "🔧 Installing ruler (AI agent configuration manager)..."
+        npm install -g @intellectronica/ruler >/dev/null 2>&1
+    end
+end
+
 # Team-standard aliases
 alias cat "bat"
 alias ls "eza"

@@ -1,0 +1,174 @@
+[[language]]
+name = "bash"
+auto-format = false
+indent = { tab-width = 4, unit = "    " }
+
+[[language]]
+name = "c"
+indent = { tab-width = 2, unit = "  " }
+auto-format = true
+formatter = { command = "clang-format"}
+language-servers = [ "clangd" ]
+
+[language.auto-pairs]
+'(' = ')'
+'{' = '}'
+'[' = ']'
+'"' = '"'
+'`' = '`'
+'<' = '>'
+'|' = '|'
+
+[[language]]
+name = "cpp"
+indent = { tab-width = 2, unit = "  " }
+auto-format = true
+formatter = { command = "clang-format"}
+language-servers = [ "clangd" ]
+
+[language.auto-pairs]
+'(' = ')'
+'{' = '}'
+'[' = ']'
+'"' = '"'
+'`' = '`'
+'<' = '>'
+'|' = '|'
+
+[[language]]
+name = "css"
+formatter = { command = 'prettier', args = ["--parser", "css"] }
+
+[[language]]
+name = "crates"
+scope = "source.toml"
+injection-regex = "toml"
+file-types = [{ glob = "Cargo.toml" }]
+comment-token = "#"
+language-servers = [ "crates-lsp" ]
+grammar = "toml"
+indent = { tab-width = 2, unit = "  " }
+diagnostic-severity = "info"
+
+[language-server.crates-lsp]
+command = "crates-lsp"
+
+[[language]]
+name = "go"
+roots = ["go.work", "go.mod"]
+auto-format = true
+indent = { tab-width = 4, unit = "    " }
+formatter = ["gofmt"]
+comment-token = "//"
+language-servers = [ "gopls", "golangci-lint-lsp" ]
+
+[language-server.golangci-lint-lsp]
+command = "golangci-lint-langserver"
+
+[[language]]
+name = "haskell"
+scope = "source.haskell"
+injection-regex = "hs|haskell"
+file-types = ["hs", "hs-boot", "hsc"]
+roots = ["Setup.hs", "stack.yaml", "cabal.project"]
+comment-token = "--"
+block-comment-tokens = { start = "{-", end = "-}" }
+language-servers = [ "haskell-language-server" ]
+formatter = { command = "none" }
+auto-format = false
+indent = { tab-width = 2, unit = "  " }
+
+[[language]]
+name = "html"
+formatter = { command = 'prettier', args = ["--parser", "html"] }
+auto-format = true
+
+[[language]]
+name = "javascript"
+formatter = { command = 'prettier', args = ["--parser", "typescript"] }
+auto-format = true
+
+[[language]]
+name = "json"
+formatter = { command = 'prettier', args = ["--parser", "json"] }
+auto-format = true
+
+[[language]]
+name = "jsx"
+formatter = { command = 'prettier', args = ["--parser", "typescript"] }
+auto-format = true
+
+[[language]]
+name = "lua"
+auto-format = false
+indent = { tab-width = 4, unit = "    " }
+
+[[language]]
+name = "python"
+scope = "source.python"
+injection-regex = "python"
+file-types = ["py", "pyi", "py3", "pyw", ".pythonstartup", ".pythonrc"]
+shebangs = ["python"]
+roots = [".", "pyproject.toml"]
+comment-token = "#"
+language-servers = ["pylsp", "ruff"]
+indent = { tab-width = 4, unit = "    " }
+auto-format = true
+rulers = [120]
+
+[language.formatter]
+command = "ruff"
+args = ["format", "-"]
+
+[[language]]
+name = "rust"
+auto-format = true
+indent = { tab-width = 4, unit = "    " }
+rulers = [100]
+
+[language.auto-pairs]
+'(' = ')'
+'{' = '}'
+'[' = ']'
+'"' = '"'
+'`' = '`'
+'<' = '>'
+'|' = '|'
+
+[language-server.rust-analyzer]
+command = "rust-analyzer"
+
+[language-server.rust-analyzer.config]
+inlayHints.bindingModeHints.enable = false
+inlayHints.closingBraceHints.minLines = 10
+inlayHints.closureReturnTypeHints.enable = "with_block"
+inlayHints.discriminantHints.enable = "fieldless"
+inlayHints.lifetimeElisionHints.enable = "skip_trivial"
+inlayHints.typeHints.hideClosureInitialization = false
+
+[language-server.rust-analyzer.config.check]
+command = "clippy"
+
+[[language]]
+name = "toml"
+auto-format = false
+indent = { tab-width = 4, unit = "    " }
+
+[[language]]
+name = "tsx"
+formatter = { command = 'prettier', args = ["--parser", "typescript"] }
+auto-format = true
+
+[[language]]
+name = "typescript"
+auto-format = true
+formatter = { command = 'prettier', args = ["--parser", "typescript"] }
+
+[[language]]
+name = "zig"
+auto-format = false
+indent = { tab-width = 4, unit = "    " }
+
+[language-server.zls]
+# Note: zls path will be determined by PATH, no hardcoded paths
+command = "zls"

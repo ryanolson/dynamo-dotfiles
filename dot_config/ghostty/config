@@ -1,0 +1,5 @@
+theme = catppuccin-mocha
+
+adjust-cell-height = 10%
+command = /bin/zsh -c "zellij"
+keybind = shift+enter=text:\x1b\r

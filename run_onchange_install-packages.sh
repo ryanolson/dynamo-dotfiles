@@ -74,7 +74,7 @@ install_linux_packages() {
         
         # Install packages available via apt
         local apt_packages=(
-            htop tree jq build-essential pkg-config libssl-dev fish
+            htop tree jq build-essential pkg-config libssl-dev fish unzip
         )
         
         for package in "${apt_packages[@]}"; do
