@@ -60,18 +60,18 @@ format = "via [$symbol($version )]($style)"
 symbol = "⬢ "
 style = "bold green"
 # Only show when Node.js project files are present in the tree
-detect_files = ["package.json", ".node-version", ".nvmrc"]
+detect_files = ["package.json", ".node-version", ".nvmrc", "package-lock.json", "yarn.lock", "pnpm-lock.yaml"]
 detect_folders = ["node_modules"]
-detect_extensions = []  # Don't show for standalone .js files
+detect_extensions = ["nodeproj"]  # Use fake extension to override default .js detection
 
 [python]
 format = "via [$symbol$pyenv_prefix($version )($virtualenv )]($style)"
 symbol = "🐍 "
 style = "bold yellow"
 # Only show when Python project files are present in the tree
-detect_files = ["pyproject.toml", "requirements.txt", "setup.py", "Pipfile", "tox.ini"]
-detect_folders = [".venv", "venv", "__pycache__"]
-detect_extensions = []  # Don't show for standalone .py files
+detect_files = ["pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "Pipfile", "tox.ini", ".python-version"]
+detect_folders = [".venv", "venv", ".virtualenv", "__pycache__"]
+detect_extensions = ["pyproj"]  # Use fake extension to override default .py detection
 
 [rust]
 format = "via [$symbol($version )]($style)"
@@ -87,9 +87,9 @@ format = "via [$symbol($version )]($style)"
 symbol = "🐹 "
 style = "bold cyan"
 # Only show when Go project files are present in the tree
-detect_files = ["go.mod", "go.sum", "glide.yaml", "Gopkg.toml", "Gopkg.lock"]
+detect_files = ["go.mod", "go.sum", "go.work", "glide.yaml", "Gopkg.toml", "Gopkg.lock"]
 detect_folders = ["vendor"]
-detect_extensions = []  # Don't show for standalone .go files
+detect_extensions = ["goproj"]  # Use fake extension to override default .go detection
 
 [zig]
 format = "via [$symbol($version )]($style)"
@@ -97,8 +97,8 @@ symbol = "↯ "
 style = "bold yellow"
 # Only show when Zig project files are present in the tree
 detect_files = ["build.zig", "build.zig.zon"]
-detect_folders = []
-detect_extensions = []  # Don't show for standalone .zig files
+detect_folders = ["zig-out", "zig-cache"]
+detect_extensions = ["zigproj"]  # Use fake extension to override default .zig detection
 
 # Package versions
 [package]
