@@ -93,14 +93,14 @@ symbol = "🐳 "
 style = "blue bold"
 
 [kubernetes]
-format = 'on [$symbol$context( \($namespace\))]($style) '
+format = 'on [$symbol$context( $namespace)]($style) '
 symbol = "☸ "
 style = "cyan bold"
 disabled = false
 
 # Cloud contexts
 [aws]
-format = "on [$symbol($profile )(\($region\) )]($style)"
+format = "on [$symbol($profile )($region )]($style)"
 symbol = "☁️ "
 style = "bold yellow"
 
