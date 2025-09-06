@@ -59,11 +59,19 @@ style = "bright-yellow"
 format = "via [$symbol($version )]($style)"
 symbol = "⬢ "
 style = "bold green"
+# Only show when Node.js project files are present in the tree
+detect_files = ["package.json", ".node-version", ".nvmrc"]
+detect_folders = ["node_modules"]
+detect_extensions = []  # Don't show for standalone .js files
 
 [python]
 format = "via [$symbol$pyenv_prefix($version )($virtualenv )]($style)"
 symbol = "🐍 "
 style = "bold yellow"
+# Only show when Python project files are present in the tree
+detect_files = ["pyproject.toml", "requirements.txt", "setup.py", "Pipfile", "tox.ini"]
+detect_folders = [".venv", "venv", "__pycache__"]
+detect_extensions = []  # Don't show for standalone .py files
 
 [rust]
 format = "via [$symbol($version )]($style)"
@@ -78,11 +86,19 @@ detect_extensions = []
 format = "via [$symbol($version )]($style)"
 symbol = "🐹 "
 style = "bold cyan"
+# Only show when Go project files are present in the tree
+detect_files = ["go.mod", "go.sum", "glide.yaml", "Gopkg.toml", "Gopkg.lock"]
+detect_folders = ["vendor"]
+detect_extensions = []  # Don't show for standalone .go files
 
 [zig]
 format = "via [$symbol($version )]($style)"
 symbol = "↯ "
 style = "bold yellow"
+# Only show when Zig project files are present in the tree
+detect_files = ["build.zig", "build.zig.zon"]
+detect_folders = []
+detect_extensions = []  # Don't show for standalone .zig files
 
 # Package versions
 [package]
