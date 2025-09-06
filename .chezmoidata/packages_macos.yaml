@@ -1,0 +1,75 @@
+# macOS-specific package definitions
+# These packages will be installed via Homebrew
+
+homebrew:
+  taps:
+    - homebrew/core
+    - homebrew/cask
+  
+  # CLI tools and utilities
+  brews:
+    # Core development tools
+    - git
+    - curl 
+    - chezmoi
+    - mise
+    
+    # Modern CLI replacements
+    - bat
+    - eza
+    - ripgrep
+    - fd
+    - zoxide
+    - dust  # du-dust
+    - procs
+    
+    # Development environment
+    - helix
+    - fish
+    - starship
+    - zellij
+    
+    # File management
+    - yazi
+    - broot
+    
+    # Git tools
+    - lazygit
+    - gh
+    
+    # Development utilities
+    - just
+    - watchexec
+    - hyperfine
+    - tokei
+    - kondo
+    
+    # Build tools (for npm native modules)
+    - gcc
+    - make
+    
+    # Optional but useful
+    - wget
+    - jq
+    - tree
+    - htop
+
+  # GUI applications (optional)
+  casks:
+    - ghostty  # Terminal emulator (when available)
+    # Add other GUI apps as needed
+
+# System-level settings
+system:
+  # macOS-specific configurations
+  defaults:
+    # Finder settings
+    com.apple.finder:
+      AppleShowAllFiles: true
+      ShowPathbar: true
+      ShowStatusBar: true
+    
+    # Dock settings  
+    com.apple.dock:
+      autohide: true
+      tilesize: 36

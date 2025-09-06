@@ -1,0 +1,136 @@
+# Core team configuration - shared across all team members
+# These tools and configurations form the baseline development environment
+
+tools:
+  # Core development tools that everyone should have
+  required:
+    - name: "git"
+      description: "Version control"
+    - name: "curl" 
+      description: "HTTP client"
+    - name: "chezmoi"
+      description: "Dotfiles manager"
+    - name: "mise"
+      description: "Runtime version manager"
+
+  # Modern CLI replacements (replacing traditional Unix tools)
+  cli_modern:
+    - name: "bat"
+      replaces: "cat"
+      description: "Syntax highlighted cat"
+    - name: "eza" 
+      replaces: "ls"
+      description: "Modern ls with colors and icons"
+    - name: "ripgrep"
+      replaces: "grep"  
+      description: "Fast text search"
+    - name: "fd"
+      replaces: "find"
+      description: "Simple and fast alternative to find"
+    - name: "zoxide"
+      replaces: "cd"
+      description: "Smart cd with frecency"
+    - name: "du-dust"
+      replaces: "du"
+      description: "More intuitive du"
+    - name: "procs"
+      replaces: "ps"
+      description: "Modern ps replacement"
+
+  # Development environment tools
+  development:
+    - name: "helix"
+      description: "Terminal text editor"
+      category: "editor"
+    - name: "fish"
+      description: "User-friendly shell"
+      category: "shell"
+    - name: "starship"
+      description: "Cross-shell prompt"
+      category: "shell"
+    - name: "zellij"
+      description: "Terminal multiplexer"
+      category: "multiplexer"
+
+  # File management and navigation
+  files:
+    - name: "yazi"
+      description: "Terminal file manager"
+    - name: "broot"
+      description: "Interactive tree view"
+
+  # Git and GitHub tools
+  vcs:
+    - name: "lazygit"
+      description: "Terminal UI for git"
+    - name: "gh"
+      description: "GitHub CLI"
+
+  # Development utilities
+  utilities:
+    - name: "just"
+      description: "Command runner (make replacement)"
+    - name: "watchexec"
+      description: "File watcher for automation"
+    - name: "hyperfine" 
+      description: "Benchmarking tool"
+    - name: "tokei"
+      description: "Lines of code counter"
+    - name: "kondo"
+      description: "Project cleanup tool"
+
+# Team-wide shell aliases that everyone gets
+aliases:
+  # Core replacements
+  cat: "bat"
+  ls: "eza"
+  l: "eza" 
+  tree: "broot"
+  grep: "rg"
+  find: "fd"
+  c: "z"  # zoxide jump
+  
+  # Editor shortcuts
+  h: "hx"  # helix
+  
+  # Git shortcuts (common team patterns)
+  gst: "git status"
+  gco: "git checkout" 
+  gp: "git push"
+  gl: "git pull"
+  ga: "git add"
+  gc: "git commit"
+  
+  # Development shortcuts
+  k: "kubectl"  # kubernetes
+  d: "docker"   # docker
+
+# Language runtimes managed by mise
+languages:
+  node:
+    default: "22"  # LTS version
+    description: "Node.js runtime and npm"
+  
+  python:
+    default: "3.12"
+    description: "Python runtime (use uv for project management)"
+  
+  rust:
+    default: "stable" 
+    description: "Rust toolchain with cargo"
+  
+  go:
+    default: "1.21"
+    description: "Go programming language"
+    
+  zig:
+    default: "0.11.0"
+    description: "Zig programming language"
+
+# Team configuration standards
+standards:
+  editor: "helix"
+  shell: "fish" 
+  multiplexer: "zellij"
+  prompt: "starship"
+  version_manager: "mise"

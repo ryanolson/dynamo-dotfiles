@@ -1,0 +1,119 @@
+# Linux-specific package definitions
+# These packages will be installed via apt and other Linux package managers
+
+apt:
+  # System packages available via apt
+  packages:
+    # Core development tools
+    - git
+    - curl
+    - build-essential  # gcc, make, etc.
+    - wget
+    - unzip
+    - software-properties-common
+    
+    # Development dependencies
+    - pkg-config
+    - libssl-dev
+    - libffi-dev
+    - python3-dev
+    
+    # Optional but useful
+    - htop
+    - tree
+    - jq
+
+# Tools installed via other methods (direct download, cargo, npm, etc.)
+direct_install:
+  # Tools not available in apt or requiring newer versions
+  tools:
+    - name: "chezmoi"
+      method: "script"
+      url: "https://get.chezmoi.io"
+      
+    - name: "mise"
+      method: "script" 
+      url: "https://mise.run"
+      
+    - name: "bat"
+      method: "github_release"
+      repo: "sharkdp/bat"
+      
+    - name: "eza"
+      method: "github_release"
+      repo: "eza-community/eza"
+      
+    - name: "ripgrep"
+      method: "github_release" 
+      repo: "BurntSushi/ripgrep"
+      
+    - name: "fd"
+      method: "github_release"
+      repo: "sharkdp/fd"
+      
+    - name: "zoxide"
+      method: "github_release"
+      repo: "ajeetdsouza/zoxide"
+      
+    - name: "dust"
+      method: "github_release"
+      repo: "bootandy/dust"
+      
+    - name: "procs"
+      method: "github_release"
+      repo: "dalance/procs"
+      
+    - name: "helix"
+      method: "github_release"
+      repo: "helix-editor/helix"
+      
+    - name: "starship"
+      method: "script"
+      url: "https://starship.rs/install.sh"
+      
+    - name: "zellij"
+      method: "github_release"
+      repo: "zellij-org/zellij"
+      
+    - name: "yazi"
+      method: "github_release"
+      repo: "sxyazi/yazi"
+      
+    - name: "lazygit"
+      method: "github_release"
+      repo: "jesseduffield/lazygit"
+      
+    - name: "gh" 
+      method: "apt_repo"
+      setup: "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg"
+      
+    - name: "just"
+      method: "github_release"
+      repo: "casey/just"
+      
+    - name: "watchexec"
+      method: "github_release"
+      repo: "watchexec/watchexec"
+      
+    - name: "hyperfine"
+      method: "github_release"
+      repo: "sharkdp/hyperfine"
+      
+    - name: "tokei"
+      method: "github_release"
+      repo: "XAMPPRocky/tokei"
+
+# Snap packages (alternative for some tools)
+snap:
+  packages:
+    - name: "broot"
+      channel: "stable"
+
+# System configuration
+system:
+  # Linux-specific settings
+  shell:
+    default: "/usr/bin/fish"  # Set fish as default shell
+    
+  # Add fish to /etc/shells if not present
+  setup_fish_shell: true

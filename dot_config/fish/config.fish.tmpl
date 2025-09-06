@@ -1,0 +1,149 @@
+# Fish shell configuration - Dynamo team setup
+# This config provides a modern, productive shell environment
+
+# Set up colors and environment
+set -gx COLORTERM truecolor
+set -gx EDITOR {{ .editor | quote }}
+set -gx VISUAL {{ .editor | quote }}
+
+# Add local bin directories to PATH
+fish_add_path $HOME/.local/bin
+fish_add_path $HOME/.cargo/bin  # Rust tools
+fish_add_path $HOME/.npm-global/bin  # npm global packages
+
+{{- if eq .chezmoi.os "darwin" }}
+# macOS-specific PATH additions
+fish_add_path /opt/homebrew/bin
+fish_add_path /usr/local/bin
+{{- end }}
+
+# Configure npm to use user directory for global packages
+set -gx NPM_CONFIG_PREFIX $HOME/.npm-global
+mkdir -p $HOME/.npm-global
+
+# Initialize tool integrations
+if command -v zoxide >/dev/null
+    zoxide init fish | source
+end
+
+if command -v starship >/dev/null
+    starship init fish | source
+end
+
+if command -v mise >/dev/null
+    mise activate fish | source
+end
+
+# Team-standard aliases (from team.yaml)
+{{- range $alias, $command := .team.aliases }}
+alias {{ $alias }} "{{ $command }}"
+{{- end }}
+
+{{- if .custom_aliases }}
+# Personal aliases
+{{- range $alias, $command := .custom_aliases }}
+alias {{ $alias }} "{{ $command }}"
+{{- end }}
+{{- end }}
+
+# Useful functions
+function mkcd --description "Create directory and cd into it"
+    mkdir -p $argv[1] && cd $argv[1]
+end
+
+function backup --description "Create a backup of a file"
+    cp $argv[1] $argv[1].backup.(date +%Y%m%d_%H%M%S)
+end
+
+function extract --description "Extract various archive formats"
+    if test -f $argv[1]
+        switch $argv[1]
+            case "*.tar.bz2"
+                tar xjf $argv[1]
+            case "*.tar.gz"
+                tar xzf $argv[1]
+            case "*.bz2"
+                bunzip2 $argv[1]
+            case "*.rar"
+                unrar e $argv[1]
+            case "*.gz"
+                gunzip $argv[1]
+            case "*.tar"
+                tar xf $argv[1]
+            case "*.tbz2"
+                tar xjf $argv[1]
+            case "*.tgz"
+                tar xzf $argv[1]
+            case "*.zip"
+                unzip $argv[1]
+            case "*.Z"
+                uncompress $argv[1]
+            case "*.7z"
+                7z x $argv[1]
+            case "*"
+                echo "Unknown archive format: $argv[1]"
+        end
+    else
+        echo "File not found: $argv[1]"
+    end
+end
+
+# Git shortcuts function
+function gcom --description "Git commit with message"
+    git commit -m $argv
+end
+
+function gpom --description "Git push origin main"
+    git push origin main
+end
+
+function gst --description "Enhanced git status"
+    git status --short --branch
+end
+
+# Development environment shortcuts
+{{- if .work_dirs }}
+# Quick navigation to work directories
+{{- range .work_dirs }}
+function {{ .name }} --description "Navigate to {{ .path }}"
+    cd {{ .path }}
+end
+{{- end }}
+{{- end }}
+
+# Welcome message for new shells
+function fish_greeting
+    set_color $fish_color_autosuggestion
+    echo "🐠 Welcome to Fish shell with Dynamo team configuration"
+    echo "   Editor: {{ .editor }} | Shell: fish | Prompt: starship"
+    if command -v mise >/dev/null
+        echo "   Runtime manager: mise ($(mise ls --current 2>/dev/null | wc -l | string trim) runtimes active)"
+    end
+    set_color normal
+end
+
+# Better history search
+bind \cr 'history --merge ; peco --layout=bottom-up --query (commandline) | read foo; if test "$foo"; commandline $foo; end; commandline -f repaint'
+
+# Auto-install commonly used tools on first run
+if not type -q {{ .cat_replacement }}
+    echo "🔧 Installing core CLI tools..."
+    {{- if eq .chezmoi.os "darwin" }}
+    if command -v brew >/dev/null
+        brew install bat eza ripgrep fd zoxide
+    end
+    {{- else }}
+    echo "Run the package installation script to install CLI tools"
+    {{- end }}
+end
+
+# Set up mise for language runtimes if not configured
+if command -v mise >/dev/null
+    if not test -f ~/.tool-versions && not test -f .mise.toml
+        echo "🔧 Setting up default language runtimes..."
+        mise use --global node@{{ .team.languages.node.default }}
+        mise use --global python@{{ .team.languages.python.default }}
+        mise use --global rust@{{ .team.languages.rust.default }}
+        mise use --global go@{{ .team.languages.go.default }}
+    end
+end

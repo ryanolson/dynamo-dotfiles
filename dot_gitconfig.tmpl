@@ -1,0 +1,82 @@
+# Git configuration template
+# Personal information will be filled from user's chezmoi config
+
+[user]
+{{- if .name }}
+    name = "{{ .name }}"
+{{- else }}
+    name = "Your Name"  # Replace with your name
+{{- end }}
+{{- if .email }}
+    email = "{{ .email }}"
+{{- else }}
+    email = "your.email@company.com"  # Replace with your email  
+{{- end }}
+
+[core]
+    editor = {{ .editor | quote }}
+    autocrlf = input
+    safecrlf = true
+    excludesfile = ~/.gitignore_global
+
+[init]
+    defaultBranch = "main"
+
+[pull]
+    rebase = true
+
+[push]
+    autoSetupRemote = true
+    default = current
+
+[rebase]
+    autostash = true
+
+[merge]
+    tool = {{ .editor | quote }}
+    conflictstyle = diff3
+
+[diff]
+    algorithm = histogram
+    colorMoved = default
+
+[log]
+    date = relative
+
+[format]
+    pretty = format:%C(yellow)%h%Creset -%C(red)%d%Creset %s %C(dim green)(%an %ar)%Creset
+
+[alias]
+    # Team-standard aliases
+    st = status
+    co = checkout
+    br = branch
+    ci = commit
+    df = diff
+    lg = log --graph --pretty=format:'%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr) %C(bold blue)<%an>%Creset' --abbrev-commit
+    
+    # Useful shortcuts
+    unstage = reset HEAD --
+    last = log -1 HEAD
+    visual = !gitk
+    
+    # Branch management
+    delete-merged = "!git branch --merged | grep -v '\\*' | xargs -n 1 git branch -d"
+    
+{{- if .github_user }}
+[github]
+    user = "{{ .github_user }}"
+{{- end }}
+
+{{- if .work_email }}
+# Work-specific configuration
+[includeIf "gitdir:~/work/"]
+    path = ~/.gitconfig-work
+
+[includeIf "gitdir:~/company/"]  
+    path = ~/.gitconfig-work
+{{- end }}
+
+# URL rewrites for faster cloning
+[url "git@github.com:"]
+    insteadOf = "https://github.com/"

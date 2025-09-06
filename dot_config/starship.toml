@@ -1,0 +1,162 @@
+# Starship prompt configuration - Dynamo team setup
+# Modern, informative prompt for development work
+
+# Main prompt format
+format = """
+$all$character"""
+
+# Right-hand side prompt
+right_format = """$time"""
+
+# Add newline before prompt
+add_newline = true
+
+# Character (prompt symbol)
+[character]
+success_symbol = "[🦄](bold green) ❯"
+error_symbol = "[🦄](bold red) ❯"
+vimcmd_symbol = "[🦄](bold yellow) ❮"
+
+# Time on right side
+[time]
+disabled = false
+format = "[$time]($style)"
+style = "bright-black"
+
+# Directory
+[directory]
+truncation_length = 3
+truncate_to_repo = true
+fish_style_pwd_dir_length = 1
+style = "bold cyan"
+
+# Git configuration  
+[git_branch]
+format = "on [$symbol$branch]($style) "
+symbol = "🌱 "
+style = "bold purple"
+
+[git_status]
+format = "([$all_status$ahead_behind]($style) )"
+style = "bold red"
+conflicted = "⚡"
+ahead = "⇡"
+behind = "⇣"
+diverged = "⇕"
+untracked = "?"
+stashed = "📦"
+modified = "!"
+staged = "+"
+renamed = "»"
+deleted = "✘"
+
+[git_state]
+format = "[$state( $progress_current of $progress_total)]($style) "
+style = "bright-yellow"
+
+# Language versions
+[nodejs]
+format = "via [$symbol($version )]($style)"
+symbol = "⬢ "
+style = "bold green"
+
+[python]
+format = "via [$symbol$pyenv_prefix($version )(\($virtualenv\) )]($style)"
+symbol = "🐍 "
+style = "bold yellow"
+
+[rust]
+format = "via [$symbol($version )]($style)"
+symbol = "🦀 "
+style = "bold red"
+
+[golang]
+format = "via [$symbol($version )]($style)"
+symbol = "🐹 "
+style = "bold cyan"
+
+[zig]
+format = "via [$symbol($version )]($style)"
+symbol = "↯ "
+style = "bold yellow"
+
+# Package versions
+[package]
+format = "is [$symbol$version]($style) "
+symbol = "📦 "
+style = "208"
+
+# Container context
+[docker_context]
+format = "via [$symbol$context]($style) "
+symbol = "🐳 "
+style = "blue bold"
+
+[kubernetes]
+format = 'on [$symbol$context( \($namespace\))]($style) '
+symbol = "☸ "
+style = "cyan bold"
+disabled = false
+
+# Cloud contexts
+[aws]
+format = "on [$symbol($profile )(\($region\) )]($style)"
+symbol = "☁️ "
+style = "bold yellow"
+
+# Execution time
+[cmd_duration]
+min_time = 2000
+format = "took [$duration]($style) "
+style = "yellow bold"
+
+# Memory usage
+[memory_usage]
+disabled = false
+threshold = 70
+format = "using [$symbol${ram_pct}]($style) "
+symbol = "🐏 "
+style = "bold dimmed white"
+
+# Battery
+[battery]
+full_symbol = "🔋"
+charging_symbol = "🔌"
+discharging_symbol = "⚡"
+
+[[battery.display]]
+threshold = 30
+style = "bold red"
+
+# Jobs
+[jobs]
+symbol = "+"
+style = "bold blue"
+
+# Status
+[status]
+style = "bg:blue"
+symbol = "💥"
+format = '[\[$symbol $common_meaning$signal_name$maybe_int\]]($style) '
+map_symbol = true
+disabled = false
+
+# Shell indicator
+[shell]
+fish_indicator = "🐠"
+bash_indicator = "bash"
+zsh_indicator = "zsh"
+disabled = false
+
+# Host information (useful for remote connections)
+[hostname]
+ssh_only = true
+format = "[$hostname]($style) in "
+style = "bold dimmed green"
+
+[username]
+style_user = "yellow bold"
+style_root = "red bold"
+format = "[$user]($style) "
+disabled = false
+show_always = false

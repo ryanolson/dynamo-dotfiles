@@ -1,0 +1,51 @@
+# Files to ignore when applying dotfiles
+# These files won't be managed by chezmoi
+
+README.md
+LICENSE
+.git/
+
+# Development files
+.chezmoi*
+.tool-versions
+.mise.toml
+
+# OS-specific files
+{{- if ne .chezmoi.os "darwin" }}
+# Ignore macOS-specific files on non-macOS systems
+.DS_Store
+.macos
+{{- end }}
+
+{{- if ne .chezmoi.os "linux" }}
+# Ignore Linux-specific files on non-Linux systems  
+.linux
+{{- end }}
+
+# Personal files that shouldn't be managed
+.ssh/id_*
+.ssh/known_hosts
+.aws/credentials
+.docker/config.json
+
+# Local development files
+node_modules/
+.env
+.env.local
+*.log
+
+# IDE-specific files (user preference)
+.vscode/
+.idea/
+*.sublime-*
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+*~
+.#*
+
+# OS cache files
+Thumbs.db
+Desktop.ini
