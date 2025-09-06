@@ -74,7 +74,7 @@ install_linux_packages() {
         
         # Install packages available via apt
         local apt_packages=(
-            htop tree jq build-essential pkg-config libssl-dev
+            htop tree jq build-essential pkg-config libssl-dev fish
         )
         
         for package in "${apt_packages[@]}"; do
@@ -100,7 +100,7 @@ install_linux_packages() {
         
         log "Installing $name from GitHub..."
         local latest_url="https://api.github.com/repos/$repo/releases/latest"
-        local download_url
+        local download_url=""
         
         case "$name" in
             "bat")
@@ -183,12 +183,12 @@ install_linux_packages() {
     local github_tools=(
         "sharkdp/bat:bat"
         "eza-community/eza:eza" 
-        "BurntSushi/ripgrep:rg"
+        "BurntSushi/ripgrep:ripgrep"  # Binary is named ripgrep, not rg
         "sharkdp/fd:fd"
         "ajeetdsouza/zoxide:zoxide"
         "bootandy/dust:dust"
         "dalance/procs:procs"
-        "helix-editor/helix:hx"
+        "helix-editor/helix:helix"  # Binary is named helix, not hx
         "zellij-org/zellij:zellij"
         "jesseduffield/lazygit:lazygit"
         "casey/just:just"
