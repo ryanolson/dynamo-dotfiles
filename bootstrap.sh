@@ -158,9 +158,12 @@ setup_runtimes() {
 install_packages() {
     log "📦 Installing additional packages..."
     
-    # Run the package installation script if it exists
-    if [[ -f "$HOME/.config/chezmoi/run_onchange_install-packages.sh" ]]; then
-        bash "$HOME/.config/chezmoi/run_onchange_install-packages.sh" || warn "Package installation script failed"
+    # Run the package installation script if it exists in chezmoi source
+    local pkg_script="$HOME/.local/share/chezmoi/run_onchange_install-packages.sh"
+    
+    if [[ -f "$pkg_script" ]]; then
+        log "Running package installation script..."
+        bash "$pkg_script" || warn "Some packages may have failed to install"
     else
         # Fallback: install core tools directly
         if [[ "$OS" == "macOS" ]]; then

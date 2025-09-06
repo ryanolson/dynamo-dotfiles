@@ -93,10 +93,27 @@ install_linux_packages() {
         local name="$2"
         local install_dir="$3"
         
-        if command -v "$name" &> /dev/null; then
-            log "✓ $name already installed"
-            return
-        fi
+        # Check if already installed (handle different binary names)
+        case "$name" in
+            "ripgrep")
+                if command -v "rg" &> /dev/null; then
+                    log "✓ ripgrep (rg) already installed"
+                    return
+                fi
+                ;;
+            "helix")
+                if command -v "hx" &> /dev/null; then
+                    log "✓ helix (hx) already installed"
+                    return
+                fi
+                ;;
+            *)
+                if command -v "$name" &> /dev/null; then
+                    log "✓ $name already installed"
+                    return
+                fi
+                ;;
+        esac
         
         log "Installing $name from GitHub..."
         local latest_url="https://api.github.com/repos/$repo/releases/latest"
@@ -162,12 +179,39 @@ install_linux_packages() {
                 unzip -q archive
             fi
             
-            # Find and install binary
-            local binary=$(find . -name "$name" -type f -executable | head -1)
+            # Find and install binary - handle different binary names
+            local binary=""
+            case "$name" in
+                "ripgrep")
+                    binary=$(find . -name "rg" -type f -executable | head -1)
+                    ;;
+                "helix")
+                    binary=$(find . -name "hx" -type f -executable | head -1)
+                    ;;
+                *)
+                    binary=$(find . -name "$name" -type f -executable | head -1)
+                    ;;
+            esac
+            
             if [[ -n "$binary" ]]; then
-                sudo cp "$binary" "$install_dir/"
-                sudo chmod +x "$install_dir/$name"
-                success "✓ $name installed"
+                # Install with expected name
+                case "$name" in
+                    "ripgrep")
+                        sudo cp "$binary" "$install_dir/rg"
+                        sudo chmod +x "$install_dir/rg"
+                        success "✓ ripgrep installed as rg"
+                        ;;
+                    "helix")
+                        sudo cp "$binary" "$install_dir/hx"
+                        sudo chmod +x "$install_dir/hx"
+                        success "✓ helix installed as hx"
+                        ;;
+                    *)
+                        sudo cp "$binary" "$install_dir/$name"
+                        sudo chmod +x "$install_dir/$name"
+                        success "✓ $name installed"
+                        ;;
+                esac
             else
                 warn "Binary not found for $name"
             fi
