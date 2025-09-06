@@ -1,6 +1,11 @@
 # Fish shell configuration - Dynamo team setup
 # This config provides a modern, productive shell environment
 
+# Handle unsupported TERM types (e.g., ghostty)
+if test "$TERM" = "xterm-ghostty"
+    set -gx TERM xterm-256color
+end
+
 # Set up colors and environment
 set -gx COLORTERM truecolor
 set -gx EDITOR hx
@@ -113,7 +118,7 @@ function fish_greeting
     echo "🐠 Welcome to Fish shell with Dynamo team configuration"
     echo "   Editor: helix | Shell: fish | Prompt: starship"
     if command -v mise >/dev/null
-        echo "   Runtime manager: mise ($(mise ls --current 2>/dev/null | wc -l | string trim) runtimes active)"
+        echo "   Runtime manager: mise ("(mise ls --current 2>/dev/null | wc -l | string trim)" runtimes active)"
     end
     set_color normal
 end
