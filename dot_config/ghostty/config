@@ -1,5 +1,13 @@
 theme = catppuccin-mocha
 
 adjust-cell-height = 10%
-command = /bin/zsh -c "zellij"
+# command = /bin/zsh -c "zellij"
 keybind = shift+enter=text:\x1b\r
+#keybind = shift+cmd+n=new_window:profile=no-zellij
+#keybind = shift+cmd+t=new_tab:profile=no-zellij
+
+# Profile without zellij
+# [profile "no-zellij"]
+# theme = catppuccin-mocha
+# adjust-cell-height = 10%
+# keybind = shift+enter=text:\x1b\r
