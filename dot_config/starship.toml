@@ -69,6 +69,8 @@ style = "bold yellow"
 format = "via [$symbol($version )]($style)"
 symbol = "🦀 "
 style = "bold red"
+detect_files = ["Cargo.toml"]
+detect_folders = []
 
 [golang]
 format = "via [$symbol($version )]($style)"

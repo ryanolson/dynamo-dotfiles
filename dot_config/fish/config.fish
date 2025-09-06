@@ -136,7 +136,7 @@ end
 # Welcome message for new shells
 function fish_greeting
     set_color $fish_color_autosuggestion
-    echo "🐠 Welcome to Fish shell with Dynamo team configuration"
+    echo "Welcome to Dynamo development environment"
     echo "   Editor: helix | Shell: fish | Prompt: starship"
     if command -v mise >/dev/null
         echo "   Runtime manager: mise ("(mise ls --current 2>/dev/null | wc -l | string trim)" runtimes active)"

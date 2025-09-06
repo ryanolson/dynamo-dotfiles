@@ -1,6 +1,6 @@
 # Dynamo Development Environment
 
-Modern, cross-platform development environment using **chezmoi** for dotfiles management and **mise** for runtime version management.
+A modern, cross-platform development environment using native package managers and dotfile management.
 
 ## 🚀 Quick Start
 
@@ -9,13 +9,13 @@ Modern, cross-platform development environment using **chezmoi** for dotfiles ma
 curl -fsSL https://raw.githubusercontent.com/ryanolson/dynamo-dotfiles/main/bootstrap.sh | bash
 ```
 
-## 🛠️ What You Get
+## 📦 What's Included
 
 ### Core Tools
-- **📝 Editor**: Helix (modern terminal editor)
-- **🐠 Shell**: Fish (user-friendly shell with modern features)  
-- **⭐ Prompt**: Starship (cross-shell prompt with git integration)
-- **🖥️ Multiplexer**: Zellij (terminal multiplexer with modern UI)
+- **Editor**: [Helix](https://helix-editor.com/) - Modern modal text editor
+- **Shell**: [Fish](https://fishshell.com/) - User-friendly command line shell
+- **Prompt**: [Starship](https://starship.rs/) - Fast, customizable prompt with 🦄
+- **Multiplexer**: [Zellij](https://zellij.dev/) - Modern terminal workspace
 
 ### Modern CLI Replacements
 - **`bat`** → enhanced `cat` with syntax highlighting
@@ -25,11 +25,22 @@ curl -fsSL https://raw.githubusercontent.com/ryanolson/dynamo-dotfiles/main/boot
 - **`zoxide`** → smart `cd` with frecency
 - **`dust`** → intuitive `du` replacement
 
+### Language Runtimes (via mise)
+- **Node.js** 22 (LTS)
+- **Python** 3.12 with [uv](https://github.com/astral-sh/uv) package manager
+- **Rust** stable toolchain
+- **Go** 1.21
+- **Zig** 0.11
+
+### AI Development Tools
+- **ccmanager** - Claude Code session manager
+- **claude** - Anthropic Claude CLI
+- **ruler** - AI agent configuration manager
+
 ### Development Environment
-- **Language Runtimes**: Node.js, Python, Rust, Go, Zig (via mise)
-- **Package Managers**: npm, cargo, pip/uv (user-managed)
 - **Version Control**: Git with team-standard configuration
 - **File Management**: yazi (terminal file manager), broot (tree view)
+- **Task Runner**: just (modern make alternative)
 
 ## 🏗️ Architecture
 
@@ -101,6 +112,40 @@ data:
     - kubectl
     - terraform
 ```
+
+## ⌨️ Key Bindings
+
+### Helix Editor
+| Key | Action |
+|-----|--------|
+| `Space f` | File picker |
+| `Space b` | Buffer picker |
+| `Space s` | Symbol picker |
+| `Space /` | Global search |
+| `Ctrl-s` | Save file |
+| `Ctrl-z` | Undo |
+| `Ctrl-y` | Redo |
+
+### Zellij Terminal
+| Key | Action |
+|-----|--------|
+| `Ctrl-p` | Enter pane mode |
+| `Ctrl-t` | Enter tab mode |
+| `Ctrl-n` | Enter resize mode |
+| `Ctrl-s` | Enter scroll mode |
+| `Alt-n` | New pane |
+| `Alt-[` / `Alt-]` | Switch tabs |
+
+### Fish Shell Aliases
+| Alias | Command |
+|-------|---------|
+| `l` | `eza` (list files) |
+| `c` | `z` (zoxide jump) |
+| `h` | `hx` (helix editor) |
+| `gst` | `git status` |
+| `gco` | `git checkout` |
+| `gp` | `git push` |
+| `gl` | `git pull` |
 
 ## 📚 Usage
 
@@ -200,7 +245,39 @@ If you're migrating from our previous Nix-based setup:
 2. Test with `chezmoi apply --dry-run`
 3. Commit changes - team gets updates automatically
 
-## 📖 Documentation
+## 🎨 Starship Prompt
+
+The prompt shows:
+- Current directory
+- Git branch and status
+- Language versions (only when relevant files present)
+- Command execution time
+- Exit status with 🦄 emoji
+
+### Prompt Behavior
+- **Rust version** only shows when `Cargo.toml` is present
+- **Python version** shows in Python projects
+- **Node version** shows in JavaScript/TypeScript projects
+- **Lock icon 🔒** appears when you don't have write permissions
+
+## 📖 Interactive Documentation
+
+For detailed documentation, install and run the TUI guide:
+```bash
+# Install the guide
+cargo install --git https://github.com/ryanolson/dynamo-tui
+
+# Run the interactive documentation
+dynamo-guide
+```
+
+The TUI provides:
+- Complete keybinding references
+- Tool usage guides
+- Configuration examples
+- Tips and tricks
+
+## 📚 External Documentation
 
 - **chezmoi**: https://chezmoi.io/
 - **mise**: https://mise.jdx.dev/  

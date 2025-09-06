@@ -46,7 +46,10 @@ install_macos_packages() {
         lazygit gh
         
         # Development utilities
-        just watchexec hyperfine tokei
+        just watchexec hyperfine tokei uv
+        
+        # Container and orchestration
+        kubectl
         
         # Optional but useful
         jq tree htop wget
@@ -252,6 +255,20 @@ install_linux_packages() {
     if ! command -v starship &> /dev/null; then
         log "Installing starship..."
         curl -sS https://starship.rs/install.sh | sh -s -- --yes || warn "Failed to install starship"
+    fi
+    
+    # uv (Python package manager)
+    if ! command -v uv &> /dev/null; then
+        log "Installing uv (Python package manager)..."
+        curl -LsSf https://astral.sh/uv/install.sh | sh || warn "Failed to install uv"
+    fi
+    
+    # kubectl (Kubernetes CLI)
+    if ! command -v kubectl &> /dev/null; then
+        log "Installing kubectl..."
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+        rm kubectl
     fi
     
     # GitHub CLI (via apt repository)

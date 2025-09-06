@@ -146,6 +146,7 @@ setup_runtimes() {
         mise use --global python@3.12 || warn "Failed to install Python" 
         mise use --global rust@stable || warn "Failed to install Rust"
         mise use --global go@1.21 || warn "Failed to install Go"
+        mise use --global zig@0.11 || warn "Failed to install Zig"
     else
         # Install from existing configuration
         mise install || warn "Some runtimes may have failed to install"
