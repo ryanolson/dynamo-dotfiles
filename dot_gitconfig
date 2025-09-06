@@ -55,6 +55,6 @@
     # Branch management
     delete-merged = "!git branch --merged | grep -v '\\*' | xargs -n 1 git branch -d"
 
-# URL rewrites for faster cloning
-[url "git@github.com:"]
-    insteadOf = "https://github.com/"
+# URL rewrites for faster cloning (uncomment if you have SSH keys set up)
+# [url "git@github.com:"]
+#     insteadOf = "https://github.com/"
