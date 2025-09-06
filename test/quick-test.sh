@@ -49,13 +49,32 @@ case "$ACTION" in
     
     tools)
         log "Checking installed tools..."
-        for tool in chezmoi mise fish bat eza ripgrep fd zoxide helix starship zellij; do
-            if sudo su - ryan -c "command -v $tool" >/dev/null 2>&1; then
-                success "✓ $tool"
+        # Check tools with their actual binary names
+        declare -A tools=(
+            ["chezmoi"]="chezmoi"
+            ["mise"]="mise"
+            ["fish"]="fish"
+            ["bat"]="bat"
+            ["eza"]="eza"
+            ["ripgrep"]="rg"
+            ["fd"]="fd"
+            ["zoxide"]="zoxide"
+            ["helix"]="hx"
+            ["starship"]="starship"
+            ["zellij"]="zellij"
+            ["lazygit"]="lazygit"
+            ["just"]="just"
+            ["gh"]="gh"
+        )
+        
+        for name in "${!tools[@]}"; do
+            binary="${tools[$name]}"
+            if sudo su - ryan -c "command -v $binary" >/dev/null 2>&1; then
+                success "✓ $name ($binary)"
             else
-                warn "✗ $tool"
+                warn "✗ $name ($binary)"
             fi
-        done
+        done | sort
         ;;
     
     shell)

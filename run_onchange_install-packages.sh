@@ -148,7 +148,7 @@ install_linux_packages() {
                 download_url=$(curl -s "$latest_url" | grep "browser_download_url.*zellij.*x86_64.*linux.*tar.gz" | cut -d'"' -f4 | head -1)
                 ;;
             "lazygit")
-                download_url=$(curl -s "$latest_url" | grep "browser_download_url.*lazygit.*Linux_x86_64.tar.gz" | cut -d'"' -f4 | head -1)
+                download_url=$(curl -s "$latest_url" | grep "browser_download_url.*lazygit.*linux_x86_64.tar.gz" | cut -d'"' -f4 | head -1)
                 ;;
             "just")
                 download_url=$(curl -s "$latest_url" | grep "browser_download_url.*just.*x86_64.*linux.*tar.gz" | cut -d'"' -f4 | head -1)
