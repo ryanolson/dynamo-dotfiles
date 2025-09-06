@@ -10,9 +10,9 @@ in {
   };
 
   imports = [
-    # Import team base configuration from GitHub (using fetchTarball to avoid hash requirement)
+    # Import team base configuration from GitHub (using specific commit hash)
     "${builtins.fetchTarball {
-      url = "https://github.com/ryanolson/dynamo-nix/archive/main.tar.gz?v=3";
+      url = "https://github.com/ryanolson/dynamo-nix/archive/d4013e7.tar.gz";
     }}/team-base.nix"
   ];
   
