@@ -10,11 +10,10 @@ in {
   };
 
   imports = [
-    # Import team base configuration from GitHub
-    (builtins.fetchurl {
-      url = "https://raw.githubusercontent.com/ryanolson/dynamo-nix/main/team-base.nix";
-      sha256 = "sha256-0000000000000000000000000000000000000000000000000000";  # Will be updated after first push
-    })
+    # Import team base configuration from GitHub (using fetchTarball to avoid hash requirement)
+    "${builtins.fetchTarball {
+      url = "https://github.com/ryanolson/dynamo-nix/archive/main.tar.gz";
+    }}/team-base.nix"
   ];
   
   # Personal git configuration (not in team base)
