@@ -69,8 +69,10 @@ style = "bold yellow"
 format = "via [$symbol($version )]($style)"
 symbol = "🦀 "
 style = "bold red"
+# Only show when Cargo.toml is present in the tree
 detect_files = ["Cargo.toml"]
 detect_folders = []
+detect_extensions = []
 
 [golang]
 format = "via [$symbol($version )]($style)"
