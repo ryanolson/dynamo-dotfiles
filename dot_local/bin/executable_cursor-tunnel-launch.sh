@@ -8,7 +8,6 @@ set -euo pipefail
 # Configuration
 CURSOR_CLI="${CURSOR_CLI:-cursor}"
 CLAUDE_COMMAND="${CLAUDE_COMMAND:-claude}"
-TUNNEL_PREFIX="${TUNNEL_PREFIX:-dev}"
 LOG_DIR="${HOME}/.local/share/cursor-tunnels"
 
 # Global state
@@ -27,34 +26,29 @@ setup_logging() {
 
 # Generate tunnel name from context
 generate_tunnel_name() {
-    local project_name=""
     local branch_name=""
     
-    # Use ccmanager environment variables if available
-    if [ -n "${CCMANAGER_WORKTREE_PATH:-}" ]; then
-        project_name=$(basename "$(dirname "$CCMANAGER_WORKTREE_PATH")")
-        branch_name="${CCMANAGER_BRANCH_NAME:-main}"
+    # Get branch name from ccmanager or git
+    if [ -n "${CCMANAGER_BRANCH_NAME:-}" ]; then
+        branch_name="${CCMANAGER_BRANCH_NAME}"
     else
         # Fallback to git detection
         if git rev-parse --git-dir > /dev/null 2>&1; then
-            project_name=$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)")
             branch_name=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
         else
-            project_name=$(basename "$(pwd)")
             branch_name="main"
         fi
     fi
     
-    # Clean names for tunnel identifier
-    project_name=${project_name//[^a-zA-Z0-9]/-}
-    branch_name=${branch_name//[^a-zA-Z0-9]/-}
+    # Clean branch name for tunnel identifier (replace non-alphanumeric with hyphens)
+    TUNNEL_NAME=${branch_name//[^a-zA-Z0-9]/-}
     
-    # Generate unique tunnel name
-    TUNNEL_NAME="${TUNNEL_PREFIX}-${project_name}-${branch_name}"
-    
-    # Truncate if too long (tunnel names have length limits)
-    if [ ${#TUNNEL_NAME} -gt 60 ]; then
-        TUNNEL_NAME="${TUNNEL_NAME:0:60}"
+    # If too long, truncate and add hash for uniqueness
+    if [ ${#TUNNEL_NAME} -gt 50 ]; then
+        # Generate 6-char hash of full branch name
+        local hash=$(echo "$branch_name" | sha256sum | cut -c1-6)
+        # Truncate to leave room for "-" and 6-char hash (50 - 7 = 43)
+        TUNNEL_NAME="${TUNNEL_NAME:0:43}-${hash}"
     fi
     
     echo "[$(date)] Generated tunnel name: $TUNNEL_NAME" >> "$TUNNEL_LOG"
