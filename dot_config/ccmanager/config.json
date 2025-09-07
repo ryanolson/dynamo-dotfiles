@@ -1,0 +1,36 @@
+{
+  "shortcuts": {
+    "returnToMenu": {
+      "ctrl": true,
+      "key": "e"
+    },
+    "cancel": {
+      "key": "escape"
+    }
+  },
+  "statusHooks": {},
+  "worktreeHooks": {
+    "post_creation": {
+      "command": "cd $CCMANAGER_WORKTREE_PATH && ruler apply --nested",
+      "enabled": true
+    }
+  },
+  "worktree": {
+    "autoDirectory": true,
+    "autoDirectoryPattern": "../{project}-workspaces/{branch}",
+    "copySessionData": true
+  },
+  "command": {
+    "command": "claude"
+  },
+  "commandPresets": {
+    "presets": [
+      {
+        "id": "1",
+        "name": "Main",
+        "command": "claude"
+      }
+    ],
+    "defaultPresetId": "1"
+  }
+}
