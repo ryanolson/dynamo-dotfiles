@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/ubuntu/.config/**)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebSearch",
+      "Bash(chezmoi data:*)",
+      "Read(//home/ubuntu/.local/share/chezmoi/.git/**)",
+      "Read(//home/ubuntu/.local/share/chezmoi/**)",
+      "Bash(git add:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

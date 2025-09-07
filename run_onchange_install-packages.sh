@@ -64,6 +64,21 @@ install_macos_packages() {
         fi
     done
     
+    # Install Cursor CLI
+    if ! command -v cursor &> /dev/null; then
+        log "Installing cursor CLI..."
+        local temp_dir=$(mktemp -d)
+        curl -Lk "https://api2.cursor.sh/updates/download-latest?os=cli-darwin-x64" \
+            --output "$temp_dir/cursor_cli.tar.gz"
+        tar -xzf "$temp_dir/cursor_cli.tar.gz" -C "$temp_dir"
+        sudo cp "$temp_dir/cursor" /usr/local/bin/cursor
+        sudo chmod +x /usr/local/bin/cursor
+        rm -rf "$temp_dir"
+        success "✓ cursor CLI installed"
+    else
+        log "✓ cursor CLI already installed"
+    fi
+    
     success "✅ macOS packages installed"
 }
 
@@ -292,6 +307,21 @@ install_linux_packages() {
     if command -v snap &> /dev/null && ! command -v broot &> /dev/null; then
         log "Installing broot via snap..."
         sudo snap install broot || warn "Failed to install broot"
+    fi
+    
+    # Cursor CLI
+    if ! command -v cursor &> /dev/null; then
+        log "Installing cursor CLI..."
+        local temp_dir=$(mktemp -d)
+        curl -Lk "https://api2.cursor.sh/updates/download-latest?os=cli-alpine-x64" \
+            --output "$temp_dir/cursor_cli.tar.gz"
+        tar -xzf "$temp_dir/cursor_cli.tar.gz" -C "$temp_dir"
+        sudo cp "$temp_dir/cursor" /usr/local/bin/cursor
+        sudo chmod +x /usr/local/bin/cursor
+        rm -rf "$temp_dir"
+        success "✓ cursor CLI installed"
+    else
+        log "✓ cursor CLI already installed"
     fi
     
     success "✅ Linux packages installed"

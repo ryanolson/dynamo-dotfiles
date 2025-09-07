@@ -79,6 +79,12 @@ tools:
     - name: "kondo"
       description: "Project cleanup tool"
 
+  # AI development tools
+  ai_tools:
+    - name: "cursor"
+      description: "Cursor IDE CLI for remote tunneling"
+      category: "ai"
+
 # Team-wide shell aliases that everyone gets
 aliases:
   # Core replacements
