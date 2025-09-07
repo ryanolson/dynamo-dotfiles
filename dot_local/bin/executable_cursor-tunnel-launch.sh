@@ -27,6 +27,7 @@ setup_logging() {
 # Generate tunnel name from context
 generate_tunnel_name() {
     local branch_name=""
+    local project_name=""
     
     # Get branch name from ccmanager or git
     if [ -n "${CCMANAGER_BRANCH_NAME:-}" ]; then
@@ -40,13 +41,34 @@ generate_tunnel_name() {
         fi
     fi
     
-    # Clean branch name for tunnel identifier (replace non-alphanumeric with hyphens)
-    TUNNEL_NAME=${branch_name//[^a-zA-Z0-9]/-}
+    # Get project name
+    if [ -n "${CCMANAGER_PROJECT:-}" ]; then
+        # Use ccmanager project if available
+        project_name="${CCMANAGER_PROJECT}"
+    elif [ -n "${CCMANAGER_WORKTREE_PATH:-}" ]; then
+        # Extract from worktree path pattern: ../{project}-workspaces/{branch}
+        # Get the parent directory name and remove the -workspaces suffix
+        local parent_dir=$(basename "$(dirname "$CCMANAGER_WORKTREE_PATH")")
+        project_name="${parent_dir%-workspaces}"
+    elif git rev-parse --git-dir > /dev/null 2>&1; then
+        # Fallback to git repo name
+        project_name=$(basename "$(git rev-parse --show-toplevel 2>/dev/null)")
+    else
+        # Last resort: current directory
+        project_name=$(basename "$(pwd)")
+    fi
+    
+    # Clean names for tunnel identifier (replace non-alphanumeric with hyphens)
+    project_name=${project_name//[^a-zA-Z0-9]/-}
+    branch_name=${branch_name//[^a-zA-Z0-9]/-}
+    
+    # Combine project and branch
+    TUNNEL_NAME="${project_name}-${branch_name}"
     
     # If too long, truncate and add hash for uniqueness
     if [ ${#TUNNEL_NAME} -gt 50 ]; then
-        # Generate 6-char hash of full branch name
-        local hash=$(echo "$branch_name" | sha256sum | cut -c1-6)
+        # Generate 6-char hash of full combined name
+        local hash=$(echo "${project_name}-${branch_name}" | sha256sum | cut -c1-6)
         # Truncate to leave room for "-" and 6-char hash (50 - 7 = 43)
         TUNNEL_NAME="${TUNNEL_NAME:0:43}-${hash}"
     fi
@@ -137,12 +159,8 @@ launch_claude() {
     
     echo "[$(date)] Launching Claude with args: ${claude_args[*]}" >> "$TUNNEL_LOG"
     
-    # Launch Claude with all provided arguments
-    "$CLAUDE_COMMAND" "${claude_args[@]}" &
-    CLAUDE_PID=$!
-    
-    # Wait for Claude to finish
-    wait "$CLAUDE_PID"
+    # Launch Claude in foreground (needs stdin for interactive mode)
+    "$CLAUDE_COMMAND" "${claude_args[@]}"
     local claude_exit_code=$?
     
     echo "[$(date)] Claude exited with code: $claude_exit_code" >> "$TUNNEL_LOG"
