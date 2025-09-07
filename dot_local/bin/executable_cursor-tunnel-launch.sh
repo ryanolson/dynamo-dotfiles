@@ -47,9 +47,11 @@ generate_tunnel_name() {
         project_name="${CCMANAGER_PROJECT}"
     elif [ -n "${CCMANAGER_WORKTREE_PATH:-}" ]; then
         # Extract from worktree path pattern: ../{project}-workspaces/{branch}
-        # Get the parent directory name and remove the -workspaces suffix
-        local parent_dir=$(basename "$(dirname "$CCMANAGER_WORKTREE_PATH")")
-        project_name="${parent_dir%-workspaces}"
+        # The parent directory is like "dynamo-workspaces", we want "dynamo"
+        local workspaces_dir=$(dirname "$CCMANAGER_WORKTREE_PATH")
+        local workspaces_name=$(basename "$workspaces_dir")
+        # Remove the -workspaces suffix to get the project name
+        project_name="${workspaces_name%-workspaces}"
     elif git rev-parse --git-dir > /dev/null 2>&1; then
         # Fallback to git repo name
         project_name=$(basename "$(git rev-parse --show-toplevel 2>/dev/null)")
@@ -74,6 +76,9 @@ generate_tunnel_name() {
     fi
     
     echo "[$(date)] Generated tunnel name: $TUNNEL_NAME" >> "$TUNNEL_LOG"
+    
+    # Output tunnel name to user
+    echo "🏷️  Tunnel name: $TUNNEL_NAME"
 }
 
 # Launch Cursor tunnel

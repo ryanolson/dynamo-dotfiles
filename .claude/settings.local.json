@@ -16,7 +16,9 @@
       "Bash(git pull:*)",
       "Bash(chezmoi apply:*)",
       "Read(//home/ubuntu/.local/share/cursor-tunnels/**)",
-      "Bash(chmod:*)"
+      "Bash(chmod:*)",
+      "Bash(timeout:*)",
+      "Bash(git commit:*)"
     ],
     "deny": [],
     "ask": []
