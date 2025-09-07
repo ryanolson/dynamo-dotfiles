@@ -8,7 +8,11 @@
       "Bash(chezmoi data:*)",
       "Read(//home/ubuntu/.local/share/chezmoi/.git/**)",
       "Read(//home/ubuntu/.local/share/chezmoi/**)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "WebFetch(domain:docs.rc.fas.harvard.edu)",
+      "WebFetch(domain:code.visualstudio.com)",
+      "Read(//home/ubuntu/.local/bin/**)",
+      "Bash(cursor:*)"
     ],
     "deny": [],
     "ask": []

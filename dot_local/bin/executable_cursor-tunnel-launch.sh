@@ -58,6 +58,23 @@ generate_tunnel_name() {
 launch_cursor_tunnel() {
     echo "[$(date)] Launching Cursor tunnel: $TUNNEL_NAME" >> "$TUNNEL_LOG"
     
+    # Change to worktree directory if available
+    if [ -n "${CCMANAGER_WORKTREE_PATH:-}" ]; then
+        cd "$CCMANAGER_WORKTREE_PATH"
+        echo "[$(date)] Changed to worktree: $CCMANAGER_WORKTREE_PATH" >> "$TUNNEL_LOG"
+    fi
+    
+    # Log current directory
+    echo "[$(date)] Tunnel starting in directory: $(pwd)" >> "$TUNNEL_LOG"
+    
+    # Check for workspace file
+    local workspace_file=""
+    local workspace_count=$(ls -1 *.code-workspace 2>/dev/null | wc -l)
+    if [ "$workspace_count" -eq 1 ]; then
+        workspace_file=$(ls -1 *.code-workspace 2>/dev/null)
+        echo "[$(date)] Found workspace file: $workspace_file" >> "$TUNNEL_LOG"
+    fi
+    
     # Check if Cursor CLI exists
     if ! command -v "$CURSOR_CLI" &> /dev/null; then
         echo "[$(date)] ERROR: Cursor CLI not found at: $CURSOR_CLI" >> "$TUNNEL_LOG"
@@ -67,6 +84,10 @@ launch_cursor_tunnel() {
     
     # Start tunnel in background
     (
+        # Pass workspace_file to subshell
+        local ws_file="$workspace_file"
+        local work_dir="$(pwd)"
+        
         # Set up authentication if needed
         if ! "$CURSOR_CLI" tunnel user show &>/dev/null; then
             echo "[$(date)] Authenticating with GitHub..." >> "$TUNNEL_LOG"
@@ -84,6 +105,11 @@ launch_cursor_tunnel() {
                 # Show tunnel URL to user
                 if [[ "$line" == *"https://"* ]]; then
                     echo "🔗 Cursor tunnel available at: $(echo "$line" | grep -oE 'https://[^ ]+' | head -1)"
+                    echo "📁 Working directory: $work_dir"
+                    if [ -n "$ws_file" ]; then
+                        echo "📂 Workspace file: $ws_file"
+                        echo "💡 Tip: Open the workspace file in Cursor for full configuration"
+                    fi
                 fi
             done
     ) &
