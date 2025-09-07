@@ -11,7 +11,7 @@
   "statusHooks": {},
   "worktreeHooks": {
     "post_creation": {
-      "command": "cd $CCMANAGER_WORKTREE_PATH && ruler apply --nested",
+      "command": "cd $CCMANAGER_WORKTREE_PATH && ruler apply",
       "enabled": true
     }
   },
