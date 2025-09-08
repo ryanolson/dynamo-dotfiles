@@ -328,13 +328,17 @@ launch_claude() {
 # Cleanup function
 cleanup() {
     echo "[$(date)] Cleanup initiated" >> "$TUNNEL_LOG"
+    
+    # Always kill our session's tail process (if it exists)
+    # This prevents the script from hanging after Claude exits
+    if [ -f "$MASTER_LOCK.tail" ]; then
+        local tail_pid=$(cat "$MASTER_LOCK.tail")
+        echo "[$(date)] Stopping session tail process PID: $tail_pid" >> "$TUNNEL_LOG"
+        kill -TERM "$tail_pid" 2>/dev/null || true
+    fi
+    
     release_tunnel
     echo "[$(date)] Cleanup completed" >> "$TUNNEL_LOG"
-    
-    # Note about known limitation
-    if [ -n "$(pgrep -f 'cursor tunnel')" ]; then
-        echo "⚠️  Note: Cursor tunnel may still be running. Press Ctrl+C if needed to fully exit."
-    fi
 }
 
 # Main execution
