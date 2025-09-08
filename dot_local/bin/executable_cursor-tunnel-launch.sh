@@ -434,3 +434,4 @@ main() {
 
 # Execute main function with all script arguments
 main "$@"
+exit $?
