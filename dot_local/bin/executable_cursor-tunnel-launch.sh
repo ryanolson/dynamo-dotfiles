@@ -106,21 +106,26 @@ start_tunnel_process() {
     fi
     
     # Process output in background
-    (
-        tail -f "$output_file" 2>/dev/null | while IFS= read -r line; do
-            echo "[CURSOR] $line" >> "$TUNNEL_LOG"
-            
-            # Show tunnel URL only once when it starts
-            if [[ "$line" == *"https://"* ]] && [ ! -f "$LOCK_DIR/url_shown" ]; then
-                echo "🔗 Cursor tunnel available at: $(echo "$line" | grep -oE 'https://[^ ]+' | head -1)"
-                touch "$LOCK_DIR/url_shown"
-            fi
-        done
-    ) &
+    tail -f "$output_file" 2>/dev/null | while IFS= read -r line; do
+        echo "[CURSOR] $line" >> "$TUNNEL_LOG"
+        
+        # Show tunnel URL only once when it starts
+        if [[ "$line" == *"https://"* ]] && [ ! -f "$LOCK_DIR/url_shown" ]; then
+            echo "🔗 Cursor tunnel available at: $(echo "$line" | grep -oE 'https://[^ ]+' | head -1)"
+            touch "$LOCK_DIR/url_shown"
+        fi
+    done &
     
-    # Save the tail PID so we can clean it up later
-    local tail_pid=$!
-    echo "$tail_pid" > "$MASTER_LOCK.tail"
+    # Save the pipeline PID so we can clean it up later
+    local pipeline_pid=$!
+    echo "$pipeline_pid" > "$MASTER_LOCK.tail"
+    
+    # Also save the actual tail PID (it's the first process in the pipeline)
+    sleep 0.2  # Give the pipeline a moment to start
+    local actual_tail_pid=$(pgrep -f "tail -f $output_file" | head -1)
+    if [ -n "$actual_tail_pid" ]; then
+        echo "$actual_tail_pid" > "$MASTER_LOCK.tail.real"
+    fi
 }
 
 # Acquire tunnel (start new or join existing)
@@ -252,7 +257,7 @@ release_tunnel() {
                     fi
                     
                     # Clean up all files
-                    rm -f "$MASTER_LOCK" "$MASTER_LOCK.real" "$MASTER_LOCK.tail" "$NAME_FILE" "$LOCK_DIR/url_shown"
+                    rm -f "$MASTER_LOCK" "$MASTER_LOCK.real" "$MASTER_LOCK.tail" "$MASTER_LOCK.tail.real" "$NAME_FILE" "$LOCK_DIR/url_shown"
                     rm -f "$TUNNEL_DIR"/tunnel_output.*
                 fi
             else
@@ -329,12 +334,20 @@ launch_claude() {
 cleanup() {
     echo "[$(date)] Cleanup initiated" >> "$TUNNEL_LOG"
     
-    # Always kill our session's tail process (if it exists)
+    # Always kill our session's tail processes (if they exist)
     # This prevents the script from hanging after Claude exits
+    # Kill the actual tail process first
+    if [ -f "$MASTER_LOCK.tail.real" ]; then
+        local actual_tail_pid=$(cat "$MASTER_LOCK.tail.real")
+        echo "[$(date)] Stopping tail process PID: $actual_tail_pid" >> "$TUNNEL_LOG"
+        kill -TERM "$actual_tail_pid" 2>/dev/null || true
+    fi
+    
+    # Then kill the pipeline
     if [ -f "$MASTER_LOCK.tail" ]; then
-        local tail_pid=$(cat "$MASTER_LOCK.tail")
-        echo "[$(date)] Stopping session tail process PID: $tail_pid" >> "$TUNNEL_LOG"
-        kill -TERM "$tail_pid" 2>/dev/null || true
+        local pipeline_pid=$(cat "$MASTER_LOCK.tail")
+        echo "[$(date)] Stopping pipeline PID: $pipeline_pid" >> "$TUNNEL_LOG"
+        kill -TERM "$pipeline_pid" 2>/dev/null || true
     fi
     
     release_tunnel
