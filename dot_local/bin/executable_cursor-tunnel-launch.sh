@@ -87,7 +87,8 @@ start_tunnel_process() {
     # Launch tunnel in background, redirect output to file for processing
     local output_file="$TUNNEL_DIR/tunnel_output.$$"
     
-    "$CURSOR_CLI" tunnel \
+    # Use nohup to detach the process from the terminal
+    nohup "$CURSOR_CLI" tunnel \
         --name "$tunnel_name" \
         --accept-server-license-terms > "$output_file" 2>&1 &
     
@@ -95,6 +96,14 @@ start_tunnel_process() {
     local tunnel_pid=$!
     echo "$tunnel_pid" > "$MASTER_LOCK.real"
     echo "[$(date)] Started cursor tunnel with PID: $tunnel_pid" >> "$TUNNEL_LOG"
+    
+    # Also get the actual cursor process PID (sometimes nohup creates a wrapper)
+    sleep 0.5
+    local actual_pid=$(pgrep -f "cursor tunnel --name $tunnel_name" | head -1)
+    if [ -n "$actual_pid" ] && [ "$actual_pid" != "$tunnel_pid" ]; then
+        echo "$actual_pid" > "$MASTER_LOCK.real"
+        echo "[$(date)] Found actual cursor PID: $actual_pid (wrapper was $tunnel_pid)" >> "$TUNNEL_LOG"
+    fi
     
     # Process output in background
     (
@@ -112,9 +121,6 @@ start_tunnel_process() {
     # Save the tail PID so we can clean it up later
     local tail_pid=$!
     echo "$tail_pid" > "$MASTER_LOCK.tail"
-    
-    # Clean up output file on exit
-    trap "rm -f $output_file" EXIT
 }
 
 # Acquire tunnel (start new or join existing)
@@ -204,6 +210,7 @@ release_tunnel() {
                         local real_pid=$(cat "$MASTER_LOCK.real")
                         echo "[$(date)] Stopping cursor tunnel PID: $real_pid" >> "$TUNNEL_LOG"
                         kill -TERM "$real_pid" 2>/dev/null || true
+                        kill -INT "$real_pid" 2>/dev/null || true  # Also try SIGINT
                     fi
                     
                     # Kill the tail process if it exists
@@ -213,10 +220,15 @@ release_tunnel() {
                         kill -TERM "$tail_pid" 2>/dev/null || true
                     fi
                     
-                    # Kill by name as fallback
+                    # Kill by name as fallback (more aggressive)
                     if [ -f "$NAME_FILE" ]; then
                         local tunnel_name=$(cat "$NAME_FILE")
-                        pkill -f "cursor tunnel --name $tunnel_name" 2>/dev/null || true
+                        # Try multiple times with different signals
+                        pkill -TERM -f "cursor tunnel --name $tunnel_name" 2>/dev/null || true
+                        sleep 0.5
+                        pkill -INT -f "cursor tunnel --name $tunnel_name" 2>/dev/null || true
+                        sleep 0.5
+                        pkill -KILL -f "cursor tunnel --name $tunnel_name" 2>/dev/null || true
                     fi
                     
                     # Give it time to cleanup
@@ -257,31 +269,25 @@ display_tunnel_urls() {
     local tunnel_name="$1"
     local working_dir="${2:-$(pwd)}"
     
-    # Base tunnel URL
-    local base_url="https://vscode.dev/tunnel/${tunnel_name}"
-    
     echo ""
-    echo "🔗 Tunnel URLs:"
+    echo "🔗 Cursor Tunnel URLs:"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    
-    # Web browser URL (always works)
-    echo "🌐 Browser: $base_url/"
     
     # Generate clickable Cursor URL for folder using OSC 8 (with new window parameter)
     local cursor_folder_url="cursor://vscode-remote/tunnel+${tunnel_name}${working_dir}?windowId=_blank"
-    printf '📂 Open folder: \033]8;;%s\033\\Click to open in Cursor (new window)\033]8;;\033\\\n' "$cursor_folder_url"
+    printf '📂 Open folder: \033]8;;%s\033\\\033[4m[Click to open in Cursor]\033[24m\033]8;;\033\\\n' "$cursor_folder_url"
     
     # Check for workspace file
     local workspace_files=(*.code-workspace)
     if [ ${#workspace_files[@]} -eq 1 ] && [ -f "${workspace_files[0]}" ]; then
         local workspace_path="${working_dir}/${workspace_files[0]}"
         local cursor_workspace_url="cursor://vscode-remote/tunnel+${tunnel_name}${workspace_path}?windowId=_blank"
-        printf '📄 Open workspace: \033]8;;%s\033\\%s (Click to open in Cursor - new window)\033]8;;\033\\\n' "$cursor_workspace_url" "${workspace_files[0]}"
+        printf '📄 Open workspace (%s): \033]8;;%s\033\\\033[4m[Click to open in Cursor]\033[24m\033]8;;\033\\\n' "${workspace_files[0]}" "$cursor_workspace_url"
     fi
     
     # Check if running in Zellij and show tip
     if [ -n "${ZELLIJ:-}" ]; then
-        echo "💡 Zellij tip: Hold SHIFT while clicking links to open them"
+        echo "💡 Zellij tip: Hold SHIFT+CMD while clicking links to open them"
     fi
     
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
