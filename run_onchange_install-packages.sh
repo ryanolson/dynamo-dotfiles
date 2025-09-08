@@ -178,7 +178,8 @@ install_linux_packages() {
                 download_url=$(curl -s "$latest_url" | grep "browser_download_url.*hyperfine.*x86_64.*linux.*tar.gz" | cut -d'"' -f4 | head -1)
                 ;;
             "tokei")
-                download_url=$(curl -s "$latest_url" | grep "browser_download_url.*tokei.*x86_64.*linux.*tar.gz" | cut -d'"' -f4 | head -1)
+                # Tokei uses a different naming pattern: tokei-x86_64-unknown-linux-gnu.tar.gz
+                download_url=$(curl -s "$latest_url" | grep "browser_download_url.*tokei.*x86_64.*linux.*gnu.*tar.gz" | cut -d'"' -f4 | head -1)
                 ;;
         esac
         
@@ -186,7 +187,8 @@ install_linux_packages() {
             local temp_dir=$(mktemp -d)
             cd "$temp_dir"
             
-            curl -L "$download_url" -o archive || { warn "Failed to download $name"; return; }
+            log "Downloading from: $download_url"
+            curl -L "$download_url" -o archive || { warn "Failed to download $name"; cd - > /dev/null; rm -rf "$temp_dir"; return 1; }
             
             # Extract based on file type
             if file archive | grep -q "gzip"; then
@@ -237,7 +239,8 @@ install_linux_packages() {
             cd - > /dev/null
             rm -rf "$temp_dir"
         else
-            warn "Download URL not found for $name"
+            warn "Download URL not found for $name (check GitHub releases)"
+            return 1
         fi
     }
     
@@ -261,7 +264,7 @@ install_linux_packages() {
     
     for tool in "${github_tools[@]}"; do
         IFS=':' read -r repo name <<< "$tool"
-        install_github_release "$repo" "$name" "/usr/local/bin"
+        install_github_release "$repo" "$name" "/usr/local/bin" || warn "Skipping $name due to installation failure"
     done
     
     # Install tools via direct scripts
