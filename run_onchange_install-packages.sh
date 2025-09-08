@@ -301,9 +301,12 @@ install_linux_packages() {
     # Yazi (file manager)
     if ! command -v yazi &> /dev/null; then
         log "Installing yazi..."
-        curl -L https://github.com/sxyazi/yazi/releases/latest/download/yazi-x86_64-unknown-linux-gnu.tar.gz | tar -xz -C /tmp/
-        sudo cp /tmp/yazi-x86_64-unknown-linux-gnu/yazi /usr/local/bin/
+        local temp_dir=$(mktemp -d)
+        curl -L https://github.com/sxyazi/yazi/releases/latest/download/yazi-x86_64-unknown-linux-gnu.zip -o "$temp_dir/yazi.zip"
+        unzip -q "$temp_dir/yazi.zip" -d "$temp_dir"
+        sudo cp "$temp_dir/yazi-x86_64-unknown-linux-gnu/yazi" /usr/local/bin/
         sudo chmod +x /usr/local/bin/yazi
+        rm -rf "$temp_dir"
     fi
     
     # Broot (via snap if available)

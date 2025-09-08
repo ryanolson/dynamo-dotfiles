@@ -87,8 +87,8 @@ start_tunnel_process() {
     # Launch tunnel in background, redirect output to file for processing
     local output_file="$TUNNEL_DIR/tunnel_output.$$"
     
-    # Use setsid to create a new session and process group for better cleanup
-    setsid "$CURSOR_CLI" tunnel \
+    # Start tunnel in background (without setsid which causes signal issues)
+    "$CURSOR_CLI" tunnel \
         --name "$tunnel_name" \
         --accept-server-license-terms > "$output_file" 2>&1 &
     
@@ -205,14 +205,14 @@ release_tunnel() {
                     echo "[$(date)] Last session, stopping tunnel PID: $tunnel_pid" >> "$TUNNEL_LOG"
                     echo "🔚 Last session, closing tunnel..."
                     
-                    # Kill the actual cursor tunnel process (and its process group)
+                    # Kill the actual cursor tunnel process
                     if [ -f "$MASTER_LOCK.real" ]; then
                         local real_pid=$(cat "$MASTER_LOCK.real")
                         echo "[$(date)] Stopping cursor tunnel PID: $real_pid" >> "$TUNNEL_LOG"
-                        # Kill the entire process group (negative PID)
-                        kill -TERM "-$real_pid" 2>/dev/null || kill -TERM "$real_pid" 2>/dev/null || true
+                        # Try to kill the cursor process
+                        kill -TERM "$real_pid" 2>/dev/null || true
                         sleep 0.5
-                        kill -INT "-$real_pid" 2>/dev/null || kill -INT "$real_pid" 2>/dev/null || true
+                        kill -INT "$real_pid" 2>/dev/null || true
                     fi
                     
                     # Kill the tail process if it exists
