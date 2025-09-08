@@ -234,6 +234,37 @@ release_tunnel() {
     ) 200>"$LOCK_DIR/.flock"
 }
 
+# Generate and display clickable tunnel URLs
+display_tunnel_urls() {
+    local tunnel_name="$1"
+    local working_dir="${2:-$(pwd)}"
+    
+    # Base tunnel URL
+    local base_url="https://vscode.dev/tunnel/${tunnel_name}"
+    
+    echo ""
+    echo "🔗 Tunnel URLs:"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    # Web browser URL (always works)
+    echo "🌐 Browser: $base_url/"
+    
+    # Generate clickable VSCode URL for folder using OSC 8
+    local vscode_folder_url="vscode://vscode-remote/tunnel+${tunnel_name}${working_dir}"
+    printf '📂 Open folder: \033]8;;%s\033\\Click to open in VSCode\033]8;;\033\\\n' "$vscode_folder_url"
+    
+    # Check for workspace file
+    local workspace_files=(*.code-workspace)
+    if [ ${#workspace_files[@]} -eq 1 ] && [ -f "${workspace_files[0]}" ]; then
+        local workspace_path="${working_dir}/${workspace_files[0]}"
+        local vscode_workspace_url="vscode://vscode-remote/tunnel+${tunnel_name}${workspace_path}"
+        printf '📄 Open workspace: \033]8;;%s\033\\%s (Click to open)\033]8;;\033\\\n' "$vscode_workspace_url" "${workspace_files[0]}"
+    fi
+    
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+}
+
 # Launch Claude with provided arguments
 launch_claude() {
     local claude_args=("$@")
@@ -245,6 +276,12 @@ launch_claude() {
         echo "📂 Working directory: $CCMANAGER_WORKTREE_PATH"
     else
         echo "📁 Working directory: $(pwd)"
+    fi
+    
+    # Display tunnel URLs if tunnel is running
+    if [ -f "$NAME_FILE" ]; then
+        local tunnel_name=$(cat "$NAME_FILE")
+        display_tunnel_urls "$tunnel_name" "$(pwd)"
     fi
     
     echo "[$(date)] Launching Claude with args: ${claude_args[*]}" >> "$TUNNEL_LOG"
