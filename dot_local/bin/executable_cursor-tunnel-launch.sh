@@ -84,26 +84,34 @@ start_tunnel_process() {
             "$CURSOR_CLI" tunnel user login --provider github
     fi
     
-    # Launch tunnel
+    # Launch tunnel with proper process tracking
+    # Start tunnel in background and immediately capture its PID
     "$CURSOR_CLI" tunnel \
         --name "$tunnel_name" \
-        --accept-server-license-terms 2>&1 | \
-        while IFS= read -r line; do
-            echo "[CURSOR] $line" >> "$TUNNEL_LOG"
-            
-            # Show tunnel URL only once when it starts
-            if [[ "$line" == *"https://"* ]] && [ ! -f "$LOCK_DIR/url_shown" ]; then
-                echo "🔗 Cursor tunnel available at: $(echo "$line" | grep -oE 'https://[^ ]+' | head -1)"
-                touch "$LOCK_DIR/url_shown"
+        --accept-server-license-terms > >( \
+            while IFS= read -r line; do
+                echo "[CURSOR] $line" >> "$TUNNEL_LOG"
                 
-                # Find and save the actual cursor tunnel PID
-                local actual_pid=$(pgrep -f "cursor tunnel --name $tunnel_name" | head -1)
-                if [ -n "$actual_pid" ]; then
-                    echo "$actual_pid" > "$MASTER_LOCK.real"
-                    echo "[$(date)] Found actual cursor PID: $actual_pid" >> "$TUNNEL_LOG"
+                # Show tunnel URL only once when it starts
+                if [[ "$line" == *"https://"* ]] && [ ! -f "$LOCK_DIR/url_shown" ]; then
+                    echo "🔗 Cursor tunnel available at: $(echo "$line" | grep -oE 'https://[^ ]+' | head -1)"
+                    touch "$LOCK_DIR/url_shown"
                 fi
-            fi
-        done
+            done
+        ) 2>&1 &
+    
+    # Immediately save the tunnel PID
+    local tunnel_pid=$!
+    echo "$tunnel_pid" > "$MASTER_LOCK.real"
+    echo "[$(date)] Started cursor tunnel with PID: $tunnel_pid" >> "$TUNNEL_LOG"
+    
+    # Also try to find the actual cursor process (in case $! gives us a wrapper)
+    sleep 1
+    local actual_pid=$(pgrep -f "cursor tunnel --name $tunnel_name" | head -1)
+    if [ -n "$actual_pid" ] && [ "$actual_pid" != "$tunnel_pid" ]; then
+        echo "$actual_pid" > "$MASTER_LOCK.real"
+        echo "[$(date)] Found actual cursor PID: $actual_pid (was $tunnel_pid)" >> "$TUNNEL_LOG"
+    fi
 }
 
 # Acquire tunnel (start new or join existing)
@@ -144,9 +152,11 @@ acquire_tunnel() {
         echo "🏷️  Tunnel name: $tunnel_name"
         echo "🚀 Starting new shared cursor tunnel..."
         
-        # Start tunnel in background
-        start_tunnel_process "$tunnel_name" &
-        local tunnel_pid=$!
+        # Start tunnel (it handles backgrounding internally)
+        start_tunnel_process "$tunnel_name"
+        
+        # Read the saved PID
+        local tunnel_pid=$(cat "$MASTER_LOCK.real" 2>/dev/null || echo "")
         
         # Save tunnel info
         echo "$tunnel_pid" > "$MASTER_LOCK"
@@ -249,16 +259,16 @@ display_tunnel_urls() {
     # Web browser URL (always works)
     echo "🌐 Browser: $base_url/"
     
-    # Generate clickable VSCode URL for folder using OSC 8
-    local vscode_folder_url="vscode://vscode-remote/tunnel+${tunnel_name}${working_dir}"
-    printf '📂 Open folder: \033]8;;%s\033\\Click to open in VSCode\033]8;;\033\\\n' "$vscode_folder_url"
+    # Generate clickable Cursor URL for folder using OSC 8
+    local cursor_folder_url="cursor://vscode-remote/tunnel+${tunnel_name}${working_dir}"
+    printf '📂 Open folder: \033]8;;%s\033\\Click to open in Cursor\033]8;;\033\\\n' "$cursor_folder_url"
     
     # Check for workspace file
     local workspace_files=(*.code-workspace)
     if [ ${#workspace_files[@]} -eq 1 ] && [ -f "${workspace_files[0]}" ]; then
         local workspace_path="${working_dir}/${workspace_files[0]}"
-        local vscode_workspace_url="vscode://vscode-remote/tunnel+${tunnel_name}${workspace_path}"
-        printf '📄 Open workspace: \033]8;;%s\033\\%s (Click to open)\033]8;;\033\\\n' "$vscode_workspace_url" "${workspace_files[0]}"
+        local cursor_workspace_url="cursor://vscode-remote/tunnel+${tunnel_name}${workspace_path}"
+        printf '📄 Open workspace: \033]8;;%s\033\\%s (Click to open in Cursor)\033]8;;\033\\\n' "$cursor_workspace_url" "${workspace_files[0]}"
     fi
     
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
