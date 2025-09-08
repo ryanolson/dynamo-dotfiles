@@ -28,67 +28,36 @@ setup_logging() {
     echo "[$(date)] Session $$ starting" >> "$TUNNEL_LOG"
 }
 
-# Generate tunnel name from context
+# Generate tunnel name from machine identity
 generate_tunnel_name() {
-    local branch_name=""
-    local project_name=""
+    local tunnel_name=""
     
-    # Get branch name from ccmanager or git
-    if [ -n "${CCMANAGER_BRANCH_NAME:-}" ]; then
-        branch_name="${CCMANAGER_BRANCH_NAME}"
+    # Get hostname
+    local hostname=$(hostname)
+    
+    # Get public IP and convert dots to hyphens
+    local public_ip=$(curl -s --max-time 2 ifconfig.me 2>/dev/null || echo "")
+    local ip_dashed="${public_ip//./-}"
+    
+    # Determine tunnel name based on hostname and IP
+    if [ -z "$public_ip" ]; then
+        # Couldn't get public IP, just use hostname
+        tunnel_name="$hostname"
+    elif [ "$hostname" = "$ip_dashed" ]; then
+        # Hostname is already the IP (with dashes), use it once
+        tunnel_name="$hostname"
     else
-        # Fallback to git detection
-        if git rev-parse --git-dir > /dev/null 2>&1; then
-            branch_name=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
-        else
-            branch_name="main"
-        fi
+        # Hostname differs from IP, combine them
+        tunnel_name="${hostname}-${ip_dashed}"
     fi
     
-    # Get project name
-    if [ -n "${CCMANAGER_PROJECT:-}" ]; then
-        # Use ccmanager project if available
-        project_name="${CCMANAGER_PROJECT}"
-    elif [ -n "${CCMANAGER_WORKTREE_PATH:-}" ]; then
-        # Extract from worktree path pattern: ../{project}-workspaces/{branch}
-        # For path like /home/ubuntu/repo/dynamo-workspaces/testing
-        # We want the actual project from the parent of workspaces dir
-        local workspaces_dir=$(dirname "$CCMANAGER_WORKTREE_PATH")
-        local workspaces_name=$(basename "$workspaces_dir")
-        
-        # If it ends with -workspaces, extract the base project name
-        if [[ "$workspaces_name" == *-workspaces ]]; then
-            # Get the actual project name from the parent path
-            local repo_dir=$(dirname "$workspaces_dir")
-            project_name=$(basename "$repo_dir")
-            # If repo dir basename is "repo", use the workspaces prefix
-            if [ "$project_name" = "repo" ]; then
-                project_name="${workspaces_name%-workspaces}"
-            fi
-        else
-            # Not in expected format, use current branch name as project
-            project_name=$(basename "$CCMANAGER_WORKTREE_PATH")
-        fi
-    elif git rev-parse --git-dir > /dev/null 2>&1; then
-        # Fallback to git repo name
-        project_name=$(basename "$(git rev-parse --show-toplevel 2>/dev/null)")
-    else
-        # Last resort: current directory
-        project_name=$(basename "$(pwd)")
-    fi
+    # Clean tunnel name (ensure only alphanumeric and hyphens)
+    tunnel_name=${tunnel_name//[^a-zA-Z0-9-]/-}
     
-    # Clean names for tunnel identifier (replace non-alphanumeric with hyphens)
-    project_name=${project_name//[^a-zA-Z0-9]/-}
-    branch_name=${branch_name//[^a-zA-Z0-9]/-}
-    
-    # Combine project and branch
-    local tunnel_name="${project_name}-${branch_name}"
-    
-    # If too long, truncate and add hash for uniqueness
+    # Ensure tunnel name isn't too long (cursor has a 50 char limit)
     if [ ${#tunnel_name} -gt 50 ]; then
-        # Generate 6-char hash of full combined name
-        local hash=$(echo "${project_name}-${branch_name}" | sha256sum | cut -c1-6)
-        # Truncate to leave room for "-" and 6-char hash (50 - 7 = 43)
+        # Truncate and add hash for uniqueness
+        local hash=$(echo "$hostname-$public_ip" | sha256sum | cut -c1-6)
         tunnel_name="${tunnel_name:0:43}-${hash}"
     fi
     
