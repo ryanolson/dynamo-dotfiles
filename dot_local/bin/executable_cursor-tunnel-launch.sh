@@ -192,87 +192,79 @@ acquire_tunnel() {
 release_tunnel() {
     echo "[$(date)] Releasing tunnel lock..." >> "$TUNNEL_LOG"
     
-    (
-        # Use a timeout to prevent indefinite hanging
-        if ! flock -x -w 5 200; then
-            echo "[$(date)] WARNING: Could not acquire lock for release_tunnel (timeout)" >> "$TUNNEL_LOG"
-            return 1
-        fi
+    # No flock needed here - we're just doing cleanup based on hard link count
+    if [ -f "$SESSION_LOCK" ]; then
+        # Get link count before removing our link
+        local links=$(stat -c %h "$SESSION_LOCK" 2>/dev/null || stat -f %l "$SESSION_LOCK" 2>/dev/null)
+        echo "[$(date)] Current sessions: $links" >> "$TUNNEL_LOG"
         
-        if [ -f "$SESSION_LOCK" ]; then
-            # Get link count before removing our link
-            local links=$(stat -c %h "$SESSION_LOCK" 2>/dev/null || stat -f %l "$SESSION_LOCK" 2>/dev/null)
-            echo "[$(date)] Current sessions: $links" >> "$TUNNEL_LOG"
-            
-            # Remove our session link
-            rm -f "$SESSION_LOCK"
-            
-            if [ $links -le 2 ]; then  # Was 2 (master + ours), now just master
-                # We were the last session
-                if [ -f "$MASTER_LOCK" ]; then
-                    local tunnel_pid=$(cat "$MASTER_LOCK")
-                    echo "[$(date)] Last session, stopping tunnel PID: $tunnel_pid" >> "$TUNNEL_LOG"
-                    echo "🔚 Last session, closing tunnel..."
-                    
-                    # Kill the actual cursor tunnel process
-                    if [ -f "$MASTER_LOCK.real" ]; then
-                        local real_pid=$(cat "$MASTER_LOCK.real")
-                        echo "[$(date)] Stopping cursor tunnel PID: $real_pid" >> "$TUNNEL_LOG"
-                        # Try to kill the cursor process
-                        kill -TERM "$real_pid" 2>/dev/null || true
-                        sleep 0.5
-                        kill -INT "$real_pid" 2>/dev/null || true
-                    fi
-                    
-                    # Kill any tail processes for this tunnel
-                    if [ -f "$MASTER_LOCK.output" ]; then
-                        local output_file=$(cat "$MASTER_LOCK.output")
-                        pkill -f "tail -f $output_file" 2>/dev/null || true
-                        rm -f "$output_file"
-                    fi
-                    
-                    # Kill by name as fallback (more aggressive)
-                    if [ -f "$NAME_FILE" ]; then
-                        local tunnel_name=$(cat "$NAME_FILE")
-                        # Try multiple times with different signals
-                        pkill -TERM -f "cursor tunnel --name $tunnel_name" 2>/dev/null || true
-                        sleep 0.5
-                        pkill -INT -f "cursor tunnel --name $tunnel_name" 2>/dev/null || true
-                        sleep 0.5
-                        pkill -KILL -f "cursor tunnel --name $tunnel_name" 2>/dev/null || true
-                    fi
-                    
-                    # Give it time to cleanup
-                    local wait_count=0
-                    while (kill -0 "$tunnel_pid" 2>/dev/null || ([ -f "$MASTER_LOCK.real" ] && kill -0 "$(cat "$MASTER_LOCK.real")" 2>/dev/null)) && [ $wait_count -lt 5 ]; do
-                        sleep 1
-                        ((wait_count++))
-                    done
-                    
-                    # Force kill if necessary
-                    if kill -0 "$tunnel_pid" 2>/dev/null; then
-                        kill -KILL "$tunnel_pid" 2>/dev/null || true
-                    fi
-                    if [ -f "$MASTER_LOCK.real" ]; then
-                        local real_pid=$(cat "$MASTER_LOCK.real")
-                        if kill -0 "$real_pid" 2>/dev/null; then
-                            kill -KILL "$real_pid" 2>/dev/null || true
-                        fi
-                    fi
-                    
-                    # Clean up all files
-                    rm -f "$MASTER_LOCK" "$MASTER_LOCK.real" "$MASTER_LOCK.output" "$MASTER_LOCK.bgpid" "$NAME_FILE" "$LOCK_DIR/url_shown"
-                    rm -f "$TUNNEL_DIR"/tunnel_output.*
+        # Remove our session link
+        rm -f "$SESSION_LOCK"
+        
+        if [ $links -le 2 ]; then  # Was 2 (master + ours), now just master
+            # We were the last session
+            if [ -f "$MASTER_LOCK" ]; then
+                local tunnel_pid=$(cat "$MASTER_LOCK")
+                echo "[$(date)] Last session, stopping tunnel PID: $tunnel_pid" >> "$TUNNEL_LOG"
+                echo "🔚 Last session, closing tunnel..."
+                
+                # Kill the actual cursor tunnel process
+                if [ -f "$MASTER_LOCK.real" ]; then
+                    local real_pid=$(cat "$MASTER_LOCK.real")
+                    echo "[$(date)] Stopping cursor tunnel PID: $real_pid" >> "$TUNNEL_LOG"
+                    # Try to kill the cursor process
+                    kill -TERM "$real_pid" 2>/dev/null || true
+                    sleep 0.5
+                    kill -INT "$real_pid" 2>/dev/null || true
                 fi
-            else
-                echo "[$(date)] Tunnel still in use ($((links - 1)) sessions remaining)" >> "$TUNNEL_LOG"
-                echo "📉 Tunnel still in use ($((links - 1)) sessions)"
+                
+                # Kill any tail processes for this tunnel
+                if [ -f "$MASTER_LOCK.output" ]; then
+                    local output_file=$(cat "$MASTER_LOCK.output")
+                    pkill -f "tail -f $output_file" 2>/dev/null || true
+                    rm -f "$output_file"
+                fi
+                
+                # Kill by name as fallback (more aggressive)
+                if [ -f "$NAME_FILE" ]; then
+                    local tunnel_name=$(cat "$NAME_FILE")
+                    # Try multiple times with different signals
+                    pkill -TERM -f "cursor tunnel --name $tunnel_name" 2>/dev/null || true
+                    sleep 0.5
+                    pkill -INT -f "cursor tunnel --name $tunnel_name" 2>/dev/null || true
+                    sleep 0.5
+                    pkill -KILL -f "cursor tunnel --name $tunnel_name" 2>/dev/null || true
+                fi
+                
+                # Give it time to cleanup
+                local wait_count=0
+                while (kill -0 "$tunnel_pid" 2>/dev/null || ([ -f "$MASTER_LOCK.real" ] && kill -0 "$(cat "$MASTER_LOCK.real")" 2>/dev/null)) && [ $wait_count -lt 5 ]; do
+                    sleep 1
+                    ((wait_count++))
+                done
+                
+                # Force kill if necessary
+                if kill -0 "$tunnel_pid" 2>/dev/null; then
+                    kill -KILL "$tunnel_pid" 2>/dev/null || true
+                fi
+                if [ -f "$MASTER_LOCK.real" ]; then
+                    local real_pid=$(cat "$MASTER_LOCK.real")
+                    if kill -0 "$real_pid" 2>/dev/null; then
+                        kill -KILL "$real_pid" 2>/dev/null || true
+                    fi
+                fi
+                
+                # Clean up all files
+                rm -f "$MASTER_LOCK" "$MASTER_LOCK.real" "$MASTER_LOCK.output" "$MASTER_LOCK.bgpid" "$NAME_FILE" "$LOCK_DIR/url_shown"
+                rm -f "$TUNNEL_DIR"/tunnel_output.*
             fi
         else
-            echo "[$(date)] No session lock found" >> "$TUNNEL_LOG"
+            echo "[$(date)] Tunnel still in use ($((links - 1)) sessions remaining)" >> "$TUNNEL_LOG"
+            echo "📉 Tunnel still in use ($((links - 1)) sessions)"
         fi
-        
-    ) 200>"$LOCK_DIR/.flock"
+    else
+        echo "[$(date)] No session lock found" >> "$TUNNEL_LOG"
+    fi
 }
 
 # Generate and display clickable tunnel URLs
@@ -336,86 +328,35 @@ launch_claude() {
 
 # Cleanup function
 cleanup() {
-    echo "[$(date)] Cleanup initiated (trap context: $BASH_COMMAND)" >> "$TUNNEL_LOG"
-    echo "[$(date)] Current PID: $$, PPID: $PPID" >> "$TUNNEL_LOG"
-    
-    # Debug: Show current jobs
-    echo "[$(date)] Current jobs:" >> "$TUNNEL_LOG"
-    jobs -l >> "$TUNNEL_LOG" 2>&1 || echo "[$(date)] No jobs found via 'jobs'" >> "$TUNNEL_LOG"
-    
-    # Debug: Check if our saved background PID is still running
-    if [ -f "$MASTER_LOCK.bgpid" ]; then
-        local bg_pid=$(cat "$MASTER_LOCK.bgpid")
-        echo "[$(date)] Checking saved background PID: $bg_pid" >> "$TUNNEL_LOG"
-        if kill -0 "$bg_pid" 2>/dev/null; then
-            echo "[$(date)] Background PID $bg_pid is still running, killing it" >> "$TUNNEL_LOG"
-            kill -TERM "$bg_pid" 2>/dev/null || true
-            sleep 0.2
-            kill -KILL "$bg_pid" 2>/dev/null || true
-        else
-            echo "[$(date)] Background PID $bg_pid is not running" >> "$TUNNEL_LOG"
-        fi
-        rm -f "$MASTER_LOCK.bgpid"
-    fi
+    echo "[$(date)] Cleanup initiated" >> "$TUNNEL_LOG"
     
     # Kill any tail processes monitoring our output file
     if [ -f "$MASTER_LOCK.output" ]; then
         local output_file=$(cat "$MASTER_LOCK.output")
         echo "[$(date)] Stopping tail processes for $output_file" >> "$TUNNEL_LOG"
-        
-        # Debug: Check what tail processes exist
-        local tail_pids=$(pgrep -f "tail -f $output_file" 2>/dev/null || true)
-        if [ -n "$tail_pids" ]; then
-            echo "[$(date)] Found tail PIDs: $tail_pids" >> "$TUNNEL_LOG"
-            pkill -f "tail -f $output_file" 2>/dev/null || true
-        else
-            echo "[$(date)] No tail processes found" >> "$TUNNEL_LOG"
-        fi
-        
-        # Clean up the output file
+        pkill -f "tail -f $output_file" 2>/dev/null || true
         rm -f "$output_file"
         rm -f "$MASTER_LOCK.output"
     fi
     
-    # Kill all background jobs of this script
-    local job_pids=$(jobs -p 2>/dev/null)
-    if [ -n "$job_pids" ]; then
-        echo "[$(date)] Found background jobs: $job_pids" >> "$TUNNEL_LOG"
-        echo "$job_pids" | while read pid; do
-            echo "[$(date)] Killing background job $pid" >> "$TUNNEL_LOG"
-            kill -TERM "$pid" 2>/dev/null || true
-        done
-        
-        # Give processes a moment to die
-        sleep 0.2
-        
-        # Force kill any remaining jobs
-        jobs -p | while read pid; do
-            echo "[$(date)] Force killing job $pid" >> "$TUNNEL_LOG"
-            kill -KILL "$pid" 2>/dev/null || true
-        done
-    else
-        echo "[$(date)] No background jobs found via 'jobs -p'" >> "$TUNNEL_LOG"
+    # Kill saved background PID if it exists
+    if [ -f "$MASTER_LOCK.bgpid" ]; then
+        local bg_pid=$(cat "$MASTER_LOCK.bgpid")
+        if kill -0 "$bg_pid" 2>/dev/null; then
+            echo "[$(date)] Killing background PID $bg_pid" >> "$TUNNEL_LOG"
+            kill -KILL "$bg_pid" 2>/dev/null || true
+        fi
+        rm -f "$MASTER_LOCK.bgpid"
     fi
     
+    # Release tunnel (remove our session link, stop tunnel if last)
     release_tunnel
-    
-    # Wait for any remaining background jobs to complete (with timeout)
-    local wait_count=0
-    while [ -n "$(jobs -p)" ] && [ $wait_count -lt 10 ]; do
-        echo "[$(date)] Waiting for background jobs to complete..." >> "$TUNNEL_LOG"
-        sleep 0.5
-        ((wait_count++))
-    done
-    
-    # Force kill any stubborn jobs
-    if [ -n "$(jobs -p)" ]; then
-        echo "[$(date)] Force killing remaining jobs" >> "$TUNNEL_LOG"
-        jobs -p | xargs -r kill -KILL 2>/dev/null || true
-    fi
     
     echo "[$(date)] Cleanup completed" >> "$TUNNEL_LOG"
 }
+
+# Global variable to store Claude's exit code
+CLAUDE_EXIT_CODE=0
 
 # Main execution
 main() {
@@ -430,8 +371,15 @@ main() {
     
     # Launch Claude with all arguments
     launch_claude "$@"
+    CLAUDE_EXIT_CODE=$?
+    
+    # Return Claude's exit code
+    return $CLAUDE_EXIT_CODE
 }
 
 # Execute main function with all script arguments
 main "$@"
-exit $?
+SCRIPT_EXIT_CODE=$?
+
+# Exit with the code from main (which is Claude's exit code)
+exit $SCRIPT_EXIT_CODE
