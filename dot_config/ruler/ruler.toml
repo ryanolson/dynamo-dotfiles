@@ -25,6 +25,10 @@ nested = true
 # [agents.gemini-cli]
 # enabled = true
 
+[agents.cursor]
+enabled = true
+output_path = ".cursor/instructions.md"
+
 # --- MCP Servers ---
 # Define Model Context Protocol servers here. Two examples:
 # 1. A stdio server (local executable)

@@ -27,10 +27,40 @@
     "presets": [
       {
         "id": "1",
-        "name": "Main",
+        "name": "Claude",
         "command": "claude"
+      },
+      {
+        "id": "2",
+        "name": "Claude + Resume",
+        "command": "claude",
+        "args": ["--resume"]
+      },
+      {
+        "id": "3",
+        "name": "Claude + Yolo",
+        "command": "claude",
+        "args": ["--yolo"]
+      },
+      {
+        "id": "4",
+        "name": "Claude + Cursor",
+        "command": "cursor-tunnel-launch.sh"
+      },
+      {
+        "id": "5",
+        "name": "Claude + Cursor + Resume",
+        "command": "cursor-tunnel-launch.sh",
+        "args": ["--resume"]
+      },
+      {
+        "id": "6",
+        "name": "Claude + Cursor + Yolo",
+        "command": "cursor-tunnel-launch.sh",
+        "args": ["--yolo"]
       }
     ],
-    "defaultPresetId": "1"
+    "defaultPresetId": "1",
+    "selectPresetOnStart": true
   }
 }

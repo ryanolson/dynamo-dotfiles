@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/ubuntu/.config/**)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebSearch",
+      "Bash(chezmoi data:*)",
+      "Read(//home/ubuntu/.local/share/chezmoi/.git/**)",
+      "Read(//home/ubuntu/.local/share/chezmoi/**)",
+      "Bash(git add:*)",
+      "WebFetch(domain:docs.rc.fas.harvard.edu)",
+      "WebFetch(domain:code.visualstudio.com)",
+      "Read(//home/ubuntu/.local/bin/**)",
+      "Bash(cursor:*)",
+      "Bash(git pull:*)",
+      "Bash(chezmoi apply:*)",
+      "Read(//home/ubuntu/.local/share/cursor-tunnels/**)",
+      "Bash(chmod:*)",
+      "Bash(timeout:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(pkill:*)",
+      "WebFetch(domain:stackoverflow.com)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

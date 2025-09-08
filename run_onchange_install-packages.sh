@@ -64,6 +64,21 @@ install_macos_packages() {
         fi
     done
     
+    # Install Cursor CLI
+    if ! command -v cursor &> /dev/null; then
+        log "Installing cursor CLI..."
+        local temp_dir=$(mktemp -d)
+        curl -Lk "https://api2.cursor.sh/updates/download-latest?os=cli-darwin-x64" \
+            --output "$temp_dir/cursor_cli.tar.gz"
+        tar -xzf "$temp_dir/cursor_cli.tar.gz" -C "$temp_dir"
+        sudo cp "$temp_dir/cursor" /usr/local/bin/cursor
+        sudo chmod +x /usr/local/bin/cursor
+        rm -rf "$temp_dir"
+        success "✓ cursor CLI installed"
+    else
+        log "✓ cursor CLI already installed"
+    fi
+    
     success "✅ macOS packages installed"
 }
 
@@ -163,7 +178,8 @@ install_linux_packages() {
                 download_url=$(curl -s "$latest_url" | grep "browser_download_url.*hyperfine.*x86_64.*linux.*tar.gz" | cut -d'"' -f4 | head -1)
                 ;;
             "tokei")
-                download_url=$(curl -s "$latest_url" | grep "browser_download_url.*tokei.*x86_64.*linux.*tar.gz" | cut -d'"' -f4 | head -1)
+                # Tokei uses a different naming pattern: tokei-x86_64-unknown-linux-gnu.tar.gz
+                download_url=$(curl -s "$latest_url" | grep "browser_download_url.*tokei.*x86_64.*linux.*gnu.*tar.gz" | cut -d'"' -f4 | head -1)
                 ;;
         esac
         
@@ -171,7 +187,8 @@ install_linux_packages() {
             local temp_dir=$(mktemp -d)
             cd "$temp_dir"
             
-            curl -L "$download_url" -o archive || { warn "Failed to download $name"; return; }
+            log "Downloading from: $download_url"
+            curl -L "$download_url" -o archive || { warn "Failed to download $name"; cd - > /dev/null; rm -rf "$temp_dir"; return 1; }
             
             # Extract based on file type
             if file archive | grep -q "gzip"; then
@@ -222,7 +239,8 @@ install_linux_packages() {
             cd - > /dev/null
             rm -rf "$temp_dir"
         else
-            warn "Download URL not found for $name"
+            warn "Download URL not found for $name (check GitHub releases)"
+            return 1
         fi
     }
     
@@ -246,7 +264,7 @@ install_linux_packages() {
     
     for tool in "${github_tools[@]}"; do
         IFS=':' read -r repo name <<< "$tool"
-        install_github_release "$repo" "$name" "/usr/local/bin"
+        install_github_release "$repo" "$name" "/usr/local/bin" || warn "Skipping $name due to installation failure"
     done
     
     # Install tools via direct scripts
@@ -283,15 +301,33 @@ install_linux_packages() {
     # Yazi (file manager)
     if ! command -v yazi &> /dev/null; then
         log "Installing yazi..."
-        curl -L https://github.com/sxyazi/yazi/releases/latest/download/yazi-x86_64-unknown-linux-gnu.tar.gz | tar -xz -C /tmp/
-        sudo cp /tmp/yazi-x86_64-unknown-linux-gnu/yazi /usr/local/bin/
+        local temp_dir=$(mktemp -d)
+        curl -L https://github.com/sxyazi/yazi/releases/latest/download/yazi-x86_64-unknown-linux-gnu.zip -o "$temp_dir/yazi.zip"
+        unzip -q "$temp_dir/yazi.zip" -d "$temp_dir"
+        sudo cp "$temp_dir/yazi-x86_64-unknown-linux-gnu/yazi" /usr/local/bin/
         sudo chmod +x /usr/local/bin/yazi
+        rm -rf "$temp_dir"
     fi
     
     # Broot (via snap if available)
     if command -v snap &> /dev/null && ! command -v broot &> /dev/null; then
         log "Installing broot via snap..."
         sudo snap install broot || warn "Failed to install broot"
+    fi
+    
+    # Cursor CLI
+    if ! command -v cursor &> /dev/null; then
+        log "Installing cursor CLI..."
+        local temp_dir=$(mktemp -d)
+        curl -Lk "https://api2.cursor.sh/updates/download-latest?os=cli-alpine-x64" \
+            --output "$temp_dir/cursor_cli.tar.gz"
+        tar -xzf "$temp_dir/cursor_cli.tar.gz" -C "$temp_dir"
+        sudo cp "$temp_dir/cursor" /usr/local/bin/cursor
+        sudo chmod +x /usr/local/bin/cursor
+        rm -rf "$temp_dir"
+        success "✓ cursor CLI installed"
+    else
+        log "✓ cursor CLI already installed"
     fi
     
     success "✅ Linux packages installed"
