@@ -259,16 +259,16 @@ display_tunnel_urls() {
     # Web browser URL (always works)
     echo "🌐 Browser: $base_url/"
     
-    # Generate clickable Cursor URL for folder using OSC 8
-    local cursor_folder_url="cursor://vscode-remote/tunnel+${tunnel_name}${working_dir}"
-    printf '📂 Open folder: \033]8;;%s\033\\Click to open in Cursor\033]8;;\033\\\n' "$cursor_folder_url"
+    # Generate clickable Cursor URL for folder using OSC 8 (with new window parameter)
+    local cursor_folder_url="cursor://vscode-remote/tunnel+${tunnel_name}${working_dir}?windowId=_blank"
+    printf '📂 Open folder: \033]8;;%s\033\\Click to open in Cursor (new window)\033]8;;\033\\\n' "$cursor_folder_url"
     
     # Check for workspace file
     local workspace_files=(*.code-workspace)
     if [ ${#workspace_files[@]} -eq 1 ] && [ -f "${workspace_files[0]}" ]; then
         local workspace_path="${working_dir}/${workspace_files[0]}"
-        local cursor_workspace_url="cursor://vscode-remote/tunnel+${tunnel_name}${workspace_path}"
-        printf '📄 Open workspace: \033]8;;%s\033\\%s (Click to open in Cursor)\033]8;;\033\\\n' "$cursor_workspace_url" "${workspace_files[0]}"
+        local cursor_workspace_url="cursor://vscode-remote/tunnel+${tunnel_name}${workspace_path}?windowId=_blank"
+        printf '📄 Open workspace: \033]8;;%s\033\\%s (Click to open in Cursor - new window)\033]8;;\033\\\n' "$cursor_workspace_url" "${workspace_files[0]}"
     fi
     
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
