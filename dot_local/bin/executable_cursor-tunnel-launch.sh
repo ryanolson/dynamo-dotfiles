@@ -84,34 +84,37 @@ start_tunnel_process() {
             "$CURSOR_CLI" tunnel user login --provider github
     fi
     
-    # Launch tunnel with proper process tracking
-    # Start tunnel in background and immediately capture its PID
+    # Launch tunnel in background, redirect output to file for processing
+    local output_file="$TUNNEL_DIR/tunnel_output.$$"
+    
     "$CURSOR_CLI" tunnel \
         --name "$tunnel_name" \
-        --accept-server-license-terms > >( \
-            while IFS= read -r line; do
-                echo "[CURSOR] $line" >> "$TUNNEL_LOG"
-                
-                # Show tunnel URL only once when it starts
-                if [[ "$line" == *"https://"* ]] && [ ! -f "$LOCK_DIR/url_shown" ]; then
-                    echo "🔗 Cursor tunnel available at: $(echo "$line" | grep -oE 'https://[^ ]+' | head -1)"
-                    touch "$LOCK_DIR/url_shown"
-                fi
-            done
-        ) 2>&1 &
+        --accept-server-license-terms > "$output_file" 2>&1 &
     
-    # Immediately save the tunnel PID
+    # Immediately save the tunnel PID (this should be the actual cursor process)
     local tunnel_pid=$!
     echo "$tunnel_pid" > "$MASTER_LOCK.real"
     echo "[$(date)] Started cursor tunnel with PID: $tunnel_pid" >> "$TUNNEL_LOG"
     
-    # Also try to find the actual cursor process (in case $! gives us a wrapper)
-    sleep 1
-    local actual_pid=$(pgrep -f "cursor tunnel --name $tunnel_name" | head -1)
-    if [ -n "$actual_pid" ] && [ "$actual_pid" != "$tunnel_pid" ]; then
-        echo "$actual_pid" > "$MASTER_LOCK.real"
-        echo "[$(date)] Found actual cursor PID: $actual_pid (was $tunnel_pid)" >> "$TUNNEL_LOG"
-    fi
+    # Process output in background
+    (
+        tail -f "$output_file" 2>/dev/null | while IFS= read -r line; do
+            echo "[CURSOR] $line" >> "$TUNNEL_LOG"
+            
+            # Show tunnel URL only once when it starts
+            if [[ "$line" == *"https://"* ]] && [ ! -f "$LOCK_DIR/url_shown" ]; then
+                echo "🔗 Cursor tunnel available at: $(echo "$line" | grep -oE 'https://[^ ]+' | head -1)"
+                touch "$LOCK_DIR/url_shown"
+            fi
+        done
+    ) &
+    
+    # Save the tail PID so we can clean it up later
+    local tail_pid=$!
+    echo "$tail_pid" > "$MASTER_LOCK.tail"
+    
+    # Clean up output file on exit
+    trap "rm -f $output_file" EXIT
 }
 
 # Acquire tunnel (start new or join existing)
@@ -196,14 +199,18 @@ release_tunnel() {
                     echo "[$(date)] Last session, stopping tunnel PID: $tunnel_pid" >> "$TUNNEL_LOG"
                     echo "🔚 Last session, closing tunnel..."
                     
-                    # Kill the wrapper process
-                    kill -TERM "$tunnel_pid" 2>/dev/null || true
-                    
-                    # Also kill the actual cursor tunnel if we have its PID
+                    # Kill the actual cursor tunnel process
                     if [ -f "$MASTER_LOCK.real" ]; then
                         local real_pid=$(cat "$MASTER_LOCK.real")
-                        echo "[$(date)] Stopping actual cursor PID: $real_pid" >> "$TUNNEL_LOG"
+                        echo "[$(date)] Stopping cursor tunnel PID: $real_pid" >> "$TUNNEL_LOG"
                         kill -TERM "$real_pid" 2>/dev/null || true
+                    fi
+                    
+                    # Kill the tail process if it exists
+                    if [ -f "$MASTER_LOCK.tail" ]; then
+                        local tail_pid=$(cat "$MASTER_LOCK.tail")
+                        echo "[$(date)] Stopping tail process PID: $tail_pid" >> "$TUNNEL_LOG"
+                        kill -TERM "$tail_pid" 2>/dev/null || true
                     fi
                     
                     # Kill by name as fallback
@@ -231,7 +238,8 @@ release_tunnel() {
                     fi
                     
                     # Clean up all files
-                    rm -f "$MASTER_LOCK" "$MASTER_LOCK.real" "$NAME_FILE" "$LOCK_DIR/url_shown"
+                    rm -f "$MASTER_LOCK" "$MASTER_LOCK.real" "$MASTER_LOCK.tail" "$NAME_FILE" "$LOCK_DIR/url_shown"
+                    rm -f "$TUNNEL_DIR"/tunnel_output.*
                 fi
             else
                 echo "[$(date)] Tunnel still in use ($((links - 1)) sessions remaining)" >> "$TUNNEL_LOG"
@@ -269,6 +277,11 @@ display_tunnel_urls() {
         local workspace_path="${working_dir}/${workspace_files[0]}"
         local cursor_workspace_url="cursor://vscode-remote/tunnel+${tunnel_name}${workspace_path}?windowId=_blank"
         printf '📄 Open workspace: \033]8;;%s\033\\%s (Click to open in Cursor - new window)\033]8;;\033\\\n' "$cursor_workspace_url" "${workspace_files[0]}"
+    fi
+    
+    # Check if running in Zellij and show tip
+    if [ -n "${ZELLIJ:-}" ]; then
+        echo "💡 Zellij tip: Hold SHIFT while clicking links to open them"
     fi
     
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
