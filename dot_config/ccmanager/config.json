@@ -60,6 +60,7 @@
         "args": ["--yolo"]
       }
     ],
-    "defaultPresetId": "1"
+    "defaultPresetId": "1",
+    "selectPresetOnStart": true
   }
 }
