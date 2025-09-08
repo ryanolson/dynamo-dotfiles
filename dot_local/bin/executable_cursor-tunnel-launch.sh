@@ -116,16 +116,8 @@ start_tunnel_process() {
         fi
     done &
     
-    # Save the pipeline PID so we can clean it up later
-    local pipeline_pid=$!
-    echo "$pipeline_pid" > "$MASTER_LOCK.tail"
-    
-    # Also save the actual tail PID (it's the first process in the pipeline)
-    sleep 0.2  # Give the pipeline a moment to start
-    local actual_tail_pid=$(pgrep -f "tail -f $output_file" | head -1)
-    if [ -n "$actual_tail_pid" ]; then
-        echo "$actual_tail_pid" > "$MASTER_LOCK.tail.real"
-    fi
+    # Save the output file name for cleanup (not PID which is unreliable)
+    echo "$output_file" > "$MASTER_LOCK.output"
 }
 
 # Acquire tunnel (start new or join existing)
@@ -220,11 +212,11 @@ release_tunnel() {
                         kill -INT "$real_pid" 2>/dev/null || true
                     fi
                     
-                    # Kill the tail process if it exists
-                    if [ -f "$MASTER_LOCK.tail" ]; then
-                        local tail_pid=$(cat "$MASTER_LOCK.tail")
-                        echo "[$(date)] Stopping tail process PID: $tail_pid" >> "$TUNNEL_LOG"
-                        kill -TERM "$tail_pid" 2>/dev/null || true
+                    # Kill any tail processes for this tunnel
+                    if [ -f "$MASTER_LOCK.output" ]; then
+                        local output_file=$(cat "$MASTER_LOCK.output")
+                        pkill -f "tail -f $output_file" 2>/dev/null || true
+                        rm -f "$output_file"
                     fi
                     
                     # Kill by name as fallback (more aggressive)
@@ -257,7 +249,7 @@ release_tunnel() {
                     fi
                     
                     # Clean up all files
-                    rm -f "$MASTER_LOCK" "$MASTER_LOCK.real" "$MASTER_LOCK.tail" "$MASTER_LOCK.tail.real" "$NAME_FILE" "$LOCK_DIR/url_shown"
+                    rm -f "$MASTER_LOCK" "$MASTER_LOCK.real" "$MASTER_LOCK.output" "$NAME_FILE" "$LOCK_DIR/url_shown"
                     rm -f "$TUNNEL_DIR"/tunnel_output.*
                 fi
             else
@@ -334,21 +326,30 @@ launch_claude() {
 cleanup() {
     echo "[$(date)] Cleanup initiated" >> "$TUNNEL_LOG"
     
-    # Always kill our session's tail processes (if they exist)
-    # This prevents the script from hanging after Claude exits
-    # Kill the actual tail process first
-    if [ -f "$MASTER_LOCK.tail.real" ]; then
-        local actual_tail_pid=$(cat "$MASTER_LOCK.tail.real")
-        echo "[$(date)] Stopping tail process PID: $actual_tail_pid" >> "$TUNNEL_LOG"
-        kill -TERM "$actual_tail_pid" 2>/dev/null || true
+    # Kill any tail processes monitoring our output file
+    if [ -f "$MASTER_LOCK.output" ]; then
+        local output_file=$(cat "$MASTER_LOCK.output")
+        echo "[$(date)] Stopping tail processes for $output_file" >> "$TUNNEL_LOG"
+        # Use pkill to find and kill the specific tail process
+        pkill -f "tail -f $output_file" 2>/dev/null || true
+        # Clean up the output file
+        rm -f "$output_file"
+        rm -f "$MASTER_LOCK.output"
     fi
     
-    # Then kill the pipeline
-    if [ -f "$MASTER_LOCK.tail" ]; then
-        local pipeline_pid=$(cat "$MASTER_LOCK.tail")
-        echo "[$(date)] Stopping pipeline PID: $pipeline_pid" >> "$TUNNEL_LOG"
-        kill -TERM "$pipeline_pid" 2>/dev/null || true
-    fi
+    # Kill all background jobs of this script
+    jobs -p | while read pid; do
+        echo "[$(date)] Killing background job $pid" >> "$TUNNEL_LOG"
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+    
+    # Give processes a moment to die
+    sleep 0.2
+    
+    # Force kill any remaining jobs
+    jobs -p | while read pid; do
+        kill -KILL "$pid" 2>/dev/null || true
+    done
     
     release_tunnel
     echo "[$(date)] Cleanup completed" >> "$TUNNEL_LOG"
