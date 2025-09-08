@@ -116,8 +116,12 @@ start_tunnel_process() {
         fi
     done &
     
+    local bg_pid=$!
+    echo "[$(date)] Started background tail pipeline with PID: $bg_pid" >> "$TUNNEL_LOG"
+    
     # Save the output file name for cleanup (not PID which is unreliable)
     echo "$output_file" > "$MASTER_LOCK.output"
+    echo "$bg_pid" > "$MASTER_LOCK.bgpid"
 }
 
 # Acquire tunnel (start new or join existing)
@@ -249,7 +253,7 @@ release_tunnel() {
                     fi
                     
                     # Clean up all files
-                    rm -f "$MASTER_LOCK" "$MASTER_LOCK.real" "$MASTER_LOCK.output" "$NAME_FILE" "$LOCK_DIR/url_shown"
+                    rm -f "$MASTER_LOCK" "$MASTER_LOCK.real" "$MASTER_LOCK.output" "$MASTER_LOCK.bgpid" "$NAME_FILE" "$LOCK_DIR/url_shown"
                     rm -f "$TUNNEL_DIR"/tunnel_output.*
                 fi
             else
@@ -324,32 +328,67 @@ launch_claude() {
 
 # Cleanup function
 cleanup() {
-    echo "[$(date)] Cleanup initiated" >> "$TUNNEL_LOG"
+    echo "[$(date)] Cleanup initiated (trap context: $BASH_COMMAND)" >> "$TUNNEL_LOG"
+    echo "[$(date)] Current PID: $$, PPID: $PPID" >> "$TUNNEL_LOG"
+    
+    # Debug: Show current jobs
+    echo "[$(date)] Current jobs:" >> "$TUNNEL_LOG"
+    jobs -l >> "$TUNNEL_LOG" 2>&1 || echo "[$(date)] No jobs found via 'jobs'" >> "$TUNNEL_LOG"
+    
+    # Debug: Check if our saved background PID is still running
+    if [ -f "$MASTER_LOCK.bgpid" ]; then
+        local bg_pid=$(cat "$MASTER_LOCK.bgpid")
+        echo "[$(date)] Checking saved background PID: $bg_pid" >> "$TUNNEL_LOG"
+        if kill -0 "$bg_pid" 2>/dev/null; then
+            echo "[$(date)] Background PID $bg_pid is still running, killing it" >> "$TUNNEL_LOG"
+            kill -TERM "$bg_pid" 2>/dev/null || true
+            sleep 0.2
+            kill -KILL "$bg_pid" 2>/dev/null || true
+        else
+            echo "[$(date)] Background PID $bg_pid is not running" >> "$TUNNEL_LOG"
+        fi
+        rm -f "$MASTER_LOCK.bgpid"
+    fi
     
     # Kill any tail processes monitoring our output file
     if [ -f "$MASTER_LOCK.output" ]; then
         local output_file=$(cat "$MASTER_LOCK.output")
         echo "[$(date)] Stopping tail processes for $output_file" >> "$TUNNEL_LOG"
-        # Use pkill to find and kill the specific tail process
-        pkill -f "tail -f $output_file" 2>/dev/null || true
+        
+        # Debug: Check what tail processes exist
+        local tail_pids=$(pgrep -f "tail -f $output_file" 2>/dev/null || true)
+        if [ -n "$tail_pids" ]; then
+            echo "[$(date)] Found tail PIDs: $tail_pids" >> "$TUNNEL_LOG"
+            pkill -f "tail -f $output_file" 2>/dev/null || true
+        else
+            echo "[$(date)] No tail processes found" >> "$TUNNEL_LOG"
+        fi
+        
         # Clean up the output file
         rm -f "$output_file"
         rm -f "$MASTER_LOCK.output"
     fi
     
     # Kill all background jobs of this script
-    jobs -p | while read pid; do
-        echo "[$(date)] Killing background job $pid" >> "$TUNNEL_LOG"
-        kill -TERM "$pid" 2>/dev/null || true
-    done
-    
-    # Give processes a moment to die
-    sleep 0.2
-    
-    # Force kill any remaining jobs
-    jobs -p | while read pid; do
-        kill -KILL "$pid" 2>/dev/null || true
-    done
+    local job_pids=$(jobs -p 2>/dev/null)
+    if [ -n "$job_pids" ]; then
+        echo "[$(date)] Found background jobs: $job_pids" >> "$TUNNEL_LOG"
+        echo "$job_pids" | while read pid; do
+            echo "[$(date)] Killing background job $pid" >> "$TUNNEL_LOG"
+            kill -TERM "$pid" 2>/dev/null || true
+        done
+        
+        # Give processes a moment to die
+        sleep 0.2
+        
+        # Force kill any remaining jobs
+        jobs -p | while read pid; do
+            echo "[$(date)] Force killing job $pid" >> "$TUNNEL_LOG"
+            kill -KILL "$pid" 2>/dev/null || true
+        done
+    else
+        echo "[$(date)] No background jobs found via 'jobs -p'" >> "$TUNNEL_LOG"
+    fi
     
     release_tunnel
     echo "[$(date)] Cleanup completed" >> "$TUNNEL_LOG"
