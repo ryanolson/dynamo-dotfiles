@@ -132,7 +132,11 @@ acquire_tunnel() {
     
     # Use flock for atomic operations
     (
-        flock -x 200
+        if ! flock -x -w 5 200; then
+            echo "[$(date)] ERROR: Could not acquire lock for acquire_tunnel (timeout)" >> "$TUNNEL_LOG"
+            echo "❌ Failed to acquire tunnel lock. Another process may be stuck."
+            exit 1
+        fi
         
         # Check if tunnel is already running
         if [ -f "$MASTER_LOCK" ]; then
@@ -189,7 +193,11 @@ release_tunnel() {
     echo "[$(date)] Releasing tunnel lock..." >> "$TUNNEL_LOG"
     
     (
-        flock -x 200
+        # Use a timeout to prevent indefinite hanging
+        if ! flock -x -w 5 200; then
+            echo "[$(date)] WARNING: Could not acquire lock for release_tunnel (timeout)" >> "$TUNNEL_LOG"
+            return 1
+        fi
         
         if [ -f "$SESSION_LOCK" ]; then
             # Get link count before removing our link
@@ -391,6 +399,21 @@ cleanup() {
     fi
     
     release_tunnel
+    
+    # Wait for any remaining background jobs to complete (with timeout)
+    local wait_count=0
+    while [ -n "$(jobs -p)" ] && [ $wait_count -lt 10 ]; do
+        echo "[$(date)] Waiting for background jobs to complete..." >> "$TUNNEL_LOG"
+        sleep 0.5
+        ((wait_count++))
+    done
+    
+    # Force kill any stubborn jobs
+    if [ -n "$(jobs -p)" ]; then
+        echo "[$(date)] Force killing remaining jobs" >> "$TUNNEL_LOG"
+        jobs -p | xargs -r kill -KILL 2>/dev/null || true
+    fi
+    
     echo "[$(date)] Cleanup completed" >> "$TUNNEL_LOG"
 }
 
