@@ -51,11 +51,24 @@ generate_tunnel_name() {
         project_name="${CCMANAGER_PROJECT}"
     elif [ -n "${CCMANAGER_WORKTREE_PATH:-}" ]; then
         # Extract from worktree path pattern: ../{project}-workspaces/{branch}
-        # The parent directory is like "dynamo-workspaces", we want "dynamo"
+        # For path like /home/ubuntu/repo/dynamo-workspaces/testing
+        # We want the actual project from the parent of workspaces dir
         local workspaces_dir=$(dirname "$CCMANAGER_WORKTREE_PATH")
         local workspaces_name=$(basename "$workspaces_dir")
-        # Remove the -workspaces suffix to get the project name
-        project_name="${workspaces_name%-workspaces}"
+        
+        # If it ends with -workspaces, extract the base project name
+        if [[ "$workspaces_name" == *-workspaces ]]; then
+            # Get the actual project name from the parent path
+            local repo_dir=$(dirname "$workspaces_dir")
+            project_name=$(basename "$repo_dir")
+            # If repo dir basename is "repo", use the workspaces prefix
+            if [ "$project_name" = "repo" ]; then
+                project_name="${workspaces_name%-workspaces}"
+            fi
+        else
+            # Not in expected format, use current branch name as project
+            project_name=$(basename "$CCMANAGER_WORKTREE_PATH")
+        fi
     elif git rev-parse --git-dir > /dev/null 2>&1; then
         # Fallback to git repo name
         project_name=$(basename "$(git rev-parse --show-toplevel 2>/dev/null)")
@@ -113,6 +126,13 @@ start_tunnel_process() {
             if [[ "$line" == *"https://"* ]] && [ ! -f "$LOCK_DIR/url_shown" ]; then
                 echo "🔗 Cursor tunnel available at: $(echo "$line" | grep -oE 'https://[^ ]+' | head -1)"
                 touch "$LOCK_DIR/url_shown"
+                
+                # Find and save the actual cursor tunnel PID
+                local actual_pid=$(pgrep -f "cursor tunnel --name $tunnel_name" | head -1)
+                if [ -n "$actual_pid" ]; then
+                    echo "$actual_pid" > "$MASTER_LOCK.real"
+                    echo "[$(date)] Found actual cursor PID: $actual_pid" >> "$TUNNEL_LOG"
+                fi
             fi
         done
 }
@@ -197,12 +217,25 @@ release_tunnel() {
                     echo "[$(date)] Last session, stopping tunnel PID: $tunnel_pid" >> "$TUNNEL_LOG"
                     echo "🔚 Last session, closing tunnel..."
                     
-                    # Kill tunnel process
+                    # Kill the wrapper process
                     kill -TERM "$tunnel_pid" 2>/dev/null || true
+                    
+                    # Also kill the actual cursor tunnel if we have its PID
+                    if [ -f "$MASTER_LOCK.real" ]; then
+                        local real_pid=$(cat "$MASTER_LOCK.real")
+                        echo "[$(date)] Stopping actual cursor PID: $real_pid" >> "$TUNNEL_LOG"
+                        kill -TERM "$real_pid" 2>/dev/null || true
+                    fi
+                    
+                    # Kill by name as fallback
+                    if [ -f "$NAME_FILE" ]; then
+                        local tunnel_name=$(cat "$NAME_FILE")
+                        pkill -f "cursor tunnel --name $tunnel_name" 2>/dev/null || true
+                    fi
                     
                     # Give it time to cleanup
                     local wait_count=0
-                    while kill -0 "$tunnel_pid" 2>/dev/null && [ $wait_count -lt 5 ]; do
+                    while (kill -0 "$tunnel_pid" 2>/dev/null || ([ -f "$MASTER_LOCK.real" ] && kill -0 "$(cat "$MASTER_LOCK.real")" 2>/dev/null)) && [ $wait_count -lt 5 ]; do
                         sleep 1
                         ((wait_count++))
                     done
@@ -211,9 +244,15 @@ release_tunnel() {
                     if kill -0 "$tunnel_pid" 2>/dev/null; then
                         kill -KILL "$tunnel_pid" 2>/dev/null || true
                     fi
+                    if [ -f "$MASTER_LOCK.real" ]; then
+                        local real_pid=$(cat "$MASTER_LOCK.real")
+                        if kill -0 "$real_pid" 2>/dev/null; then
+                            kill -KILL "$real_pid" 2>/dev/null || true
+                        fi
+                    fi
                     
                     # Clean up all files
-                    rm -f "$MASTER_LOCK" "$NAME_FILE" "$LOCK_DIR/url_shown"
+                    rm -f "$MASTER_LOCK" "$MASTER_LOCK.real" "$NAME_FILE" "$LOCK_DIR/url_shown"
                 fi
             else
                 echo "[$(date)] Tunnel still in use ($((links - 1)) sessions remaining)" >> "$TUNNEL_LOG"
