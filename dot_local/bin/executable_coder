@@ -1,0 +1,388 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Print error message and exit
+error() {
+    echo -e "${RED}Error: $1${NC}" >&2
+    exit 1
+}
+
+# Print info message
+info() {
+    echo -e "${BLUE}$1${NC}"
+}
+
+# Print success message
+success() {
+    echo -e "${GREEN}$1${NC}"
+}
+
+# Print warning message
+warn() {
+    echo -e "${YELLOW}$1${NC}"
+}
+
+# Validate current directory requirements
+validate_directory() {
+    # Check if we're in a git repository
+    if [[ ! -d ".git" ]]; then
+        error "Current directory is not a git repository (no .git directory found)"
+    fi
+    
+    # Check if parent directory is writable (for ccmanager workspaces)
+    local parent_dir
+    parent_dir=$(dirname "$(pwd)")
+    if [[ ! -w "$parent_dir" ]]; then
+        error "Parent directory '$parent_dir' is not writable (needed for ccmanager workspaces)"
+    fi
+}
+
+# Generate session name based on current directory
+generate_session_name() {
+    local current_dir
+    local dir_name
+    local full_path
+    local path_hash
+    
+    current_dir=$(pwd)
+    dir_name=$(basename "$current_dir")
+    full_path=$(realpath "$current_dir")
+    path_hash=$(echo -n "$full_path" | sha256sum | cut -c1-8)
+    
+    echo "coder-${dir_name}-${path_hash}"
+}
+
+# Get session status (ACTIVE, EXITED, or NOT_FOUND)
+get_session_status() {
+    local session_name="$1"
+    local session_line
+    local clean_sessions
+    
+    # Strip ANSI color codes and search for session
+    clean_sessions=$(zellij list-sessions 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+    session_line=$(echo "$clean_sessions" | grep "^${session_name} " || true)
+    
+    if [[ -z "$session_line" ]]; then
+        echo "NOT_FOUND"
+    elif echo "$session_line" | grep -q "EXITED"; then
+        echo "EXITED" 
+    else
+        echo "ACTIVE"
+    fi
+}
+
+# Prompt for confirmation (returns 0 for yes, 1 for no)
+confirm() {
+    local message="$1"
+    echo -e "${YELLOW}${message}${NC}"
+    read -r -p "Continue? (y/N): " response
+    case "$response" in
+        [yY][eE][sS]|[yY]) 
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# List all coder-managed sessions
+list_sessions() {
+    local sessions
+    sessions=$(zellij list-sessions 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep "^coder-" || true)
+    
+    if [[ -z "$sessions" ]]; then
+        info "No coder sessions found"
+        return 0
+    fi
+    
+    {
+        echo -e "Project\tSession ID\tStatus"
+        echo "$sessions" | while IFS= read -r line; do
+            local session_name
+            local status
+            local project_name
+            
+            # Extract session name (first word before space)
+            session_name=$(echo "$line" | awk '{print $1}' | sed 's/\x1b\[[0-9;]*m//g')
+            
+            # Extract status
+            if echo "$line" | grep -q "EXITED"; then
+                status="EXITED"
+            else
+                status="ACTIVE"
+            fi
+            
+            # Parse session name to extract project name
+            if [[ "$session_name" =~ ^coder-(.+)-([a-f0-9]{8})$ ]]; then
+                project_name="${BASH_REMATCH[1]}"
+                echo -e "${project_name}\t${session_name}\t${status}"
+            fi
+        done
+    } | column -t -s $'\t'
+}
+
+# Check if session is attached elsewhere
+is_session_attached() {
+    local session_name="$1"
+    # This is a simplified check - zellij doesn't easily expose attachment status
+    # We'll use the presence of the session as a proxy
+    zellij list-sessions 2>/dev/null | grep -q "^${session_name} " && ! echo "$session_name" | grep -q "EXITED"
+}
+
+# Stop session (with optional confirmation)
+stop_session() {
+    local session_name="$1"
+    local force="$2"
+    
+    # If no session name provided, infer from current directory
+    if [[ -z "$session_name" ]]; then
+        validate_directory
+        session_name=$(generate_session_name)
+    fi
+    
+    # Check if session exists
+    local status
+    status=$(get_session_status "$session_name")
+    
+    if [[ "$status" == "NOT_FOUND" ]]; then
+        error "Session '$session_name' not found"
+    fi
+    
+    # Ask for confirmation unless force flag is set
+    if [[ "$force" != "true" ]]; then
+        if ! confirm "This will kill session '$session_name' and terminate all running processes."; then
+            info "Cancelled"
+            exit 0
+        fi
+    fi
+    
+    info "Stopping session '$session_name'..."
+    if [[ "$status" == "EXITED" ]]; then
+        zellij delete-session "$session_name"
+    else
+        zellij kill-session "$session_name"
+    fi
+    success "Session '$session_name' stopped"
+}
+
+# Reset session (stop and recreate)
+reset_session() {
+    local force="$1"
+    local session_name
+    
+    validate_directory
+    session_name=$(generate_session_name)
+    
+    # Check if session exists
+    local status
+    status=$(get_session_status "$session_name")
+    
+    if [[ "$status" == "NOT_FOUND" ]]; then
+        info "No existing session found. Creating new session..."
+        exec ~/.local/bin/zellij-wrapper --new-session-with-layout coder-ccmanager --session "$session_name"
+    fi
+    
+    # Ask for confirmation unless force flag is set
+    if [[ "$force" != "true" ]]; then
+        if ! confirm "This will kill session '$session_name' and recreate it fresh."; then
+            info "Cancelled"
+            exit 0
+        fi
+    fi
+    
+    info "Resetting session '$session_name'..."
+    if [[ "$status" == "EXITED" ]]; then
+        zellij delete-session "$session_name" 2>/dev/null || true
+    else
+        zellij kill-session "$session_name" 2>/dev/null || true
+    fi
+    sleep 1
+    
+    info "Creating fresh session..."
+    exec ~/.local/bin/zellij-wrapper --new-session-with-layout coder-ccmanager --session "$session_name"
+}
+
+# Attach to a specific session
+attach_session() {
+    local session_name="$1"
+    local force="$2"
+    
+    if ! zellij list-sessions 2>/dev/null | grep -q "^${session_name} "; then
+        error "Session '$session_name' not found"
+    fi
+    
+    # If force flag is set, kill the session first to detach any existing connections
+    if [[ "$force" == "true" ]]; then
+        info "Force flag set, detaching existing connections and recreating..."
+        zellij kill-session "$session_name" 2>/dev/null || true
+        sleep 1
+        # Session is now gone, need to recreate it
+        info "Recreating session..."
+        exec ~/.local/bin/zellij-wrapper --new-session-with-layout coder-ccmanager --session "$session_name"
+    fi
+    
+    info "Attaching to session '$session_name'..."
+    exec ~/.local/bin/zellij-wrapper attach "$session_name"
+}
+
+
+
+# Create or attach to session for current directory (smart behavior)
+create_or_attach() {
+    local session_name
+    local status
+    
+    validate_directory
+    session_name=$(generate_session_name)
+    status=$(get_session_status "$session_name")
+    
+    case "$status" in
+        "NOT_FOUND")
+            info "Creating new session '$session_name' in $(pwd)..."
+            info "Starting ccmanager..."
+            exec ~/.local/bin/zellij-wrapper --new-session-with-layout coder-ccmanager --session "$session_name"
+            ;;
+        "EXITED")
+            info "Attaching to existing session '$session_name'..."
+            exec ~/.local/bin/zellij-wrapper attach "$session_name"
+            ;;
+        "ACTIVE")
+            warn "Session '$session_name' is currently active (attached elsewhere)."
+            echo
+            info "Options:"
+            info "  • coder attach -f    - Force attach (recreates session)"
+            info "  • coder reset        - Stop and recreate session"  
+            info "  • coder stop         - Stop the session"
+            exit 1
+            ;;
+    esac
+}
+
+# Show usage information
+show_usage() {
+    cat << EOF
+Usage: coder [COMMAND] [OPTIONS]
+
+COMMANDS:
+    (no command)     Smart create/attach based on session status
+    ls               List all coder-managed sessions  
+    attach [-f]      Attach to current directory's session (or force recreate)
+    attach SESSION   Attach to specific named session
+    stop [-f]        Stop current directory's session (with confirmation)
+    kill [SESSION]   Alias for 'stop' command
+    reset [-f]       Stop and recreate current directory's session
+    help             Show this help message
+
+SESSION BEHAVIOR:
+    • If session doesn't exist → creates new session with ccmanager running
+    • If session exists but detached → attaches to existing session  
+    • If session exists and active → shows options (use -f to force)
+
+OPTIONS:
+    --force, -f      Skip confirmation prompts for destructive operations
+
+EXAMPLES:
+    coder                    # Smart create/attach for current directory
+    coder attach -f          # Force recreate current directory's session
+    coder ls                 # List all coder sessions with status
+    coder stop               # Stop current session (with confirmation)  
+    coder reset -f           # Force reset current session (no confirmation)
+    coder kill some-session  # Kill specific named session
+
+REQUIREMENTS:
+    - Current directory must be a git repository (.git must exist)
+    - Parent directory must be writable (for ccmanager workspaces)
+    - ccmanager command must be available in PATH
+
+EOF
+}
+
+# Main function
+main() {
+    local command=""
+    local force=false
+    local session_name=""
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --force|-f)
+                force=true
+                shift
+                ;;
+            ls|list)
+                command="list"
+                shift
+                ;;
+            attach)
+                command="attach"
+                shift
+                # Optional session name for attach
+                if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
+                    session_name="$1"
+                    shift
+                fi
+                ;;
+            stop)
+                command="stop"
+                shift
+                # Optional session name for stop
+                if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
+                    session_name="$1"
+                    shift
+                fi
+                ;;
+            kill)
+                command="kill"
+                shift
+                # Optional session name for kill (alias to stop)
+                if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
+                    session_name="$1"
+                    shift
+                fi
+                ;;
+            reset)
+                command="reset"
+                shift
+                ;;
+            help|-h|--help)
+                show_usage
+                exit 0
+                ;;
+            *)
+                error "Unknown option: $1. Use 'coder help' for usage information."
+                ;;
+        esac
+    done
+    
+    # Execute command
+    case $command in
+        list)
+            list_sessions
+            ;;
+        attach)
+            attach_session "$session_name" "$force"
+            ;;
+        stop|kill)
+            stop_session "$session_name" "$force"
+            ;;
+        reset)
+            reset_session "$force"
+            ;;
+        *)
+            create_or_attach
+            ;;
+    esac
+}
+
+# Run main function with all arguments
+main "$@"

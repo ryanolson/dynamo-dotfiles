@@ -40,7 +40,7 @@
         "id": "3",
         "name": "Claude + Yolo",
         "command": "claude",
-        "args": ["--yolo"]
+        "args": ["--dangerously-skip-permissions"]
       },
       {
         "id": "4",
@@ -57,7 +57,7 @@
         "id": "6",
         "name": "Claude + Cursor + Yolo",
         "command": "cursor-tunnel-launch.sh",
-        "args": ["--yolo"]
+        "args": ["--dangerously-skip-permissions"]
       }
     ],
     "defaultPresetId": "1",

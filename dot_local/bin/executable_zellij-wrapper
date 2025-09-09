@@ -1,0 +1,96 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Print debug message (only if DEBUG_ZELLIJ_WRAPPER is set)
+debug() {
+    if [[ "${DEBUG_ZELLIJ_WRAPPER:-}" == "1" ]]; then
+        echo -e "${BLUE}[zellij-wrapper] $1${NC}" >&2
+    fi
+}
+
+# Get all coder sessions that are currently EXITED
+get_exited_coder_sessions() {
+    zellij list-sessions 2>/dev/null | \
+        sed 's/\x1b\[[0-9;]*m//g' | \
+        grep "^coder-" | \
+        grep "EXITED" | \
+        awk '{print $1}' || true
+}
+
+# Clean up EXITED coder sessions
+cleanup_exited_sessions() {
+    local exited_sessions
+    exited_sessions=$(get_exited_coder_sessions)
+    
+    if [[ -n "$exited_sessions" ]]; then
+        debug "Found EXITED coder sessions to clean up:"
+        echo "$exited_sessions" | while IFS= read -r session; do
+            if [[ -n "$session" ]]; then
+                debug "Deleting EXITED session: $session"
+                zellij delete-session "$session" 2>/dev/null || true
+            fi
+        done
+        debug "Cleanup completed"
+    else
+        debug "No EXITED coder sessions found"
+    fi
+}
+
+# Store the session name if we're creating/attaching to a specific session
+session_name=""
+prev_arg=""
+for arg in "$@"; do
+    case "$prev_arg" in
+        "--session"|"-s")
+            session_name="$arg"
+            break
+            ;;
+        "--new-session-with-layout"|"-n")
+            # For --new-session-with-layout, the session name comes after --session
+            continue
+            ;;
+    esac
+    prev_arg="$arg"
+done
+
+# If using attach command, extract session name from args
+if [[ "$1" == "attach" ]] && [[ $# -gt 1 ]]; then
+    session_name="$2"
+fi
+
+debug "Running: zellij $*"
+if [[ -n "$session_name" ]] && [[ "$session_name" =~ ^coder- ]]; then
+    debug "Monitoring coder session: $session_name"
+fi
+
+# Run zellij with all provided arguments
+zellij "$@"
+exit_code=$?
+
+debug "zellij exited with code: $exit_code"
+
+# Only clean up if this was a coder session and zellij exited normally
+if [[ -n "$session_name" ]] && [[ "$session_name" =~ ^coder- ]] && [[ $exit_code -eq 0 ]]; then
+    debug "Checking if session became EXITED: $session_name"
+    
+    # Check if the specific session is now EXITED
+    if zellij list-sessions 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -q "^${session_name} .*EXITED"; then
+        debug "Session $session_name is EXITED, deleting it"
+        zellij delete-session "$session_name" 2>/dev/null || true
+        debug "Deleted EXITED session: $session_name"
+    else
+        debug "Session $session_name is not EXITED, skipping cleanup"
+    fi
+fi
+
+# Always do a general cleanup of old EXITED coder sessions
+cleanup_exited_sessions
+
+exit $exit_code
