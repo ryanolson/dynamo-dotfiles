@@ -6,6 +6,10 @@
 {{- if $opSSH -}}
 {{-   $signingKey = promptStringOnce . "onepassword.signing_key" "SSH public key for signing (ssh-ed25519 AAAA...)" -}}
 {{- end -}}
+{{- $opServiceToken := "" -}}
+{{- if $opEnabled -}}
+{{-   $opServiceToken = promptStringOnce . "onepassword.service_account_token" "1Password service account token (empty for desktop app)" -}}
+{{- end -}}
 
 sourceDir: {{ .chezmoi.sourceDir | quote }}
 
@@ -34,6 +38,7 @@ data:
     enabled: {{ $opEnabled }}
     ssh_agent: {{ $opSSH }}
     signing_key: {{ $signingKey | quote }}
+    service_account_token: {{ $opServiceToken | quote }}
     vault: "Development"
     secrets:
       anthropic_api_key: "op://Development/Anthropic API/credential"

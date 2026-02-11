@@ -19,6 +19,7 @@ onepassword:
   enabled: false
   ssh_agent: false
   signing_key: ""
+  service_account_token: ""
   vault: "Development"
   secrets:
     anthropic_api_key: "op://Development/Anthropic API/credential"
