@@ -1,4 +1,4 @@
-{{- if and (hasKey . "onepassword") .onepassword.ssh_agent .onepassword.signing_key -}}
+{{- if and (hasKey . "onepassword") .onepassword.enabled .onepassword.ssh_agent .onepassword.signing_key_ref -}}
 # Allowed SSH signers for git signature verification (managed by chezmoi)
-{{ .email }} {{ .onepassword.signing_key }}
+{{ .email }} {{ onepasswordRead .onepassword.signing_key_ref | trim }}
 {{- end }}

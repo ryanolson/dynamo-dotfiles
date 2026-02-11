@@ -2,10 +2,6 @@
 {{- $email := promptStringOnce . "email" "Your email address" -}}
 {{- $opEnabled := promptBoolOnce . "onepassword.enabled" "Enable 1Password integration" -}}
 {{- $opSSH := promptBoolOnce . "onepassword.ssh_agent" "Enable 1Password SSH agent" -}}
-{{- $signingKey := "" -}}
-{{- if $opSSH -}}
-{{-   $signingKey = promptStringOnce . "onepassword.signing_key" "SSH public key for signing (ssh-ed25519 AAAA...)" -}}
-{{- end -}}
 {{- $opServiceToken := "" -}}
 {{- if $opEnabled -}}
 {{-   $opServiceToken = promptStringOnce . "onepassword.service_account_token" "1Password service account token (empty for desktop app)" -}}
@@ -37,10 +33,7 @@ data:
   onepassword:
     enabled: {{ $opEnabled }}
     ssh_agent: {{ $opSSH }}
-    signing_key: {{ $signingKey | quote }}
     service_account_token: {{ $opServiceToken | quote }}
     vault: "Development"
-    secrets:
-      anthropic_api_key: "op://Development/Anthropic API/credential"
-      hf_token: "op://Development/HuggingFace/credential"
-      github_token: "op://Development/GitHub Token/credential"
+    # secrets: override in ~/.config/chezmoi/chezmoi.yaml
+    # defaults from .chezmoidata/team.yaml

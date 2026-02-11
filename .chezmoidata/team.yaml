@@ -18,7 +18,7 @@ cd_replacement: "zoxide"
 onepassword:
   enabled: false
   ssh_agent: false
-  signing_key: ""
+  signing_key_ref: "op://Development/Git Signing Key/public key"
   service_account_token: ""
   vault: "Development"
   secrets:

@@ -3,8 +3,8 @@
 [user]
     name = {{ .name | default "Your Name" }}
     email = {{ .email | default "your.email@company.com" }}
-{{- if and (hasKey . "onepassword") .onepassword.ssh_agent .onepassword.signing_key }}
-    signingkey = {{ .onepassword.signing_key | quote }}
+{{- if and (hasKey . "onepassword") .onepassword.enabled .onepassword.ssh_agent .onepassword.signing_key_ref }}
+    signingkey = {{ onepasswordRead .onepassword.signing_key_ref | trim | quote }}
 {{- end }}
 
 [core]
@@ -68,7 +68,7 @@
 {{- if eq .chezmoi.os "darwin" }}
     program = "/Applications/1Password.app/Contents/MacOS/op-ssh-sign"
 {{- end }}
-{{- if .onepassword.signing_key }}
+{{- if .onepassword.signing_key_ref }}
     allowedSignersFile = ~/.ssh/allowed_signers
 {{- end }}
 
