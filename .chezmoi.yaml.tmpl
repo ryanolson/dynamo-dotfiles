@@ -8,6 +8,12 @@
 {{- end -}}
 
 sourceDir: {{ .chezmoi.sourceDir | quote }}
+{{- if $opServiceToken }}
+
+# 1Password CLI mode (service account for headless/remote)
+onepassword:
+  mode: "service"
+{{- end }}
 
 # Global settings
 progress: true
