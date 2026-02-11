@@ -1,0 +1,21 @@
+#!/bin/bash
+{{- if and (hasKey . "onepassword") .onepassword.ssh_agent }}
+{{- if eq .chezmoi.os "darwin" }}
+# macOS: inject 1Password IdentityAgent if not present
+CONFIG="$(cat)"
+if ! echo "$CONFIG" | grep -q 'IdentityAgent.*1password'; then
+    printf '%s\n' \
+        '# 1Password SSH Agent (managed by chezmoi)' \
+        'Host *' \
+        '    IdentityAgent "~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"' \
+        ''
+fi
+echo "$CONFIG"
+{{- else }}
+# Linux: pass through — SSH_AUTH_SOCK (forwarded agent) handles everything
+cat
+{{- end }}
+{{- else }}
+# 1Password SSH agent disabled — pass through unchanged
+cat
+{{- end }}

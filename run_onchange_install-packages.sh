@@ -44,9 +44,12 @@ install_macos_packages() {
         
         # Git tools
         lazygit gh
+
+        # Secrets management
+        1password-cli
         
         # Development utilities
-        just watchexec hyperfine tokei uv
+        just watchexec hyperfine tokei kondo uv
         
         # Container and orchestration
         kubectl
@@ -298,6 +301,23 @@ install_linux_packages() {
         sudo apt-get install -y gh || warn "Failed to install GitHub CLI"
     fi
     
+    # 1Password CLI
+    if ! command -v op &> /dev/null; then
+        log "Installing 1Password CLI..."
+        curl -sS https://downloads.1password.com/linux/keys/1password.asc | \
+            sudo gpg --dearmor --output /usr/share/keyrings/1password-archive-keyring.gpg
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/1password-archive-keyring.gpg] https://downloads.1password.com/linux/debian/$(dpkg --print-architecture) stable main" | \
+            sudo tee /etc/apt/sources.list.d/1password.list > /dev/null
+        sudo mkdir -p /etc/debsig/policies/AC2D62742012EA22/
+        curl -sS https://downloads.1password.com/linux/debian/debsig/1password.pol | \
+            sudo tee /etc/debsig/policies/AC2D62742012EA22/1password.pol > /dev/null
+        sudo mkdir -p /usr/share/debsig/keyrings/AC2D62742012EA22
+        curl -sS https://downloads.1password.com/linux/keys/1password.asc | \
+            sudo gpg --dearmor --output /usr/share/debsig/keyrings/AC2D62742012EA22/debsig.gpg
+        sudo apt-get update -qq
+        sudo apt-get install -y 1password-cli || warn "Failed to install 1Password CLI"
+    fi
+
     # Yazi (file manager)
     if ! command -v yazi &> /dev/null; then
         log "Installing yazi..."

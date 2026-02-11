@@ -27,15 +27,15 @@ curl -fsSL https://raw.githubusercontent.com/ryanolson/dynamo-dotfiles/main/boot
 
 ### Language Runtimes (via mise)
 - **Node.js** 22 (LTS)
-- **Python** 3.12 with [uv](https://github.com/astral-sh/uv) package manager
 - **Rust** stable toolchain
-- **Go** 1.21
 - **Zig** 0.11
 
+> **Python**: Use [uv](https://github.com/astral-sh/uv) for Python project management (installed via Homebrew/direct). Python is no longer installed globally via mise.
+
 ### AI Development Tools
-- **ccmanager** - Claude Code session manager
-- **claude** - Anthropic Claude CLI
-- **ruler** - AI agent configuration manager
+- **claude** - Claude Code CLI (installed via [native installer](https://claude.ai/install.sh), auto-updates)
+- **ccmanager** - Claude Code session manager (npm)
+- **ruler** - AI agent configuration manager (npm)
 
 ### Development Environment
 - **Version Control**: Git with team-standard configuration
@@ -87,19 +87,62 @@ data:
       path: "~/projects"
 ```
 
-### Secrets Management
+### Secrets Management (1Password)
 
-chezmoi supports multiple secret storage options:
+API keys and tokens are managed via 1Password CLI (`op`). Secrets are fetched once and cached as fish universal variables with 1-hour auto-expiry.
 
-```yaml
-# In ~/.config/chezmoi/chezmoi.yaml
-data:
-  # For 1Password integration
-  onepassword_account: "your-account"
-  
-  # For Bitwarden integration  
-  bitwarden_email: "your-email"
+**Setup:**
+
+1. Install and sign in to 1Password CLI:
+   ```bash
+   op account add    # first time
+   op signin         # subsequent times
+   ```
+
+2. Ensure these items exist in your 1Password **Development** vault:
+   - `Anthropic API` (credential field = API key)
+   - `HuggingFace` (credential field = HF token)
+   - `GitHub Token` (credential field = token)
+
+3. Enable in your local chezmoi config (`~/.config/chezmoi/chezmoi.yaml`):
+   ```yaml
+   data:
+     name: "Your Name"
+     email: "your.email@company.com"
+     onepassword:
+       enabled: true
+       ssh_agent: true
+   ```
+
+4. Apply and restart your shell:
+   ```bash
+   chezmoi apply
+   exec fish
+   ```
+
+**How it works:**
+- `secrets.fish` auto-runs on shell startup via fish `conf.d/`
+- Fetches secrets from 1Password via `op read` and stores them as fish universal variables (`set -Ux`)
+- Universal variables persist in `~/.config/fish/fish_variables` (same security posture as a `.env` file)
+- Auto-refreshes when cache is older than 1 hour
+- Run `refresh-secrets` to manually reload
+
+**SSH Agent (1Password):**
+- When `onepassword.ssh_agent` is `true`, SSH config points to the 1Password SSH agent
+- Git is configured for SSH commit signing via `op-ssh-sign`
+- GitHub HTTPS URLs are rewritten to SSH automatically
+- Use `gh auth login -p ssh` to authenticate the GitHub CLI
+
+**Manual auth steps (once per machine):**
+- `claude login` — Claude Code uses OAuth, no static key needed
+- `gh auth login -p ssh` — GitHub CLI piggybacks on the 1Password SSH agent
+
+**Verification helper:**
+```bash
+setup-secrets    # checks op install, sign-in, and vault items
 ```
+
+> **Note:** Fish universal variables are persisted on disk. This is the accepted trade-off for cached secrets with auto-expiry and `op` integration. Users without 1Password are unaffected — `onepassword.enabled` defaults to `false`.
 
 ### Adding Custom Packages
 
@@ -139,13 +182,11 @@ data:
 ### Fish Shell Aliases
 | Alias | Command |
 |-------|---------|
-| `l` | `eza` (list files) |
-| `c` | `z` (zoxide jump) |
 | `h` | `hx` (helix editor) |
-| `gst` | `git status` |
-| `gco` | `git checkout` |
-| `gp` | `git push` |
-| `gl` | `git pull` |
+| `k` | `kubectl` (kubernetes) |
+| `d` | `docker` |
+
+> Additional optional aliases (tool replacements, git shortcuts) are available in `config.fish` — uncomment to enable.
 
 ## 📚 Usage
 

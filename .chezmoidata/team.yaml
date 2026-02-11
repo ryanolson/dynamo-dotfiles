@@ -1,6 +1,30 @@
 # Core team configuration - shared across all team members
 # These tools and configurations form the baseline development environment
 
+# Personal defaults (override in ~/.config/chezmoi/chezmoi.yaml)
+name: "Your Name"
+email: "your.email@company.com"
+editor: "helix"
+shell: "fish"
+
+# Tool preference defaults
+cat_replacement: "bat"
+ls_replacement: "eza"
+grep_replacement: "ripgrep"
+find_replacement: "fd"
+cd_replacement: "zoxide"
+
+# 1Password integration (override in ~/.config/chezmoi/chezmoi.yaml)
+onepassword:
+  enabled: false
+  ssh_agent: false
+  signing_key: ""
+  vault: "Development"
+  secrets:
+    anthropic_api_key: "op://Development/Anthropic API/credential"
+    hf_token: "op://Development/HuggingFace/credential"
+    github_token: "op://Development/GitHub Token/credential"
+
 tools:
   # Core development tools that everyone should have
   required:
@@ -66,6 +90,11 @@ tools:
     - name: "gh"
       description: "GitHub CLI"
 
+  # Secrets management
+  secrets:
+    - name: "op"
+      description: "1Password CLI for secrets management"
+
   # Development utilities
   utilities:
     - name: "just"
@@ -81,54 +110,52 @@ tools:
 
   # AI development tools
   ai_tools:
+    - name: "claude"
+      description: "Claude Code CLI (native installer)"
+      category: "ai"
+    - name: "ccmanager"
+      description: "Claude Code session manager"
+      category: "ai"
+    - name: "ruler"
+      description: "AI agent configuration manager"
+      category: "ai"
     - name: "cursor"
       description: "Cursor IDE CLI for remote tunneling"
       category: "ai"
 
-# Team-wide shell aliases that everyone gets
+# Team-wide shell aliases
 aliases:
-  # Core replacements
-  cat: "bat"
-  ls: "eza"
-  l: "eza" 
-  tree: "broot"
-  grep: "rg"
-  find: "fd"
-  c: "z"  # zoxide jump
-  
-  # Editor shortcuts
-  h: "hx"  # helix
-  
-  # Git shortcuts (common team patterns)
-  gst: "git status"
-  gco: "git checkout" 
-  gp: "git push"
-  gl: "git pull"
-  ga: "git add"
-  gc: "git commit"
-  
-  # Development shortcuts
-  k: "kubectl"  # kubernetes
-  d: "docker"   # docker
+  # Active aliases (always enabled)
+  active:
+    h: "hx"       # helix editor
+    k: "kubectl"   # kubernetes
+    d: "docker"    # docker
+
+  # Optional aliases (commented out in config, uncomment to enable)
+  optional:
+    cat: "bat"
+    ls: "eza"
+    l: "eza"
+    tree: "broot"
+    grep: "rg"
+    find: "fd"
+    c: "z"          # zoxide jump
+    gco: "git checkout"
+    gp: "git push"
+    gl: "git pull"
+    ga: "git add"
+    gc: "git commit"
 
 # Language runtimes managed by mise
 languages:
   node:
     default: "22"  # LTS version
     description: "Node.js runtime and npm"
-  
-  python:
-    default: "3.12"
-    description: "Python runtime (use uv for project management)"
-  
+
   rust:
-    default: "stable" 
+    default: "stable"
     description: "Rust toolchain with cargo"
-  
-  go:
-    default: "1.21"
-    description: "Go programming language"
-    
+
   zig:
     default: "0.11.0"
     description: "Zig programming language"

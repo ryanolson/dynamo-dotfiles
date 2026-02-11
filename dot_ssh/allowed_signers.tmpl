@@ -1,0 +1,4 @@
+{{- if and (hasKey . "onepassword") .onepassword.ssh_agent .onepassword.signing_key -}}
+# Allowed SSH signers for git signature verification (managed by chezmoi)
+{{ .email }} {{ .onepassword.signing_key }}
+{{- end }}

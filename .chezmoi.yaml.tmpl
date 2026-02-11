@@ -1,0 +1,41 @@
+{{- $name := promptStringOnce . "name" "Your full name" -}}
+{{- $email := promptStringOnce . "email" "Your email address" -}}
+{{- $opEnabled := promptBoolOnce . "onepassword.enabled" "Enable 1Password integration" -}}
+{{- $opSSH := promptBoolOnce . "onepassword.ssh_agent" "Enable 1Password SSH agent" -}}
+{{- $signingKey := "" -}}
+{{- if $opSSH -}}
+{{-   $signingKey = promptStringOnce . "onepassword.signing_key" "SSH public key for signing (ssh-ed25519 AAAA...)" -}}
+{{- end -}}
+
+sourceDir: {{ .chezmoi.sourceDir | quote }}
+
+# Global settings
+progress: true
+color: true
+
+# Git settings
+git:
+  autoCommit: false
+  autoPush: false
+
+# Merge strategy
+merge:
+  command: "hx"
+
+# CD hook
+cd:
+  command: "fish"
+
+# Personal config (set during chezmoi init)
+data:
+  name: {{ $name | quote }}
+  email: {{ $email | quote }}
+  onepassword:
+    enabled: {{ $opEnabled }}
+    ssh_agent: {{ $opSSH }}
+    signing_key: {{ $signingKey | quote }}
+    vault: "Development"
+    secrets:
+      anthropic_api_key: "op://Development/Anthropic API/credential"
+      hf_token: "op://Development/HuggingFace/credential"
+      github_token: "op://Development/GitHub Token/credential"

@@ -143,9 +143,7 @@ setup_runtimes() {
     if [[ ! -f "$HOME/.tool-versions" && ! -f "$HOME/.mise.toml" ]]; then
         log "Installing default language runtimes..."
         mise use --global node@22 || warn "Failed to install Node.js"
-        mise use --global python@3.12 || warn "Failed to install Python" 
         mise use --global rust@stable || warn "Failed to install Rust"
-        mise use --global go@1.21 || warn "Failed to install Go"
         mise use --global zig@0.11 || warn "Failed to install Zig"
     else
         # Install from existing configuration
@@ -153,6 +151,19 @@ setup_runtimes() {
     fi
     
     success "✅ Language runtimes configured"
+}
+
+# Install Claude Code CLI via native installer
+install_claude_code() {
+    if command -v claude &> /dev/null; then
+        log "📦 Claude Code already installed ($(claude --version 2>/dev/null || echo 'unknown'))"
+        return
+    fi
+
+    log "📦 Installing Claude Code CLI..."
+    curl -fsSL https://claude.ai/install.sh | bash || warn "Failed to install Claude Code"
+
+    success "✅ Claude Code installed successfully"
 }
 
 # Install additional packages
@@ -217,6 +228,7 @@ main() {
     # Set up development environment
     setup_runtimes
     install_packages
+    install_claude_code
     setup_shell
     
     # Final steps
@@ -227,11 +239,18 @@ main() {
     log "   2. Run: fish  # to start using Fish shell"
     log "   3. Customize your config in ~/.config/chezmoi/chezmoi.yaml"
     log "   4. Update dotfiles: chezmoi update"
+    log "   5. Set up commit signing:"
+    log "      op item get 'YOUR-KEY-NAME' --vault Development --fields 'public key'"
+    log "      # Paste the key when chezmoi init prompts for signing key"
+    log "   6. Upload signing key to GitHub (for Verified badges):"
+    log "      gh ssh-key add ~/.ssh/allowed_signers --type signing --title 'chezmoi-signing'"
+    log "      # Or: GitHub.com > Settings > SSH and GPG keys > New SSH key > Type: Signing Key"
     log ""
     log "🔧 What you now have:"
     log "   - Modern CLI tools (bat, eza, ripgrep, fd, zoxide)"
     log "   - Development environment (helix, fish, starship, zellij)"
-    log "   - Language runtimes via mise (node, python, rust, go)" 
+    log "   - Language runtimes via mise (node, rust, zig)"
+    log "   - Claude Code CLI (native installer)"
     log "   - Team-standard configurations and aliases"
     log ""
     log "📚 Documentation: https://github.com/ryanolson/dynamo-dotfiles"

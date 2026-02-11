@@ -21,7 +21,19 @@
       "Bash(git commit:*)",
       "Bash(git push:*)",
       "Bash(pkill:*)",
-      "WebFetch(domain:stackoverflow.com)"
+      "WebFetch(domain:stackoverflow.com)",
+      "Bash(chezmoi status:*)",
+      "Bash(chezmoi managed:*)",
+      "Bash(chezmoi cat:*)",
+      "Bash(chezmoi source-path:*)",
+      "Bash(chezmoi state:*)",
+      "Bash(python3:*)",
+      "Bash(chezmoi execute-template:*)",
+      "Bash(chezmoi doctor:*)",
+      "Bash(chezmoi:*)",
+      "Bash(git -C /Users/rolson/repos/dynamo-dotfiles remote -v)",
+      "Bash(git -C /Users/rolson/repos/dynamo-dotfiles diff --stat HEAD)",
+      "WebFetch(domain:developer.1password.com)"
     ],
     "deny": [],
     "ask": []

@@ -33,46 +33,44 @@ if command -v mise >/dev/null
     mise activate fish | source
 end
 
+# Install Claude Code CLI via native installer on first run
+if not command -v claude >/dev/null
+    echo "Installing Claude Code CLI..."
+    curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1
+end
+
 # Install npm tools for AI development on first run
 if command -v npm >/dev/null
-    # Check and install ccmanager (Claude Code session manager)
     if not command -v ccmanager >/dev/null
-        echo "🔧 Installing ccmanager (Claude Code session manager)..."
+        echo "Installing ccmanager..."
         npm install -g ccmanager >/dev/null 2>&1
     end
-    
-    # Check and install Claude Code CLI
-    if not command -v claude >/dev/null
-        echo "🔧 Installing Claude Code CLI..."
-        npm install -g @anthropic-ai/claude-code >/dev/null 2>&1
-    end
-    
-    # Check and install ruler (AI agent configuration manager)
     if not command -v ruler >/dev/null
-        echo "🔧 Installing ruler (AI agent configuration manager)..."
+        echo "Installing ruler..."
         npm install -g @intellectronica/ruler >/dev/null 2>&1
     end
 end
 
 # Team-standard aliases
-alias cat "bat"
-alias ls "eza"
-alias l "eza"
-alias tree "broot"
-alias grep "rg"
-alias find "fd"
-alias c "z"  # zoxide jump
+# Tool replacements (optional - uncomment to override defaults)
+# alias cat "bat"
+# alias ls "eza"
+# alias l "eza"
+# alias tree "broot"
+# alias grep "rg"
+# alias find "fd"
+# alias c "z"  # zoxide jump
 
 # Editor shortcuts
 alias h "hx"  # helix
 
-# Git shortcuts (common team patterns)
-alias gst "git status"
-alias gco "git checkout"
-alias gp "git push"
-alias gl "git pull"
-alias ga "git add"
-alias gc "git commit"
+# Git shortcuts (optional - uncomment if desired)
+# Note: gst is defined as a function below with --short --branch output
+# alias gco "git checkout"
+# alias gp "git push"
+# alias gl "git pull"
+# alias ga "git add"
+# alias gc "git commit"
 
 # Development shortcuts
 alias k "kubectl"  # kubernetes

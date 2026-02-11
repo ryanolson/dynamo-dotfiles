@@ -1,9 +1,11 @@
 # Git configuration - Dynamo team setup
-# Update the user section with your personal information
 
 [user]
-    name = Your Name  # Replace with your name
-    email = your.email@company.com  # Replace with your email
+    name = {{ .name | default "Your Name" }}
+    email = {{ .email | default "your.email@company.com" }}
+{{- if and (hasKey . "onepassword") .onepassword.ssh_agent .onepassword.signing_key }}
+    signingkey = {{ .onepassword.signing_key | quote }}
+{{- end }}
 
 [core]
     editor = hx
@@ -46,15 +48,30 @@
     ci = commit
     df = diff
     lg = log --graph --pretty=format:'%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr) %C(bold blue)<%an>%Creset' --abbrev-commit
-    
+
     # Useful shortcuts
     unstage = reset HEAD --
     last = log -1 HEAD
     visual = !gitk
-    
+
     # Branch management
     delete-merged = "!git branch --merged | grep -v '\\*' | xargs -n 1 git branch -d"
+{{- if and (hasKey . "onepassword") .onepassword.ssh_agent }}
 
-# URL rewrites for faster cloning (uncomment if you have SSH keys set up)
-# [url "git@github.com:"]
-#     insteadOf = "https://github.com/"
+[url "git@github.com:"]
+    insteadOf = "https://github.com/"
+
+[gpg]
+    format = ssh
+
+[gpg "ssh"]
+{{- if eq .chezmoi.os "darwin" }}
+    program = "/Applications/1Password.app/Contents/MacOS/op-ssh-sign"
+{{- end }}
+{{- if .onepassword.signing_key }}
+    allowedSignersFile = ~/.ssh/allowed_signers
+{{- end }}
+
+[commit]
+    gpgsign = true
+{{- end }}

@@ -2,10 +2,8 @@
 # These packages will be installed via Homebrew
 
 homebrew:
-  taps:
-    - homebrew/core
-    - homebrew/cask
-  
+  taps: []
+
   # CLI tools and utilities
   brews:
     # Core development tools
@@ -36,6 +34,9 @@ homebrew:
     # Git tools
     - lazygit
     - gh
+
+    # Secrets management
+    - 1password-cli
     
     # Development utilities
     - just
