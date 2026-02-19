@@ -13,6 +13,10 @@ sourceDir: {{ .chezmoi.sourceDir | quote }}
 # 1Password CLI mode (service account for headless/remote)
 onepassword:
   mode: "service"
+
+# Ensure OP_SERVICE_ACCOUNT_TOKEN is set for all chezmoi operations (apply, update, etc.)
+env:
+  OP_SERVICE_ACCOUNT_TOKEN: {{ $opServiceToken | quote }}
 {{- end }}
 
 # Global settings
