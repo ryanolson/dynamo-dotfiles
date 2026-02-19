@@ -124,9 +124,20 @@ init_dotfiles() {
         return
     fi
     
-    # Initialize and apply dotfiles
-    chezmoi init --apply "$REPO_URL" || error "Failed to initialize dotfiles"
-    
+    # Initialize (generates config from template, prompts for values)
+    chezmoi init "$REPO_URL" || error "Failed to initialize dotfiles"
+
+    # Export service account token so onepasswordRead works during apply
+    local op_token
+    op_token=$(chezmoi execute-template '{{ .onepassword.service_account_token }}' 2>/dev/null || true)
+    if [[ -n "$op_token" ]]; then
+        export OP_SERVICE_ACCOUNT_TOKEN="$op_token"
+        log "1Password service account token set for apply phase"
+    fi
+
+    # Apply dotfiles (uses token in env if set)
+    chezmoi apply || error "Failed to apply dotfiles"
+
     success "✅ Dotfiles initialized and applied"
 }
 
