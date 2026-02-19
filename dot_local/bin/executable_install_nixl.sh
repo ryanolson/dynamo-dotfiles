@@ -23,6 +23,7 @@ error()   { echo -e "\033[0;31m[ERROR]\033[0m $*" >&2; exit 1; }
 
 # --- Phase 1: Linux guard ---
 [[ "$(uname -s)" == "Linux" ]] || { echo "NIXL is only supported on Linux."; exit 0; }
+command -v uv &>/dev/null || error "uv is required but not found. Install: curl -LsSf https://astral.sh/uv/install.sh | sh"
 
 log "Installing NIXL ref='$NIXL_REF'..."
 
@@ -32,7 +33,7 @@ install_apt_deps() {
 
     local required_pkgs=(
         build-essential autoconf automake libtool pkg-config cmake git
-        python3-pip meson ninja-build
+        meson ninja-build
     )
     local optional_pkgs=(libibverbs-dev librdmacm-dev)
 
@@ -66,7 +67,9 @@ install_apt_deps
 
 # --- Phase 3: Python build dependencies ---
 log "Installing Python build dependencies..."
-pip3 install --quiet --upgrade meson ninja pybind11 tomlkit
+uv venv "$BUILD_DIR/.venv" --quiet
+uv pip install --python "$BUILD_DIR/.venv/bin/python" --quiet meson ninja pybind11 tomlkit
+export PATH="$BUILD_DIR/.venv/bin:$PATH"
 success "Python build dependencies ready."
 
 # --- Phase 4: UCX ---
@@ -145,23 +148,7 @@ install_nixl() {
 
 install_nixl
 
-# --- Phase 6: Python bindings ---
-log "Installing NIXL Python bindings..."
-
-cuda_major=""
-if command -v nvcc &>/dev/null; then
-    cuda_major=$(nvcc --version | grep -oP 'release \K\d+')
-fi
-
-if [[ "$cuda_major" == "13" ]]; then
-    pip3 install --upgrade "nixl[cu13]"
-else
-    pip3 install --upgrade "nixl[cu12]"
-fi
-
-success "NIXL Python bindings installed."
-
-# --- Phase 7: Environment file ---
+# --- Phase 6: Environment file ---
 log "Writing NIXL environment variables..."
 
 NIXL_ENV_CONTENT='export NIXL_HOME=/opt/nvidia/nvda_nixl
