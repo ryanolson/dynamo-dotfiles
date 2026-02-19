@@ -49,3 +49,6 @@ node_modules/
 # OS cache files
 Thumbs.db
 Desktop.ini
+
+# 1Password service account token (managed during init only)
+.config/op/token

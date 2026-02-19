@@ -1,0 +1,3 @@
+{{- if and (hasKey . "onepassword") .onepassword.service_account_token }}
+{{ .onepassword.service_account_token }}
+{{- end }}

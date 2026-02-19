@@ -8,8 +8,8 @@ end
 
 # Set up colors and environment
 set -gx COLORTERM truecolor
-set -gx EDITOR hx
-set -gx VISUAL hx
+set -gx EDITOR vi
+set -gx VISUAL vi
 
 # Add local bin directories to PATH
 fish_add_path $HOME/.local/bin
