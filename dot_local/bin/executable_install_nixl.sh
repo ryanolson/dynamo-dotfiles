@@ -1,12 +1,30 @@
 #!/bin/bash
 set -euo pipefail
 
+# =============================================================================
 # install_nixl.sh [GIT_REF]
+#
 # Installs or upgrades NIXL (NVIDIA Inference Xfer Library) and prerequisites.
 # Linux only. GIT_REF defaults to 'main'.
+#
+# REFERENCE: This script mirrors the official NIXL Dockerfile build procedure:
+#   https://github.com/ai-dynamo/nixl  →  contrib/Dockerfile
+#
+# Key NIXL build knobs (see meson_options.txt in nixl repo):
+#   -Denable_plugins=UCX,POSIX,GDS   Comma-separated list of dynamic plugins
+#   -Ducx_path=<prefix>              Where UCX is installed
+#   -Dinstall_headers=true            Install C/C++ headers
+#   -Dbuild_tests=false               Skip test targets
+#
+# UCX's ./contrib/configure-release-mt is a wrapper around ./configure that
+# adds: --enable-mt --disable-logging --disable-debug --disable-assertions
+#        --disable-params-check
+#
+# To update versions, change UCX_VERSION and NIXL_REF below.
+# =============================================================================
 
 # --- Configuration ---
-UCX_VERSION="1.20.0"
+UCX_VERSION="v1.20.0"
 UCX_PREFIX="/usr/local"
 NIXL_PREFIX="/opt/nvidia/nvda_nixl"
 NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
@@ -21,11 +39,37 @@ success() { echo -e "\033[0;32m[SUCCESS]\033[0m $*"; }
 warn()    { echo -e "\033[1;33m[WARN]\033[0m $*"; }
 error()   { echo -e "\033[0;31m[ERROR]\033[0m $*" >&2; exit 1; }
 
-# --- Phase 1: Linux guard ---
+# --- Phase 1: Linux guard + dependency check ---
 [[ "$(uname -s)" == "Linux" ]] || { echo "NIXL is only supported on Linux."; exit 0; }
-command -v uv &>/dev/null || error "uv is required but not found. Install: curl -LsSf https://astral.sh/uv/install.sh | sh"
 
-log "Installing NIXL ref='$NIXL_REF'..."
+# Force HTTPS for github clones. User git configs (inherited via sudo -E) may
+# have insteadOf rules rewriting https:// to git@github.com:, which fails
+# without SSH keys under sudo. GIT_CONFIG_GLOBAL=/dev/null makes git ignore
+# the user's ~/.gitconfig entirely.
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_TERMINAL_PROMPT=0
+
+# uv is often installed in user-local paths that sudo doesn't inherit.
+# Search common locations so `sudo ./install_nixl.sh` works.
+if ! command -v uv &>/dev/null; then
+    for p in "$HOME/.local/bin" "$HOME/.cargo/bin" /usr/local/bin /home/*/.local/bin; do
+        if [[ -x "$p/uv" ]]; then
+            export PATH="$p:$PATH"
+            break
+        fi
+    done
+    command -v uv &>/dev/null || error "uv is required but not found. Install: curl -LsSf https://astral.sh/uv/install.sh | sh"
+fi
+
+# Determine architecture
+ARCH="$(uname -m)"
+case "$ARCH" in
+    x86_64)  ARCH_TRIPLET="x86_64-linux-gnu" ;;
+    aarch64) ARCH_TRIPLET="aarch64-linux-gnu" ;;
+    *) error "Unsupported architecture: $ARCH" ;;
+esac
+
+log "Installing NIXL ref='$NIXL_REF' on $ARCH ($ARCH_TRIPLET)..."
 
 # --- Phase 2: apt system dependencies ---
 install_apt_deps() {
@@ -33,9 +77,9 @@ install_apt_deps() {
 
     local required_pkgs=(
         build-essential autoconf automake libtool pkg-config cmake git
-        meson ninja-build
+        python3-dev meson ninja-build
     )
-    local optional_pkgs=(libibverbs-dev librdmacm-dev)
+    local optional_pkgs=(libibverbs-dev librdmacm-dev liburing-dev)
 
     local to_install=()
     for pkg in "${required_pkgs[@]}"; do
@@ -72,15 +116,23 @@ uv pip install --python "$BUILD_DIR/.venv/bin/python" --quiet meson ninja pybind
 export PATH="$BUILD_DIR/.venv/bin:$PATH"
 success "Python build dependencies ready."
 
-# --- Phase 4: UCX ---
-install_ucx() {
-    if pkg-config --exists ucx 2>/dev/null && \
-       [[ "$(pkg-config --modversion ucx 2>/dev/null)" == "$UCX_VERSION" ]]; then
-        log "UCX $UCX_VERSION already installed — skipping"
-        return
+# --- Phase 4: Remove conflicting system UCX plugin dirs ---
+# The NIXL Dockerfile explicitly removes these to prevent old UCX transports
+# from shadowing the freshly built ones (see contrib/Dockerfile):
+#   RUN rm -rf /usr/lib/ucx
+#   RUN rm -rf /opt/hpcx/ucx
+for ucx_dir in /usr/lib/ucx /opt/hpcx/ucx; do
+    if [[ -d "$ucx_dir" ]]; then
+        log "Removing conflicting system UCX dir: $ucx_dir"
+        sudo rm -rf "$ucx_dir"
     fi
+done
 
-    log "Installing UCX $UCX_VERSION..."
+# --- Phase 5: UCX ---
+# Built from source with ./contrib/configure-release-mt (the official NIXL way).
+# This wrapper adds --enable-mt plus release optimizations.
+install_ucx() {
+    log "Installing UCX $UCX_VERSION from source with configure-release-mt..."
 
     # CUDA detection
     CUDA_FLAGS=""
@@ -92,26 +144,42 @@ install_ucx() {
         fi
     done
 
-    curl -fsSL "https://github.com/openucx/ucx/releases/download/v${UCX_VERSION}/ucx-${UCX_VERSION}.tar.gz" \
-        | tar -xz -C "$BUILD_DIR"
+    # gdrcopy detection
+    GDRCOPY_FLAGS=""
+    if [[ -f /usr/local/include/gdrapi.h ]] || [[ -f /usr/include/gdrapi.h ]]; then
+        GDRCOPY_FLAGS="--with-gdrcopy=/usr/local"
+        log "gdrcopy found — enabling in UCX"
+    fi
 
-    cd "$BUILD_DIR/ucx-${UCX_VERSION}"
-    ./configure \
+    git clone --depth 1 -b "$UCX_VERSION" https://github.com/openucx/ucx.git "$BUILD_DIR/ucx"
+    cd "$BUILD_DIR/ucx"
+    ./autogen.sh
+
+    # Use UCX's own configure-release-mt wrapper (adds --enable-mt + release flags)
+    # then layer on the same flags the NIXL Dockerfile uses.
+    ./contrib/configure-release-mt \
         --prefix="$UCX_PREFIX" \
         --enable-shared \
         --disable-static \
+        --disable-doxygen-doc \
+        --enable-optimizations \
+        --enable-cma \
+        --enable-devel-headers \
         --with-verbs \
-        $CUDA_FLAGS
+        --with-dm \
+        $CUDA_FLAGS \
+        $GDRCOPY_FLAGS
+
     make -j"$(nproc)"
-    sudo make install
+    sudo make -j"$(nproc)" install-strip
     sudo ldconfig
 
-    success "UCX $UCX_VERSION installed."
+    success "UCX $UCX_VERSION installed with MT support at $UCX_PREFIX."
 }
 
 install_ucx
 
-# --- Phase 5: NIXL ---
+# --- Phase 6: NIXL ---
 install_nixl() {
     local installed_ref=""
     [[ -f "$NIXL_REF_FILE" ]] && installed_ref="$(cat "$NIXL_REF_FILE")"
@@ -132,11 +200,18 @@ install_nixl() {
         || { git clone "$NIXL_REPO" "$BUILD_DIR/nixl" && git -C "$BUILD_DIR/nixl" checkout "$NIXL_REF"; }
 
     cd "$BUILD_DIR/nixl"
+
+    # Plugin list: UCX and POSIX are always enabled.
+    # GDS is included when CUDA/cuFile headers are available (meson skips it gracefully if not).
+    PLUGIN_LIST="UCX,POSIX,GDS"
+
     meson setup build \
         --prefix="$NIXL_PREFIX" \
         -Ducx_path="$UCX_PREFIX" \
         -Dinstall_headers=true \
-        -Denable_plugins=UCX,POSIX
+        -Denable_plugins="$PLUGIN_LIST" \
+        -Dbuild_tests=false \
+        -Dbuild_examples=false
     ninja -C build
     sudo ninja -C build install
 
@@ -148,19 +223,47 @@ install_nixl() {
 
 install_nixl
 
-# --- Phase 6: Environment file ---
+# --- Phase 7: Post-install — ldconfig for NIXL libs ---
+# Matches the Dockerfile pattern:
+#   RUN echo "$NIXL_PREFIX/lib/$ARCH-linux-gnu" > /etc/ld.so.conf.d/nixl.conf && \
+#       echo "$NIXL_PLUGIN_DIR" >> /etc/ld.so.conf.d/nixl.conf && \
+#       ldconfig
+log "Configuring dynamic linker for NIXL..."
+{
+    echo "$NIXL_PREFIX/lib/$ARCH_TRIPLET"
+    echo "$NIXL_PREFIX/lib/$ARCH_TRIPLET/plugins"
+} | sudo tee /etc/ld.so.conf.d/nixl.conf > /dev/null
+sudo ldconfig
+success "ldconfig updated with NIXL library paths."
+
+# --- Phase 8: Environment file ---
 log "Writing NIXL environment variables..."
 
-NIXL_ENV_CONTENT='export NIXL_HOME=/opt/nvidia/nvda_nixl
-export PATH="$NIXL_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$NIXL_HOME/lib:${LD_LIBRARY_PATH:-}"'
+NIXL_ENV_CONTENT="export NIXL_HOME=$NIXL_PREFIX
+export PATH=\"\$NIXL_HOME/bin:\$PATH\"
+export LD_LIBRARY_PATH=\"$UCX_PREFIX/lib:\$NIXL_HOME/lib/$ARCH_TRIPLET:\$NIXL_HOME/lib:\${LD_LIBRARY_PATH:-}\"
+export NIXL_PLUGIN_DIR=\"\$NIXL_HOME/lib/$ARCH_TRIPLET/plugins\""
 
 if sudo tee /etc/profile.d/nixl.sh <<< "$NIXL_ENV_CONTENT" > /dev/null 2>&1; then
-    log "Environment written to /etc/profile.d/nixl.sh"
+    log "Environment written to /etc/profile.d/nixl.sh (bash/zsh)"
 else
     mkdir -p "$HOME/.local/share"
     echo "$NIXL_ENV_CONTENT" > "$HOME/.local/share/nixl.sh"
     warn "Could not write /etc/profile.d/nixl.sh — source ~/.local/share/nixl.sh manually"
 fi
 
-success "NIXL installation complete. Re-login or source the environment file to apply PATH changes."
+# Fish shell config — /etc/profile.d/*.sh is ignored by fish
+FISH_NIXL_CONTENT="set -gx NIXL_HOME $NIXL_PREFIX
+fish_add_path \$NIXL_HOME/bin
+set -gx LD_LIBRARY_PATH $UCX_PREFIX/lib \$NIXL_HOME/lib/$ARCH_TRIPLET \$NIXL_HOME/lib \$LD_LIBRARY_PATH
+set -gx NIXL_PLUGIN_DIR \$NIXL_HOME/lib/$ARCH_TRIPLET/plugins"
+
+if [[ -d /etc/fish ]] || command -v fish &>/dev/null; then
+    sudo mkdir -p /etc/fish/conf.d
+    sudo tee /etc/fish/conf.d/nixl.fish <<< "$FISH_NIXL_CONTENT" > /dev/null
+    log "Environment written to /etc/fish/conf.d/nixl.fish (fish)"
+fi
+
+success "NIXL installation complete. Open a new shell to apply, or:"
+log "  bash/zsh: source /etc/profile.d/nixl.sh"
+log "  fish:     source /etc/fish/conf.d/nixl.fish"
