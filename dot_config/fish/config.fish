@@ -21,9 +21,10 @@ set -gx NPM_CONFIG_PREFIX $HOME/.npm-global
 mkdir -p $HOME/.npm-global
 
 # Initialize tool integrations
-if command -v zoxide >/dev/null
-    zoxide init fish | source
-end
+# zoxide: disabled (macOS binary may be present but non-executable on Linux)
+# if command -v zoxide >/dev/null
+#     zoxide init fish | source
+# end
 
 if command -v starship >/dev/null
     starship init fish | source
