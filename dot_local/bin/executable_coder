@@ -43,6 +43,31 @@ validate_directory() {
     if [[ ! -w "$parent_dir" ]]; then
         error "Parent directory '$parent_dir' is not writable (needed for ccmanager workspaces)"
     fi
+    
+    # Ensure workspaces directory exists
+    ensure_workspaces_directory
+}
+
+# Ensure the {project}-workspaces directory exists
+ensure_workspaces_directory() {
+    local current_dir
+    local project_name
+    local parent_dir
+    local workspaces_dir
+    
+    current_dir=$(pwd)
+    project_name=$(basename "$current_dir")
+    parent_dir=$(dirname "$current_dir")
+    workspaces_dir="${parent_dir}/${project_name}-workspaces"
+    
+    if [[ ! -d "$workspaces_dir" ]]; then
+        info "Creating workspaces directory: $workspaces_dir"
+        if mkdir -p "$workspaces_dir"; then
+            success "Created workspaces directory: $workspaces_dir"
+        else
+            error "Failed to create workspaces directory: $workspaces_dir"
+        fi
+    fi
 }
 
 # Generate session name based on current directory
