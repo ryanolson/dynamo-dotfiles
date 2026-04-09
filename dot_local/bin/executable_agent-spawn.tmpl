@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# agent-spawn — Launch an AI agent in a Zellij tab on a worktree
+# Usage:
+#   agent-spawn claude [worktree-name] [prompt]
+#   agent-spawn codex [worktree-name] [prompt]
+#   agent-spawn claude-auto [worktree-name] <prompt>
+#   agent-spawn codex-auto [worktree-name] <prompt>
+
+set -euo pipefail
+
+SSH_HOST="{{ .cursor_ssh_host }}"
+STATE_DIR="${HOME}/.local/state/agents"
+
+# --- Colors (catppuccin-mocha) ---
+RED='\033[38;2;243;139;168m'
+GREEN='\033[38;2;166;227;161m'
+BLUE='\033[38;2;137;180;250m'
+YELLOW='\033[38;2;249;226;175m'
+NC='\033[0m'
+
+usage() {
+    cat <<EOF
+Usage: agent-spawn <type> [worktree-name] [prompt]
+
+Types:
+  claude        Interactive Claude Code session
+  codex         Interactive Codex CLI session
+  claude-auto   Autonomous Claude (requires prompt)
+  codex-auto    Autonomous Codex (requires prompt)
+
+If worktree-name is provided, resolves to .claude/worktrees/<name>.
+If omitted, uses the current directory.
+
+Examples:
+  agent-spawn claude                    # Claude in current dir
+  agent-spawn claude auth              # Claude in auth worktree
+  agent-spawn claude-auto auth "Fix all lint errors"
+EOF
+    exit 1
+}
+
+AGENT="${1:-}"
+[[ -z "$AGENT" ]] && usage
+shift
+
+# Parse worktree name and prompt
+WT_NAME=""
+PROMPT=""
+CWD="$(pwd)"
+
+if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
+    # Check if this looks like a worktree name (not a prompt)
+    local_repo_root="$(git rev-parse --show-toplevel 2>/dev/null || echo "")"
+    if [[ -n "$local_repo_root" ]]; then
+        potential_path="${local_repo_root}/.claude/worktrees/$1"
+        if [[ -d "$potential_path" ]]; then
+            WT_NAME="$1"
+            CWD="$potential_path"
+            shift
+        fi
+    fi
+fi
+
+if [[ $# -gt 0 ]]; then
+    PROMPT="$*"
+fi
+
+# Build the agent command
+case "$AGENT" in
+    claude)
+        CMD="claude"
+        [[ -n "$PROMPT" ]] && CMD="claude \"${PROMPT}\""
+        TAB_PREFIX="claude"
+        ;;
+    claude-auto)
+        [[ -z "$PROMPT" ]] && { echo -e "${RED}Error: claude-auto requires a prompt${NC}" >&2; exit 1; }
+        CMD="claude -p '${PROMPT}' --dangerously-skip-permissions --max-turns 50"
+        TAB_PREFIX="claude-auto"
+        ;;
+    codex)
+        CMD="codex"
+        [[ -n "$PROMPT" ]] && CMD="codex '${PROMPT}'"
+        TAB_PREFIX="codex"
+        ;;
+    codex-auto)
+        [[ -z "$PROMPT" ]] && { echo -e "${RED}Error: codex-auto requires a prompt${NC}" >&2; exit 1; }
+        CMD="codex exec --full-auto '${PROMPT}'"
+        TAB_PREFIX="codex-auto"
+        ;;
+    *)
+        echo -e "${RED}Unknown agent type: $AGENT${NC}" >&2
+        usage
+        ;;
+esac
+
+# Determine tab name
+DIR_NAME="$(basename "$CWD")"
+TAB_NAME="${TAB_PREFIX}-${WT_NAME:-$DIR_NAME}"
+
+# Create state directory
+mkdir -p "$STATE_DIR"
+
+# Launch in Zellij
+if [[ -n "${ZELLIJ:-}" ]]; then
+    zellij action new-tab --name "$TAB_NAME" --cwd "$CWD"
+    sleep 0.3
+    zellij action write-chars "$CMD"
+    zellij action write 10  # Enter key
+    echo -e "${GREEN}Spawned ${AGENT} in tab '${TAB_NAME}'${NC}"
+
+    # Show Cursor link if configured
+    if [[ -n "$SSH_HOST" ]]; then
+        printf 'Cursor: \e]8;;%s\e\\%s\e]8;;\e\\\n' \
+            "cursor://vscode-remote/ssh-remote+${SSH_HOST}${CWD}" \
+            "Open in Cursor"
+    fi
+else
+    echo -e "${YELLOW}Not inside Zellij. Run manually:${NC}"
+    echo "  cd $CWD && $CMD"
+fi

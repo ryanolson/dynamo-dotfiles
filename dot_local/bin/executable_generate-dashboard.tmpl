@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# generate-dashboard — Generate HTML agent dashboard with clickable Cursor links
+# Output: ~/.local/share/agent-dashboard/index.html
+# Serve with: python3 -m http.server 8787 --directory ~/.local/share/agent-dashboard
+
+set -euo pipefail
+
+SSH_HOST="{{ .cursor_ssh_host }}"
+DASHBOARD_DIR="${HOME}/.local/share/agent-dashboard"
+OUTPUT="${DASHBOARD_DIR}/index.html"
+mkdir -p "$DASHBOARD_DIR"
+
+# Collect worktree rows
+ROWS=""
+
+# Scan known repo locations
+for dir in "$HOME"/src/*/; do
+    [[ -d "${dir}.git" ]] || continue
+    repo_root="$(realpath "$dir")"
+    repo_name="$(basename "$repo_root")"
+
+    git -C "$repo_root" worktree list --porcelain 2>/dev/null | {
+        wt_path="" branch=""
+        while IFS= read -r line; do
+            case "$line" in
+                "worktree "*) wt_path="${line#worktree }" ;;
+                "branch "*)   branch="${line#branch refs/heads/}" ;;
+                "")
+                    if [[ -n "${wt_path:-}" ]]; then
+                        name="$(basename "$wt_path")"
+                        status="clean"
+                        status_class="clean"
+                        if [[ -n "$(git -C "$wt_path" status --porcelain 2>/dev/null)" ]]; then
+                            status="dirty"
+                            status_class="dirty"
+                        fi
+
+                        agent="&mdash;"
+                        agent_class=""
+                        if pgrep -f "claude.*${wt_path}" >/dev/null 2>&1; then
+                            agent="Claude Code"
+                            agent_class="claude"
+                        fi
+                        if pgrep -f "codex.*${wt_path}" >/dev/null 2>&1; then
+                            if [[ -n "$agent_class" ]]; then
+                                agent="Claude + Codex"
+                            else
+                                agent="Codex CLI"
+                                agent_class="codex"
+                            fi
+                        fi
+
+                        cursor_uri="cursor://vscode-remote/ssh-remote+${SSH_HOST}${wt_path}"
+
+                        echo "<tr>"
+                        echo "<td class=\"name\">${repo_name}/${name}</td>"
+                        echo "<td>${branch:-detached}</td>"
+                        echo "<td class=\"${status_class}\">${status}</td>"
+                        echo "<td class=\"${agent_class}\">${agent}</td>"
+                        if [[ -n "$SSH_HOST" ]]; then
+                            echo "<td><a class=\"btn\" href=\"${cursor_uri}\">Open in Cursor</a></td>"
+                        else
+                            echo "<td class=\"dim\">No SSH host configured</td>"
+                        fi
+                        echo "</tr>"
+                    fi
+                    wt_path="" branch=""
+                    ;;
+            esac
+        done
+    } >> /tmp/dashboard_rows_$$.html
+done
+
+ROWS="$(cat /tmp/dashboard_rows_$$.html 2>/dev/null || echo "")"
+rm -f /tmp/dashboard_rows_$$.html
+
+# Generate HTML
+cat > "$OUTPUT" << HTMLEOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="30">
+<title>Agent Dashboard</title>
+<style>
+  :root { --bg: #1e1e2e; --surface: #313244; --text: #cdd6f4; --subtext: #a6adc8;
+          --green: #a6e3a1; --yellow: #f9e2af; --red: #f38ba8; --blue: #89b4fa;
+          --mauve: #cba6f7; --border: #45475a; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'JetBrains Mono', 'Fira Code', monospace; background: var(--bg);
+         color: var(--text); padding: 24px; max-width: 1200px; margin: 0 auto; }
+  h1 { color: var(--mauve); margin-bottom: 4px; font-size: 1.4em; }
+  .meta { color: var(--subtext); margin-bottom: 20px; font-size: 0.85em; }
+  h2 { color: var(--blue); margin: 20px 0 10px; font-size: 1.1em; }
+  table { width: 100%; border-collapse: collapse; margin-bottom: 16px; }
+  th { text-align: left; padding: 8px 12px; background: var(--surface);
+       color: var(--subtext); font-size: 0.8em; text-transform: uppercase;
+       letter-spacing: 0.05em; border-bottom: 2px solid var(--border); }
+  td { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  tr:hover { background: var(--surface); }
+  .name { font-weight: bold; }
+  .clean { color: var(--green); }
+  .dirty { color: var(--yellow); }
+  .claude { color: var(--green); }
+  .codex { color: var(--blue); }
+  .dim { color: var(--subtext); }
+  .btn { display: inline-block; padding: 4px 14px; background: var(--mauve);
+         color: var(--bg); text-decoration: none; border-radius: 4px;
+         font-size: 0.85em; font-weight: bold; transition: opacity 0.15s; }
+  .btn:hover { opacity: 0.8; }
+  .footer { margin-top: 24px; color: var(--subtext); font-size: 0.75em; }
+</style>
+</head>
+<body>
+<h1>Agent Dashboard</h1>
+<p class="meta">Host: $(hostname) &middot; Updated: $(date '+%Y-%m-%d %H:%M:%S')</p>
+
+<h2>Git Worktrees</h2>
+<table>
+<tr><th>Worktree</th><th>Branch</th><th>Status</th><th>Agent</th><th>Cursor</th></tr>
+${ROWS}
+</table>
+
+<p class="footer">Auto-refreshes every 30s. <code>cursor://</code> links require Cursor Desktop + Remote-SSH.</p>
+</body>
+</html>
+HTMLEOF

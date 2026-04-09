@@ -49,3 +49,21 @@ node_modules/
 # OS cache files
 Thumbs.db
 Desktop.ini
+
+# Agent infrastructure (only for remote-dev machines)
+{{- if ne .machine_type "remote-dev" }}
+dot_local/bin/executable_wt.tmpl
+dot_local/bin/executable_agent-spawn.tmpl
+dot_local/bin/executable_agent-status.tmpl
+dot_local/bin/executable_generate-dashboard.tmpl
+dot_local/bin/executable_osc8-link
+dot_config/zellij/layouts/agents.kdl
+dot_config/systemd/
+dot_config/fish/conf.d/agent-aliases.fish
+dot_config/fish/conf.d/ssh-auth-sock.fish
+{{- end }}
+
+# systemd only on Linux
+{{- if ne .chezmoi.os "linux" }}
+dot_config/systemd/
+{{- end }}

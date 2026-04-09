@@ -36,7 +36,9 @@
       "WebFetch(domain:developer.1password.com)",
       "WebFetch(domain:developers.openai.com)",
       "Bash(git -C /Users/rolson/repos/dynamo-dotfiles log --oneline --all)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(zellij --help)",
+      "Bash(/home/ryan/.cargo/bin/zellij list-sessions:*)"
     ],
     "deny": [],
     "ask": []

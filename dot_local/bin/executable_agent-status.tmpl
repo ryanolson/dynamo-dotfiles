@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# agent-status — Terminal status display with OSC 8 clickable Cursor links
+# Designed to run under: watch -n5 -c agent-status
+# Or standalone for a one-shot view.
+
+set -euo pipefail
+
+SSH_HOST="{{ .cursor_ssh_host }}"
+
+# --- Colors (catppuccin-mocha) ---
+RED='\033[38;2;243;139;168m'
+GREEN='\033[38;2;166;227;161m'
+YELLOW='\033[38;2;249;226;175m'
+BLUE='\033[38;2;137;180;250m'
+MAUVE='\033[38;2;203;166;247m'
+SUBTEXT='\033[38;2;166;173;200m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+_osc8() {
+    printf '\e]8;;%s\e\\%s\e]8;;\e\\' "$1" "$2"
+}
+
+# --- Header ---
+printf "${BOLD}${MAUVE}Agent Infrastructure Status${NC}\n"
+printf "${SUBTEXT}Host: ${YELLOW}%s${SUBTEXT}  %s${NC}\n\n" \
+    "$(hostname)" "$(date '+%H:%M:%S')"
+
+# --- Find repo roots to scan ---
+# Collect unique repo roots from known worktree locations
+declare -A REPOS=()
+
+# Current directory's repo (if any)
+if repo=$(git rev-parse --show-toplevel 2>/dev/null); then
+    REPOS["$repo"]=1
+fi
+
+# Scan common project directories
+for dir in "$HOME"/src/*/; do
+    if [[ -d "${dir}.git" ]]; then
+        REPOS["$(realpath "$dir")"]=1
+    fi
+done
+
+if [[ ${#REPOS[@]} -eq 0 ]]; then
+    echo -e "${SUBTEXT}No git repositories found.${NC}"
+    exit 0
+fi
+
+# --- Worktree Table ---
+printf "${BOLD}${SUBTEXT}%-22s %-28s %-10s %-14s" "WORKTREE" "BRANCH" "STATUS" "AGENT"
+if [[ -n "$SSH_HOST" ]]; then
+    printf " %s" "CURSOR"
+fi
+printf "${NC}\n"
+
+for repo_root in "${!REPOS[@]}"; do
+    repo_name="$(basename "$repo_root")"
+
+    git -C "$repo_root" worktree list --porcelain 2>/dev/null | {
+        wt_path="" branch=""
+        while IFS= read -r line; do
+            case "$line" in
+                "worktree "*) wt_path="${line#worktree }" ;;
+                "branch "*)   branch="${line#branch refs/heads/}" ;;
+                "")
+                    if [[ -n "${wt_path:-}" ]]; then
+                        name="$(basename "$wt_path")"
+
+                        # Prefix with repo name if scanning multiple repos
+                        if [[ ${#REPOS[@]} -gt 1 ]]; then
+                            display_name="${repo_name}/${name}"
+                        else
+                            display_name="$name"
+                        fi
+
+                        # Status
+                        if [[ -n "$(git -C "$wt_path" status --porcelain 2>/dev/null)" ]]; then
+                            status="${YELLOW}dirty${NC}"
+                        else
+                            status="${GREEN}clean${NC}"
+                        fi
+
+                        # Detect agents
+                        agent="${DIM}--${NC}"
+                        if pgrep -f "claude.*${wt_path}" >/dev/null 2>&1; then
+                            agent="${GREEN}claude${NC}"
+                        fi
+                        if pgrep -f "codex.*${wt_path}" >/dev/null 2>&1; then
+                            if [[ "$agent" == *"claude"* ]]; then
+                                agent="${GREEN}claude${NC}+${BLUE}codex${NC}"
+                            else
+                                agent="${BLUE}codex${NC}"
+                            fi
+                        fi
+
+                        printf "%-22s %-28s %-10b %-14b" \
+                            "$display_name" \
+                            "${branch:-detached}" \
+                            "$status" \
+                            "$agent"
+
+                        if [[ -n "$SSH_HOST" ]]; then
+                            printf " %s" "$(_osc8 "cursor://vscode-remote/ssh-remote+${SSH_HOST}${wt_path}" "Open")"
+                        fi
+                        printf "\n"
+                    fi
+                    wt_path="" branch=""
+                    ;;
+            esac
+        done
+    }
+done
+
+echo ""
+
+# --- Zellij Tabs ---
+if [[ -n "${ZELLIJ:-}" ]] && command -v zellij >/dev/null 2>&1; then
+    printf "${BOLD}${SUBTEXT}Zellij Tabs${NC}\n"
+    zellij action query-tab-names 2>/dev/null | while read -r tab; do
+        printf "  ${SUBTEXT}%s${NC}\n" "$tab"
+    done
+    echo ""
+fi
+
+# --- Resources ---
+printf "${BOLD}${SUBTEXT}Resources${NC}\n"
+cpu="$(grep 'cpu ' /proc/stat 2>/dev/null | awk '{usage=($2+$4)*100/($2+$4+$5)} END {printf "%.0f%%", usage}')" || cpu="N/A"
+mem="$(free -h 2>/dev/null | awk '/Mem:/{printf "%s/%s", $3, $2}')" || mem="N/A"
+gpu="$(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | awk -F', ' '{
+    util=$1; used=$2; total=$3;
+    gsub(/\[N\/A\]/, "?", util); gsub(/\[N\/A\]/, "?", used); gsub(/\[N\/A\]/, "?", total);
+    if (used != "?" && total != "?") printf "%s%% (%sMi/%sMi)", util, used, total;
+    else printf "%s%%", util;
+}')" || gpu="N/A"
+printf "  CPU: ${BLUE}%s${NC}  MEM: ${BLUE}%s${NC}  GPU: ${BLUE}%s${NC}\n" "$cpu" "$mem" "$gpu"

@@ -1,0 +1,12 @@
+[Unit]
+Description=Agent Dashboard HTTP Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m http.server 8787 --directory %h/.local/share/agent-dashboard
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

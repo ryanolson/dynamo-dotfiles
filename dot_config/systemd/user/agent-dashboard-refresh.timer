@@ -1,0 +1,9 @@
+[Unit]
+Description=Refresh Agent Dashboard every 30 seconds
+
+[Timer]
+OnBootSec=10s
+OnUnitActiveSec=30s
+
+[Install]
+WantedBy=timers.target

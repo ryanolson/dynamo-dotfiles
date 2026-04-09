@@ -1,0 +1,39 @@
+{{ if and (eq .chezmoi.os "linux") (eq .machine_type "remote-dev") -}}
+#!/bin/bash
+# Setup agent infrastructure (runs on chezmoi apply when config changes)
+# hash: {{ include "dot_config/systemd/user/agent-dashboard.service" | sha256sum }}
+# hash: {{ include "dot_config/systemd/user/agent-dashboard-refresh.timer" | sha256sum }}
+
+set -euo pipefail
+
+echo "==> Setting up agent infrastructure..."
+
+# Create required directories
+mkdir -p "${HOME}/.local/state/agents"
+mkdir -p "${HOME}/.local/share/agent-dashboard"
+
+# Ensure .ssh directory exists for auth_sock symlink
+mkdir -p "${HOME}/.ssh"
+
+# Generate initial dashboard HTML
+if command -v generate-dashboard &>/dev/null; then
+    generate-dashboard 2>/dev/null || echo "Warning: generate-dashboard not yet available (will work after chezmoi apply completes)"
+elif [[ -x "${HOME}/.local/bin/generate-dashboard" ]]; then
+    "${HOME}/.local/bin/generate-dashboard" 2>/dev/null || true
+fi
+
+# Reload and enable systemd user services
+if command -v systemctl &>/dev/null; then
+    systemctl --user daemon-reload
+
+    systemctl --user enable --now agent-dashboard.service 2>/dev/null || \
+        echo "Warning: could not enable agent-dashboard.service"
+
+    systemctl --user enable --now agent-dashboard-refresh.timer 2>/dev/null || \
+        echo "Warning: could not enable agent-dashboard-refresh.timer"
+
+    echo "==> Dashboard: http://localhost:8787 (SSH tunnel: ssh -L 8787:localhost:8787 HOST)"
+fi
+
+echo "==> Agent infrastructure setup complete"
+{{ end -}}

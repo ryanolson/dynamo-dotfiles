@@ -17,7 +17,7 @@
   },
   "worktree": {
     "autoDirectory": true,
-    "autoDirectoryPattern": "../{project}-workspaces/{branch}",
+    "autoDirectoryPattern": ".claude/worktrees/{branch}",
     "copySessionData": true
   },
   "command": {

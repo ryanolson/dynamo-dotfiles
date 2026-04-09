@@ -23,6 +23,29 @@ case "$OSTYPE" in
     *)        error "Unsupported OS: $OSTYPE" ;;
 esac
 
+# Detect architecture and set naming variants used by different projects
+ARCH="$(uname -m)"
+case "$ARCH" in
+    x86_64)
+        ARCH_ALT="amd64"      # kubectl, gh
+        ARCH_RUST="x86_64"    # most Rust projects
+        ARCH_GO="x86_64"      # lazygit uses this for x86
+        ARCH_CURSOR="x64"     # cursor CLI
+        ;;
+    aarch64|arm64)
+        ARCH="aarch64"
+        ARCH_ALT="arm64"
+        ARCH_RUST="aarch64"
+        ARCH_GO="arm64"       # lazygit uses arm64
+        ARCH_CURSOR="arm64"
+        ;;
+    *)
+        error "Unsupported architecture: $ARCH"
+        exit 1
+        ;;
+esac
+log "Detected architecture: $ARCH ($ARCH_ALT)"
+
 # Install packages on macOS via Homebrew
 install_macos_packages() {
     if ! command -v brew &> /dev/null; then
@@ -71,7 +94,7 @@ install_macos_packages() {
     if ! command -v cursor &> /dev/null; then
         log "Installing cursor CLI..."
         local temp_dir=$(mktemp -d)
-        curl -Lk "https://api2.cursor.sh/updates/download-latest?os=cli-darwin-x64" \
+        curl -Lk "https://api2.cursor.sh/updates/download-latest?os=cli-darwin-${ARCH_CURSOR}" \
             --output "$temp_dir/cursor_cli.tar.gz"
         tar -xzf "$temp_dir/cursor_cli.tar.gz" -C "$temp_dir"
         sudo cp "$temp_dir/cursor" /usr/local/bin/cursor
@@ -140,49 +163,52 @@ install_linux_packages() {
         local latest_url="https://api.github.com/repos/$repo/releases/latest"
         local download_url=""
         
+        # Fetch release JSON once
+        local release_json
+        release_json=$(curl -s "$latest_url")
+
         case "$name" in
             "bat")
-                download_url=$(curl -s "$latest_url" | grep "browser_download_url.*bat.*x86_64.*linux.*musl.tar.gz" | cut -d'"' -f4 | head -1)
+                download_url=$(echo "$release_json" | grep "browser_download_url.*bat.*${ARCH_RUST}.*linux.*tar.gz" | cut -d'"' -f4 | head -1)
                 ;;
             "eza")
-                download_url=$(curl -s "$latest_url" | grep "browser_download_url.*eza.*x86_64.*linux.*tar.gz" | cut -d'"' -f4 | head -1)
+                download_url=$(echo "$release_json" | grep "browser_download_url.*eza.*${ARCH_RUST}.*linux.*tar.gz" | cut -d'"' -f4 | head -1)
                 ;;
             "ripgrep")
-                download_url=$(curl -s "$latest_url" | grep "browser_download_url.*ripgrep.*x86_64.*linux.*tar.gz" | cut -d'"' -f4 | head -1)
+                download_url=$(echo "$release_json" | grep "browser_download_url.*ripgrep.*${ARCH_RUST}.*linux.*tar.gz" | cut -d'"' -f4 | head -1)
                 ;;
             "fd")
-                download_url=$(curl -s "$latest_url" | grep "browser_download_url.*fd.*x86_64.*linux.*tar.gz" | cut -d'"' -f4 | head -1)
+                download_url=$(echo "$release_json" | grep "browser_download_url.*fd.*${ARCH_RUST}.*linux.*tar.gz" | cut -d'"' -f4 | head -1)
                 ;;
             "zoxide")
-                download_url=$(curl -s "$latest_url" | grep "browser_download_url.*zoxide.*x86_64.*linux.*tar.gz" | cut -d'"' -f4 | head -1)
+                download_url=$(echo "$release_json" | grep "browser_download_url.*zoxide.*${ARCH_RUST}.*linux.*tar.gz" | cut -d'"' -f4 | head -1)
                 ;;
             "dust")
-                download_url=$(curl -s "$latest_url" | grep "browser_download_url.*dust.*x86_64.*linux.*tar.gz" | cut -d'"' -f4 | head -1)
+                download_url=$(echo "$release_json" | grep "browser_download_url.*dust.*${ARCH_RUST}.*linux.*tar.gz" | cut -d'"' -f4 | head -1)
                 ;;
             "procs")
-                download_url=$(curl -s "$latest_url" | grep "browser_download_url.*procs.*x86_64.*linux.*zip" | cut -d'"' -f4 | head -1)
+                download_url=$(echo "$release_json" | grep "browser_download_url.*procs.*${ARCH_RUST}.*linux.*zip" | cut -d'"' -f4 | head -1)
                 ;;
             "helix")
-                download_url=$(curl -s "$latest_url" | grep "browser_download_url.*helix.*x86_64.*linux.*tar.xz" | cut -d'"' -f4 | head -1)
+                download_url=$(echo "$release_json" | grep "browser_download_url.*helix.*${ARCH_RUST}.*linux.*tar.xz" | cut -d'"' -f4 | head -1)
                 ;;
             "zellij")
-                download_url=$(curl -s "$latest_url" | grep "browser_download_url.*zellij.*x86_64.*linux.*tar.gz" | cut -d'"' -f4 | head -1)
+                download_url=$(echo "$release_json" | grep "browser_download_url.*zellij.*${ARCH_RUST}.*linux.*tar.gz" | cut -d'"' -f4 | head -1)
                 ;;
             "lazygit")
-                download_url=$(curl -s "$latest_url" | grep "browser_download_url.*lazygit.*linux_x86_64.tar.gz" | cut -d'"' -f4 | head -1)
+                download_url=$(echo "$release_json" | grep "browser_download_url.*lazygit.*Linux_${ARCH_GO}.tar.gz" | cut -d'"' -f4 | head -1)
                 ;;
             "just")
-                download_url=$(curl -s "$latest_url" | grep "browser_download_url.*just.*x86_64.*linux.*tar.gz" | cut -d'"' -f4 | head -1)
+                download_url=$(echo "$release_json" | grep "browser_download_url.*just.*${ARCH_RUST}.*linux.*tar.gz" | cut -d'"' -f4 | head -1)
                 ;;
             "watchexec")
-                download_url=$(curl -s "$latest_url" | grep "browser_download_url.*watchexec.*x86_64.*linux.*tar.xz" | cut -d'"' -f4 | head -1)
+                download_url=$(echo "$release_json" | grep "browser_download_url.*watchexec.*${ARCH_RUST}.*linux.*tar.xz" | cut -d'"' -f4 | head -1)
                 ;;
             "hyperfine")
-                download_url=$(curl -s "$latest_url" | grep "browser_download_url.*hyperfine.*x86_64.*linux.*tar.gz" | cut -d'"' -f4 | head -1)
+                download_url=$(echo "$release_json" | grep "browser_download_url.*hyperfine.*${ARCH_RUST}.*linux.*tar.gz" | cut -d'"' -f4 | head -1)
                 ;;
             "tokei")
-                # Tokei uses a different naming pattern: tokei-x86_64-unknown-linux-gnu.tar.gz
-                download_url=$(curl -s "$latest_url" | grep "browser_download_url.*tokei.*x86_64.*linux.*gnu.*tar.gz" | cut -d'"' -f4 | head -1)
+                download_url=$(echo "$release_json" | grep "browser_download_url.*tokei.*${ARCH_RUST}.*linux.*tar.gz" | cut -d'"' -f4 | head -1)
                 ;;
         esac
         
@@ -287,7 +313,7 @@ install_linux_packages() {
     # kubectl (Kubernetes CLI)
     if ! command -v kubectl &> /dev/null; then
         log "Installing kubectl..."
-        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH_ALT}/kubectl"
         sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
         rm kubectl
     fi
@@ -322,9 +348,9 @@ install_linux_packages() {
     if ! command -v yazi &> /dev/null; then
         log "Installing yazi..."
         local temp_dir=$(mktemp -d)
-        curl -L https://github.com/sxyazi/yazi/releases/latest/download/yazi-x86_64-unknown-linux-gnu.zip -o "$temp_dir/yazi.zip"
+        curl -L "https://github.com/sxyazi/yazi/releases/latest/download/yazi-${ARCH_RUST}-unknown-linux-gnu.zip" -o "$temp_dir/yazi.zip"
         unzip -q "$temp_dir/yazi.zip" -d "$temp_dir"
-        sudo cp "$temp_dir/yazi-x86_64-unknown-linux-gnu/yazi" /usr/local/bin/
+        sudo cp "$temp_dir/yazi-${ARCH_RUST}-unknown-linux-gnu/yazi" /usr/local/bin/
         sudo chmod +x /usr/local/bin/yazi
         rm -rf "$temp_dir"
     fi
@@ -339,7 +365,7 @@ install_linux_packages() {
     if ! command -v cursor &> /dev/null; then
         log "Installing cursor CLI..."
         local temp_dir=$(mktemp -d)
-        curl -Lk "https://api2.cursor.sh/updates/download-latest?os=cli-alpine-x64" \
+        curl -Lk "https://api2.cursor.sh/updates/download-latest?os=cli-alpine-${ARCH_CURSOR}" \
             --output "$temp_dir/cursor_cli.tar.gz"
         tar -xzf "$temp_dir/cursor_cli.tar.gz" -C "$temp_dir"
         sudo cp "$temp_dir/cursor" /usr/local/bin/cursor

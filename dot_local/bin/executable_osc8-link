@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# osc8-link — Generate clickable OSC 8 terminal hyperlinks
+# Usage: osc8-link <url> [display-text]
+# If display-text is omitted, the URL is used as display text.
+
+set -euo pipefail
+
+url="${1:?Usage: osc8-link <url> [text]}"
+text="${2:-$url}"
+printf '\e]8;;%s\e\\%s\e]8;;\e\\' "$url" "$text"

@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# wt — Git worktree lifecycle manager with Cursor deep links
+# Usage:
+#   wt new <name> [base-ref]   — Create worktree + branch wt/<name>
+#   wt rm <name>               — Remove worktree + branch (confirms if dirty)
+#   wt ls                      — List worktrees with status + clickable Cursor links
+#   wt cd <name>               — Print worktree path (use: cd (wt cd feat) in fish)
+#   wt cursor <name>           — Print Cursor SSH Remote deep link
+#   wt prune                   — Run git worktree prune
+
+set -euo pipefail
+
+# --- Configuration ---
+SSH_HOST="{{ .cursor_ssh_host }}"
+WT_DIR=".claude/worktrees"
+
+# --- Colors (catppuccin-mocha) ---
+RED='\033[38;2;243;139;168m'
+GREEN='\033[38;2;166;227;161m'
+YELLOW='\033[38;2;249;226;175m'
+BLUE='\033[38;2;137;180;250m'
+MAUVE='\033[38;2;203;166;247m'
+SUBTEXT='\033[38;2;166;173;200m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# --- Helpers ---
+_repo_root() {
+    git rev-parse --show-toplevel 2>/dev/null || {
+        echo "Error: not inside a git repository" >&2
+        exit 1
+    }
+}
+
+_wt_base() {
+    echo "$(_repo_root)/${WT_DIR}"
+}
+
+_wt_path() {
+    echo "$(_wt_base)/$1"
+}
+
+_cursor_uri() {
+    local path="$1"
+    echo "cursor://vscode-remote/ssh-remote+${SSH_HOST}${path}"
+}
+
+_osc8_link() {
+    local url="$1" text="$2"
+    printf '\e]8;;%s\e\\%s\e]8;;\e\\' "$url" "$text"
+}
+
+_ensure_wt_dir() {
+    local base
+    base="$(_wt_base)"
+    mkdir -p "$base"
+    # Ensure .claude/worktrees is gitignored
+    local repo_root
+    repo_root="$(_repo_root)"
+    local gitignore="${repo_root}/.gitignore"
+    if [[ -f "$gitignore" ]]; then
+        if ! grep -qF '.claude/worktrees' "$gitignore" 2>/dev/null; then
+            echo '.claude/worktrees/' >> "$gitignore"
+        fi
+    fi
+}
+
+# --- Commands ---
+cmd_new() {
+    local name="${1:?Usage: wt new <name> [base-ref]}"
+    local base="${2:-HEAD}"
+    local repo_root wt_path
+
+    repo_root="$(_repo_root)"
+    wt_path="$(_wt_path "$name")"
+
+    if [[ -d "$wt_path" ]]; then
+        echo -e "${RED}Error: worktree '$name' already exists at $wt_path${NC}" >&2
+        return 1
+    fi
+
+    _ensure_wt_dir
+
+    git -C "$repo_root" worktree add "$wt_path" -b "wt/${name}" "$base"
+    echo -e "${GREEN}Created worktree:${NC} $wt_path (branch: wt/${name})"
+
+    # Show Cursor link if SSH_HOST is configured
+    if [[ -n "$SSH_HOST" ]]; then
+        local uri
+        uri="$(_cursor_uri "$wt_path")"
+        echo -e "Cursor: $(_osc8_link "$uri" "Open ${name} in Cursor")"
+    fi
+}
+
+cmd_rm() {
+    local name="${1:?Usage: wt rm <name>}"
+    local wt_path
+    wt_path="$(_wt_path "$name")"
+
+    if [[ ! -d "$wt_path" ]]; then
+        echo -e "${RED}Error: worktree '$name' not found at $wt_path${NC}" >&2
+        return 1
+    fi
+
+    # Check for uncommitted changes
+    if [[ -n "$(git -C "$wt_path" status --porcelain 2>/dev/null)" ]]; then
+        echo -e "${YELLOW}Warning: uncommitted changes in $wt_path${NC}"
+        read -rp "Remove anyway? [y/N] " confirm
+        [[ "$confirm" =~ ^[Yy]$ ]] || return 1
+    fi
+
+    local repo_root
+    repo_root="$(_repo_root)"
+    git -C "$repo_root" worktree remove "$wt_path" --force
+    git -C "$repo_root" branch -D "wt/${name}" 2>/dev/null || true
+    echo -e "${GREEN}Removed worktree:${NC} $name"
+}
+
+cmd_ls() {
+    local repo_root
+    repo_root="$(_repo_root)"
+
+    echo ""
+    printf "${BOLD}${SUBTEXT}%-20s %-30s %-10s" "NAME" "BRANCH" "STATUS"
+    if [[ -n "$SSH_HOST" ]]; then
+        printf " %s" "CURSOR"
+    fi
+    printf "${NC}\n"
+    printf "${SUBTEXT}%-20s %-30s %-10s" "----" "------" "------"
+    if [[ -n "$SSH_HOST" ]]; then
+        printf " %s" "------"
+    fi
+    printf "${NC}\n"
+
+    local wt_path="" branch=""
+    git -C "$repo_root" worktree list --porcelain | while IFS= read -r line; do
+        case "$line" in
+            "worktree "*)
+                wt_path="${line#worktree }"
+                ;;
+            "branch "*)
+                branch="${line#branch refs/heads/}"
+                ;;
+            "")
+                if [[ -n "${wt_path:-}" ]]; then
+                    local name
+                    name="$(basename "$wt_path")"
+
+                    # Determine dirty state
+                    local status_str
+                    if [[ -n "$(git -C "$wt_path" status --porcelain 2>/dev/null)" ]]; then
+                        status_str="${YELLOW}dirty${NC}"
+                    else
+                        status_str="${GREEN}clean${NC}"
+                    fi
+
+                    # Detect running agents
+                    local agent_indicator=""
+                    if pgrep -f "claude.*${wt_path}" >/dev/null 2>&1; then
+                        agent_indicator=" ${GREEN}[claude]${NC}"
+                    fi
+                    if pgrep -f "codex.*${wt_path}" >/dev/null 2>&1; then
+                        agent_indicator="${agent_indicator} ${BLUE}[codex]${NC}"
+                    fi
+
+                    printf "%-20s %-30s %-10b" \
+                        "${name}${agent_indicator}" \
+                        "${branch:-detached}" \
+                        "$status_str"
+
+                    if [[ -n "$SSH_HOST" ]]; then
+                        local cursor_link
+                        cursor_link="$(_osc8_link "$(_cursor_uri "$wt_path")" "Open")"
+                        printf " %s" "$cursor_link"
+                    fi
+                    printf "\n"
+                fi
+                wt_path="" branch=""
+                ;;
+        esac
+    done
+    echo ""
+}
+
+cmd_cd() {
+    local name="${1:?Usage: wt cd <name>}"
+    local wt_path
+    wt_path="$(_wt_path "$name")"
+
+    if [[ ! -d "$wt_path" ]]; then
+        echo "Error: worktree '$name' not found" >&2
+        return 1
+    fi
+
+    echo "$wt_path"
+}
+
+cmd_cursor() {
+    local name="${1:?Usage: wt cursor <name>}"
+    local wt_path
+    wt_path="$(_wt_path "$name")"
+
+    if [[ -z "$SSH_HOST" ]]; then
+        echo "Error: cursor_ssh_host not configured in chezmoi" >&2
+        return 1
+    fi
+
+    local uri
+    uri="$(_cursor_uri "$wt_path")"
+    echo "$(_osc8_link "$uri" "Open ${name} in Cursor")"
+    echo "URI: $uri"
+}
+
+cmd_prune() {
+    local repo_root
+    repo_root="$(_repo_root)"
+    git -C "$repo_root" worktree prune -v
+}
+
+# --- Dispatch ---
+case "${1:-help}" in
+    new)    shift; cmd_new "$@" ;;
+    rm)     shift; cmd_rm "$@" ;;
+    ls)     shift; cmd_ls "$@" ;;
+    cd)     shift; cmd_cd "$@" ;;
+    cursor) shift; cmd_cursor "$@" ;;
+    prune)  shift; cmd_prune "$@" ;;
+    help|*) echo "Usage: wt {new|rm|ls|cd|cursor|prune} <name> [args...]"
+            echo ""
+            echo "Commands:"
+            echo "  new <name> [base]   Create worktree at .claude/worktrees/<name>"
+            echo "  rm <name>           Remove worktree and branch"
+            echo "  ls                  List all worktrees with status"
+            echo "  cd <name>           Print worktree path"
+            echo "  cursor <name>       Print Cursor SSH Remote deep link"
+            echo "  prune               Clean up stale worktree references"
+            ;;
+esac

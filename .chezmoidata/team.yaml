@@ -7,6 +7,14 @@ email: "your.email@company.com"
 editor: "helix"
 shell: "fish"
 
+# Machine type: remote-dev, laptop, or workstation
+# Controls which agent-infrastructure files are deployed
+machine_type: "remote-dev"
+
+# SSH hostname for Cursor deep links (cursor://vscode-remote/ssh-remote+HOST/path)
+# Set per-machine during chezmoi init to match local SSH config entry
+cursor_ssh_host: ""
+
 # Tool preference defaults
 cat_replacement: "bat"
 ls_replacement: "eza"

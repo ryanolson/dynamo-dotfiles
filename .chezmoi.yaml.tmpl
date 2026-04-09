@@ -1,5 +1,7 @@
 {{- $name := promptStringOnce . "name" "Your full name" -}}
 {{- $email := promptStringOnce . "email" "Your email address" -}}
+{{- $machineType := promptStringOnce . "machine_type" "Machine type (remote-dev/laptop/workstation)" -}}
+{{- $cursorSSHHost := promptStringOnce . "cursor_ssh_host" "SSH hostname for Cursor deep links (e.g. devbox)" -}}
 {{- $opEnabled := promptBoolOnce . "onepassword.enabled" "Enable 1Password integration" -}}
 {{- $opSSH := promptBoolOnce . "onepassword.ssh_agent" "Enable 1Password SSH agent" -}}
 {{- $opServiceToken := "" -}}
@@ -40,6 +42,8 @@ cd:
 data:
   name: {{ $name | quote }}
   email: {{ $email | quote }}
+  machine_type: {{ $machineType | quote }}
+  cursor_ssh_host: {{ $cursorSSHHost | quote }}
   onepassword:
     enabled: {{ $opEnabled }}
     ssh_agent: {{ $opSSH }}
