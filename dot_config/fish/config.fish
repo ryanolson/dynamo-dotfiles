@@ -2,8 +2,16 @@
 # This config provides a modern, productive shell environment
 
 # Handle unsupported TERM types (e.g., ghostty)
+if test -z "$TERM"
+    set -gx TERM xterm-256color
+end
 if test "$TERM" = "xterm-ghostty"
     set -gx TERM xterm-256color
+end
+if test -n "$TERM"
+    if command -q infocmp; and not infocmp "$TERM" >/dev/null 2>&1
+        set -gx TERM xterm-256color
+    end
 end
 
 # Set up colors and environment

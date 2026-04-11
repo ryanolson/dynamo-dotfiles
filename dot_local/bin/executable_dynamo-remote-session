@@ -36,6 +36,26 @@ have_session() {
     zellij list-sessions -s 2>/dev/null | grep -Fxq "$session"
 }
 
+refresh_auth_sock() {
+    local stable_sock="$HOME/.ssh/auth_sock"
+
+    mkdir -p "$HOME/.ssh"
+
+    if [[ -n "${SSH_AUTH_SOCK:-}" ]] && [[ "$SSH_AUTH_SOCK" != "$stable_sock" ]]; then
+        ln -sf "$SSH_AUTH_SOCK" "$stable_sock"
+    fi
+
+    if [[ -S "$stable_sock" ]]; then
+        export SSH_AUTH_SOCK="$stable_sock"
+    fi
+}
+
+refresh_term() {
+    if [[ -z "${TERM:-}" ]]; then
+        export TERM="xterm-256color"
+    fi
+}
+
 load_payload() {
     local line name encoded decoded
     while IFS= read -r line; do
@@ -51,6 +71,8 @@ load_payload() {
 case "$command_name" in
     prime)
         load_payload
+        refresh_auth_sock
+        refresh_term
         if [[ "$refresh" -eq 1 ]] && have_session; then
             zellij kill-session "$session" >/dev/null 2>&1 || true
         fi
@@ -62,6 +84,8 @@ case "$command_name" in
         fi
         ;;
     attach)
+        refresh_auth_sock
+        refresh_term
         exec zellij attach -c "$session"
         ;;
     *)
