@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="${DYNAMO_OP_ENV_FILE:-$HOME/.config/dynamo/dev.env.op}"
+
+usage() {
+    echo "Usage: openv <command...>" >&2
+    exit 1
+}
+
+[[ $# -gt 0 ]] || usage
+
+if ! command -v op >/dev/null 2>&1; then
+    echo "openv: 1Password CLI (op) is not installed" >&2
+    exit 1
+fi
+
+if [[ ! -f "$ENV_FILE" ]]; then
+    echo "openv: env file not found at $ENV_FILE" >&2
+    exit 1
+fi
+
+exec op run --env-file "$ENV_FILE" -- "$@"

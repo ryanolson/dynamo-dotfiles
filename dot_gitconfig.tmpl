@@ -3,8 +3,8 @@
 [user]
     name = {{ .name | default "Your Name" }}
     email = {{ .email | default "your.email@company.com" }}
-{{- if and (hasKey . "onepassword") .onepassword.enabled .onepassword.ssh_agent .onepassword.signing_key_ref }}
-    signingkey = {{ onepasswordRead .onepassword.signing_key_ref | trim | quote }}
+{{- if and (hasKey . "onepassword") .onepassword.enabled .onepassword.ssh_agent .onepassword.signing_public_key }}
+    signingkey = {{ .onepassword.signing_public_key | trim | quote }}
 {{- end }}
 
 [core]
@@ -56,7 +56,7 @@
 
     # Branch management
     delete-merged = "!git branch --merged | grep -v '\\*' | xargs -n 1 git branch -d"
-{{- if and (hasKey . "onepassword") .onepassword.ssh_agent }}
+{{- if and (hasKey . "onepassword") .onepassword.enabled .onepassword.ssh_agent }}
 
 [url "git@github.com:"]
     insteadOf = "https://github.com/"
@@ -68,10 +68,12 @@
 {{- if eq .chezmoi.os "darwin" }}
     program = "/Applications/1Password.app/Contents/MacOS/op-ssh-sign"
 {{- end }}
-{{- if .onepassword.signing_key_ref }}
+{{- if .onepassword.signing_public_key }}
     allowedSignersFile = ~/.ssh/allowed_signers
 {{- end }}
 
+{{- if .onepassword.signing_public_key }}
 [commit]
     gpgsign = true
+{{- end }}
 {{- end }}

@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+Usage:
+  dynamo-remote-session prime [--session NAME] [--refresh]
+  dynamo-remote-session attach [--session NAME]
+EOF
+    exit 1
+}
+
+session="main"
+command_name="${1:-}"
+[[ -n "$command_name" ]] || usage
+shift || true
+refresh=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --session)
+            session="${2:?missing session name}"
+            shift 2
+            ;;
+        --refresh)
+            refresh=1
+            shift
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
+
+have_session() {
+    zellij list-sessions -s 2>/dev/null | grep -Fxq "$session"
+}
+
+load_payload() {
+    local line name encoded decoded
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        name="${line%%=*}"
+        encoded="${line#*=}"
+        [[ "$name" =~ ^[A-Z0-9_]+$ ]] || continue
+        decoded="$(printf '%s' "$encoded" | base64 -d)"
+        export "$name=$decoded"
+    done
+}
+
+case "$command_name" in
+    prime)
+        load_payload
+        if [[ "$refresh" -eq 1 ]] && have_session; then
+            zellij kill-session "$session" >/dev/null 2>&1 || true
+        fi
+        if ! have_session; then
+            zellij attach -b -c "$session" >/dev/null 2>&1 || {
+                echo "Failed to create zellij session '$session'" >&2
+                exit 1
+            }
+        fi
+        ;;
+    attach)
+        exec zellij attach -c "$session"
+        ;;
+    *)
+        usage
+        ;;
+esac

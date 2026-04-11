@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+signing_key="$(git config --global user.signingkey 2>/dev/null || true)"
+if [[ -z "$signing_key" ]]; then
+    echo "disabled: git user.signingkey is not configured"
+    exit 1
+fi
+
+if [[ ! -f "$HOME/.ssh/allowed_signers" ]]; then
+    echo "degraded: ~/.ssh/allowed_signers is missing"
+    exit 1
+fi
+
+if [[ "$OSTYPE" == darwin* ]]; then
+    if [[ -x "/Applications/1Password.app/Contents/MacOS/op-ssh-sign" ]]; then
+        echo "ready: macOS signing is configured"
+        exit 0
+    fi
+    echo "degraded: op-ssh-sign is missing"
+    exit 1
+fi
+
+if [[ -z "${SSH_AUTH_SOCK:-}" ]]; then
+    echo "degraded: SSH_AUTH_SOCK is not set"
+    exit 1
+fi
+
+if ssh-add -L >/dev/null 2>&1; then
+    echo "ready: forwarded SSH agent is available"
+    exit 0
+fi
+
+echo "degraded: SSH agent is present but no keys are available"
+exit 1

@@ -89,7 +89,7 @@ data:
 
 ### Secrets Management (1Password)
 
-API keys and tokens are managed via 1Password CLI (`op`). Secrets are fetched once and cached as fish universal variables with 1-hour auto-expiry.
+API keys and tokens are managed via 1Password CLI (`op`) with on-demand injection. Secrets stay in 1Password and are only resolved into the subprocess that needs them.
 
 **Setup:**
 
@@ -112,6 +112,11 @@ API keys and tokens are managed via 1Password CLI (`op`). Secrets are fetched on
      onepassword:
        enabled: true
        ssh_agent: true
+       signing_public_key: "ssh-ed25519 AAAA..."
+   ```
+   Get the signing public key from 1Password once:
+   ```bash
+   op item get "Git Signing Key" --vault Development --fields "public key"
    ```
 
 4. Apply and restart your shell:
@@ -121,17 +126,22 @@ API keys and tokens are managed via 1Password CLI (`op`). Secrets are fetched on
    ```
 
 **How it works:**
-- `secrets.fish` auto-runs on shell startup via fish `conf.d/`
-- Fetches secrets from 1Password via `op read` and stores them as fish universal variables (`set -Ux`)
-- Universal variables persist in `~/.config/fish/fish_variables` (same security posture as a `.env` file)
-- Auto-refreshes when cache is older than 1 hour
-- Run `refresh-secrets` to manually reload
+- Chezmoi writes `~/.config/dynamo/dev.env.op` with 1Password secret references only
+- `openv <cmd...>` runs a command under `op run --env-file ~/.config/dynamo/dev.env.op`
+- `openv-file <env-file> <cmd...>` does the same for an alternate env-reference file
+- No service-account token is stored in `chezmoi` config or auto-exported into every shell
 
 **SSH Agent (1Password):**
 - When `onepassword.ssh_agent` is `true`, SSH config points to the 1Password SSH agent
-- Git is configured for SSH commit signing via `op-ssh-sign`
+- Git is configured for SSH commit signing using your stored public key plus the 1Password SSH agent on macOS
 - GitHub HTTPS URLs are rewritten to SSH automatically
 - Use `gh auth login -p ssh` to authenticate the GitHub CLI
+
+**Remote Dev (Tailscale + zellij):**
+- Use ordinary OpenSSH over the tailnet for sessions that need commit signing or secrets
+- `dev-remote <host> [session]` primes a remote zellij session with per-session env vars and then attaches
+- `dev-remote refresh <host> [session]` recreates the session after a secret rotation
+- Commit signing on Linux remotes uses the forwarded SSH agent, so reconnect with `ssh -A` or `dev-remote` before signing if the agent went stale
 
 **Manual auth steps (once per machine):**
 - `claude login` — Claude Code uses OAuth, no static key needed
@@ -139,10 +149,20 @@ API keys and tokens are managed via 1Password CLI (`op`). Secrets are fetched on
 
 **Verification helper:**
 ```bash
-setup-secrets    # checks op install, sign-in, and vault items
+setup-secrets
+setup-secrets remote <host>
 ```
 
-> **Note:** Fish universal variables are persisted on disk. This is the accepted trade-off for cached secrets with auto-expiry and `op` integration. Users without 1Password are unaffected — `onepassword.enabled` defaults to `false`.
+**Examples:**
+```bash
+openv env | rg 'ANTHROPIC_API_KEY|HF_TOKEN|GITHUB_TOKEN|NGC_API_KEY'
+openv claude
+dev-remote spark-d
+dev-remote refresh spark-d main
+git-signing-status
+```
+
+> **Note:** `tailscale ssh` is not the default path for signing/secrets sessions. Use standard OpenSSH over the tailnet so SSH-agent forwarding works cleanly with remote zellij sessions.
 
 ### Adding Custom Packages
 

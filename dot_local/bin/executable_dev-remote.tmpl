@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DEFAULT_HOST="{{ .cursor_ssh_host }}"
+ENV_FILE="${DYNAMO_OP_ENV_FILE:-$HOME/.config/dynamo/dev.env.op}"
+ALLOWED_ENV=(
+{{- range $key, $_ := .onepassword.secrets }}
+    "{{ $key | upper }}"
+{{- end }}
+)
+
+usage() {
+    cat >&2 <<'EOF'
+Usage:
+  dev-remote [host] [session]
+  dev-remote refresh [host] [session]
+EOF
+    exit 1
+}
+
+require_host() {
+    local host="${1:-$DEFAULT_HOST}"
+    if [[ -z "$host" ]]; then
+        echo "dev-remote: no host provided and cursor_ssh_host is not configured" >&2
+        exit 1
+    fi
+    printf '%s\n' "$host"
+}
+
+ensure_op_env() {
+    if [[ -n "${DYNAMO_DEV_REMOTE_ACTIVE:-}" ]]; then
+        return
+    fi
+
+    if [[ ! -f "$ENV_FILE" ]]; then
+        return
+    fi
+
+    if ! command -v op >/dev/null 2>&1; then
+        echo "dev-remote: 1Password CLI (op) is not installed" >&2
+        exit 1
+    fi
+
+    exec env DYNAMO_DEV_REMOTE_ACTIVE=1 op run --env-file "$ENV_FILE" -- "$0" "$@"
+}
+
+build_payload() {
+    local name value encoded
+    for name in "${ALLOWED_ENV[@]}"; do
+        value="${!name-}"
+        [[ -n "$value" ]] || continue
+        encoded="$(printf '%s' "$value" | base64 | tr -d '\n')"
+        printf '%s=%s\n' "$name" "$encoded"
+    done
+}
+
+ssh_base=(
+    ssh
+    -A
+    -o ForwardAgent=yes
+)
+remote_helper='$HOME/.local/bin/dynamo-remote-session'
+
+refresh_mode=0
+if [[ "${1:-}" == "refresh" ]]; then
+    refresh_mode=1
+    shift
+fi
+
+host="$(require_host "${1:-}")"
+session="${2:-main}"
+
+ensure_op_env "$@"
+
+remote_prime=("$remote_helper" prime --session "$session")
+if [[ "$refresh_mode" -eq 1 ]]; then
+    remote_prime+=(--refresh)
+fi
+
+build_payload | "${ssh_base[@]}" "$host" "${remote_prime[@]}"
+exec "${ssh_base[@]}" -tt "$host" "$remote_helper" attach --session "$session"

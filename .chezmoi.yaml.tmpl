@@ -4,22 +4,12 @@
 {{- $cursorSSHHost := promptStringOnce . "cursor_ssh_host" "SSH hostname for Cursor deep links (e.g. devbox)" -}}
 {{- $opEnabled := promptBoolOnce . "onepassword.enabled" "Enable 1Password integration" -}}
 {{- $opSSH := promptBoolOnce . "onepassword.ssh_agent" "Enable 1Password SSH agent" -}}
-{{- $opServiceToken := "" -}}
-{{- if $opEnabled -}}
-{{-   $opServiceToken = promptStringOnce . "onepassword.service_account_token" "1Password service account token (empty for desktop app)" -}}
+{{- $opSigningKey := "" -}}
+{{- if and $opEnabled $opSSH -}}
+{{-   $opSigningKey = promptStringOnce . "onepassword.signing_public_key" "SSH signing public key (from 1Password item public key field; empty to skip signing)" -}}
 {{- end -}}
 
 sourceDir: {{ .chezmoi.sourceDir | quote }}
-{{- if $opServiceToken }}
-
-# 1Password CLI mode (service account for headless/remote)
-onepassword:
-  mode: "service"
-
-# Ensure OP_SERVICE_ACCOUNT_TOKEN is set for all chezmoi operations (apply, update, etc.)
-env:
-  OP_SERVICE_ACCOUNT_TOKEN: {{ $opServiceToken | quote }}
-{{- end }}
 
 # Global settings
 progress: true
@@ -47,7 +37,7 @@ data:
   onepassword:
     enabled: {{ $opEnabled }}
     ssh_agent: {{ $opSSH }}
-    service_account_token: {{ $opServiceToken | quote }}
+    signing_public_key: {{ $opSigningKey | quote }}
     vault: "Development"
     # secrets: override in ~/.config/chezmoi/chezmoi.yaml
     # defaults from .chezmoidata/team.yaml
