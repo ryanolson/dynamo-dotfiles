@@ -68,6 +68,11 @@ dot_config/fish/conf.d/ssh-auth-sock.fish.tmpl
 dot_config/systemd/
 {{- end }}
 
+# .claude hooks — primary only (GSD infra tightly coupled to primary's environment)
+{{- if ne .user_role "primary" }}
+dot_claude/hooks/
+{{- end }}
+
 # Shared cache symlinks — only for primary/secondary users with /opt/shared-cache present
 {{- if or (eq .user_role "standalone") (not (stat "/opt/shared-cache")) }}
 dot_cache/symlink_huggingface.tmpl

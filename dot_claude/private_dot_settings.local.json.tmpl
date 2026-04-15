@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Read({{ .chezmoi.homeDir }}/.config/**)",
+      "Read({{ .chezmoi.homeDir }}/.local/share/chezmoi/**)",
+      "Read({{ .chezmoi.homeDir }}/.local/share/chezmoi/.git/**)",
+      "Read({{ .chezmoi.homeDir }}/.local/bin/**)",
+      "Bash(chezmoi:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git pull:*)",
+      "Bash(git -C {{ .chezmoi.homeDir }}/repos/**)",
+      "Bash(find:*)",
+      "Bash(chmod:*)",
+      "Bash(cursor:*)",
+      "Bash(timeout:*)",
+      "Bash(pkill:*)",
+      "Bash(python3:*)",
+      "Bash(zellij --help)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:developer.1password.com)",
+      "WebFetch(domain:developers.openai.com)",
+      "WebSearch"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
