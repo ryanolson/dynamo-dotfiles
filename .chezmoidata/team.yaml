@@ -1,6 +1,11 @@
 # Core team configuration - shared across all team members
 # These tools and configurations form the baseline development environment
 
+# Machine topology (override in ~/.config/chezmoi/chezmoi.yaml)
+user_role: "standalone"          # standalone | primary | secondary
+credentials_profile: "personal"  # personal | corp
+primary_user_auth_sock: ""       # path to primary user's SSH auth_sock (secondary only)
+
 # Personal defaults (override in ~/.config/chezmoi/chezmoi.yaml)
 name: "Your Name"
 email: "your.email@company.com"

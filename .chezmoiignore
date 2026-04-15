@@ -60,10 +60,16 @@ dot_local/bin/executable_osc8-link
 dot_config/zellij/layouts/agents.kdl
 dot_config/systemd/
 dot_config/fish/conf.d/agent-aliases.fish
-dot_config/fish/conf.d/ssh-auth-sock.fish
+dot_config/fish/conf.d/ssh-auth-sock.fish.tmpl
 {{- end }}
 
 # systemd only on Linux
 {{- if ne .chezmoi.os "linux" }}
 dot_config/systemd/
+{{- end }}
+
+# Shared cache symlinks — only for primary/secondary users with /opt/shared-cache present
+{{- if or (eq .user_role "standalone") (not (stat "/opt/shared-cache")) }}
+dot_cache/symlink_huggingface.tmpl
+dot_cache/symlink_llama.cpp.tmpl
 {{- end }}

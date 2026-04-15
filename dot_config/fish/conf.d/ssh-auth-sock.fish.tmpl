@@ -1,0 +1,35 @@
+# Stable SSH_AUTH_SOCK — role: {{ .user_role }}
+# Managed by chezmoi. Do not edit directly.
+{{ if eq .user_role "primary" -}}
+# PRIMARY: own the socket, share it with devs group for su'd sessions
+if status is-login; and set -q SSH_CONNECTION
+    if set -q SSH_AUTH_SOCK; and test "$SSH_AUTH_SOCK" != "$HOME/.ssh/auth_sock"
+        ln -sf "$SSH_AUTH_SOCK" "$HOME/.ssh/auth_sock"
+    end
+    if test -S "$HOME/.ssh/auth_sock"
+        set -l _real_sock (readlink -f "$HOME/.ssh/auth_sock")
+        chgrp devs "$_real_sock" 2>/dev/null
+        chmod g+rw "$_real_sock" 2>/dev/null
+    end
+end
+if test -e "$HOME/.ssh/auth_sock"
+    set -gx SSH_AUTH_SOCK "$HOME/.ssh/auth_sock"
+end
+
+{{ else if eq .user_role "secondary" -}}
+# SECONDARY: borrow primary's stable socket (no symlink management)
+if test -S {{ .primary_user_auth_sock | quote }}
+    set -gx SSH_AUTH_SOCK {{ .primary_user_auth_sock | quote }}
+end
+
+{{ else -}}
+# STANDALONE: stable symlink, no group sharing
+if status is-login; and set -q SSH_CONNECTION
+    if set -q SSH_AUTH_SOCK; and test "$SSH_AUTH_SOCK" != "$HOME/.ssh/auth_sock"
+        ln -sf "$SSH_AUTH_SOCK" "$HOME/.ssh/auth_sock"
+    end
+end
+if test -e "$HOME/.ssh/auth_sock"
+    set -gx SSH_AUTH_SOCK "$HOME/.ssh/auth_sock"
+end
+{{ end -}}

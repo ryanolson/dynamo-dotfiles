@@ -2,6 +2,12 @@
 {{- $email := promptStringOnce . "email" "Your email address" -}}
 {{- $machineType := promptStringOnce . "machine_type" "Machine type (remote-dev/laptop/workstation)" -}}
 {{- $cursorSSHHost := promptStringOnce . "cursor_ssh_host" "SSH hostname for Cursor deep links (e.g. devbox)" -}}
+{{- $userRole := promptStringOnce . "user_role" "User role on this machine (standalone/primary/secondary)" -}}
+{{- $credProfile := promptStringOnce . "credentials_profile" "Credentials profile (personal/corp)" -}}
+{{- $primarySock := "" -}}
+{{- if eq $userRole "secondary" -}}
+{{-   $primarySock = promptStringOnce . "primary_user_auth_sock" "Path to primary user's SSH auth_sock" -}}
+{{- end -}}
 {{- $opEnabled := promptBoolOnce . "onepassword.enabled" "Enable 1Password integration" -}}
 {{- $opSSH := promptBoolOnce . "onepassword.ssh_agent" "Enable 1Password SSH agent" -}}
 {{- $opSigningKey := "" -}}
@@ -34,10 +40,13 @@ data:
   email: {{ $email | quote }}
   machine_type: {{ $machineType | quote }}
   cursor_ssh_host: {{ $cursorSSHHost | quote }}
+  user_role: {{ $userRole | quote }}
+  credentials_profile: {{ $credProfile | quote }}
+  primary_user_auth_sock: {{ $primarySock | quote }}
   onepassword:
     enabled: {{ $opEnabled }}
     ssh_agent: {{ $opSSH }}
     signing_public_key: {{ $opSigningKey | quote }}
-    vault: "Development"
+    vault: {{ if eq $credProfile "corp" }}"Corp"{{ else }}"Development"{{ end }}
     # secrets: override in ~/.config/chezmoi/chezmoi.yaml
     # defaults from .chezmoidata/team.yaml
