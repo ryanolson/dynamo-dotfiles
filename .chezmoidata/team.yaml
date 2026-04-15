@@ -36,8 +36,8 @@ onepassword:
   secrets:
     anthropic_api_key: "op://Development/Anthropic API/credential"
     hf_token: "op://Development/HuggingFace/credential"
-    github_token: "op://Development/GitHub Token/credential"
     ngc_api_key: "op://Development/NGC/credential"
+    # github_token removed — use 'gh auth login' for filesystem-based auth
 
 tools:
   # Core development tools that everyone should have
