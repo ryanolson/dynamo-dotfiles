@@ -3,8 +3,12 @@
 {{ if eq .user_role "primary" -}}
 # PRIMARY: own the socket, share it with devs group for su'd sessions
 if status is-login; and set -q SSH_CONNECTION
-    if set -q SSH_AUTH_SOCK; and test "$SSH_AUTH_SOCK" != "$HOME/.ssh/auth_sock"
-        ln -sf "$SSH_AUTH_SOCK" "$HOME/.ssh/auth_sock"
+    if set -q SSH_AUTH_SOCK
+        set -l _real (readlink -f "$SSH_AUTH_SOCK" 2>/dev/null; or echo "$SSH_AUTH_SOCK")
+        set -l _stable (readlink -f "$HOME/.ssh/auth_sock" 2>/dev/null; or echo "")
+        if test "$_real" != "$_stable"
+            ln -sf "$_real" "$HOME/.ssh/auth_sock"
+        end
     end
     if test -S "$HOME/.ssh/auth_sock"
         set -l _real_sock (readlink -f "$HOME/.ssh/auth_sock")
@@ -25,8 +29,12 @@ end
 {{ else -}}
 # STANDALONE: stable symlink, no group sharing
 if status is-login; and set -q SSH_CONNECTION
-    if set -q SSH_AUTH_SOCK; and test "$SSH_AUTH_SOCK" != "$HOME/.ssh/auth_sock"
-        ln -sf "$SSH_AUTH_SOCK" "$HOME/.ssh/auth_sock"
+    if set -q SSH_AUTH_SOCK
+        set -l _real (readlink -f "$SSH_AUTH_SOCK" 2>/dev/null; or echo "$SSH_AUTH_SOCK")
+        set -l _stable (readlink -f "$HOME/.ssh/auth_sock" 2>/dev/null; or echo "")
+        if test "$_real" != "$_stable"
+            ln -sf "$_real" "$HOME/.ssh/auth_sock"
+        end
     end
 end
 if test -e "$HOME/.ssh/auth_sock"

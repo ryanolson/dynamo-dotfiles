@@ -4,9 +4,11 @@
 #   wt new <name> [base-ref]   — Create worktree + branch wt/<name>
 #   wt rm <name>               — Remove worktree + branch (confirms if dirty)
 #   wt ls                      — List worktrees with status + clickable Cursor links
-#   wt cd <name>               — Print worktree path (use: cd (wt cd feat) in fish)
+#   wt path <name>             — Print worktree path
+#   wt dir <name>              — Same as wt path
 #   wt cursor <name>           — Print Cursor SSH Remote deep link
 #   wt prune                   — Run git worktree prune
+#   wt cd <name>               — Fish shell function (changes directory; not in this script)
 
 set -euo pipefail
 
@@ -26,10 +28,13 @@ NC='\033[0m'
 
 # --- Helpers ---
 _repo_root() {
-    git rev-parse --show-toplevel 2>/dev/null || {
+    local root
+    root=$(git worktree list --porcelain 2>/dev/null | awk '/^worktree / { print $2; exit }')
+    if [[ -z "$root" ]]; then
         echo "Error: not inside a git repository" >&2
         exit 1
-    }
+    fi
+    echo "$root"
 }
 
 _wt_base() {
@@ -80,6 +85,7 @@ cmd_new() {
     fi
 
     _ensure_wt_dir
+    mkdir -p "$(dirname "$wt_path")"
 
     git -C "$repo_root" worktree add "$wt_path" -b "wt/${name}" "$base"
     echo -e "${GREEN}Created worktree:${NC} $wt_path (branch: wt/${name})"
@@ -132,6 +138,8 @@ cmd_ls() {
     fi
     printf "${NC}\n"
 
+    local wt_base
+    wt_base="$(_wt_base)"
     local wt_path="" branch=""
     git -C "$repo_root" worktree list --porcelain | while IFS= read -r line; do
         case "$line" in
@@ -144,7 +152,11 @@ cmd_ls() {
             "")
                 if [[ -n "${wt_path:-}" ]]; then
                     local name
-                    name="$(basename "$wt_path")"
+                    if [[ "$wt_path" == "${wt_base}/"* ]]; then
+                        name="${wt_path#${wt_base}/}"
+                    else
+                        name="$(basename "$wt_path")"
+                    fi
 
                     # Determine dirty state
                     local status_str
@@ -182,8 +194,8 @@ cmd_ls() {
     echo ""
 }
 
-cmd_cd() {
-    local name="${1:?Usage: wt cd <name>}"
+cmd_path() {
+    local name="${1:?Usage: wt path <name>}"
     local wt_path
     wt_path="$(_wt_path "$name")"
 
@@ -222,17 +234,20 @@ case "${1:-help}" in
     new)    shift; cmd_new "$@" ;;
     rm)     shift; cmd_rm "$@" ;;
     ls)     shift; cmd_ls "$@" ;;
-    cd)     shift; cmd_cd "$@" ;;
+    path)   shift; cmd_path "$@" ;;
+    dir)    shift; cmd_path "$@" ;;
     cursor) shift; cmd_cursor "$@" ;;
     prune)  shift; cmd_prune "$@" ;;
-    help|*) echo "Usage: wt {new|rm|ls|cd|cursor|prune} <name> [args...]"
+    help|*) echo "Usage: wt {new|rm|ls|path|dir|cursor|prune} <name> [args...]"
             echo ""
             echo "Commands:"
             echo "  new <name> [base]   Create worktree at .claude/worktrees/<name>"
             echo "  rm <name>           Remove worktree and branch"
             echo "  ls                  List all worktrees with status"
-            echo "  cd <name>           Print worktree path"
+            echo "  path <name>         Print worktree path (also: dir)"
             echo "  cursor <name>       Print Cursor SSH Remote deep link"
             echo "  prune               Clean up stale worktree references"
+            echo ""
+            echo "  wt cd <name>        Change directory (fish shell function)"
             ;;
 esac

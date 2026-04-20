@@ -8,6 +8,19 @@ function agents --description "Attach to agents zellij session"
 end
 
 # Worktree shortcuts
+function wt --wraps wt --description "Git worktree manager"
+    if test (count $argv) -ge 1 -a "$argv[1]" = cd
+        if test (count $argv) -lt 2
+            echo "Usage: wt cd <name>" >&2
+            return 1
+        end
+        set -l wt_path (command wt path $argv[2])
+        and cd $wt_path
+    else
+        command wt $argv
+    end
+end
+
 function ws --description "List worktrees"
     wt ls $argv
 end
@@ -21,12 +34,7 @@ function wrm --description "Remove worktree"
 end
 
 function wcd --description "cd into worktree"
-    if test (count $argv) -lt 1
-        echo "Usage: wcd <name>"
-        return 1
-    end
-    set -l path (wt cd $argv[1])
-    and cd $path
+    wt cd $argv
 end
 
 # Agent shortcuts
