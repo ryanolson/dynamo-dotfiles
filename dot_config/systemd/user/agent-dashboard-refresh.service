@@ -1,6 +1,0 @@
-[Unit]
-Description=Refresh Agent Dashboard HTML
-
-[Service]
-Type=oneshot
-ExecStart=%h/.local/bin/generate-dashboard

@@ -17,12 +17,27 @@ success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
+# Read interactively even when stdin is a pipe (curl | bash).
+# Falls back to default when no controlling terminal is available.
+prompt_read() {
+    local prompt="$1" default="$2" var_name="$3"
+    if [[ -e /dev/tty ]]; then
+        local input
+        read -r -p "$prompt" input </dev/tty
+        printf -v "$var_name" '%s' "${input:-$default}"
+    else
+        log "Non-interactive mode — using default: $default"
+        printf -v "$var_name" '%s' "$default"
+    fi
+}
+
 # Configuration
 REPO_URL="https://github.com/ryanolson/dynamo-dotfiles.git"
 DOTFILES_DIR="$HOME/.local/share/chezmoi"
 
 # Topology globals (set by detect_topology)
 SETUP_MODE="single"
+SETUP_MODE_ARG=""
 PRIMARY_USER=""
 SECONDARY_USERS=()
 
@@ -222,15 +237,18 @@ detect_topology() {
 
     log "🔍 Detecting system topology..."
 
-    local mode_input
-    read -r -p "Setup mode [single/multi] (default: single): " mode_input
-    SETUP_MODE="${mode_input:-single}"
+    if [[ -n "${SETUP_MODE_ARG}" ]]; then
+        SETUP_MODE="$SETUP_MODE_ARG"
+        log "Mode set via flag: $SETUP_MODE"
+    else
+        prompt_read "Setup mode [single/multi] (default: single): " "single" "SETUP_MODE"
+    fi
 
     if [[ "$SETUP_MODE" == "multi" ]]; then
         log "Multi-user mode. Primary user: $PRIMARY_USER"
         log "Enter secondary usernames (space-separated, accounts must already exist):"
         local secondary_input
-        read -r -p "Secondary users: " secondary_input
+        prompt_read "Secondary users: " "" "secondary_input"
         read -ra SECONDARY_USERS <<< "$secondary_input"
 
         if [[ ${#SECONDARY_USERS[@]} -eq 0 ]]; then
@@ -323,8 +341,8 @@ setup_secondary_user() {
 
     # Gather identity details
     local full_name email
-    read -r -p "Full name for $username: " full_name
-    read -r -p "Corporate email for $username: " email
+    prompt_read "Full name for $username: " "" "full_name"
+    prompt_read "Corporate email for $username: " "" "email"
 
     # Inherit primary user's signing key (same physical person)
     local signing_key=""
@@ -385,6 +403,14 @@ EOF
 
 # Main installation flow
 main() {
+    # Parse optional flags (supports: curl ... | bash -s -- --mode single)
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --mode) SETUP_MODE_ARG="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
     log "🚀 Starting Dynamo development environment bootstrap"
     log "📦 Using modern tooling: chezmoi + native package managers"
 
