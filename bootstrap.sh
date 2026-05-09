@@ -111,26 +111,27 @@ install_chezmoi() {
 
 # Install mise for runtime version management
 install_mise() {
+    if [[ "$OS" == "macOS" ]]; then
+        log "⏭️  Skipping mise on macOS"
+        return
+    fi
+
     if command -v mise &> /dev/null; then
         log "📦 mise already installed ($(mise --version))"
         return
     fi
-    
+
     log "📦 Installing mise (runtime version manager)..."
-    if [[ "$OS" == "macOS" ]]; then
-        brew install mise || error "Failed to install mise"
-    else
-        curl https://mise.run | sh || error "Failed to install mise"
-        
-        # Add mise to PATH for current session
-        export PATH="$HOME/.local/bin:$PATH"
-        
-        # Add to shell profile
-        if [[ -f "$HOME/.bashrc" ]]; then
-            echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
-        fi
+    curl https://mise.run | sh || error "Failed to install mise"
+
+    # Add mise to PATH for current session
+    export PATH="$HOME/.local/bin:$PATH"
+
+    # Add to shell profile
+    if [[ -f "$HOME/.bashrc" ]]; then
+        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
     fi
-    
+
     success "✅ mise installed successfully"
 }
 

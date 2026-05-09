@@ -30,14 +30,12 @@ case "$ARCH" in
         ARCH_ALT="amd64"      # kubectl, gh
         ARCH_RUST="x86_64"    # most Rust projects
         ARCH_GO="x86_64"      # lazygit uses this for x86
-        ARCH_CURSOR="x64"     # cursor CLI
         ;;
     aarch64|arm64)
         ARCH="aarch64"
         ARCH_ALT="arm64"
         ARCH_RUST="aarch64"
         ARCH_GO="arm64"       # lazygit uses arm64
-        ARCH_CURSOR="arm64"
         ;;
     *)
         error "Unsupported architecture: $ARCH"
@@ -89,22 +87,22 @@ install_macos_packages() {
             brew install "$package" || warn "Failed to install $package"
         fi
     done
-    
-    # Install Cursor CLI
-    if ! command -v cursor &> /dev/null; then
-        log "Installing cursor CLI..."
-        local temp_dir=$(mktemp -d)
-        curl -Lk "https://api2.cursor.sh/updates/download-latest?os=cli-darwin-${ARCH_CURSOR}" \
-            --output "$temp_dir/cursor_cli.tar.gz"
-        tar -xzf "$temp_dir/cursor_cli.tar.gz" -C "$temp_dir"
-        sudo cp "$temp_dir/cursor" /usr/local/bin/cursor
-        sudo chmod +x /usr/local/bin/cursor
-        rm -rf "$temp_dir"
-        success "✓ cursor CLI installed"
+
+    # Add fish to /etc/shells if not already present (required to use fish as login shell)
+    local fish_path
+    fish_path="$(brew --prefix)/bin/fish"
+    if [[ -x "$fish_path" ]]; then
+        if ! grep -qxF "$fish_path" /etc/shells; then
+            log "Adding $fish_path to /etc/shells..."
+            echo "$fish_path" | sudo tee -a /etc/shells > /dev/null
+            success "✓ $fish_path added to /etc/shells"
+        else
+            log "✓ $fish_path already in /etc/shells"
+        fi
     else
-        log "✓ cursor CLI already installed"
+        warn "fish not found at $fish_path, skipping /etc/shells update"
     fi
-    
+
     success "✅ macOS packages installed"
 }
 
@@ -359,21 +357,6 @@ install_linux_packages() {
     if command -v snap &> /dev/null && ! command -v broot &> /dev/null; then
         log "Installing broot via snap..."
         sudo snap install broot || warn "Failed to install broot"
-    fi
-    
-    # Cursor CLI
-    if ! command -v cursor &> /dev/null; then
-        log "Installing cursor CLI..."
-        local temp_dir=$(mktemp -d)
-        curl -Lk "https://api2.cursor.sh/updates/download-latest?os=cli-alpine-${ARCH_CURSOR}" \
-            --output "$temp_dir/cursor_cli.tar.gz"
-        tar -xzf "$temp_dir/cursor_cli.tar.gz" -C "$temp_dir"
-        sudo cp "$temp_dir/cursor" /usr/local/bin/cursor
-        sudo chmod +x /usr/local/bin/cursor
-        rm -rf "$temp_dir"
-        success "✓ cursor CLI installed"
-    else
-        log "✓ cursor CLI already installed"
     fi
     
     success "✅ Linux packages installed"

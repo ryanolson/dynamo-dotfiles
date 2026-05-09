@@ -24,6 +24,10 @@ fish_add_path $HOME/.local/bin
 fish_add_path $HOME/.cargo/bin  # Rust tools
 fish_add_path $HOME/.npm-global/bin  # npm global packages
 
+if test -S ~/Library/Group\ Containers/2BUA8C4S2C.com.1password/t/agent.sock
+    set -gx SSH_AUTH_SOCK ~/Library/Group\ Containers/2BUA8C4S2C.com.1password/t/agent.sock
+end
+
 # Configure npm to use user directory for global packages
 set -gx NPM_CONFIG_PREFIX $HOME/.npm-global
 mkdir -p $HOME/.npm-global

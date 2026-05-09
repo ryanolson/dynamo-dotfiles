@@ -8,10 +8,9 @@ homebrew:
   brews:
     # Core development tools
     - git
-    - curl 
+    - curl
     - chezmoi
-    - mise
-    
+
     # Modern CLI replacements
     - bat
     - eza
