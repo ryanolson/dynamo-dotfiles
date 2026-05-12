@@ -39,20 +39,14 @@ case "$ACTION" in
     
     fish)
         log "Testing fish shell..."
-        sudo su - ryan -c "fish -c 'echo Fish shell works!; mise --version; exit'"
+        sudo su - ryan -c "fish -c 'echo Fish shell works!; exit'"
         ;;
-    
-    mise)
-        log "Testing mise runtime management..."
-        sudo su - ryan -c "mise ls --current"
-        ;;
-    
+
     tools)
         log "Checking installed tools..."
         # Check tools with their actual binary names
         declare -A tools=(
             ["chezmoi"]="chezmoi"
-            ["mise"]="mise"
             ["fish"]="fish"
             ["bat"]="bat"
             ["eza"]="eza"
@@ -90,7 +84,6 @@ case "$ACTION" in
         echo "  chezmoi-update  - Update chezmoi from repo"
         echo "  chezmoi-apply   - Apply chezmoi configuration"
         echo "  fish           - Test fish shell"
-        echo "  mise           - Check mise runtimes"
         echo "  tools          - Check all installed tools"
         echo "  shell          - Start interactive shell as ryan"
         echo "  help           - Show this help"

@@ -61,6 +61,17 @@ if ! command -v uv &>/dev/null; then
     command -v uv &>/dev/null || error "uv is required but not found. Install: curl -LsSf https://astral.sh/uv/install.sh | sh"
 fi
 
+# cargo is required for NIXL's Rust bindings; search user-local paths as above.
+if ! command -v cargo &>/dev/null; then
+    for p in "$HOME/.cargo/bin" /usr/local/bin; do
+        if [[ -x "$p/cargo" ]]; then
+            export PATH="$p:$PATH"
+            break
+        fi
+    done
+    command -v cargo &>/dev/null || error "cargo is required but not found. Install: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+fi
+
 # Determine architecture
 ARCH="$(uname -m)"
 case "$ARCH" in
@@ -76,7 +87,7 @@ install_apt_deps() {
     log "Installing system dependencies via apt..."
 
     local required_pkgs=(
-        build-essential autoconf automake libtool pkg-config cmake git
+        build-essential autoconf automake libtool pkg-config cmake git clang libclang-dev
         python3-dev meson ninja-build
     )
     local optional_pkgs=(libibverbs-dev librdmacm-dev liburing-dev)
@@ -132,6 +143,18 @@ done
 # Built from source with ./contrib/configure-release-mt (the official NIXL way).
 # This wrapper adds --enable-mt plus release optimizations.
 install_ucx() {
+    local target_version="${UCX_VERSION#v}"
+    local ucx_pc="$UCX_PREFIX/lib/pkgconfig/ucx.pc"
+    if [[ -f "$ucx_pc" ]]; then
+        local installed_version
+        installed_version=$(grep "^Version:" "$ucx_pc" | awk '{print $2}')
+        if [[ "$installed_version" == "$target_version" ]]; then
+            log "UCX $target_version already installed at $UCX_PREFIX — skipping"
+            return
+        fi
+        log "UCX version mismatch (installed: $installed_version, target: $target_version) — rebuilding"
+    fi
+
     log "Installing UCX $UCX_VERSION from source with configure-release-mt..."
 
     # CUDA detection

@@ -25,12 +25,9 @@ curl -fsSL https://raw.githubusercontent.com/ryanolson/dynamo-dotfiles/main/boot
 - **`zoxide`** → smart `cd` with frecency
 - **`dust`** → intuitive `du` replacement
 
-### Language Runtimes (via mise)
-- **Node.js** 22 (LTS)
-- **Rust** stable toolchain
-- **Zig** 0.11
-
-> **Python**: Use [uv](https://github.com/astral-sh/uv) for Python project management (installed via Homebrew/direct). Python is no longer installed globally via mise.
+### Language Runtimes
+- **Rust** stable toolchain (via [rustup](https://rustup.rs/), installed automatically)
+- **Python** via [uv](https://github.com/astral-sh/uv) (installed automatically)
 
 ### AI Development Tools
 - **claude** - Claude Code CLI (installed via [native installer](https://claude.ai/install.sh), auto-updates)
@@ -52,7 +49,8 @@ curl -fsSL https://raw.githubusercontent.com/ryanolson/dynamo-dotfiles/main/boot
 
 ### Tool Stack
 - **chezmoi** - Dotfiles and configuration management
-- **mise** - Language runtime version management
+- **rustup** - Rust toolchain management
+- **uv** - Python package and project management
 - **Homebrew** (macOS) / **apt** (Linux) - System package management
 - **Fish + Starship** - Modern shell experience
 
@@ -230,17 +228,16 @@ chezmoi add ~/.newconfig
 
 ### Runtime Management
 ```bash
-# List available versions
-mise ls-remote node
+# Update Rust toolchain
+rustup update
 
-# Install specific version
-mise install node@20.10.0
+# Install a specific Rust toolchain
+rustup toolchain install nightly
 
-# Set global default
-mise use --global node@20.10.0
-
-# Project-specific version
-mise use node@18.19.0  # creates .tool-versions
+# Manage Python projects
+uv init myproject
+uv add requests
+uv run python main.py
 ```
 
 ### Shell Features
@@ -273,8 +270,8 @@ brew update && brew upgrade
 # Update packages (Linux)  
 sudo apt update && sudo apt upgrade
 
-# Update runtimes
-mise install
+# Update Rust toolchain
+rustup update
 ```
 
 ## 🆚 Migration from Nix
@@ -289,7 +286,7 @@ If you're migrating from our previous Nix-based setup:
 ### Key Differences
 - **Package Management**: Native (Homebrew/apt) instead of Nix
 - **Configuration**: Templates instead of Nix expressions
-- **Runtimes**: mise instead of Nix toolchains
+- **Runtimes**: rustup + uv instead of Nix toolchains
 - **Installation**: Lighter, no system-wide `/nix` directory
 
 ## 🤝 Team Contributions
@@ -341,7 +338,8 @@ The TUI provides:
 ## 📚 External Documentation
 
 - **chezmoi**: https://chezmoi.io/
-- **mise**: https://mise.jdx.dev/  
+- **rustup**: https://rustup.rs/
+- **uv**: https://docs.astral.sh/uv/
 - **Fish Shell**: https://fishshell.com/
 - **Starship**: https://starship.rs/
 - **Helix Editor**: https://helix-editor.com/

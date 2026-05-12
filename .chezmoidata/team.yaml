@@ -48,8 +48,6 @@ tools:
       description: "HTTP client"
     - name: "chezmoi"
       description: "Dotfiles manager"
-    - name: "mise"
-      description: "Runtime version manager"
 
   # Modern CLI replacements (replacing traditional Unix tools)
   cli_modern:
@@ -160,24 +158,10 @@ aliases:
     ga: "git add"
     gc: "git commit"
 
-# Language runtimes managed by mise
-languages:
-  node:
-    default: "22"  # LTS version
-    description: "Node.js runtime and npm"
-
-  rust:
-    default: "stable"
-    description: "Rust toolchain with cargo"
-
-  zig:
-    default: "0.11.0"
-    description: "Zig programming language"
-
 # Team configuration standards
 standards:
   editor: "helix"
   shell: "fish" 
   multiplexer: "zellij"
   prompt: "starship"
-  version_manager: "mise"
+  version_manager: "rustup+uv"

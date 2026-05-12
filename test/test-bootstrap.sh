@@ -69,14 +69,6 @@ else
     warn "✗ chezmoi not found"
 fi
 
-# Check mise  
-if sudo su - ryan -c "command -v mise" >/dev/null 2>&1; then
-    success "✓ mise installed"
-    sudo su - ryan -c "mise --version"
-else
-    warn "✗ mise not found"
-fi
-
 # Check fish
 if sudo su - ryan -c "command -v fish" >/dev/null 2>&1; then
     success "✓ fish installed"
@@ -109,7 +101,8 @@ done
 
 # Check language runtimes
 log "Checking language runtimes..."
-sudo su - ryan -c "mise ls --current 2>/dev/null || echo 'No runtimes configured yet'"
+sudo su - ryan -c "cargo --version 2>/dev/null || echo 'Rust not installed'"
+sudo su - ryan -c "uv --version 2>/dev/null || echo 'uv not installed'"
 
 success "🎉 Bootstrap test complete!"
 log ""

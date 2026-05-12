@@ -103,6 +103,15 @@ install_macos_packages() {
         warn "fish not found at $fish_path, skipping /etc/shells update"
     fi
 
+    # Rust toolchain via rustup
+    if ! command -v cargo &>/dev/null; then
+        log "Installing Rust toolchain via rustup..."
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path \
+            || warn "Failed to install Rust"
+    else
+        log "✓ Rust (cargo) already installed"
+    fi
+
     success "✅ macOS packages installed"
 }
 
@@ -307,7 +316,18 @@ install_linux_packages() {
         log "Installing uv (Python package manager)..."
         curl -LsSf https://astral.sh/uv/install.sh | sh || warn "Failed to install uv"
     fi
-    
+
+    # Rust toolchain via rustup
+    if ! command -v cargo &>/dev/null; then
+        log "Installing Rust toolchain via rustup..."
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+            || warn "Failed to install Rust"
+        # shellcheck disable=SC1090
+        source "$HOME/.cargo/env" 2>/dev/null || true
+    else
+        log "✓ Rust (cargo) already installed"
+    fi
+
     # kubectl (Kubernetes CLI)
     if ! command -v kubectl &> /dev/null; then
         log "Installing kubectl..."

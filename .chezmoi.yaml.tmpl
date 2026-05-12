@@ -1,7 +1,9 @@
 {{- $name := promptStringOnce . "name" "Your full name" -}}
 {{- $email := promptStringOnce . "email" "Your email address" -}}
 {{- $machineType := promptStringOnce . "machine_type" "Machine type (remote-dev/laptop/workstation)" -}}
-{{- $cursorSSHHost := promptStringOnce . "cursor_ssh_host" "SSH hostname for Cursor deep links (e.g. devbox)" -}}
+{{- $defaultHost := .chezmoi.hostname -}}
+{{- $cursorSSHHost := promptStringOnce . "cursor_ssh_host" (printf "SSH hostname for Cursor deep links [leave blank to use: %s]" $defaultHost) -}}
+{{- if eq $cursorSSHHost "" -}}{{- $cursorSSHHost = $defaultHost -}}{{- end -}}
 {{- $userRole := promptStringOnce . "user_role" "User role on this machine (standalone/primary/secondary)" -}}
 {{- $credProfile := promptStringOnce . "credentials_profile" "Credentials profile (personal/corp)" -}}
 {{- $primarySock := "" -}}

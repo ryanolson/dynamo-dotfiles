@@ -109,32 +109,6 @@ install_chezmoi() {
     success "✅ chezmoi installed successfully"
 }
 
-# Install mise for runtime version management
-install_mise() {
-    if [[ "$OS" == "macOS" ]]; then
-        log "⏭️  Skipping mise on macOS"
-        return
-    fi
-
-    if command -v mise &> /dev/null; then
-        log "📦 mise already installed ($(mise --version))"
-        return
-    fi
-
-    log "📦 Installing mise (runtime version manager)..."
-    curl https://mise.run | sh || error "Failed to install mise"
-
-    # Add mise to PATH for current session
-    export PATH="$HOME/.local/bin:$PATH"
-
-    # Add to shell profile
-    if [[ -f "$HOME/.bashrc" ]]; then
-        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
-    fi
-
-    success "✅ mise installed successfully"
-}
-
 # Initialize dotfiles with chezmoi
 init_dotfiles() {
     log "🏠 Initializing dotfiles with chezmoi..."
@@ -152,29 +126,6 @@ init_dotfiles() {
     chezmoi apply || error "Failed to apply dotfiles"
 
     success "✅ Dotfiles initialized and applied"
-}
-
-# Set up runtime environments
-setup_runtimes() {
-    if ! command -v mise &> /dev/null; then
-        warn "mise not available, skipping runtime setup"
-        return
-    fi
-    
-    log "🔧 Setting up language runtimes with mise..."
-    
-    # Install default versions if no configuration exists
-    if [[ ! -f "$HOME/.tool-versions" && ! -f "$HOME/.mise.toml" ]]; then
-        log "Installing default language runtimes..."
-        mise use --global node@22 || warn "Failed to install Node.js"
-        mise use --global rust@stable || warn "Failed to install Rust"
-        mise use --global zig@0.11 || warn "Failed to install Zig"
-    else
-        # Install from existing configuration
-        mise install || warn "Some runtimes may have failed to install"
-    fi
-    
-    success "✅ Language runtimes configured"
 }
 
 # Install Claude Code CLI via native installer
@@ -426,7 +377,6 @@ main() {
 
     # Install core tools
     install_chezmoi
-    install_mise
 
     # Set up dotfiles
     init_dotfiles
@@ -442,7 +392,6 @@ main() {
     fi
 
     # Set up development environment
-    setup_runtimes
     install_packages
     install_claude_code
     setup_shell
@@ -465,18 +414,19 @@ main() {
     log "🔧 What you now have:"
     log "   - Modern CLI tools (bat, eza, ripgrep, fd, zoxide)"
     log "   - Development environment (helix, fish, starship, zellij)"
-    log "   - Language runtimes via mise (node, rust, zig)"
+    log "   - uv (Python) + Rust toolchain (rustup)"
     log "   - Claude Code CLI (native installer)"
     log "   - Team-standard configurations and aliases"
     log ""
     log "📚 Documentation: https://github.com/ryanolson/dynamo-dotfiles"
-    log "🔄 Architecture: chezmoi (dotfiles) + mise (runtimes) + native packages"
-    
+    log "🔄 Architecture: chezmoi (dotfiles) + uv (Python) + rustup (Rust) + native packages"
+
     # Show installed tool versions
     log ""
     log "📋 Installed versions:"
     command -v chezmoi && log "   chezmoi: $(chezmoi --version | head -1)" || true
-    command -v mise && log "   mise: $(mise --version)" || true
+    command -v cargo && log "   rust: $(cargo --version)" || true
+    command -v uv && log "   uv: $(uv --version)" || true
     command -v git && log "   git: $(git --version)" || true
 }
 
