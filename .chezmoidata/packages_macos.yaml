@@ -53,6 +53,7 @@ homebrew:
     - jq
     - tree
     - htop
+    - mosh
 
   # GUI applications (optional)
   casks:

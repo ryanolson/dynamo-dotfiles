@@ -22,6 +22,7 @@ apt:
     - htop
     - tree
     - jq
+    - mosh
 
 # Tools installed via other methods (direct download, cargo, npm, etc.)
 direct_install:
