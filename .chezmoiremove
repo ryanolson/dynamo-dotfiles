@@ -1,7 +1,11 @@
 # Files to remove from target directory
 # These files will be deleted when chezmoi applies
 
-# For now, no files to remove by default
+# ccmanager and ruler removed in favor of local skills marketplace
+.config/ccmanager
+.config/ruler
+
+# For now, no other files to remove by default
 # Uncomment lines below as needed:
 
 # Legacy Nix files (if migrating from Nix setup)

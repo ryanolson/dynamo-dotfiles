@@ -54,15 +54,21 @@
     "type": "command",
     "command": "node \"{{ .chezmoi.homeDir }}/.claude/hooks/gsd-statusline.js\""
   },
+  {{ end -}}
   "extraKnownMarketplaces": {
+    "personal-skills": {
+      "source": {
+        "source": "directory",
+        "path": "{{ .chezmoi.homeDir }}/.skills"
+      }
+    }{{ if eq .user_role "primary" }},
     "dynamo-ai-workflows": {
       "source": {
         "source": "directory",
         "path": "{{ .chezmoi.homeDir }}/repos/dynamo-ai-workflows"
       }
-    }
+    }{{ end }}
   },
-  {{ end -}}
   "enabledPlugins": {
     "rust-analyzer-lsp@claude-plugins-official": true
   },
