@@ -82,6 +82,25 @@ esac
 
 log "Installing NIXL ref='$NIXL_REF' on $ARCH ($ARCH_TRIPLET)..."
 
+# --- Phase 1b: CUDA / nvcc detection ---
+CUDA_HOME=""
+if command -v nvcc &>/dev/null; then
+    CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
+    log "nvcc found in PATH (CUDA_HOME=$CUDA_HOME)"
+else
+    for _cuda_dir in /usr/local/cuda /opt/nvidia/cuda /usr/local/cuda-1[2-9] /usr/local/cuda-[2-9][0-9]; do
+        if [[ -x "$_cuda_dir/bin/nvcc" ]]; then
+            CUDA_HOME="$_cuda_dir"
+            export PATH="$CUDA_HOME/bin:$PATH"
+            log "nvcc found at $CUDA_HOME/bin/nvcc — added to PATH"
+            break
+        fi
+    done
+    if [[ -z "$CUDA_HOME" ]]; then
+        warn "nvcc not found — CUDA support will be disabled in UCX/NIXL"
+    fi
+fi
+
 # --- Phase 2: apt system dependencies ---
 install_apt_deps() {
     log "Installing system dependencies via apt..."
@@ -120,6 +139,14 @@ install_apt_deps() {
 
 install_apt_deps
 
+# --- Phase 2b: Ensure clang headers are present ---
+# NIXL pulls in clang/libclang headers at build time; the packages must be
+# installed even if clang is not used as the compiler.
+if ! dpkg -l libclang-dev 2>/dev/null | grep -q '^ii'; then
+    log "libclang-dev not found — installing clang and libclang-dev via apt..."
+    sudo apt-get install -y clang libclang-dev || error "Failed to install libclang-dev"
+fi
+
 # --- Phase 3: Python build dependencies ---
 log "Installing Python build dependencies..."
 uv venv "$BUILD_DIR/.venv" --quiet
@@ -157,15 +184,12 @@ install_ucx() {
 
     log "Installing UCX $UCX_VERSION from source with configure-release-mt..."
 
-    # CUDA detection
+    # CUDA detection (uses CUDA_HOME resolved in Phase 1b)
     CUDA_FLAGS=""
-    for cuda_path in /usr/local/cuda /usr/local/cuda-12 /usr/local/cuda-13; do
-        if [[ -d "$cuda_path" ]]; then
-            CUDA_FLAGS="--with-cuda=$cuda_path"
-            log "CUDA found at $cuda_path — enabling CUDA support in UCX"
-            break
-        fi
-    done
+    if [[ -n "$CUDA_HOME" ]]; then
+        CUDA_FLAGS="--with-cuda=$CUDA_HOME"
+        log "Enabling CUDA support in UCX ($CUDA_HOME)"
+    fi
 
     # gdrcopy detection
     GDRCOPY_FLAGS=""
