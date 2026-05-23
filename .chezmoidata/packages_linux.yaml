@@ -23,6 +23,7 @@ apt:
     - tree
     - jq
     - mosh
+    - protobuf-compiler
 
 # Tools installed via other methods (direct download, cargo, npm, etc.)
 direct_install:

@@ -47,6 +47,7 @@ homebrew:
     # Build tools (for npm native modules)
     - gcc
     - make
+    - protobuf
     
     # Optional but useful
     - wget

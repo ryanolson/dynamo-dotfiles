@@ -75,6 +75,9 @@ install_macos_packages() {
         # Container and orchestration
         kubectl
         
+        # Build tools
+        protobuf
+
         # Optional but useful
         jq tree htop wget
     )
@@ -125,7 +128,7 @@ install_linux_packages() {
         
         # Install packages available via apt
         local apt_packages=(
-            htop tree jq build-essential pkg-config libssl-dev fish unzip
+            htop tree jq build-essential pkg-config libssl-dev fish unzip protobuf-compiler
         )
         
         for package in "${apt_packages[@]}"; do
