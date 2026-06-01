@@ -254,18 +254,44 @@ install_claude() {
 
 # Codex CLI via npm (needs node >= 18.18). Node comes from pixi (current, sudo-free)
 # on every class — apt's node is usually too old.
+# Resolve the pixi binary to use. CRITICAL on multi-arch shared $HOME: a stale
+# x86 ~/.pixi/bin/pixi is often on PATH on the aarch64 node, so we must NOT rely
+# on `command -v pixi`. Prefer the arch-namespaced one ($PIXI_HOME/bin/pixi).
+pixi_cmd() {
+    # When PIXI_HOME is set (no-sudo, arch slot) ONLY the arch pixi is valid —
+    # never fall back to a PATH pixi, which may be the wrong architecture.
+    if [[ -n "${PIXI_HOME:-}" ]]; then
+        [[ -x "$PIXI_HOME/bin/pixi" ]] && echo "$PIXI_HOME/bin/pixi"
+    elif command -v pixi >/dev/null 2>&1; then
+        command -v pixi
+    fi
+}
+
+# Install pixi into PIXI_HOME (the pixi installer honors $PIXI_HOME). On no-sudo
+# nodes PIXI_HOME is the arch slot, so this yields an arch-correct pixi even when
+# a stale wrong-arch pixi sits on PATH.
+ensure_pixi() {
+    if [[ -n "${PIXI_HOME:-}" ]]; then
+        [[ -x "$PIXI_HOME/bin/pixi" ]] && return 0
+    else
+        command -v pixi >/dev/null 2>&1 && return 0
+    fi
+    log "Installing pixi${PIXI_HOME:+ into $PIXI_HOME}..."
+    PIXI_NO_PATH_UPDATE=1 curl -fsSL https://pixi.sh/install.sh | bash || warn "Failed to install pixi"
+}
+
+# Codex CLI via npm (needs node >= 18.18). Node comes from pixi (current, sudo-free)
+# on every class — apt's node is usually too old.
 install_codex() {
     export NPM_CONFIG_PREFIX="${NPM_CONFIG_PREFIX:-$HOME/.npm-global}"
     mkdir -p "$NPM_CONFIG_PREFIX"
     if ! command -v npm &> /dev/null; then
-        if ! command -v pixi &> /dev/null; then
-            log "Installing pixi (to provide nodejs for codex)..."
-            curl -fsSL https://pixi.sh/install.sh | bash || warn "Failed to install pixi"
-        fi
-        export PATH="$HOME/.pixi/bin:$PATH"
-        if command -v pixi &> /dev/null; then
+        ensure_pixi
+        local PIXI; PIXI="$(pixi_cmd)"
+        if [[ -n "$PIXI" && -x "$PIXI" ]]; then
             log "Installing nodejs via pixi (for codex)..."
-            pixi global install nodejs || warn "Failed to install nodejs via pixi"
+            "$PIXI" global install nodejs || warn "Failed to install nodejs via pixi"
+            export PATH="$(dirname "$PIXI"):$PATH"
         else
             warn "No npm and pixi unavailable — skipping codex install"
             return
@@ -344,17 +370,6 @@ install_linux_sudo() {
     success "✅ Linux packages installed"
 }
 
-# Linux path WITHOUT sudo (headless-nosudo / SLURM login node)
-# Migrate a legacy single-arch install (~/.pixi, created by an earlier bootstrap)
-# into the arch-namespaced root, so the login node keeps working without a wipe.
-migrate_legacy_pixi() {
-    if [[ -d "$HOME/.pixi" && ! -e "$PIXI_HOME" ]]; then
-        log "Migrating legacy ~/.pixi -> $PIXI_HOME (assumed $ARCH_RAW)..."
-        mkdir -p "$(dirname "$PIXI_HOME")"
-        mv "$HOME/.pixi" "$PIXI_HOME" || warn "Could not migrate ~/.pixi"
-    fi
-}
-
 # No-sudo path is PIXI-CENTRIC: conda-forge has nearly the whole tool list, pixi
 # does arch detection for free, and its bundled libs sidestep glibc/ABI issues
 # that hand-grabbed release binaries hit on these kernels. Everything lands under
@@ -364,16 +379,14 @@ install_linux_nosudo() {
     log "📦 Installing packages into $ARCH_ROOT (no sudo, arch=$ARCH_RAW)"
     command -v curl >/dev/null || { error "curl is required but not found"; return 1; }
 
-    migrate_legacy_pixi
-
-    if ! command -v pixi &> /dev/null; then
-        log "Installing pixi into $PIXI_HOME..."
-        curl -fsSL https://pixi.sh/install.sh | bash || warn "Failed to install pixi"
-        export PATH="$PIXI_HOME/bin:$PATH"
+    # IMPORTANT: never trust `command -v pixi` here — a stale x86 ~/.pixi/bin/pixi
+    # is often on PATH on the aarch64 node. Install + invoke the arch one by path.
+    ensure_pixi
+    local PIXI; PIXI="$(pixi_cmd)"
+    if [[ -z "$PIXI" || ! -x "$PIXI" ]]; then
+        error "pixi unavailable at $PIXI_HOME/bin/pixi — cannot install fish/node"; return 1
     fi
-    if ! command -v pixi &> /dev/null; then
-        error "pixi unavailable — cannot install fish/node without it"; return 1
-    fi
+    log "Using pixi: $PIXI"
 
     # conda-forge package names (a few differ from the binary they ship).
     local pkgs=(
@@ -386,7 +399,7 @@ install_linux_nosudo() {
     # pixi global install is idempotent (no-ops if already present).
     for p in "${pkgs[@]}"; do
         log "pixi global install $p..."
-        pixi global install "$p" || warn "Failed to pixi-install $p"
+        "$PIXI" global install "$p" || warn "Failed to pixi-install $p"
     done
 
     install_claude     # native installer; per-arch (launcher in ~/.local/bin, store in ~/.claude)
