@@ -20,7 +20,7 @@ error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 REPO_URL="https://github.com/ryanolson/dynamo-dotfiles.git"
 DOTFILES_DIR="$HOME/.local/share/chezmoi"
-NO_SUDO=0
+NO_SUDO=auto   # auto | 0 | 1  (forced by --no-sudo / --sudo)
 
 detect_os() {
     case "$OSTYPE" in
@@ -28,11 +28,20 @@ detect_os() {
         linux*)   OS="Linux" ;;
         *)        error "Unsupported operating system: $OSTYPE" ;;
     esac
-    # No sudo on this box? Switch to the $HOME-only path automatically.
-    if [[ "$OS" == "Linux" && $NO_SUDO -eq 0 ]]; then
-        if ! command -v sudo >/dev/null 2>&1; then
-            warn "sudo not found — switching to no-sudo install"
+    # Resolve sudo mode. A login node usually HAS the sudo binary but the user
+    # can't use it — so test real usability with `sudo -n true`, not `command -v`.
+    if [[ "$NO_SUDO" == "auto" ]]; then
+        if [[ "$OS" == "macOS" ]]; then
+            NO_SUDO=0
+        elif ! command -v sudo >/dev/null 2>&1; then
+            warn "sudo not found — using no-sudo install"
             NO_SUDO=1
+        elif ! sudo -n true >/dev/null 2>&1; then
+            warn "sudo present but not usable without a password — using no-sudo install"
+            warn "(re-run with --sudo to force the apt path)"
+            NO_SUDO=1
+        else
+            NO_SUDO=0
         fi
     fi
     log "🖥️  Detected OS: $OS$([[ $NO_SUDO -eq 1 ]] && echo ' (no-sudo)')"
@@ -90,6 +99,11 @@ init_dotfiles() {
         warn "Dotfiles already initialized. Use 'chezmoi update' to update."
         chezmoi apply || warn "chezmoi apply reported issues"
         return
+    fi
+    # Pre-seed the machine_class prompt default so a no-sudo node doesn't land on
+    # the apt path (which would sudo-prompt and abort apply under set -e).
+    if [[ $NO_SUDO -eq 1 ]]; then
+        export DOTFILES_MACHINE_CLASS="headless-nosudo"
     fi
     # init prompts for machine_class etc.; apply runs the package install script.
     chezmoi init "$REPO_URL" || error "Failed to initialize dotfiles"
@@ -158,6 +172,7 @@ main() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --no-sudo) NO_SUDO=1; shift ;;
+            --sudo)    NO_SUDO=0; shift ;;
             *) shift ;;
         esac
     done
