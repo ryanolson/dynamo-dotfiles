@@ -1,9 +1,15 @@
 {{- $name := promptStringOnce . "name" "Your full name" -}}
 {{- $email := promptStringOnce . "email" "Your email address" -}}
-{{/* bootstrap.sh exports DOTFILES_MACHINE_CLASS=headless-nosudo when it detects no usable sudo */}}
-{{- $defaultClass := env "DOTFILES_MACHINE_CLASS" -}}
-{{- if eq $defaultClass "" -}}{{- $defaultClass = "headless-sudo" -}}{{- end -}}
-{{- $machineClass := promptChoiceOnce . "machine_class" "Machine class" (list "headless-sudo" "headless-nosudo" "primary") $defaultClass -}}
+{{/* bootstrap.sh exports DOTFILES_MACHINE_CLASS when it detects no usable sudo.
+     When set it is AUTHORITATIVE (not just a prompt default), so re-running
+     bootstrap on a node with a stale machine_class self-corrects. */}}
+{{- $envClass := env "DOTFILES_MACHINE_CLASS" -}}
+{{- $machineClass := "" -}}
+{{- if ne $envClass "" -}}
+{{-   $machineClass = $envClass -}}
+{{- else -}}
+{{-   $machineClass = promptChoiceOnce . "machine_class" "Machine class" (list "headless-sudo" "headless-nosudo" "primary") "headless-sudo" -}}
+{{- end -}}
 {{- $machineSeed := promptChoiceOnce . "machine_seed" "Per-machine fish seed (creates conf.d/local.fish once, then unsynced)" (list "blank" "cuda") "blank" -}}
 {{- $defaultHost := .chezmoi.hostname -}}
 {{- $cursorSSHHost := promptStringOnce . "cursor_ssh_host" (printf "SSH hostname for Cursor deep links [leave blank to use: %s]" $defaultHost) -}}

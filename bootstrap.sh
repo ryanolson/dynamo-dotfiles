@@ -95,17 +95,14 @@ install_chezmoi() {
 
 init_dotfiles() {
     log "🏠 Initializing dotfiles with chezmoi..."
-    if [[ -d "$DOTFILES_DIR" ]]; then
-        warn "Dotfiles already initialized. Use 'chezmoi update' to update."
-        chezmoi apply || warn "chezmoi apply reported issues"
-        return
-    fi
-    # Pre-seed the machine_class prompt default so a no-sudo node doesn't land on
-    # the apt path (which would sudo-prompt and abort apply under set -e).
+    # On a no-sudo node, force machine_class authoritatively (see .chezmoi.yaml.tmpl).
+    # This corrects a stale config left by an earlier run, not just fresh installs.
     if [[ $NO_SUDO -eq 1 ]]; then
         export DOTFILES_MACHINE_CLASS="headless-nosudo"
     fi
-    # init prompts for machine_class etc.; apply runs the package install script.
+    # `chezmoi init` is safe to re-run: it pulls the source and regenerates the
+    # config from the template (re-applying the forced machine_class). Existing
+    # name/email/etc. are remembered, so only unset prompts fire.
     chezmoi init "$REPO_URL" || error "Failed to initialize dotfiles"
     chezmoi apply || error "Failed to apply dotfiles"
     success "✅ Dotfiles initialized and applied"
