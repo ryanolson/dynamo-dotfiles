@@ -19,19 +19,35 @@ set -gx COLORTERM truecolor
 set -gx EDITOR vi
 set -gx VISUAL vi
 
-# Add local bin directories to PATH
+# Add local bin directories to PATH (legacy / single-arch machines)
 fish_add_path $HOME/.local/bin
 fish_add_path $HOME/.cargo/bin  # Rust tools
-fish_add_path $HOME/.npm-global/bin  # npm global packages (codex, etc.)
-fish_add_path $HOME/.pixi/bin  # pixi global tools (fish, node on no-sudo nodes)
+fish_add_path $HOME/.npm-global/bin  # npm global packages
+fish_add_path $HOME/.pixi/bin  # pixi global tools
+
+# Arch-namespaced no-sudo layout — for HPC nodes that share $HOME across
+# architectures (x86_64 login + aarch64 compute). Activates only where the
+# per-arch root exists; harmless no-op on laptops/workstations.
+# Added LAST so fish_add_path (which prepends) gives these top priority.
+set -l _arch (uname -m)
+if test -d $HOME/.local/$_arch
+    set -gx PIXI_HOME $HOME/.local/$_arch/pixi
+    set -gx NPM_CONFIG_PREFIX $HOME/.local/$_arch/npm
+    fish_add_path $HOME/.local/$_arch/npm/bin
+    fish_add_path $HOME/.local/$_arch/pixi/bin
+    fish_add_path $HOME/.local/$_arch/bin
+end
 
 if test -S ~/Library/Group\ Containers/2BUA8C4S2C.com.1password/t/agent.sock
     set -gx SSH_AUTH_SOCK ~/Library/Group\ Containers/2BUA8C4S2C.com.1password/t/agent.sock
 end
 
-# Configure npm to use user directory for global packages
-set -gx NPM_CONFIG_PREFIX $HOME/.npm-global
-mkdir -p $HOME/.npm-global
+# Configure npm to use a user directory for global packages.
+# Keep the arch-namespaced prefix if the layout above already set one.
+if not set -q NPM_CONFIG_PREFIX
+    set -gx NPM_CONFIG_PREFIX $HOME/.npm-global
+end
+mkdir -p $NPM_CONFIG_PREFIX
 
 # Initialize tool integrations
 # zoxide: disabled (macOS binary may be present but non-executable on Linux)

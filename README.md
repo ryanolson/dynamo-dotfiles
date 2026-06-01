@@ -22,16 +22,25 @@ curl -fsSL https://raw.githubusercontent.com/ryanolson/dynamo-dotfiles/main/boot
 | Class             | Install path                | Sudo | 1Password / signing | Agent infra |
 |-------------------|-----------------------------|------|---------------------|-------------|
 | `headless-sudo`   | apt + `/usr/local/bin`      | yes  | no                  | yes         |
-| `headless-nosudo` | `$HOME` + pixi (fish, node) | no   | no                  | no          |
+| `headless-nosudo` | `~/.local/<arch>/` via pixi | no   | no                  | no          |
 | `primary`         | apt + `/usr/local/bin`      | yes  | **yes**             | yes         |
 
-On `headless-nosudo`, `fish` and `node` come from [pixi](https://pixi.sh)
-(conda-forge — glibc-independent, robust on old login nodes); every other tool is
-a GitHub-release binary downloaded into `~/.local/bin`. If `$HOME` is quota-capped,
-set `PIXI_HOME` to scratch before running. There is no `chsh` on a login node, so
-bootstrap appends a hard-guarded `exec fish` to `~/.bashrc` (interactive shells
-only — `scp`, non-interactive ssh, and `#!/bin/bash -l` SLURM batch scripts are
-unaffected).
+On `headless-nosudo` the install is **pixi-centric**: nearly the whole toolset
+(`fish`, `node`, `git`, `gh`, `bat`, `ripgrep`, `fd`, `helix`, `zellij`, `lazygit`,
+`starship`, `uv`, …) comes from [pixi](https://pixi.sh)/conda-forge — glibc-independent
+and arch-aware. Only `claude` (native installer) and `codex` (npm) are separate.
+
+**Multi-architecture shared `$HOME`** (e.g. an x86_64 SLURM login node with aarch64
+GB200 compute nodes mounting the same home): everything installs under an
+**arch-namespaced root** `~/.local/<uname -m>/` (`bin`, `pixi`, `npm`), and the
+shell rc selects the right one via `uname -m` at startup. Run bootstrap **once per
+architecture** (on the login node and on one compute node); the shared dotfiles are
+arch-aware, so both just work. `chezmoi` itself is installed per-arch. If `$HOME` is
+quota-capped, set `PIXI_HOME` to scratch before running.
+
+There is no `chsh` on a login node, so bootstrap appends a hard-guarded, arch-aware
+`exec fish` to `~/.bashrc` (interactive shells only — `scp`, non-interactive ssh,
+and `#!/bin/bash -l` SLURM batch scripts are unaffected).
 
 ## 📦 What's Included
 

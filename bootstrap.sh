@@ -78,18 +78,24 @@ install_dependencies() {
 }
 
 install_chezmoi() {
+    # chezmoi is itself arch-specific. On a no-sudo node (shared $HOME across
+    # x86_64 + aarch64) install it into the arch-namespaced bin so the x86 one
+    # never shadows the aarch64 one. Single-arch/sudo boxes use ~/.local/bin.
+    local cz_bin="$HOME/.local/bin"
+    if [[ $NO_SUDO -eq 1 ]]; then
+        cz_bin="$HOME/.local/$(uname -m)/bin"
+    fi
+    export PATH="$cz_bin:$HOME/.local/bin:$PATH"
     if command -v chezmoi &> /dev/null; then
         log "📦 chezmoi already installed ($(chezmoi --version | head -1))"; return
     fi
-    log "📦 Installing chezmoi into ~/.local/bin..."
-    mkdir -p "$HOME/.local/bin"
+    log "📦 Installing chezmoi into $cz_bin..."
+    mkdir -p "$cz_bin"
     if [[ "$OS" == "macOS" ]]; then
         brew install chezmoi || error "Failed to install chezmoi"
     else
-        # Install to $HOME — no sudo needed on any Linux box.
-        sh -c "$(curl -fsLS get.chezmoi.io)" -- -b "$HOME/.local/bin" || error "Failed to install chezmoi"
+        sh -c "$(curl -fsLS get.chezmoi.io)" -- -b "$cz_bin" || error "Failed to install chezmoi"
     fi
-    export PATH="$HOME/.local/bin:$PATH"
     success "✅ chezmoi installed"
 }
 
@@ -131,9 +137,13 @@ setup_fish_no_chsh() {
 # >>> chezmoi exec-fish >>>
 # Launch fish for interactive shells only. Guarded so scp/rsync,
 # non-interactive ssh, and SLURM batch scripts are never affected.
-# Self-contained PATH: pixi puts fish in ~/.pixi/bin, which may not be on PATH yet.
+# Self-contained, arch-aware PATH: fish lives in the per-arch pixi root on HPC
+# nodes that share $HOME across x86_64 (login) and aarch64 (compute).
 case $- in
     *i*)
+        __a="$(uname -m)"
+        [ -d "$HOME/.local/$__a/bin" ] && PATH="$HOME/.local/$__a/bin:$PATH"
+        [ -d "$HOME/.local/$__a/pixi/bin" ] && PATH="$HOME/.local/$__a/pixi/bin:$PATH"
         [ -d "$HOME/.pixi/bin" ] && PATH="$HOME/.pixi/bin:$PATH"
         [ -d "$HOME/.local/bin" ] && PATH="$HOME/.local/bin:$PATH"
         if [ -z "$FISH_VERSION" ] && [ -t 0 ] && [ -t 1 ] && command -v fish >/dev/null 2>&1; then

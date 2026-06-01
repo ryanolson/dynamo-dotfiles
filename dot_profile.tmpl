@@ -27,6 +27,15 @@ if [ -d "$HOME/.local/bin" ] ; then
 fi
 . "$HOME/.cargo/env"
 
+# Arch-namespaced no-sudo layout — HPC nodes sharing $HOME across architectures
+# (x86_64 login + aarch64 compute). Prepended so it wins; no-op where absent.
+_arch="$(uname -m)"
+if [ -d "$HOME/.local/$_arch" ]; then
+    export PIXI_HOME="$HOME/.local/$_arch/pixi"
+    [ -z "${NPM_CONFIG_PREFIX:-}" ] && export NPM_CONFIG_PREFIX="$HOME/.local/$_arch/npm"
+    PATH="$HOME/.local/$_arch/bin:$HOME/.local/$_arch/pixi/bin:$HOME/.local/$_arch/npm/bin:$PATH"
+fi
+
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 [ -f "$HOME/.local/bin/env" ] && . "$HOME/.local/bin/env"
 

@@ -9,6 +9,11 @@
 set -euo pipefail
 
 MACHINE_CLASS="{{ .machine_class }}"
+# target-arch: {{ .chezmoi.arch }}
+# ^ embeds the rendering machine's arch so run_onchange's content hash differs
+#   per architecture. $HOME (and chezmoi's state) is shared across the x86_64
+#   login node and aarch64 compute nodes; without this the installer would be
+#   considered "already run" on the second arch and skipped.
 
 # Colors for output
 RED='\033[0;31m'
@@ -50,12 +55,21 @@ case "$ARCH" in
 esac
 log "Detected architecture: $ARCH ($ARCH_ALT)"
 
-# No-sudo install lands here; sudo classes use /usr/local/bin
+# No-sudo install is arch-namespaced under ~/.local/<arch> because $HOME is
+# shared across the x86_64 login node and aarch64 compute nodes. sudo classes
+# use /usr/local/bin (single-arch boxes).
+ARCH_RAW="$(uname -m)"          # x86_64 | aarch64
 BIN_DIR="/usr/local/bin"
 SUDO="sudo"
+ARCH_ROOT=""
 if [[ "$MACHINE_CLASS" == "headless-nosudo" ]]; then
-    BIN_DIR="$HOME/.local/bin"
+    ARCH_ROOT="$HOME/.local/$ARCH_RAW"
+    BIN_DIR="$ARCH_ROOT/bin"
     SUDO=""
+    export PIXI_HOME="$ARCH_ROOT/pixi"
+    export NPM_CONFIG_PREFIX="$ARCH_ROOT/npm"
+    export PATH="$BIN_DIR:$PIXI_HOME/bin:$NPM_CONFIG_PREFIX/bin:$PATH"
+    mkdir -p "$BIN_DIR" "$PIXI_HOME" "$NPM_CONFIG_PREFIX"
 fi
 mkdir -p "$BIN_DIR" 2>/dev/null || true
 
@@ -331,50 +345,53 @@ install_linux_sudo() {
 }
 
 # Linux path WITHOUT sudo (headless-nosudo / SLURM login node)
+# Migrate a legacy single-arch install (~/.pixi, created by an earlier bootstrap)
+# into the arch-namespaced root, so the login node keeps working without a wipe.
+migrate_legacy_pixi() {
+    if [[ -d "$HOME/.pixi" && ! -e "$PIXI_HOME" ]]; then
+        log "Migrating legacy ~/.pixi -> $PIXI_HOME (assumed $ARCH_RAW)..."
+        mkdir -p "$(dirname "$PIXI_HOME")"
+        mv "$HOME/.pixi" "$PIXI_HOME" || warn "Could not migrate ~/.pixi"
+    fi
+}
+
+# No-sudo path is PIXI-CENTRIC: conda-forge has nearly the whole tool list, pixi
+# does arch detection for free, and its bundled libs sidestep glibc/ABI issues
+# that hand-grabbed release binaries hit on these kernels. Everything lands under
+# one arch-namespaced root ($ARCH_ROOT). Only claude (proprietary) and codex (npm)
+# are special. Override PIXI_HOME to scratch before bootstrap if $HOME is quota-capped.
 install_linux_nosudo() {
-    log "📦 Installing packages into \$HOME (no sudo) — class: $MACHINE_CLASS"
+    log "📦 Installing packages into $ARCH_ROOT (no sudo, arch=$ARCH_RAW)"
     command -v curl >/dev/null || { error "curl is required but not found"; return 1; }
 
-    # pixi provides fish + node without sudo, glibc-independent.
-    # Override footprint location with PIXI_HOME (e.g. scratch) if $HOME is quota-capped.
+    migrate_legacy_pixi
+
     if ! command -v pixi &> /dev/null; then
-        log "Installing pixi..."
+        log "Installing pixi into $PIXI_HOME..."
         curl -fsSL https://pixi.sh/install.sh | bash || warn "Failed to install pixi"
-        export PATH="$HOME/.pixi/bin:$PATH"
+        export PATH="$PIXI_HOME/bin:$PATH"
     fi
-    if command -v pixi &> /dev/null; then
-        for p in fish nodejs unzip; do
-            log "pixi global install $p..."
-            pixi global install "$p" || warn "Failed to pixi-install $p"
-        done
-        export PATH="$HOME/.pixi/bin:$PATH"
-    else
-        warn "pixi unavailable — fish/node will be missing"
+    if ! command -v pixi &> /dev/null; then
+        error "pixi unavailable — cannot install fish/node without it"; return 1
     fi
 
-    install_github_tools
-    install_curl_tools
+    # conda-forge package names (a few differ from the binary they ship).
+    local pkgs=(
+        fish nodejs git gh
+        bat eza ripgrep fd zoxide dust procs
+        helix zellij lazygit yazi
+        just watchexec hyperfine tokei
+        starship uv
+    )
+    # pixi global install is idempotent (no-ops if already present).
+    for p in "${pkgs[@]}"; do
+        log "pixi global install $p..."
+        pixi global install "$p" || warn "Failed to pixi-install $p"
+    done
 
-    # GitHub CLI via release tarball (no apt)
-    if ! command -v gh &> /dev/null; then
-        log "Installing GitHub CLI (release tarball)..."
-        local gh_url td
-        gh_url=$(curl -s https://api.github.com/repos/cli/cli/releases/latest \
-            | grep "browser_download_url.*linux_${ARCH_ALT}.tar.gz" | cut -d'"' -f4 | head -1)
-        if [[ -n "$gh_url" ]]; then
-            td=$(mktemp -d)
-            ( cd "$td"; curl -L "$gh_url" -o gh.tgz && tar -xzf gh.tgz )
-            local ghbin; ghbin=$(find "$td" -type f -name gh -path '*/bin/*' | head -1)
-            [[ -n "$ghbin" ]] && { cp "$ghbin" "$BIN_DIR/gh"; chmod +x "$BIN_DIR/gh"; success "✓ gh installed"; }
-            rm -rf "$td"
-        else
-            warn "Could not resolve gh release URL"
-        fi
-    fi
-
-    install_claude
-    install_codex
-    success "✅ No-sudo packages installed into $HOME"
+    install_claude     # native installer; per-arch (launcher in ~/.local/bin, store in ~/.claude)
+    install_codex      # npm -g under the arch-namespaced NPM prefix
+    success "✅ No-sudo packages installed under $ARCH_ROOT"
 }
 
 main() {
