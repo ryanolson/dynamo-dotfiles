@@ -50,31 +50,34 @@ node_modules/
 Thumbs.db
 Desktop.ini
 
-# Agent infrastructure (only for remote-dev machines)
-{{- if ne .machine_type "remote-dev" }}
-dot_local/bin/executable_wt.tmpl
-dot_local/bin/executable_agent-spawn.tmpl
-dot_local/bin/executable_agent-status.tmpl
-dot_local/bin/executable_generate-dashboard.tmpl
-dot_local/bin/executable_osc8-link
-dot_config/zellij/layouts/agents.kdl
-dot_config/systemd/
-dot_config/fish/conf.d/agent-aliases.fish
-dot_config/fish/conf.d/ssh-auth-sock.fish.tmpl
+# NOTE: .chezmoiignore matches TARGET paths (relative to $HOME), not source
+# filenames. Use .config/..., .local/bin/..., NOT dot_config/executable_...
+#
+# Agent infrastructure — on any machine with sudo (headless-sudo + primary),
+# excluded only on no-sudo login nodes.
+{{- if eq .machine_class "headless-nosudo" }}
+.local/bin/wt
+.local/bin/agent-spawn
+.local/bin/agent-status
+.local/bin/osc8-link
+.config/zellij/layouts/agents.kdl
+.config/systemd
+.config/fish/conf.d/agent-aliases.fish
+.config/fish/conf.d/ssh-auth-sock.fish
 {{- end }}
 
 # systemd only on Linux
 {{- if ne .chezmoi.os "linux" }}
-dot_config/systemd/
+.config/systemd
 {{- end }}
 
 # .claude hooks — primary only (GSD infra tightly coupled to primary's environment)
-{{- if ne .user_role "primary" }}
-dot_claude/hooks/
+{{- if ne .machine_class "primary" }}
+.claude/hooks
 {{- end }}
 
-# Shared cache symlinks — only for primary/secondary users with /opt/shared-cache present
-{{- if or (eq .user_role "standalone") (not (stat "/opt/shared-cache")) }}
-dot_cache/symlink_huggingface.tmpl
-dot_cache/symlink_llama.cpp.tmpl
+# Shared cache symlinks — only where /opt/shared-cache exists
+{{- if not (stat "/opt/shared-cache") }}
+.cache/huggingface
+.cache/llama.cpp
 {{- end }}

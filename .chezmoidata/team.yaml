@@ -1,20 +1,21 @@
 # Core team configuration - shared across all team members
 # These tools and configurations form the baseline development environment
 
-# Machine topology (override in ~/.config/chezmoi/chezmoi.yaml)
-user_role: "standalone"          # standalone | primary | secondary
-credentials_profile: "personal"  # personal | corp
-primary_user_auth_sock: ""       # path to primary user's SSH auth_sock (secondary only)
+# Machine class (override in ~/.config/chezmoi/chezmoi.yaml)
+#   headless-sudo   | headless node with sudo (apt install path)
+#   headless-nosudo | headless node without sudo (everything into $HOME; SLURM login node)
+#   primary         | personal machine with 1Password CLI + commit signing
+machine_class: "headless-sudo"
+
+# Per-machine fish seed: which template materializes once into conf.d/local.fish
+#   blank | cuda  (see .chezmoitemplates/seed-*.fish)
+machine_seed: "blank"
 
 # Personal defaults (override in ~/.config/chezmoi/chezmoi.yaml)
 name: "Your Name"
 email: "your.email@company.com"
 editor: "helix"
 shell: "fish"
-
-# Machine type: remote-dev, laptop, or workstation
-# Controls which agent-infrastructure files are deployed
-machine_type: "remote-dev"
 
 # SSH hostname for Cursor deep links (cursor://vscode-remote/ssh-remote+HOST/path)
 # Set per-machine during chezmoi init to match local SSH config entry

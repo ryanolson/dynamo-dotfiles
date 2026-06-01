@@ -1,4 +1,4 @@
-{{ if and (eq .chezmoi.os "linux") (eq .machine_type "remote-dev") -}}
+{{ if and (eq .chezmoi.os "linux") (ne .machine_class "headless-nosudo") -}}
 #!/bin/bash
 # Setup agent infrastructure (runs on chezmoi apply when config changes)
 

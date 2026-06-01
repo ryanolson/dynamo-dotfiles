@@ -9,6 +9,30 @@ A modern, cross-platform development environment using native package managers a
 curl -fsSL https://raw.githubusercontent.com/ryanolson/dynamo-dotfiles/main/bootstrap.sh | bash
 ```
 
+**No-sudo (SLURM login node / shared HPC):** everything installs into `$HOME`.
+```bash
+curl -fsSL https://raw.githubusercontent.com/ryanolson/dynamo-dotfiles/main/bootstrap.sh | bash -s -- --no-sudo
+```
+(`--no-sudo` is auto-detected when `sudo` is absent.)
+
+### Machine classes
+
+`chezmoi init` prompts for a **machine class** that selects the install path and features:
+
+| Class             | Install path                | Sudo | 1Password / signing | Agent infra |
+|-------------------|-----------------------------|------|---------------------|-------------|
+| `headless-sudo`   | apt + `/usr/local/bin`      | yes  | no                  | yes         |
+| `headless-nosudo` | `$HOME` + pixi (fish, node) | no   | no                  | no          |
+| `primary`         | apt + `/usr/local/bin`      | yes  | **yes**             | yes         |
+
+On `headless-nosudo`, `fish` and `node` come from [pixi](https://pixi.sh)
+(conda-forge — glibc-independent, robust on old login nodes); every other tool is
+a GitHub-release binary downloaded into `~/.local/bin`. If `$HOME` is quota-capped,
+set `PIXI_HOME` to scratch before running. There is no `chsh` on a login node, so
+bootstrap appends a hard-guarded `exec fish` to `~/.bashrc` (interactive shells
+only — `scp`, non-interactive ssh, and `#!/bin/bash -l` SLURM batch scripts are
+unaffected).
+
 ## 📦 What's Included
 
 ### Core Tools
@@ -31,8 +55,16 @@ curl -fsSL https://raw.githubusercontent.com/ryanolson/dynamo-dotfiles/main/boot
 
 ### AI Development Tools
 - **claude** - Claude Code CLI (installed via [native installer](https://claude.ai/install.sh), auto-updates)
-- **ccmanager** - Claude Code session manager (npm)
-- **ruler** - AI agent configuration manager (npm)
+- **codex** - OpenAI Codex CLI (`npm i -g @openai/codex`; run `codex login` to authenticate)
+
+> **Codex Claude Code plugin** ([openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc))
+> is a separate, manual step — it installs interactively *inside* Claude Code and
+> cannot be scripted by bootstrap:
+> ```
+> /plugin marketplace add openai/codex-plugin-cc
+> /plugin install codex@openai-codex
+> /codex:setup
+> ```
 
 ### Development Environment
 - **Version Control**: Git with team-standard configuration
@@ -57,7 +89,8 @@ curl -fsSL https://raw.githubusercontent.com/ryanolson/dynamo-dotfiles/main/boot
 ## 📋 Requirements
 
 - **macOS**: 10.15+ with Xcode command line tools
-- **Linux**: Ubuntu 20.04+ or equivalent with apt
+- **Linux (sudo)**: Ubuntu 20.04+ or equivalent with apt
+- **Linux (no sudo / SLURM login node)**: just `git` + `curl` on PATH; everything else lands in `$HOME` (`--no-sudo`)
 
 ## 🔧 Customization
 

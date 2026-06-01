@@ -1,23 +1,19 @@
 {{- $name := promptStringOnce . "name" "Your full name" -}}
 {{- $email := promptStringOnce . "email" "Your email address" -}}
-{{- $machineType := promptStringOnce . "machine_type" "Machine type (remote-dev/laptop/workstation)" -}}
+{{- $machineClass := promptChoiceOnce . "machine_class" "Machine class" (list "headless-sudo" "headless-nosudo" "primary") "headless-sudo" -}}
+{{- $machineSeed := promptChoiceOnce . "machine_seed" "Per-machine fish seed (creates conf.d/local.fish once, then unsynced)" (list "blank" "cuda") "blank" -}}
 {{- $defaultHost := .chezmoi.hostname -}}
 {{- $cursorSSHHost := promptStringOnce . "cursor_ssh_host" (printf "SSH hostname for Cursor deep links [leave blank to use: %s]" $defaultHost) -}}
 {{- if eq $cursorSSHHost "" -}}{{- $cursorSSHHost = $defaultHost -}}{{- end -}}
-{{- $userRole := promptStringOnce . "user_role" "User role on this machine (standalone/primary/secondary)" -}}
-{{- $credProfile := promptStringOnce . "credentials_profile" "Credentials profile (personal/corp)" -}}
-{{- $primarySock := "" -}}
-{{- if eq $userRole "secondary" -}}
-{{-   $primarySock = promptStringOnce . "primary_user_auth_sock" "Path to primary user's SSH auth_sock" -}}
-{{- end -}}
-{{- $opEnabled := promptBoolOnce . "onepassword.enabled" "Enable 1Password integration" -}}
-{{- $opSSH := promptBoolOnce . "onepassword.ssh_agent" "Enable 1Password SSH agent" -}}
+{{/* Derived capabilities — primary is the only class with 1Password + commit signing. */}}
+{{- $isPrimary := eq $machineClass "primary" -}}
 {{- $opSigningKey := "" -}}
-{{- if and $opEnabled $opSSH -}}
+{{- if $isPrimary -}}
 {{-   $opSigningKey = promptStringOnce . "onepassword.signing_public_key" "SSH signing public key (from 1Password item public key field; empty to skip signing)" -}}
 {{- end -}}
 
-sourceDir: {{ .chezmoi.sourceDir | quote }}
+# sourceDir intentionally omitted — chezmoi defaults to ~/.local/share/chezmoi,
+# which adapts to whatever $HOME is (login nodes are rarely /home/<user>).
 
 # Global settings
 progress: true
@@ -40,15 +36,18 @@ cd:
 data:
   name: {{ $name | quote }}
   email: {{ $email | quote }}
-  machine_type: {{ $machineType | quote }}
+  # Machine class: headless-sudo | headless-nosudo | primary
+  #   headless-nosudo => no sudo, everything installs into $HOME (SLURM login node)
+  #   primary         => 1Password CLI + commit signing enabled
+  machine_class: {{ $machineClass | quote }}
+  # Per-machine fish seed picked at init; materialized once into conf.d/local.fish
+  machine_seed: {{ $machineSeed | quote }}
   cursor_ssh_host: {{ $cursorSSHHost | quote }}
-  user_role: {{ $userRole | quote }}
-  credentials_profile: {{ $credProfile | quote }}
-  primary_user_auth_sock: {{ $primarySock | quote }}
   onepassword:
-    enabled: {{ $opEnabled }}
-    ssh_agent: {{ $opSSH }}
+    # Auto-enabled on primary machines; override in ~/.config/chezmoi/chezmoi.yaml
+    enabled: {{ $isPrimary }}
+    ssh_agent: {{ $isPrimary }}
     signing_public_key: {{ $opSigningKey | quote }}
-    vault: {{ if eq $credProfile "corp" }}"Corp"{{ else }}"Development"{{ end }}
+    vault: "Development"
     # secrets: override in ~/.config/chezmoi/chezmoi.yaml
     # defaults from .chezmoidata/team.yaml

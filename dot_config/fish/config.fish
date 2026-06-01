@@ -22,7 +22,8 @@ set -gx VISUAL vi
 # Add local bin directories to PATH
 fish_add_path $HOME/.local/bin
 fish_add_path $HOME/.cargo/bin  # Rust tools
-fish_add_path $HOME/.npm-global/bin  # npm global packages
+fish_add_path $HOME/.npm-global/bin  # npm global packages (codex, etc.)
+fish_add_path $HOME/.pixi/bin  # pixi global tools (fish, node on no-sudo nodes)
 
 if test -S ~/Library/Group\ Containers/2BUA8C4S2C.com.1password/t/agent.sock
     set -gx SSH_AUTH_SOCK ~/Library/Group\ Containers/2BUA8C4S2C.com.1password/t/agent.sock
@@ -46,21 +47,14 @@ if command -v mise >/dev/null
     mise activate fish | source
 end
 
-# Install Claude Code CLI via native installer on first run
+# Install Claude Code CLI via native installer — attempt once, not every shell.
+# bootstrap.sh installs it too; this is a fallback for shells on fresh machines.
 if not command -v claude >/dev/null
-    echo "Installing Claude Code CLI..."
-    curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1
-end
-
-# Install npm tools for AI development on first run
-if command -v npm >/dev/null
-    if not command -v ccmanager >/dev/null
-        echo "Installing ccmanager..."
-        npm install -g ccmanager >/dev/null 2>&1
-    end
-    if not command -v ruler >/dev/null
-        echo "Installing ruler..."
-        npm install -g @intellectronica/ruler >/dev/null 2>&1
+    if not test -e $HOME/.local/state/claude-install-attempted
+        mkdir -p $HOME/.local/state
+        touch $HOME/.local/state/claude-install-attempted
+        echo "Installing Claude Code CLI..."
+        curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1
     end
 end
 
