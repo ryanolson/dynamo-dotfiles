@@ -246,9 +246,46 @@ install_curl_tools() {
 
 # Claude Code CLI (native installer, $HOME-scoped)
 install_claude() {
-    if ! command -v claude &> /dev/null; then
-        log "Installing Claude Code CLI..."
-        curl -fsSL https://claude.ai/install.sh | bash || warn "Failed to install Claude Code"
+    # Single-arch / sudo box: the native installer (launcher + shell integration
+    # in ~/.local/bin) is fine.
+    if [[ -z "$ARCH_ROOT" ]]; then
+        if ! command -v claude &> /dev/null; then
+            log "Installing Claude Code CLI..."
+            curl -fsSL https://claude.ai/install.sh | bash || warn "Failed to install Claude Code"
+        fi
+        return
+    fi
+
+    # No-sudo multi-arch: the native installer hardcodes ~/.local/bin, which is
+    # shared across architectures — the x86 launcher can't exec on aarch64. So
+    # fetch the arch-correct claude binary straight into the arch bin (first on
+    # PATH). The downloaded file IS the full CLI (it has an `install` subcommand).
+    if [[ -x "$BIN_DIR/claude" ]]; then
+        log "✓ claude already present in $BIN_DIR"; return
+    fi
+    local aarch plat base ver
+    case "$ARCH_RAW" in
+        x86_64) aarch="x64" ;;
+        aarch64|arm64) aarch="arm64" ;;
+        *) warn "claude: unsupported arch $ARCH_RAW"; return ;;
+    esac
+    if [ -f /lib/libc.musl-x86_64.so.1 ] || [ -f /lib/libc.musl-aarch64.so.1 ] || ldd /bin/ls 2>&1 | grep -q musl; then
+        plat="linux-${aarch}-musl"
+    else
+        plat="linux-${aarch}"
+    fi
+    base="https://downloads.claude.ai/claude-code-releases"
+    ver=$(curl -fsSL "$base/latest" 2>/dev/null)
+    if [[ ! "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+        warn "claude: could not resolve latest version"; return
+    fi
+    log "Installing claude $ver ($plat) into $BIN_DIR..."
+    if curl -fsSL "$base/$ver/$plat/claude" -o "$BIN_DIR/claude"; then
+        chmod +x "$BIN_DIR/claude"
+        success "✓ claude installed (arch $ARCH_RAW)"
+    else
+        warn "claude: download failed for $plat"
+        rm -f "$BIN_DIR/claude"
     fi
 }
 
