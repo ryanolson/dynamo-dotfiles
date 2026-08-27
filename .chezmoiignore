@@ -71,10 +71,10 @@ Desktop.ini
 .config/systemd
 {{- end }}
 
-# .claude hooks — primary only (GSD infra tightly coupled to primary's environment)
-{{- if ne .machine_class "primary" }}
-.claude/hooks
-{{- end }}
+# NOTE: no .claude/hooks rule here on purpose. The GSD hook scripts this used to
+# guard no longer exist, and settings.json referencing missing hook commands makes
+# every Bash/Edit/Write call fail with a node module-not-found error. If hooks come
+# back, add the source under dot_claude/hooks/ and restore the machine_class guard.
 
 # Shared cache symlinks — only where /opt/shared-cache exists
 {{- if not (stat "/opt/shared-cache") }}
