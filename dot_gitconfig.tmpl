@@ -58,6 +58,14 @@
     delete-merged = "!git branch --merged | grep -v '\\*' | xargs -n 1 git branch -d"
 {{- if and (hasKey . "onepassword") .onepassword.enabled .onepassword.ssh_agent }}
 
+# GitHub auth policy: never a personal access token. On this machine git reaches
+# GitHub over SSH through the 1Password agent, so no HTTPS credential is ever
+# requested. Authenticate the CLI with `gh auth login -p ssh`.
+#
+# Do not add the inverse rewrite (`[url "https://github.com/"] insteadOf = git@github.com:`).
+# It forces HTTPS, which is the one transport that needs a credential, and is how
+# a PAT gets reintroduced. If you find one in ~/.gitconfig, something ran
+# `git config --global` outside chezmoi -- `chezmoi apply` removes it.
 [url "git@github.com:"]
     insteadOf = "https://github.com/"
 
@@ -76,4 +84,16 @@
 [commit]
     gpgsign = true
 {{- end }}
+{{- else }}
+
+# No 1Password SSH agent on this machine, so git talks to GitHub over HTTPS.
+# Broker that through `gh` rather than a personal access token: `gh auth login`
+# stores an OAuth credential in the system keyring and this helper reads it.
+# Declared here so `gh auth setup-git` never needs to mutate this file behind
+# chezmoi's back. Never set GITHUB_TOKEN or GH_TOKEN instead.
+[credential "https://github.com"]
+    helper = !gh auth git-credential
+
+[credential "https://gist.github.com"]
+    helper = !gh auth git-credential
 {{- end }}

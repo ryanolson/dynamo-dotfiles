@@ -122,6 +122,22 @@ install_macos_packages() {
 }
 
 # Download a GitHub-release binary into $BIN_DIR (uses $SUDO, empty on no-sudo nodes)
+# Fetch a repo's latest-release JSON. Prefer `gh api`: it uses the credential
+# `gh auth login` already stores, which lifts the anonymous 60 req/hr limit that
+# a fresh bootstrap blows through in this loop. Falls back to anonymous curl so
+# bootstrap still works before `gh auth login` has been run.
+#
+# This is the only authenticated path here on purpose. Never add an
+# `Authorization: token ...` header or read GITHUB_TOKEN -- see the GitHub auth
+# policy in README.md.
+github_release_json() {
+    local repo="$1"
+    if command -v gh &>/dev/null && gh auth status &>/dev/null; then
+        gh api "repos/$repo/releases/latest" 2>/dev/null && return 0
+    fi
+    curl -s "https://api.github.com/repos/$repo/releases/latest"
+}
+
 install_github_release() {
     local repo="$1"
     local name="$2"
@@ -135,7 +151,7 @@ install_github_release() {
 
     log "Installing $name from GitHub..."
     local release_json
-    release_json=$(curl -s "https://api.github.com/repos/$repo/releases/latest")
+    release_json=$(github_release_json "$repo")
     local download_url=""
     case "$name" in
         "bat")       download_url=$(echo "$release_json" | grep "browser_download_url.*bat.*${ARCH_RUST}.*linux.*tar.gz" | cut -d'"' -f4 | head -1) ;;

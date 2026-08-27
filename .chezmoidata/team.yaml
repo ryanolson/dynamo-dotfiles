@@ -37,7 +37,8 @@ onepassword:
   secrets:
     hf_token: "op://Development/HuggingFace/credential"
     ngc_api_key: "op://Development/NGC/credential"
-    # github_token removed — use 'gh auth login' for filesystem-based auth
+    # Deliberately no github_token. GitHub auth is 'gh auth login' only; see the
+    # GitHub auth policy in README.md. Do not re-add one here.
 
 tools:
   # Core development tools that everyone should have
