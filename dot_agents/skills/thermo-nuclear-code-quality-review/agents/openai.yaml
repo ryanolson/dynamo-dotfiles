@@ -1,0 +1,4 @@
+interface:
+  display_name: "Thermo-Nuclear Review"
+  short_description: "Strict adversarial correctness, performance, and maintainability audit."
+  default_prompt: "Use $thermo-nuclear-code-quality-review on the current branch diff."

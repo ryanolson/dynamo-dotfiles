@@ -1,0 +1,4 @@
+interface:
+  display_name: "Will's Mega Review"
+  short_description: "Iterate strict reviews before human PR review."
+  default_prompt: "Use $wills-mega-review to prepare this PR for human review."

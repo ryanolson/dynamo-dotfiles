@@ -1,0 +1,4 @@
+interface:
+  display_name: "PR Babysitter"
+  short_description: "Adversarially review AI feedback and drive CI green"
+  default_prompt: "Use $pr-babysitter to monitor this open PR, adversarially evaluate every AI-authored comment (including Devin's), handle only demonstrated failures, and get CI green."

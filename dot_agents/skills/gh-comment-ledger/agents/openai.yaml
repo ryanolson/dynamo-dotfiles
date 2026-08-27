@@ -1,0 +1,4 @@
+interface:
+  display_name: "GH Comment Ledger"
+  short_description: "Table PR comments before fixing"
+  default_prompt: "Use $gh-comment-ledger to fetch PR comments into a table before I choose what to address."

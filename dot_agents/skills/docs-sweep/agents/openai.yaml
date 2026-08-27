@@ -1,0 +1,4 @@
+interface:
+  display_name: "Docs Sweep"
+  short_description: "Sweep agent-docs, comments, and docs for drift against the code."
+  default_prompt: "Use $docs-sweep to build a documentation drift ledger for this repository."

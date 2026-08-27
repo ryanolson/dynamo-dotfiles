@@ -1,0 +1,4 @@
+interface:
+  display_name: "Rust Code Review"
+  short_description: "Strict systems-level Rust review"
+  default_prompt: "Use $rust-code-review to review the current Rust changes."

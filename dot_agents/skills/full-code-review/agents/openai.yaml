@@ -1,0 +1,4 @@
+interface:
+  display_name: "Full Code Review"
+  short_description: "Run general and deep code review together"
+  default_prompt: "Use $full-code-review to run one consolidated general and deep review of this change."

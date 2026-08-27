@@ -1,0 +1,4 @@
+interface:
+  display_name: "General Review"
+  short_description: "Adversarial review of plans, code, and artifacts"
+  default_prompt: "Use $general-review to review this artifact for all material concerns."

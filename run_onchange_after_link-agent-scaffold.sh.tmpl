@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Link the shared agent scaffold in ~/.agents into every agent home.
+#
+# Claude Code and Codex both discover skills at <home>/skills/<name>/SKILL.md and
+# neither supports an external-directories setting, so per-skill symlinks are the
+# only mechanism. Instruction files are linked the same way.
+#
+# This is a run_onchange_ script templated from .chezmoidata/agent_skills.yaml:
+# the rendered content changes exactly when the roster changes, which is exactly
+# when relinking is needed. Editing a skill's content needs no relink.
+set -euo pipefail
+
+AGENTS_ROOT="${HOME}/.agents"
+CLAUDE_DIR="${CLAUDE_HOME:-${HOME}/.claude}"
+CODEX_DIR="${CODEX_HOME:-${HOME}/.codex}"
+BACKUP_DIR="${HOME}/.agent-scaffold-backup-$(date +%Y%m%d-%H%M%S)"
+
+SKILLS=(
+{{- range .agent_skills }}
+  {{ . | quote }}
+{{- end }}
+)
+
+if [[ ! -d "${AGENTS_ROOT}/skills" ]]; then
+    echo "==> ${AGENTS_ROOT}/skills is missing; run chezmoi apply first" >&2
+    exit 1
+fi
+
+backed_up=0
+
+# Move a real (non-symlink) target aside before we replace it. Symlinks are ours
+# to overwrite; anything else is the user's and is preserved.
+preserve() {
+    local target="$1"
+    [[ -L "${target}" ]] && return 0
+    [[ -e "${target}" ]] || return 0
+    mkdir -p "${BACKUP_DIR}$(dirname "${target#"${HOME}"}")"
+    mv "${target}" "${BACKUP_DIR}${target#"${HOME}"}"
+    backed_up=1
+}
+
+link() {
+    local src="$1" dest="$2"
+    if [[ ! -e "${src}" ]]; then
+        echo "    skip ${dest} (source missing: ${src})" >&2
+        return 0
+    fi
+    preserve "${dest}"
+    mkdir -p "$(dirname "${dest}")"
+    ln -sfn "${src}" "${dest}"
+}
+
+# Drop symlinks we previously created for skills no longer on the roster. Only
+# links pointing into ${AGENTS_ROOT}/skills are ours; everything else is left
+# alone, including Codex's own .system directory.
+prune() {
+    local skills_dir="$1" entry name keep skill
+    [[ -d "${skills_dir}" ]] || return 0
+    for entry in "${skills_dir}"/*; do
+        [[ -L "${entry}" ]] || continue
+        case "$(readlink "${entry}")" in
+            "${AGENTS_ROOT}/skills/"*) ;;
+            *) continue ;;
+        esac
+        name="$(basename "${entry}")"
+        keep=0
+        for skill in "${SKILLS[@]}"; do
+            [[ "${skill}" == "${name}" ]] && keep=1 && break
+        done
+        if [[ "${keep}" -eq 0 ]]; then
+            rm "${entry}"
+            echo "    unlinked ${entry} (off roster)"
+        fi
+    done
+}
+
+install_home() {
+    local label="$1" home_dir="$2" instructions="$3"
+
+    echo "==> ${label}: ${home_dir}"
+    mkdir -p "${home_dir}/skills"
+
+    link "${AGENTS_ROOT}/AGENTS.md" "${home_dir}/${instructions}"
+    for skill in "${SKILLS[@]}"; do
+        link "${AGENTS_ROOT}/skills/${skill}" "${home_dir}/skills/${skill}"
+    done
+    prune "${home_dir}/skills"
+    echo "    ${instructions} + ${#SKILLS[@]} skills"
+}
+
+install_home "claude" "${CLAUDE_DIR}" "CLAUDE.md"
+install_home "codex" "${CODEX_DIR}" "AGENTS.md"
+
+if [[ "${backed_up}" -eq 1 ]]; then
+    echo "==> pre-existing files moved to ${BACKUP_DIR}"
+fi

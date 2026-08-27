@@ -1,0 +1,24 @@
+# Skills linked into every agent home (~/.claude/skills and ~/.codex/skills).
+#
+# Source of truth is dot_agents/skills/<name>/. This list is the roster: the
+# linker script (run_onchange_after_link-agent-scaffold.sh.tmpl) is templated
+# from it, so adding or removing a name re-runs the linker on the next
+# `chezmoi apply`. Editing a skill's *content* needs no relink -- the agent
+# homes hold symlinks into the live directory.
+#
+# Adding a skill:
+#   1. mkdir dot_agents/skills/<name>/ with SKILL.md (+ agents/openai.yaml for Codex)
+#   2. add <name> below
+#   3. chezmoi apply
+agent_skills:
+  - docs-sweep
+  - full-code-review
+  - general-review
+  - gh-comment-ledger
+  - gh-pr-description
+  - phone-a-friend
+  - pr-babysitter
+  - rust-code-review
+  - simple-english
+  - thermo-nuclear-code-quality-review
+  - wills-mega-review

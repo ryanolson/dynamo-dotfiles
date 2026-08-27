@@ -1,0 +1,4 @@
+interface:
+  display_name: "Phone a Friend"
+  short_description: "Drive Claude, Cursor, or Devin through ACP sessions"
+  default_prompt: "Use $phone-a-friend to get an independent ACP-based verification, choosing fresh parallel sessions or a persistent multi-turn session as appropriate."

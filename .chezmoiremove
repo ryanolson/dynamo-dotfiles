@@ -5,6 +5,16 @@
 .config/ccmanager
 .config/ruler
 
+# Superseded by the shared agent scaffold in ~/.agents (dot_agents/).
+# ~/.skills was a placeholder wired to a `personal-skills` plugin marketplace that
+# never had a marketplace.json, so nothing ever loaded from it.
+.skills
+
+# Wrong filename: chezmoi wrote ~/.claude/.settings.local.json (leading dot) but
+# Claude Code reads settings.local.json, so this file was inert. The source is now
+# dot_claude/private_settings.local.json.tmpl.
+.claude/.settings.local.json
+
 # For now, no other files to remove by default
 # Uncomment lines below as needed:
 
