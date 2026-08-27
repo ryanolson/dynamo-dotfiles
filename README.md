@@ -75,6 +75,63 @@ and `#!/bin/bash -l` SLURM batch scripts are unaffected).
 > /codex:setup
 > ```
 
+## 🤖 Shared agent scaffold
+
+One set of instructions and skills, used by both Claude Code and Codex.
+
+`dot_agents/` → `~/.agents/` is the single source of truth:
+
+```
+~/.agents/AGENTS.md              global instructions
+~/.agents/skills/<name>/SKILL.md a skill
+              .../agents/openai.yaml   Codex UI metadata (display name, default prompt)
+              .../scripts/, references/, LICENSE
+```
+
+Both agents discover skills at `<home>/skills/<name>/SKILL.md` and neither supports pointing at an
+external directory, so `run_onchange_after_link-agent-scaffold.sh.tmpl` symlinks each skill into
+both homes:
+
+| Link | Target |
+|---|---|
+| `~/.claude/CLAUDE.md` | `~/.agents/AGENTS.md` |
+| `~/.codex/AGENTS.md` | `~/.agents/AGENTS.md` |
+| `~/.claude/skills/<name>` | `~/.agents/skills/<name>` |
+| `~/.codex/skills/<name>` | `~/.agents/skills/<name>` |
+
+The roster lives in `.chezmoidata/agent_skills.yaml`. **Adding a skill:** create
+`dot_agents/skills/<name>/SKILL.md`, add the name to that list, `chezmoi apply`. **Removing one:**
+delete the name; the linker drops both symlinks and leaves everything else, including Codex's own
+`skills/.system`, untouched. Editing a skill's *content* needs no relink — the homes hold symlinks
+into the live directory.
+
+Installed skills:
+
+| Skill | What it does |
+|---|---|
+| `thermo-nuclear-code-quality-review` | Strict adversarial review: correctness, hot-path performance, abstraction quality, file-size and spaghetti growth |
+| `wills-mega-review` | Iterates the above in fresh read-only subagents until clean, then tags the PR `human-review` |
+| `full-code-review` | One consolidated general + thermo-nuclear pass |
+| `general-review` | Plans, designs, and documents rather than diffs |
+| `rust-code-review` | Rust systems and concurrency rules |
+| `phone-a-friend` | Independent second opinion from Claude / Cursor / Devin over ACP |
+| `gh-comment-ledger` | Triages PR feedback into an actionable table before editing |
+| `gh-pr-description` | Managed-block PR bodies that never clobber existing content |
+| `pr-babysitter` | Drives CI green and adjudicates AI reviewers adversarially |
+| `docs-sweep` | Repo-wide documentation drift ledger across `agent-docs/`, comments, and docs |
+| `simple-english` | ASD-STE100 Simplified Technical English for docs, PR bodies, commit messages |
+
+Sources: [`ai-dynamo/rhino`](https://github.com/ai-dynamo/rhino),
+[`ishandhanani/dotfiles`](https://github.com/ishandhanani/dotfiles), plus practice distilled from
+`ryanolson/kvbm`, `ai-dynamo/velo`, and `ryanolson/roundhouse`. Each `SKILL.md` names its upstream.
+
+Verify a machine after `chezmoi apply`:
+
+```bash
+ls -la ~/.claude/skills ~/.codex/skills   # symlinks into ~/.agents/skills
+claude plugin validate ~/.agents/skills   # catches malformed SKILL.md frontmatter
+```
+
 ### Development Environment
 - **Version Control**: Git with team-standard configuration
 - **File Management**: yazi (terminal file manager), broot (tree view)
@@ -139,10 +196,12 @@ API keys and tokens are managed via 1Password CLI (`op`) with on-demand injectio
    op signin         # subsequent times
    ```
 
-2. Ensure these items exist in your 1Password **Development** vault:
+2. Ensure these items exist in your 1Password vault (`Development` by default; the
+   `credentials_profile` in your local chezmoi config selects it):
    - `Anthropic API` (credential field = API key)
    - `HuggingFace` (credential field = HF token)
-   - `GitHub Token` (credential field = token)
+
+   There is deliberately no GitHub item — see [GitHub auth policy](#github-auth-policy).
 
 3. Enable in your local chezmoi config (`~/.config/chezmoi/chezmoi.yaml`):
    ```yaml
@@ -174,8 +233,34 @@ API keys and tokens are managed via 1Password CLI (`op`) with on-demand injectio
 **SSH Agent (1Password):**
 - When `onepassword.ssh_agent` is `true`, SSH config points to the 1Password SSH agent
 - Git is configured for SSH commit signing using your stored public key plus the 1Password SSH agent on macOS
-- GitHub HTTPS URLs are rewritten to SSH automatically
+- GitHub HTTPS URLs are rewritten to SSH automatically, so no HTTPS credential is ever requested
 - Use `gh auth login -p ssh` to authenticate the GitHub CLI
+
+### GitHub auth policy
+
+**`gh auth login` only. Never a personal access token.** No `GITHUB_TOKEN`, `GH_TOKEN`, or
+`GITHUB_PAT` in a shell profile, an env file, `chezmoi` data, or 1Password. Nothing in this
+repository reads one, and the tooling actively pushes back if one appears:
+
+| Layer | What enforces it |
+|---|---|
+| Git transport | `dot_gitconfig.tmpl` rewrites `https://github.com/` → `git@github.com:` so HTTPS never asks for a credential. On machines without the 1Password agent it declares `credential.helper = !gh auth git-credential` instead. Both paths are token-free. |
+| Shell | `~/.config/fish/conf.d/github-auth-guard.fish` erases GitHub token variables from interactive shells and says why. |
+| Secrets | `.chezmoidata/*.yaml` carry no GitHub entry, and `setup-secrets` **fails** if one turns up in the environment or in `dev.env.op`. |
+| GitHub API | `install-packages` calls `gh api` when authenticated and anonymous `curl` otherwise. It never sends an `Authorization` header of its own. |
+
+Authenticate once per machine:
+
+```bash
+gh auth login -p ssh   # with the 1Password SSH agent (primary machines)
+gh auth login          # device flow, everywhere else
+gh auth status         # verify
+```
+
+If a private clone fails, the cause is almost always one of two things: `gh` is not logged in, or
+something ran `git config --global url.https://github.com/.insteadOf ...` outside chezmoi and forced
+HTTPS. Check with `git config --global --get-all url.https://github.com/.insteadOf` — it should
+print nothing. `chezmoi apply` restores the correct rewrite.
 
 **Remote Dev (Tailscale + zellij):**
 - Use ordinary OpenSSH over the tailnet for sessions that need commit signing or secrets
@@ -195,7 +280,7 @@ setup-secrets remote <host>
 
 **Examples:**
 ```bash
-openv env | rg 'ANTHROPIC_API_KEY|HF_TOKEN|GITHUB_TOKEN|NGC_API_KEY'
+openv env | rg 'ANTHROPIC_API_KEY|HF_TOKEN|NGC_API_KEY'
 openv claude
 dev-remote spark-d
 dev-remote refresh spark-d main
