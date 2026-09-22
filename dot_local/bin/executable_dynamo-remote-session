@@ -3,6 +3,15 @@ set -euo pipefail
 
 export PATH="$HOME/.cargo/bin:$HOME/.local/share/mise/shims:$HOME/.local/bin:$PATH"
 
+# This script runs over non-interactive SSH, where neither ~/.profile nor the
+# fish conf.d drop-in is sourced. The socket directory therefore has to be
+# resolved here, for the same reason PATH is set above: otherwise zellij falls
+# back to XDG_RUNTIME_DIR and this script primes or attaches a session in a
+# different directory than an interactive login would.
+if [ -z "${ZELLIJ_SOCKET_DIR:-}" ] && [ -x "$HOME/.local/bin/zellij-socket-dir" ]; then
+    export ZELLIJ_SOCKET_DIR="$("$HOME/.local/bin/zellij-socket-dir")"
+fi
+
 usage() {
     cat >&2 <<'EOF'
 Usage:

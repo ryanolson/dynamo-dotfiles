@@ -45,3 +45,11 @@ if [ -d /usr/local/cuda/bin ]; then
     export CUDA_PATH=/usr/local/cuda
     export CUDA_HOME=/usr/local/cuda
 fi
+
+# Pin zellij's IPC socket directory so every login path sees the same sessions.
+# Without it the directory follows XDG_RUNTIME_DIR, which only logins that run
+# pam_systemd set, so reaching this host two ways splits `zellij a <name>` into
+# two servers. See ~/.local/bin/zellij-socket-dir for the choice and rationale.
+if [ -z "${ZELLIJ_SOCKET_DIR:-}" ] && [ -x "$HOME/.local/bin/zellij-socket-dir" ]; then
+    export ZELLIJ_SOCKET_DIR="$("$HOME/.local/bin/zellij-socket-dir")"
+fi

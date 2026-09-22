@@ -267,6 +267,7 @@ print nothing. `chezmoi apply` restores the correct rewrite.
 - `dev-remote <host> [session]` primes a remote zellij session with per-session env vars and then attaches
 - `dev-remote refresh <host> [session]` recreates the session after a secret rotation
 - Commit signing on Linux remotes uses the forwarded SSH agent, so reconnect with `ssh -A` or `dev-remote` before signing if the agent went stale
+- Every login path pins the same zellij socket directory, so `zellij a <name>` reaches one server no matter how you reached the host
 
 **Manual auth steps (once per machine):**
 - `claude login` — Claude Code uses OAuth, no static key needed
@@ -288,6 +289,29 @@ git-signing-status
 ```
 
 > **Note:** `tailscale ssh` is not the default path for signing/secrets sessions. Use standard OpenSSH over the tailnet so SSH-agent forwarding works cleanly with remote zellij sessions.
+
+**Zellij socket directory:**
+
+Zellij picks its socket directory from `XDG_RUNTIME_DIR`, which only logins that run `pam_systemd`
+set. That made `zellij a dynamo` reach a different server with its own panes and scrollback
+depending on whether you arrived over the tailnet or over the VPN. `~/.local/bin/zellij-socket-dir`
+now defines the directory once, and every entry point exports it: the fish `conf.d` drop-in,
+`~/.profile`, `zellij-wrapper`, and `dynamo-remote-session` (which runs over non-interactive SSH and
+so sources no shell rc). It resolves to `/run/user/$UID/zellij` where that exists, and falls back to
+`/tmp/zellij-$UID` on macOS and on no-sudo login nodes that have no logind runtime directory.
+
+`/run/user/$UID` needs lingering to survive your last logout, or logind removes it and every running
+server with it:
+
+```bash
+loginctl enable-linger $USER   # needs sudo; check with: loginctl show-user $USER -p Linger
+```
+
+Verify all entry points agree:
+
+```bash
+bash test/zellij-socket-dir.sh
+```
 
 ### Adding Custom Packages
 

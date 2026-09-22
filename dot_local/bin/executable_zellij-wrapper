@@ -2,6 +2,13 @@
 
 set -euo pipefail
 
+# Resolve the socket directory before any zellij call. list-sessions and
+# delete-session below must act on the same server an interactive attach would,
+# and this wrapper can be invoked from contexts that never sourced a shell rc.
+if [ -z "${ZELLIJ_SOCKET_DIR:-}" ] && [ -x "$HOME/.local/bin/zellij-socket-dir" ]; then
+    export ZELLIJ_SOCKET_DIR="$("$HOME/.local/bin/zellij-socket-dir")"
+fi
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'

@@ -1,0 +1,32 @@
+#!/bin/sh
+# Print the directory zellij must use for its IPC sockets.
+#
+# Zellij derives this directory from XDG_RUNTIME_DIR, which is set only when a
+# login runs pam_systemd. OpenSSH does; a login that bypasses PAM does not. The
+# two paths then resolve to different socket directories, so `zellij a dynamo`
+# attaches to a different server depending on how you reached the machine, and
+# each one holds its own panes and scrollback.
+#
+# Preferred is /run/user/$UID/zellij: 0700 tmpfs, the correct home for runtime
+# sockets, and not subject to the age-based cleanup that systemd-tmpfiles
+# applies to /tmp. It requires lingering (`loginctl enable-linger`) to outlive
+# the last session, otherwise logind removes /run/user/$UID on final logout and
+# takes every running server with it.
+#
+# The fallback is zellij's own /tmp path, for macOS (no /run/user at all) and
+# for no-sudo login nodes where logind never created the runtime directory and
+# an unprivileged user cannot make one -- /run/user is root-owned 0755.
+#
+# This test keys on a property of the MACHINE, not of the login. That is the
+# whole point: XDG_RUNTIME_DIR varies between logins to one host, so keying on
+# it splits the sessions. Whether /run/user/$UID exists does not vary that way.
+# This test answers "does the directory exist", not "does it persist". Without
+# lingering the directory still exists during every login, so the logins agree
+# and never split -- they just find that logind destroyed the servers on the
+# last logout. Enable lingering wherever sessions must outlive your last logout.
+uid="$(id -u)"
+if [ -d "/run/user/$uid" ] && [ -w "/run/user/$uid" ]; then
+    echo "/run/user/$uid/zellij"
+else
+    echo "/tmp/zellij-$uid"
+fi
