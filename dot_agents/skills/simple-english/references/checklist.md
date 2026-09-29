@@ -36,8 +36,12 @@ Search the draft for each pattern. Every hit outside code blocks and quoted text
 9. **Warnings.** Command or condition first, risk second (Rules 7.2, 7.3).
 10. **Completeness.** Articles present, "that" present after "make sure", no telegraph style (Rule 4.2).
 11. **Untouchables intact.** Code, identifiers, quoted errors, and proper nouns are unchanged.
+12. **Every sentence has a source.** Each fact comes from the diff, the code, the conversation, or a source that you read. Delete the rest (Rules A.1, A.6).
+13. **No growth.** The text contains no more ideas than the input (Rule A.5).
+14. **Minimal edits.** On text from the user, each change fixes a rule violation (Rule A.7).
+15. **Inferred facts named.** Your reply names each sentence that you inferred, and keeps your own suggestions out of the draft (Rules A.2, A.3).
 
 ## When reporting violations (check mode)
 
-For each violation give: the rule number, the offending text, and a compliant rewrite. Cite only rule numbers that appear in rules.md.
+For each violation give: the rule number, the offending text, and a compliant rewrite. Cite only rule numbers that appear in SKILL.md.
 End the report with this statement when the user asked for STE compliance: "No tool can guarantee ASD-STE100 compliance. Final approval rests with the writer. The official standard is a free download at asd-ste100.org."

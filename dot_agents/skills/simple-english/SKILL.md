@@ -12,10 +12,28 @@ Write technical text with the rules of ASD-STE100 Simplified Technical English. 
 
 Write for that tired reader. Each sentence must survive one read.
 
+## Authorship Rules
+
+The STE rules below make each sentence clear. These rules decide which sentences exist. You draft the text, but the user signs it. The commit, the PR, and the doc carry the name of the user, not your name.
+
+| Rule | Instruction |
+|---|---|
+| A.1 | **The user must stand behind every sentence.** Write only facts from the diff, the code, the conversation, or a source that you read. Do not invent a motive, a benefit, a risk, or a design reason. |
+| A.2 | **Tell the user what you inferred.** If a sentence states a fact that you inferred, name that sentence in your reply. The user must confirm it before the text ships. |
+| A.3 | **Mark your own ideas.** Keep your suggestions out of the draft. Give them to the user in your reply. If the user wants one in the text, label it as a question: "Open question: ...". |
+| A.4 | **The reader's time costs more than the writer's.** One person writes a document, and many people read it. Spend your effort on cuts, not on additions. |
+| A.5 | **Longer is not better.** The text must not contain more ideas than the input. Grammar and structure can add words. They cannot add ideas. |
+| A.6 | **Delete each sentence that carries no fact.** If the reader loses nothing when you delete a sentence, delete it. |
+| A.7 | **No rewrite is lossless.** Each rephrase changes the meaning, the emphasis, or both. When you edit text from the user, change only the words that break a rule. Keep the order, the emphasis, and each compliant word. |
+| A.8 | **Writing is thinking.** A spec, a design doc, a status update, or a retrospective is proof that the author thought about the problem. For these, give a draft and name the decisions that it makes for the user: what it emphasizes and what it leaves out. |
+
+Rule A.7 limits Rule 9.1. Restructure a sentence only when a rule requires it. The reader wants the thoughts of the user, not a smoother version of them.
+
 ## Your Task
 
 When asked to write or rewrite technical text:
 
+0. **List the facts** that the user gave you, and the facts that the code shows. The text states these facts and no others (Rules A.1, A.5).
 1. **Select the mode** (pragmatic or strict, below).
 2. **Classify each passage** as procedural or descriptive. Every other rule depends on this.
 3. **Fix your vocabulary before drafting.** Pick ONE verb for the check/verify/confirm/validate concept and ONE noun for config/settings. Use no other word for these concepts in the whole document.
@@ -279,14 +297,16 @@ Same rules, different targets. Full adaptations in `references/use-cases.md`:
 
 ## Self-Check Before You Deliver
 
-This step is not optional. Run these four checks on your draft:
+This step is not optional. Run these six checks on your draft:
 
 1. Count words in your three longest sentences. Over the 20/25 limit → split them.
 2. Search your draft for: `'ll`, `'re`, `'s` (contraction), `has been`, `have been`, `should`, `-ing` verbs after a comma, semicolons.
 3. Search for every `if` and `when`. Each one stands at the START of its sentence, before the command. "Increase the timeout if the network is slow" → "If the network is slow, increase the timeout."
 4. Search for the verbs you did NOT pick in Your Task step 3 (the check/verify/confirm set). Replace every hit with your chosen verb.
+5. Match each sentence to a fact from Your Task step 0. Delete each sentence that has no match (Rules A.1, A.6).
+6. If you edited text from the user, compare your version with the original. Each change must fix a rule violation. Undo the other changes (Rule A.7).
 
-Fix what you find, then deliver. For a full audit, run `references/checklist.md`.
+Fix what you find, then deliver. In your reply, name the sentences that you inferred (Rule A.2). For a full audit, run `references/checklist.md`.
 
 ## Full Example
 
