@@ -18,6 +18,11 @@ apt:
     - libffi-dev
     - python3-dev
     
+    # Backup transfer, encryption, and compression
+    - rclone
+    - age
+    - zstd
+
     # Optional but useful
     - htop
     - tree

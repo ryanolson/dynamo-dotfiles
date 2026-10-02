@@ -91,6 +91,7 @@ install_macos_packages() {
         kubectl
         protobuf
         jq tree htop wget
+        rclone age zstd
     )
 
     for package in "${packages[@]}"; do
@@ -365,7 +366,7 @@ install_linux_sudo() {
     log "📦 Installing packages on Linux (sudo)..."
     if command -v apt-get &> /dev/null; then
         sudo apt-get update -qq
-        local apt_packages=(htop tree jq build-essential pkg-config libssl-dev fish unzip protobuf-compiler)
+        local apt_packages=(htop tree jq build-essential pkg-config libssl-dev fish unzip protobuf-compiler rclone age zstd)
         for package in "${apt_packages[@]}"; do
             if dpkg -l | grep -q "^ii  $package "; then
                 log "✓ $package already installed"
@@ -447,7 +448,7 @@ install_linux_nosudo() {
         bat eza ripgrep fd zoxide dust procs
         helix zellij lazygit yazi
         just watchexec hyperfine tokei
-        starship uv
+        starship uv rclone age zstd
     )
     # pixi global install is idempotent (no-ops if already present).
     for p in "${pkgs[@]}"; do

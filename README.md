@@ -62,6 +62,10 @@ and `#!/bin/bash -l` SLURM batch scripts are unaffected).
 - **Rust** stable toolchain (via [rustup](https://rustup.rs/), installed automatically)
 - **Python** via [uv](https://github.com/astral-sh/uv) (installed automatically)
 
+### Backup tools
+
+`chezmoi apply` installs `rclone`, `age`, and `zstd` through Homebrew, apt, or pixi. These tools transfer, encrypt, and compress backups. Backup credentials, service data paths, schedules, and retention policies are configured separately. No Google account credentials belong in this repository.
+
 ### AI Development Tools
 - **claude** - Claude Code CLI (installed via [native installer](https://claude.ai/install.sh), auto-updates)
 - **codex** - OpenAI Codex CLI (`npm i -g @openai/codex`; run `codex login` to authenticate)

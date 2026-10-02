@@ -26,6 +26,11 @@ homebrew:
     - starship
     - zellij
     
+    # Backup transfer, encryption, and compression
+    - rclone
+    - age
+    - zstd
+
     # File management
     - yazi
     - broot
