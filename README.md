@@ -240,6 +240,36 @@ API keys and tokens are managed via 1Password CLI (`op`) with on-demand injectio
 - GitHub HTTPS URLs are rewritten to SSH automatically, so no HTTPS credential is ever requested
 - Use `gh auth login -p ssh` to authenticate the GitHub CLI
 
+### Local SSH keys on trusted nodes
+
+Run this command on a node after `chezmoi apply`. It copies an existing key from 1Password for SSH authentication and Git signing:
+
+```bash
+provision-keys --ssh-key-ref 'op://Private/My SSH Key/private key'
+```
+
+The node needs `op`, an authenticated 1Password CLI session, Git 2.34 or later, and OpenSSH with SSH signing support. Bootstrap installs `op` on macOS and Linux `primary` machines. On other machine classes, install `op` before provisioning. Configure your Git name and email through chezmoi first.
+
+To use a separate signing key, pass its reference with `--signing-key-ref`:
+
+```bash
+provision-keys --ssh-key-ref 'op://Private/My SSH Key/private key' --signing-key-ref 'op://Private/Git Signing Key/private key'
+```
+
+For bootstrap with an authenticated `op` session, pass the same references as flags:
+
+```bash
+bash bootstrap.sh --ssh-key-ref 'op://Private/My SSH Key/private key' --signing-key-ref 'op://Private/Git Signing Key/private key'
+```
+
+Repeat `--ssh-key-ref` to install multiple authentication keys. Omit `--signing-key-ref` to use the first authentication key for signing. The references contain vault and item names, not private key contents.
+
+The command stores unencrypted private keys and derived public keys in `~/.ssh/provisioned`. The directory has mode `700`. Its files have mode `600`. It checks a signature before installation and refuses to replace different existing files. Identical repeat runs succeed. Private key contents never enter chezmoi templates or diffs.
+
+Chezmoi includes the local SSH configuration before agent settings and the local Git configuration after agent settings. These includes survive `chezmoi apply`. Local provisioning disables agent use for SSH and supplies the authentication keys for all hosts. Explicit host-specific identity files remain additive. Git signing uses the local private key without a forwarded agent. GitHub HTTPS URLs use SSH with this key.
+
+To return to agent configuration, move `~/.ssh/provisioned` out of that path. To replace keys, move the directory aside and run `provision-keys` again. Existing public-key registrations remain valid when you copy the same keys.
+
 ### GitHub auth policy
 
 **`gh auth login` only. Never a personal access token.** No `GITHUB_TOKEN`, `GH_TOKEN`, or
@@ -270,7 +300,7 @@ print nothing. `chezmoi apply` restores the correct rewrite.
 - Use ordinary OpenSSH over the tailnet for sessions that need commit signing or secrets
 - `dev-remote <host> [session]` primes a remote zellij session with per-session env vars and then attaches
 - `dev-remote refresh <host> [session]` recreates the session after a secret rotation
-- Commit signing on Linux remotes uses the forwarded SSH agent, so reconnect with `ssh -A` or `dev-remote` before signing if the agent went stale
+- Without local key provisioning, commit signing on Linux remotes uses the forwarded SSH agent. Reconnect with `ssh -A` or `dev-remote` if the agent went stale.
 - Every login path pins the same zellij socket directory, so `zellij a <name>` reaches one server no matter how you reached the host
 
 **Manual auth steps (once per machine):**
