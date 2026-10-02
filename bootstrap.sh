@@ -20,7 +20,7 @@ error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 REPO_URL="https://github.com/ryanolson/dynamo-dotfiles.git"
 DOTFILES_DIR="$HOME/.local/share/chezmoi"
-SSH_KEY_REF=""
+SSH_KEY_REFS=()
 SIGNING_KEY_REF=""
 NO_SUDO=auto   # auto | 0 | 1  (forced by --no-sudo / --sudo)
 
@@ -182,7 +182,7 @@ main() {
         case "$1" in
             --ssh-key-ref|--signing-key-ref)
                 [[ $# -ge 2 && "$2" == op://* ]] || error "$1 requires an op:// field reference"
-                if [[ "$1" == --ssh-key-ref ]]; then SSH_KEY_REF="$2"; else SIGNING_KEY_REF="$2"; fi
+                if [[ "$1" == --ssh-key-ref ]]; then SSH_KEY_REFS+=("$2"); else SIGNING_KEY_REF="$2"; fi
                 shift 2 ;;
             --no-sudo) NO_SUDO=1; shift ;;
             --sudo)    NO_SUDO=0; shift ;;
@@ -190,15 +190,18 @@ main() {
         esac
     done
 
-    [[ -z "$SIGNING_KEY_REF" || -n "$SSH_KEY_REF" ]] || error '--signing-key-ref requires --ssh-key-ref'
+    [[ -z "$SIGNING_KEY_REF" || ${#SSH_KEY_REFS[@]} -gt 0 ]] || error '--signing-key-ref requires --ssh-key-ref'
 
     log "🚀 Starting development environment bootstrap (chezmoi)"
     detect_os
     install_dependencies
     install_chezmoi
     init_dotfiles
-    if [[ -n "$SSH_KEY_REF" ]]; then
-        "$HOME/.local/bin/provision-keys" "$SSH_KEY_REF" "${SIGNING_KEY_REF:-$SSH_KEY_REF}"
+    if [[ ${#SSH_KEY_REFS[@]} -gt 0 ]]; then
+        local key_args=() ref
+        for ref in "${SSH_KEY_REFS[@]}"; do key_args+=(--ssh-key-ref "$ref"); done
+        if [[ -n "$SIGNING_KEY_REF" ]]; then key_args+=(--signing-key-ref "$SIGNING_KEY_REF"); fi
+        "$HOME/.local/bin/provision-keys" "${key_args[@]}"
     fi
     install_claude_code
     setup_shell

@@ -5,12 +5,26 @@ set -euo pipefail
 umask 077
 
 fail() { printf '%s\n' "$*" >&2; exit 1; }
-if [[ $# -lt 1 || $# -gt 2 ]]; then
-    fail 'Usage: provision-keys <op://vault/item/private key> [signing-private-key-reference]'
-fi
-for ref in "$@"; do
-    [[ "$ref" == op://* && "$ref" != *'?'* && "$ref" != *$'\n'* ]] || fail 'Use an op:// field reference without query parameters.'
+auth_refs=()
+signing_ref=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --ssh-key-ref|--signing-key-ref)
+            [[ $# -ge 2 ]] || fail "$1 requires an op:// field reference."
+            ref="$2"
+            [[ "$ref" == op://* && "$ref" != *'?'* && "$ref" != *$'\n'* ]] || fail 'Use an op:// field reference without query parameters.'
+            if [[ "$1" == --ssh-key-ref ]]; then
+                auth_refs+=("$ref")
+            else
+                [[ -z "$signing_ref" ]] || fail 'Specify --signing-key-ref only once.'
+                signing_ref="$ref"
+            fi
+            shift 2 ;;
+        *) fail 'Usage: provision-keys --ssh-key-ref <reference> [--ssh-key-ref <reference> ...] [--signing-key-ref <reference>]' ;;
+    esac
 done
+[[ ${#auth_refs[@]} -gt 0 ]] || fail 'At least one --ssh-key-ref is required.'
+signing_ref="${signing_ref:-${auth_refs[0]}}"
 for cmd in op ssh-keygen git; do
     command -v "$cmd" >/dev/null || fail "$cmd is required. Install it before provisioning."
 done
@@ -28,22 +42,28 @@ stage=$(mktemp -d "$HOME/.ssh/.provision-XXXXXXXX")
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-op read "$1?ssh-format=openssh" > "$stage/authentication"
-if [[ "${2:-$1}" == "$1" ]]; then
+keys=()
+for ((i=0; i<${#auth_refs[@]}; i++)); do
+    key=authentication
+    if [[ $i -gt 0 ]]; then key="authentication-$((i+1))"; fi
+    keys+=("$key")
+    op read "${auth_refs[$i]}?ssh-format=openssh" > "$stage/$key"
+done
+if [[ "$signing_ref" == "${auth_refs[0]}" ]]; then
     cp "$stage/authentication" "$stage/signing"
 else
-    op read "$2?ssh-format=openssh" > "$stage/signing"
+    op read "$signing_ref?ssh-format=openssh" > "$stage/signing"
 fi
-for key in authentication signing; do
+for key in "${keys[@]}" signing; do
     ssh-keygen -y -P '' -f "$stage/$key" > "$stage/$key.pub" || fail 'Could not read an unencrypted OpenSSH private key.'
 done
 printf '%s %s\n' "$email" "$(cat "$stage/signing.pub")" > "$stage/allowed_signers"
-cat > "$stage/config" <<'EOF'
-Host *
-    IdentityAgent none
-    IdentityFile ~/.ssh/provisioned/authentication
-    IdentitiesOnly yes
-EOF
+{
+    printf '%s\n' 'Host *' '    IdentityAgent none' '    IdentitiesOnly yes'
+    for key in "${keys[@]}"; do
+        printf '    IdentityFile ~/.ssh/provisioned/%s\n' "$key"
+    done
+} > "$stage/config"
 cat > "$stage/gitconfig" <<'EOF'
 [user]
     signingkey = ~/.ssh/provisioned/signing
@@ -65,7 +85,8 @@ rm "$stage/message" "$stage/message.sig"
 chmod 600 "$stage/"*
 if [[ -e "$target" || -L "$target" ]]; then
     [[ -d "$target" && ! -L "$target" ]] || fail 'Refusing a non-directory or symlink at ~/.ssh/provisioned.'
-    for file in authentication signing authentication.pub signing.pub allowed_signers config gitconfig; do
+    for path in "$stage/"*; do
+        file="${path##*/}"
         [[ -f "$target/$file" && ! -L "$target/$file" ]] && cmp -s "$stage/$file" "$target/$file" || fail 'Existing provisioning differs. Move ~/.ssh/provisioned aside before replacing it.'
     done
     chmod 700 "$target"

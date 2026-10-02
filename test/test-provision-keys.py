@@ -32,7 +32,7 @@ class ProvisionKeys(unittest.TestCase):
                               capture_output=True, text=True, check=True)
 
     def run_script(self, ref='op://Test/Key/private key'):
-        return subprocess.run(['bash', str(SCRIPT), ref], env=self.env, capture_output=True, text=True)
+        return subprocess.run(['bash', str(SCRIPT), '--ssh-key-ref', ref], env=self.env, capture_output=True, text=True)
 
     def test_provision_sign_and_repeat(self):
         result = self.run_script()
@@ -82,7 +82,7 @@ class ProvisionKeys(unittest.TestCase):
         other = self.home / 'other'
         subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(other)], check=True)
         (self.home / 'bin/op').write_text('#!/bin/sh\ncase "$2" in\n  *Other*) cat "$HOME/other" ;;\n  *) cat "$HOME/fixture" ;;\nesac\n')
-        result = subprocess.run(['bash', str(SCRIPT), 'op://Test/Key/private key', 'op://Test/Other/private key'],
+        result = subprocess.run(['bash', str(SCRIPT), '--ssh-key-ref', 'op://Test/Key/private key', '--signing-key-ref', 'op://Test/Other/private key'],
                                 env=self.env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         target = self.home / '.ssh/provisioned'
@@ -90,6 +90,28 @@ class ProvisionKeys(unittest.TestCase):
         self.git('init', '-q')
         self.git('commit', '--allow-empty', '-m', 'separate signing key')
         self.git('verify-commit', 'HEAD')
+
+    def test_two_login_keys_and_separate_signing_key(self):
+        for name in ('brev', 'mbp-nv16', 'signer'):
+            subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(self.home / name)], check=True)
+        (self.home / 'bin/op').write_text('#!/bin/sh\ncase "$2" in\n  *brev*) cat "$HOME/brev" ;;\n  *mbp-nv16*) cat "$HOME/mbp-nv16" ;;\n  *"Git Signing Key"*) cat "$HOME/signer" ;;\n  *) exit 1 ;;\nesac\n')
+        args = ['bash', str(SCRIPT),
+                '--ssh-key-ref', 'op://Development/brev/private key',
+                '--ssh-key-ref', 'op://Development/mbp-nv16/private key',
+                '--signing-key-ref', 'op://Development/Git Signing Key/private key']
+        result = subprocess.run(args, env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        target = self.home / '.ssh/provisioned'
+        self.assertEqual((target / 'authentication.pub').read_text(), (self.home / 'brev.pub').read_text())
+        self.assertEqual((target / 'authentication-2.pub').read_text(), (self.home / 'mbp-nv16.pub').read_text())
+        self.assertEqual((target / 'signing.pub').read_text(), (self.home / 'signer.pub').read_text())
+        ssh_config = (target / 'config').read_text()
+        self.assertEqual(ssh_config.count('IdentityFile '), 2)
+        self.assertNotIn('IdentityFile ~/.ssh/provisioned/signing', ssh_config)
+        self.git('init', '-q')
+        self.git('commit', '--allow-empty', '-m', 'three keys')
+        self.git('verify-commit', 'HEAD')
+        self.assertEqual(subprocess.run(args, env=self.env, capture_output=True).returncode, 0)
 
     def test_templates_preserve_local_configuration(self):
         config = self.home / 'chezmoi.yaml'
