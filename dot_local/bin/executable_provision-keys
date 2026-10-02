@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Keep private keys out of shell traces, chezmoi templates, and diffs.
+set +x
+set -euo pipefail
+umask 077
+
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+    fail 'Usage: provision-keys <op://vault/item/private key> [signing-private-key-reference]'
+fi
+for ref in "$@"; do
+    [[ "$ref" == op://* && "$ref" != *'?'* && "$ref" != *$'\n'* ]] || fail 'Use an op:// field reference without query parameters.'
+done
+for cmd in op ssh-keygen git; do
+    command -v "$cmd" >/dev/null || fail "$cmd is required. Install it before provisioning."
+done
+email=$(git config --global user.email) || fail 'Configure Git user.email before provisioning.'
+[[ -n "$email" && "$email" != *[[:space:]]* ]] || fail 'Git user.email must contain one address without whitespace.'
+[[ ! -L "$HOME/.ssh" ]] || fail 'Refusing a symlink at ~/.ssh.'
+mkdir -p "$HOME/.ssh"
+chmod 700 "$HOME/.ssh"
+target="$HOME/.ssh/provisioned"
+lock="$HOME/.ssh/.provision-lock"
+mkdir "$lock" 2>/dev/null || fail 'Provisioning is locked. If no provision-keys process is running, remove ~/.ssh/.provision-lock.'
+stage=""
+trap 'if [[ -n "$stage" ]]; then rm -rf "$stage"; fi; rmdir "$lock"' EXIT
+stage=$(mktemp -d "$HOME/.ssh/.provision-XXXXXXXX")
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+op read "$1?ssh-format=openssh" > "$stage/authentication"
+if [[ "${2:-$1}" == "$1" ]]; then
+    cp "$stage/authentication" "$stage/signing"
+else
+    op read "$2?ssh-format=openssh" > "$stage/signing"
+fi
+for key in authentication signing; do
+    ssh-keygen -y -P '' -f "$stage/$key" > "$stage/$key.pub" || fail 'Could not read an unencrypted OpenSSH private key.'
+done
+printf '%s %s\n' "$email" "$(cat "$stage/signing.pub")" > "$stage/allowed_signers"
+cat > "$stage/config" <<'EOF'
+Host *
+    IdentityAgent none
+    IdentityFile ~/.ssh/provisioned/authentication
+    IdentitiesOnly yes
+EOF
+cat > "$stage/gitconfig" <<'EOF'
+[user]
+    signingkey = ~/.ssh/provisioned/signing
+[gpg]
+    format = ssh
+[gpg "ssh"]
+    program = ssh-keygen
+    allowedSignersFile = ~/.ssh/provisioned/allowed_signers
+[commit]
+    gpgsign = true
+[url "git@github.com:"]
+    insteadOf = https://github.com/
+EOF
+# Check the complete signing path before making the directory visible.
+printf 'provision-keys check\n' > "$stage/message"
+SSH_AUTH_SOCK= ssh-keygen -Y sign -f "$stage/signing" -n git "$stage/message" >/dev/null 2>&1
+ssh-keygen -Y verify -f "$stage/allowed_signers" -I "$email" -n git -s "$stage/message.sig" < "$stage/message" >/dev/null 2>&1
+rm "$stage/message" "$stage/message.sig"
+chmod 600 "$stage/"*
+if [[ -e "$target" || -L "$target" ]]; then
+    [[ -d "$target" && ! -L "$target" ]] || fail 'Refusing a non-directory or symlink at ~/.ssh/provisioned.'
+    for file in authentication signing authentication.pub signing.pub allowed_signers config gitconfig; do
+        [[ -f "$target/$file" && ! -L "$target/$file" ]] && cmp -s "$stage/$file" "$target/$file" || fail 'Existing provisioning differs. Move ~/.ssh/provisioned aside before replacing it.'
+    done
+    chmod 700 "$target"
+    chmod 600 "$target/"*
+else
+    mv "$stage" "$target"
+fi
+printf '%s\n' 'Local SSH authentication and Git signing keys are provisioned.'

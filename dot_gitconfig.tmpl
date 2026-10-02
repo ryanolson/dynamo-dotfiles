@@ -97,3 +97,7 @@
 [credential "https://gist.github.com"]
     helper = !gh auth git-credential
 {{- end }}
+
+# Local provisioning overrides the agent settings when this file exists.
+[include]
+    path = ~/.ssh/provisioned/gitconfig
