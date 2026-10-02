@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+install_dir="$HOME/.local/bin"
+mkdir -p "$install_dir"
+staging=$(mktemp -d "$install_dir/.iou-antigravity.XXXXXX")
+trap 'rm -rf "$staging"' EXIT
+
+# The upstream installer skips existing binaries. Stage before replacing agy.
+curl -fsSL https://antigravity.google/cli/install.sh -o "$staging/install.sh"
+# Keep the installer's shell configuration changes out of the real home.
+mkdir -p "$staging/home"
+HOME="$staging/home" bash "$staging/install.sh" --dir "$staging"
+test -x "$staging/agy"
+mv -f "$staging/agy" "$install_dir/agy"
+"$install_dir/agy" install --dir "$install_dir"

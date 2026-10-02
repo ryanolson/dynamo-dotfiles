@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if command -v claude >/dev/null 2>&1; then
+    exec claude update
+fi
+
+installer=$(mktemp)
+trap 'rm -f "$installer"' EXIT
+curl -fsSL https://claude.ai/install.sh -o "$installer"
+bash "$installer" latest

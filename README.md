@@ -413,6 +413,18 @@ broot               # interactive tree view
 
 ## 🔄 Updating
 
+`chezmoi apply` installs these executable helpers in `~/.local/bin`. Run a helper to install or upgrade its CLI:
+
+```bash
+iou_claude
+iou_codex
+iou_antigravity
+iou_cursor
+iou_pi
+```
+
+Claude and Cursor use their native installers and update commands. Antigravity uses its native installer and replaces `agy` after installation succeeds. Codex and Pi use npm and preserve `NPM_CONFIG_PREFIX`, with `~/.npm-global` as the default. Pi requires Node.js 22.19 or newer. Cursor refers to Cursor Agent CLI. Pi refers to the coding agent from [pi.dev](https://pi.dev).
+
 The environment auto-updates when team configuration changes. To manually update:
 
 ```bash

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if command -v cursor-agent >/dev/null 2>&1; then
+    exec cursor-agent update
+fi
+
+installer=$(mktemp)
+trap 'rm -f "$installer"' EXIT
+curl -fsSL https://cursor.com/install -o "$installer"
+bash "$installer"
