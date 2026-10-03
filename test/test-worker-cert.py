@@ -182,6 +182,33 @@ class Certificates(unittest.TestCase):
             with self.assertRaises(ValueError): w.sign(request, 'sample')
             read.assert_not_called()
 
+    def test_days_override_and_profile_default(self):
+        material = [w.pem(self.ca), w.private_pem(self.ca_key), w.pem(self.server_ca)]
+        for override, config, expected in [(7, {'days': 30}, 7), (None, {'days': 30}, 30), (None, {}, 45)]:
+            with self.subTest(override=override, config=config), mock.patch.object(w, 'load_profile', return_value=config), mock.patch.object(w, 'signing_material', return_value=material), mock.patch('builtins.print'):
+                response = w.sign(self.request, 'sample', days=override)
+                cert = x509.load_pem_x509_certificate(response['certificate'].encode())
+                remaining = (cert.not_valid_after_utc-datetime.now(timezone.utc)).total_seconds()
+                self.assertAlmostEqual(remaining, expected*86400, delta=3)
+
+    def test_invalid_days_override_rejected_before_vault_access(self):
+        with mock.patch.object(w, 'load_profile', return_value={}), mock.patch.object(w, 'signing_material') as read:
+            with self.assertRaises(ValueError): w.sign(self.request, 'sample', days=0)
+            read.assert_not_called()
+
+    def test_renew_days_argument_rejected_before_ssh(self):
+        with mock.patch.object(w.sys, 'argv', ['bb-worker-cert', 'renew', 'worker', '--profile', 'sample', '--days', '366']), mock.patch.object(w, 'remote') as remote, mock.patch.object(w.sys, 'stderr'):
+            with self.assertRaises(SystemExit) as error: w.main()
+            self.assertEqual(error.exception.code, 2)
+            remote.assert_not_called()
+
+    def test_days_option_reaches_signer_in_both_flows(self):
+        for command in ('sign', 'renew'):
+            argv = ['bb-worker-cert', command] + (['worker'] if command == 'renew' else []) + ['--profile', 'sample', '--days', '7']
+            with self.subTest(command=command), mock.patch.object(w.sys, 'argv', argv), mock.patch.object(w, 'read_bundle', return_value=self.request), mock.patch.object(w, 'remote', side_effect=[w.pack(self.request, 'REQUEST'), 'installed']), mock.patch.object(w, 'sign', return_value=self.response) as sign, mock.patch('builtins.print'):
+                w.main()
+                sign.assert_called_once_with(self.request, 'sample', days=7)
+
     def test_symlink_write_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory)/'target'

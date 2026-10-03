@@ -133,9 +133,21 @@ def validate_request(request):
     return csr
 
 
-def issue(request, ca_pem, key_pem, server_ca_pem, days):
+def validate_days(days):
     if type(days) is not int or not 1 <= days <= 365:
         raise ValueError('Certificate lifetime must be 1–365 days.')
+    return days
+
+
+def days_argument(value):
+    try:
+        return validate_days(int(value))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError('Certificate lifetime must be 1–365 whole days.') from error
+
+
+def issue(request, ca_pem, key_pem, server_ca_pem, days):
+    validate_days(days)
     csr = validate_request(request)
     expected_subject = csr.subject
     ca = x509.load_pem_x509_certificate(ca_pem.encode())
@@ -272,13 +284,14 @@ def signing_material(config):
     return material
 
 
-def sign(request, profile):
+def sign(request, profile, days=None):
     validate_request(request)
     if request['profile'] != profile:
         raise ValueError('Request profile differs from the selected signing profile.')
     config = load_profile('signers', profile)
+    days = validate_days(config.get('days', 45) if days is None else days)
     print(f"Signing profile {profile}, worker {request['name']!r}, request {request['request_id'][:12]}", file=sys.stderr)
-    return issue(request, *signing_material(config), config.get('days', 45))
+    return issue(request, *signing_material(config), days)
 
 
 def worker_path(config, field, default):
@@ -376,6 +389,8 @@ def main():
         command.add_argument('--profile', required=True, type=safe_name)
         if name in ('request', 'renew'):
             command.add_argument('--name', type=safe_name, default=None)
+        if name in ('sign', 'renew'):
+            command.add_argument('--days', type=days_argument, help='Validity in whole days (1–365); overrides the profile default; capped at CA expiry')
         if name == 'install':
             command.add_argument('--issuer-sha256', required=True, help='Signing CA fingerprint obtained from your trusted laptop')
         if name == 'renew':
@@ -387,7 +402,7 @@ def main():
         print(pack(request, 'REQUEST'))
         print(f'On your laptop, run: bb-worker-cert sign --profile {args.profile}\nPaste the request above. Then follow the laptop’s install instructions on this worker.', file=sys.stderr)
     elif args.command == 'sign':
-        response = sign(read_bundle('REQUEST'), args.profile)
+        response = sign(read_bundle('REQUEST'), args.profile, days=args.days)
         print(pack(response, 'RESPONSE'))
         pin = fingerprint(x509.load_pem_x509_certificate(response['client_ca'].encode()))
         print(f'On the worker, run: bb-worker-cert install --profile {args.profile} --issuer-sha256 {pin}\nPaste the response above. This pin comes from your trusted laptop; do not take it from an untrusted sender.', file=sys.stderr)
@@ -398,7 +413,7 @@ def main():
         if args.name:
             request_args += ['--name', args.name]
         request = unpack(remote(args.machine, args.jump, request_args), 'REQUEST')
-        response = sign(request, args.profile)
+        response = sign(request, args.profile, days=args.days)
         pin = fingerprint(x509.load_pem_x509_certificate(response['client_ca'].encode()))
         print(remote(args.machine, args.jump, ['install', '--profile', args.profile, '--issuer-sha256', pin], pack(response, 'RESPONSE')+'\n'), end='')
 

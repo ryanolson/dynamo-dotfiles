@@ -38,9 +38,11 @@ The referenced certificates must be current CA certificates. The client CA key m
 Install the dotfiles tool on both machines. Configure a worker profile as described below when renewing an existing transport.
 
 ```sh
-bb-worker-cert renew worker-alias --profile example
+bb-worker-cert renew worker-alias --profile example --days 7
 bb-worker-cert renew user@worker.example --profile example --jump gateway-alias
 ```
+
+`--days` accepts 1–365 whole days on `sign` and `renew`. It overrides the signing profile's `days` value. Without either setting, the lifetime is 45 days. The certificate cannot outlive its signing CA. The signer chooses the lifetime; a worker request cannot override it.
 
 SSH uses the normal user configuration, including `ProxyJump`. The optional `--jump` supplies SSH's `-J` option. The tool does not enable agent forwarding. It invokes `~/.local/bin/bb-worker-cert` on the target; `uv` must be on the remote command's PATH.
 
@@ -57,7 +59,7 @@ bb-worker-cert request --profile example
 Copy the complete REQUEST block. The command prints the next command to run on your laptop:
 
 ```sh
-bb-worker-cert sign --profile example
+bb-worker-cert sign --profile example --days 7
 ```
 
 Paste the REQUEST block, including its END line, then press Enter. No end-of-file keystroke is needed. The laptop prints a RESPONSE block and an install command containing the signing CA fingerprint.
