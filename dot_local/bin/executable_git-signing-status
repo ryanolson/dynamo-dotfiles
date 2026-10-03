@@ -1,9 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-signing_key="$(git config --global user.signingkey 2>/dev/null || true)"
+signing_key="$(git config --global --includes user.signingkey 2>/dev/null || true)"
 if [[ -z "$signing_key" ]]; then
     echo "disabled: git user.signingkey is not configured"
+    exit 1
+fi
+
+if [[ "$signing_key" == '~/.ssh/provisioned/signing' || "$signing_key" == "$HOME/.ssh/provisioned/signing" ]]; then
+    if [[ -r "$HOME/.ssh/provisioned/signing" && -r "$HOME/.ssh/provisioned/allowed_signers" ]]; then
+        echo "ready: local SSH signing key is configured"
+        exit 0
+    fi
+    echo "degraded: local signing key or allowed signers file is missing"
     exit 1
 fi
 

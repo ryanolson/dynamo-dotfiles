@@ -2,6 +2,8 @@
 # These files won't be managed by chezmoi
 
 README.md
+agent-docs
+agent-docs/**
 LICENSE
 .git/
 
