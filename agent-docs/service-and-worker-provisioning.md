@@ -113,3 +113,9 @@ Kubernetes access, transport access, and bb enrollment are separate grants. A wo
 - [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve)
 - [k3s server configuration](https://docs.k3s.io/cli/server)
 - [k3s Secrets encryption](https://docs.k3s.io/security/secrets-encryption)
+
+## 2026-10-03 addendum: certificate renewal
+
+[Worker client certificates](worker-certificates.md) documents the implemented `bb-worker-cert` command. It supports SSH renewal and a copy/paste signing exchange. Signing profiles and worker activation profiles remain outside the repository. The worker keeps its private key in memory-backed storage; only the signing machine requires 1Password access.
+
+This command renews transport credentials. BB enrollment, proxy installation, provider login delivery, a guaranteed fresh approval challenge, and disconnect-based worker retirement remain separate work.

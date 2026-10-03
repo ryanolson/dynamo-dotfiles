@@ -1,0 +1,411 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["cryptography==49.0.0"]
+# ///
+import argparse
+import base64
+import hashlib
+import fcntl
+from contextlib import contextmanager
+import json
+import os
+import re
+import secrets
+import shlex
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from cryptography import x509
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, ed448
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+LIMIT = 65536
+CONFIG = Path.home() / '.config/bb-worker-cert'
+
+
+def safe_name(value):
+    if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}', value):
+        raise ValueError('Use a name of 1–64 letters, digits, dots, underscores, or hyphens.')
+    return value
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(',', ':')).encode()
+
+
+def pem(cert):
+    return cert.public_bytes(serialization.Encoding.PEM).decode()
+
+
+def private_pem(key):
+    return key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode()
+
+
+def public_bytes(key):
+    return key.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+
+
+def fingerprint(cert):
+    return cert.fingerprint(hashes.SHA256()).hex()
+
+
+def pack(value, kind):
+    body = base64.b64encode(canonical(value)).decode()
+    lines = '\n'.join(body[i:i+76] for i in range(0, len(body), 76))
+    return f'-----BEGIN BB CERT {kind}-----\n{lines}\n-----END BB CERT {kind}-----'
+
+
+def unpack(text, kind):
+    if len(text) > LIMIT:
+        raise ValueError('Certificate bundle is too large.')
+    match = re.fullmatch(r'\s*-----BEGIN BB CERT ' + kind + r'-----\s*([A-Za-z0-9+/=\s]+)\s*-----END BB CERT ' + kind + r'-----\s*', text)
+    if not match:
+        raise ValueError('Paste the complete certificate bundle, including BEGIN and END lines.')
+    value = json.loads(base64.b64decode(''.join(match[1].split()), validate=True))
+    if not isinstance(value, dict) or value.get('version') != 1:
+        raise ValueError('Unsupported certificate bundle version.')
+    return value
+
+
+def read_bundle(kind):
+    if sys.stdin.isatty():
+        print(f'Paste the {kind.lower()} bundle, then press Enter after its END line:', file=sys.stderr)
+    lines = []
+    size = 0
+    for line in sys.stdin:
+        size += len(line)
+        if size > LIMIT:
+            raise ValueError('Certificate bundle is too large.')
+        lines.append(line)
+        if line.strip() == f'-----END BB CERT {kind}-----':
+            break
+    return unpack(''.join(lines), kind)
+
+
+def new_request(profile, name):
+    safe_name(profile)
+    safe_name(name)
+    key = ec.generate_private_key(ec.SECP256R1())
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)])
+    csr = x509.CertificateSigningRequestBuilder().subject_name(subject).sign(key, hashes.SHA256())
+    return key, dict(version=1, profile=profile, name=name, request_id=secrets.token_hex(32), csr=csr.public_bytes(serialization.Encoding.PEM).decode())
+
+
+def valid_ca(cert, now):
+    if not cert.extensions.get_extension_for_class(x509.BasicConstraints).value.ca:
+        raise ValueError('The signing certificate is not a CA.')
+    if not cert.not_valid_before_utc <= now < cert.not_valid_after_utc:
+        raise ValueError('The CA certificate is not currently valid.')
+    try:
+        if not cert.extensions.get_extension_for_class(x509.KeyUsage).value.key_cert_sign:
+            raise ValueError('The CA cannot sign certificates.')
+    except x509.ExtensionNotFound:
+        pass
+
+
+def binding(request, server_ca):
+    return 'urn:bb-worker-cert:sha256:' + hashlib.sha256(canonical({'request': request, 'server_ca_sha256': fingerprint(server_ca)})).hexdigest()
+
+
+def validate_request(request):
+    if set(request) != {'version', 'profile', 'name', 'request_id', 'csr'} or request['version'] != 1:
+        raise ValueError('Invalid signing request fields.')
+    safe_name(request['profile'])
+    safe_name(request['name'])
+    if not re.fullmatch(r'[a-f0-9]{64}', request['request_id']):
+        raise ValueError('Invalid request identifier.')
+    csr = x509.load_pem_x509_csr(request['csr'].encode())
+    if not csr.is_signature_valid or not isinstance(csr.public_key(), ec.EllipticCurvePublicKey) or not isinstance(csr.public_key().curve, ec.SECP256R1):
+        raise ValueError('Expected a valid P-256 signing request.')
+    expected_subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, request['name'])])
+    if csr.subject != expected_subject or len(csr.extensions):
+        raise ValueError('Request must contain only the stated common name and no extensions.')
+    return csr
+
+
+def issue(request, ca_pem, key_pem, server_ca_pem, days):
+    if type(days) is not int or not 1 <= days <= 365:
+        raise ValueError('Certificate lifetime must be 1–365 days.')
+    csr = validate_request(request)
+    expected_subject = csr.subject
+    ca = x509.load_pem_x509_certificate(ca_pem.encode())
+    server_ca = x509.load_pem_x509_certificate(server_ca_pem.encode())
+    key = serialization.load_pem_private_key(key_pem.encode(), None)
+    now = datetime.now(timezone.utc)
+    valid_ca(ca, now)
+    valid_ca(server_ca, now)
+    if public_bytes(key.public_key()) != public_bytes(ca.public_key()):
+        raise ValueError('Signing key does not match the CA certificate.')
+    cert = (x509.CertificateBuilder().subject_name(expected_subject).issuer_name(ca.subject)
+            .public_key(csr.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(max(now-timedelta(minutes=5), ca.not_valid_before_utc))
+            .not_valid_after(min(now+timedelta(days=days), ca.not_valid_after_utc))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), True)
+            .add_extension(x509.KeyUsage(True, False, False, False, False, False, False, None, None), True)
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]), False)
+            .add_extension(x509.SubjectAlternativeName([x509.UniformResourceIdentifier(binding(request, server_ca))]), False)
+            .sign(key, None if isinstance(key, (ed25519.Ed25519PrivateKey, ed448.Ed448PrivateKey)) else hashes.SHA256()))
+    return dict(version=1, request_id=request['request_id'], certificate=pem(cert), client_ca=pem(ca), server_ca=pem(server_ca))
+
+
+def validate_response(response, request, key, pin):
+    if set(response) != {'version', 'request_id', 'certificate', 'client_ca', 'server_ca'} or response['version'] != 1:
+        raise ValueError('Invalid certificate response fields.')
+    if response['request_id'] != request['request_id']:
+        raise ValueError('Response belongs to a different signing request.')
+    ca = x509.load_pem_x509_certificate(response['client_ca'].encode())
+    if not re.fullmatch(r'[a-fA-F0-9]{64}', pin) or fingerprint(ca) != pin.lower():
+        raise ValueError('Signing CA fingerprint does not match the trusted laptop.')
+    cert = x509.load_pem_x509_certificate(response['certificate'].encode())
+    now = datetime.now(timezone.utc)
+    valid_ca(ca, now)
+    try:
+        cert.verify_directly_issued_by(ca)
+    except InvalidSignature as error:
+        raise ValueError('Invalid client certificate signature.') from error
+    if not cert.not_valid_before_utc <= now < cert.not_valid_after_utc or cert.not_valid_after_utc > ca.not_valid_after_utc:
+        raise ValueError('Client certificate validity is outside the allowed interval.')
+    csr = x509.load_pem_x509_csr(request['csr'].encode())
+    if cert.subject != csr.subject or public_bytes(cert.public_key()) != public_bytes(key.public_key()) or public_bytes(csr.public_key()) != public_bytes(key.public_key()):
+        raise ValueError('Client certificate does not match this worker’s pending key and request.')
+    if cert.extensions.get_extension_for_class(x509.BasicConstraints).value.ca or list(cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value) != [ExtendedKeyUsageOID.CLIENT_AUTH]:
+        raise ValueError('Expected a client-only certificate.')
+    server_ca = x509.load_pem_x509_certificate(response['server_ca'].encode())
+    valid_ca(server_ca, now)
+    uris = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value.get_values_for_type(x509.UniformResourceIdentifier)
+    if uris != [binding(request, server_ca)]:
+        raise ValueError('Certificate does not bind this request and server trust certificate.')
+    return cert
+
+
+def atomic_write(path, data):
+    path = Path(path)
+    if path.is_symlink() or path.parent.is_symlink():
+        raise ValueError('Refusing a symlink destination.')
+    fd, temp = tempfile.mkstemp(prefix='.bb-cert-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+        os.replace(temp, path)
+    finally:
+        Path(temp).unlink(missing_ok=True)
+
+
+def memory_directory(path):
+    path = Path(path)
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700 or path.resolve() != path:
+        raise ValueError('Runtime directory must be owned by you, mode 0700, and contain no symlinks.')
+    fs = subprocess.run(['findmnt', '-n', '-o', 'FSTYPE', '--target', str(path)], capture_output=True, text=True, check=True).stdout.strip()
+    if fs not in ('tmpfs', 'ramfs'):
+        raise ValueError('Private key storage must be on tmpfs or ramfs.')
+    return path
+
+
+def state_dir(profile):
+    if sys.platform != 'linux':
+        raise ValueError('Worker request/install requires Linux memory-backed storage; signing also works on macOS.')
+    base = Path(f'/run/user/{os.getuid()}')
+    if not base.is_dir():
+        base = Path('/dev/shm')
+    return memory_directory(base / f'bb-worker-cert-{os.getuid()}' / safe_name(profile))
+
+
+@contextmanager
+def state_lock(profile):
+    state = state_dir(profile)
+    with (state/'lock').open('a') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        yield state
+
+
+def prepare(profile, name):
+    with state_lock(profile) as state:
+        return prepare_locked(state, profile, name)
+
+
+def prepare_locked(state, profile, name):
+    request_path = state / 'request.json'
+    if request_path.exists():
+        request = json.loads(request_path.read_text())
+        if request['name'] != name:
+            raise ValueError('A request for another worker name is pending in this profile.')
+        return request
+    key, request = new_request(profile, name)
+    atomic_write(state/'pending.key', private_pem(key).encode())
+    atomic_write(request_path, canonical(request))
+    return request
+
+
+def load_profile(kind, profile):
+    path = CONFIG / kind / (safe_name(profile)+'.json')
+    value = json.loads(path.read_text())
+    if not isinstance(value, dict):
+        raise ValueError('Profile must be a JSON object.')
+    return value
+
+
+def signing_material(config):
+    refs = [config[key] for key in ('client_ca_ref', 'client_key_ref', 'server_ca_ref')]
+    for ref in refs:
+        if not isinstance(ref, str) or not ref.startswith('op://') or any(c in ref for c in '\r\n?{}'):
+            raise ValueError('Use literal op:// field references without query parameters or templates.')
+    separator = '\nBB-CERT-' + secrets.token_hex(32) + '\n'
+    template = separator.join('{{ '+ref+' }}' for ref in refs)
+    result = subprocess.run(['op', 'inject'], input=template, capture_output=True, text=True)
+    if result.returncode:
+        raise ValueError('1Password could not read the signing fields. Check your local op login and profile.')
+    material = result.stdout.split(separator)
+    if len(material) != 3 or any(not value.strip() for value in material):
+        raise ValueError('1Password returned incomplete signing material.')
+    return material
+
+
+def sign(request, profile):
+    validate_request(request)
+    if request['profile'] != profile:
+        raise ValueError('Request profile differs from the selected signing profile.')
+    config = load_profile('signers', profile)
+    print(f"Signing profile {profile}, worker {request['name']!r}, request {request['request_id'][:12]}", file=sys.stderr)
+    return issue(request, *signing_material(config), config.get('days', 45))
+
+
+def worker_path(config, field, default):
+    return Path(os.path.expandvars(os.path.expanduser(config.get(field, str(default)))))
+
+
+def install(response, profile, pin):
+    with state_lock(profile) as state:
+        install_locked(response, profile, pin, state)
+
+
+def wait_connected(bb_config_path, timeout=30):
+    root = bb_config_path.parent
+    port = int((root/'host-daemon-port').read_text().strip())
+    host_id = (root/'host-id').read_text().strip()
+    if not 1 <= port <= 65535 or not host_id:
+        raise ValueError('Invalid BB daemon identity or port.')
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    deadline = time.monotonic()+timeout
+    while time.monotonic() < deadline:
+        try:
+            with opener.open(f'http://127.0.0.1:{port}/status', timeout=2) as response:
+                status = json.loads(response.read(LIMIT))
+            if status.get('hostId') == host_id and status.get('connected') is True:
+                print('BB worker reconnected.')
+                return
+        except (OSError, ValueError):
+            pass
+        time.sleep(1)
+    raise ValueError('Certificate installed, but BB did not reconnect within 30 seconds. Check the user service logs; retry install with the same response after fixing the service.')
+
+
+def install_locked(response, profile, pin, state):
+    request = json.loads((state/'request.json').read_text())
+    key = serialization.load_pem_private_key((state/'pending.key').read_bytes(), None)
+    cert = validate_response(response, request, key, pin)
+    profile_path = CONFIG / 'workers' / (profile+'.json')
+    config = load_profile('workers', profile) if profile_path.exists() else {}
+    public = CONFIG / 'certificates' / profile
+    public.mkdir(parents=True, exist_ok=True, mode=0o700)
+    key_path = worker_path(config, 'key_file', state/'client.key')
+    memory_directory(key_path.parent)
+    cert_path = worker_path(config, 'cert_file', public/'client.crt')
+    ca_path = worker_path(config, 'ca_file', public/'server-ca.crt')
+    for path in (cert_path, ca_path):
+        if not path.parent.is_dir():
+            raise ValueError('Configured certificate destination directory does not exist.')
+    token = None
+    if 'bb_config_file' in config:
+        bb_config = json.loads(worker_path(config, 'bb_config_file', '').read_text())
+        token = bb_config['serverHeaders']['X-BB-Local-Transport']
+        if not isinstance(token, str) or not token:
+            raise ValueError('BB local transport credential is missing.')
+        token_path = worker_path(config, 'token_file', state/'token')
+        memory_directory(token_path.parent)
+    services = config.get('services', [])
+    if not isinstance(services, list) or any(not isinstance(s, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@-]*\.service', s) for s in services):
+        raise ValueError('Services must be systemd user unit names.')
+    atomic_write(key_path, private_pem(key).encode())
+    atomic_write(cert_path, response['certificate'].encode())
+    atomic_write(ca_path, response['server_ca'].encode())
+    if token is not None:
+        atomic_write(token_path, token.encode())
+    if services:
+        subprocess.run(['systemctl', '--user', 'restart', *services], check=True)
+        subprocess.run(['systemctl', '--user', 'is-active', *services], check=True)
+    if 'bb_config_file' in config:
+        wait_connected(worker_path(config, 'bb_config_file', ''))
+    print(f'Installed client certificate; expires {cert.not_valid_after_utc.isoformat()}')
+    print(f'Certificate: {cert_path}\nPrivate key (memory-backed): {key_path}')
+    (state/'request.json').unlink()
+    (state/'pending.key').unlink()
+
+
+def ssh_command(host, jump):
+    for value in (host, jump):
+        if value is not None and (not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@:%\[\],-]*', value)):
+            raise ValueError('Invalid SSH target or jump host.')
+    return ['ssh', *(['-J', jump] if jump else []), '--', host]
+
+
+def remote(host, jump, args, input_text=None):
+    command = '"$HOME/.local/bin/bb-worker-cert" ' + shlex.join(args)
+    result = subprocess.run([*ssh_command(host, jump), command], input=input_text, text=True, capture_output=True)
+    if result.returncode:
+        raise ValueError('Remote certificate command failed: '+result.stderr[-2000:])
+    return result.stdout
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Request, sign, and install BB worker client certificates. Private keys stay in memory-backed worker storage.')
+    commands = parser.add_subparsers(dest='command', required=True)
+    for name in ('request', 'sign', 'install', 'renew'):
+        command = commands.add_parser(name)
+        command.add_argument('--profile', required=True, type=safe_name)
+        if name in ('request', 'renew'):
+            command.add_argument('--name', type=safe_name, default=None)
+        if name == 'install':
+            command.add_argument('--issuer-sha256', required=True, help='Signing CA fingerprint obtained from your trusted laptop')
+        if name == 'renew':
+            command.add_argument('machine', help='SSH config alias or user@host')
+            command.add_argument('--jump', help='Optional SSH ProxyJump host; otherwise use SSH config')
+    args = parser.parse_args()
+    if args.command == 'request':
+        request = prepare(args.profile, args.name or safe_name(socket.gethostname()))
+        print(pack(request, 'REQUEST'))
+        print(f'On your laptop, run: bb-worker-cert sign --profile {args.profile}\nPaste the request above. Then follow the laptop’s install instructions on this worker.', file=sys.stderr)
+    elif args.command == 'sign':
+        response = sign(read_bundle('REQUEST'), args.profile)
+        print(pack(response, 'RESPONSE'))
+        pin = fingerprint(x509.load_pem_x509_certificate(response['client_ca'].encode()))
+        print(f'On the worker, run: bb-worker-cert install --profile {args.profile} --issuer-sha256 {pin}\nPaste the response above. This pin comes from your trusted laptop; do not take it from an untrusted sender.', file=sys.stderr)
+    elif args.command == 'install':
+        install(read_bundle('RESPONSE'), args.profile, args.issuer_sha256)
+    else:
+        request_args = ['request', '--profile', args.profile]
+        if args.name:
+            request_args += ['--name', args.name]
+        request = unpack(remote(args.machine, args.jump, request_args), 'REQUEST')
+        response = sign(request, args.profile)
+        pin = fingerprint(x509.load_pem_x509_certificate(response['client_ca'].encode()))
+        print(remote(args.machine, args.jump, ['install', '--profile', args.profile, '--issuer-sha256', pin], pack(response, 'RESPONSE')+'\n'), end='')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (ValueError, KeyError, OSError, subprocess.SubprocessError, x509.ExtensionNotFound) as error:
+        print(f'bb-worker-cert: {error if isinstance(error, ValueError) else type(error).__name__+": check profile, dependencies, and service status"}', file=sys.stderr)
+        sys.exit(1)

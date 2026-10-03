@@ -4,6 +4,8 @@ A modern, cross-platform development environment using native package managers a
 
 [Kubernetes, Tailscale, and ephemeral worker provisioning](agent-docs/service-and-worker-provisioning.md) records the shared provisioning requirements and pending work.
 
+[Worker client certificates](agent-docs/worker-certificates.md) describes `bb-worker-cert`, SSH renewal, and the copy/paste signing flow. Signing profiles and deployment configuration stay outside this repository.
+
 ## 🚀 Quick Start
 
 **One-command installation:**
