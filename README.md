@@ -2,6 +2,8 @@
 
 A modern, cross-platform development environment using native package managers and dotfile management.
 
+[Kubernetes, Tailscale, and ephemeral worker provisioning](agent-docs/service-and-worker-provisioning.md) records the shared provisioning requirements and pending work.
+
 ## 🚀 Quick Start
 
 **One-command installation:**
