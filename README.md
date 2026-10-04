@@ -87,18 +87,17 @@ and `#!/bin/bash -l` SLURM batch scripts are unaffected).
 
 One set of instructions and skills, used by both Claude Code and Codex.
 
-`dot_agents/` → `~/.agents/` is the single source of truth:
+`dot_agents/` in the repository returned by `chezmoi source-path` is the editable source. `~/.agents/` contains deployed copies:
 
 ```
 ~/.agents/AGENTS.md              global instructions
+~/.agents/ENVIRONMENT.md         capabilities, discovery, and source-update procedures
 ~/.agents/skills/<name>/SKILL.md a skill
               .../agents/openai.yaml   Codex UI metadata (display name, default prompt)
               .../scripts/, references/, LICENSE
 ```
 
-Both agents discover skills at `<home>/skills/<name>/SKILL.md` and neither supports pointing at an
-external directory, so `run_onchange_after_link-agent-scaffold.sh.tmpl` symlinks each skill into
-both homes:
+The scaffold uses `run_onchange_after_link-agent-scaffold.sh.tmpl` to link instructions and rostered skills into both agent homes. Codex also discovers user skills directly under `~/.agents/skills`:
 
 | Link | Target |
 |---|---|
@@ -107,11 +106,9 @@ both homes:
 | `~/.claude/skills/<name>` | `~/.agents/skills/<name>` |
 | `~/.codex/skills/<name>` | `~/.agents/skills/<name>` |
 
-The roster lives in `.chezmoidata/agent_skills.yaml`. **Adding a skill:** create
-`dot_agents/skills/<name>/SKILL.md`, add the name to that list, `chezmoi apply`. **Removing one:**
-delete the name; the linker drops both symlinks and leaves everything else, including Codex's own
-`skills/.system`, untouched. Editing a skill's *content* needs no relink — the homes hold symlinks
-into the live directory.
+The roster lives in `.chezmoidata/agent_skills.yaml`. To add a skill, create `dot_agents/skills/<name>/SKILL.md` and add its name to the roster. Follow the environment guide for validation, scoped deployment, linker execution, commit, and push. Content-only edits still need an apply but do not need relinking.
+
+Removing a roster entry prunes scaffold-owned agent-home links. Inspect the deployed `~/.agents/skills/<name>` directory separately; roster removal does not delete it. Other entries, including bundled system skills and BB-installed skills, have separate owners.
 
 Installed skills:
 
@@ -133,11 +130,14 @@ Sources: [`ai-dynamo/rhino`](https://github.com/ai-dynamo/rhino),
 [`ishandhanani/dotfiles`](https://github.com/ishandhanani/dotfiles), plus practice distilled from
 `ryanolson/kvbm`, `ai-dynamo/velo`, and `ryanolson/roundhouse`. Each `SKILL.md` names its upstream.
 
-Verify a machine after `chezmoi apply`:
+Both agents are instructed to read [the environment guide](dot_agents/ENVIRONMENT.md) once per session. It maps tasks to tools, separates source ownership, and requires validation, scoped apply, commit, and push. Shared changes must work in both agents. See [the evaluation protocol](agent-docs/environment-evaluation.md) for behavioral checks.
+
+Verify a machine after the intended scoped apply:
 
 ```bash
 ls -la ~/.claude/skills ~/.codex/skills   # symlinks into ~/.agents/skills
-claude plugin validate ~/.agents/skills   # catches malformed SKILL.md frontmatter
+chezmoi status ~/.agents/AGENTS.md ~/.agents/ENVIRONMENT.md ~/.agents/skills
+# Start fresh sessions in both agents and follow the evaluation protocol.
 ```
 
 ### Development Environment
@@ -319,7 +319,7 @@ setup-secrets remote <host>
 
 **Examples:**
 ```bash
-openv env | rg 'ANTHROPIC_API_KEY|HF_TOKEN|NGC_API_KEY'
+openv sh -c 'test -n "${HF_TOKEN:-}"'   # exit status only; do not print secret values
 openv claude
 dev-remote spark-d
 dev-remote refresh spark-d main

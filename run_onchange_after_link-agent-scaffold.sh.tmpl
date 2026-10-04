@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Link the shared agent scaffold in ~/.agents into every agent home.
 #
-# Claude Code and Codex both discover skills at <home>/skills/<name>/SKILL.md and
-# neither supports an external-directories setting, so per-skill symlinks are the
-# only mechanism. Instruction files are linked the same way.
+# Keep per-skill links for both agent homes. Codex also discovers ~/.agents/skills
+# directly; preserve these links until supported launch paths are tested.
+# Instruction files use the same shared deployment tree.
 #
 # This is a run_onchange_ script templated from .chezmoidata/agent_skills.yaml:
-# the rendered content changes exactly when the roster changes, which is exactly
-# when relinking is needed. Editing a skill's content needs no relink.
+# roster changes rerun the linker on the next applicable apply. Editing a skill's
+# content needs an apply but no relink.
 set -euo pipefail
 
 AGENTS_ROOT="${HOME}/.agents"

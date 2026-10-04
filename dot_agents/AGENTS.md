@@ -1,7 +1,6 @@
 # Agent Instructions — Ryan Olson
 
-Canonical file. `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md` are symlinks to it; the source of
-truth is `dot_agents/AGENTS.md` in the chezmoi repo. Edit it there and run `chezmoi apply`.
+Canonical source: `dot_agents/AGENTS.md` in the repository returned by `chezmoi source-path`. `~/.agents/AGENTS.md` is a deployed copy. `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md` link to that copy.
 
 A repository's own `AGENTS.md` / `CLAUDE.md` **overrides this file** wherever the two disagree.
 This is the default, not the law.
@@ -19,6 +18,17 @@ correctness property rather than a follow-up.
    is ambiguous, ask rather than guess.
 2. Read the repository's own agent file and treat it as authoritative over this one.
 3. `git worktree list` — know the checkout layout before touching a build directory or a venv.
+4. Read `~/.agents/ENVIRONMENT.md` once per session before selecting workstation tools or planning environment changes. It maps capabilities, command discovery, prerequisites, and source ownership. If it is missing, report the gap and inspect the chezmoi source without applying unrelated files.
+
+## Environment ownership and updates
+
+- Use the established tooling described in the environment guide. Check availability in the actual execution shell and host. Read the relevant skill and current command help before use.
+- Before editing an installed skill, script, command, configuration, or plugin, identify its owner. Resolve symlinks before mapping deployed files with `chezmoi source-path <target>`. A path under `~` is not proof of ownership.
+- For chezmoi-managed files, edit the repository source, including templates and executable attributes. Never leave the only change in a deployed copy.
+- For files owned by another project or plugin manager, update that source and use its installation procedure. Do not edit plugin caches or adopt application state into chezmoi.
+- Validate the source change, preview and apply only the intended targets, then check the deployed result. Preserve unrelated source changes and deployment drift.
+- Finish an authorized environment update with a commit and push to the working branch in its owning repository. Follow the draft-PR policy for non-trivial changes. Apply alone is incomplete; report any validation, deployment, commit, or push blocker.
+- Match the requested scope. A command-discovery task ends after relevant help is checked; it does not authorize service repair, installation, or target changes.
 
 ## How I work
 
