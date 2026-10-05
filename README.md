@@ -84,6 +84,14 @@ and `#!/bin/bash -l` SLURM batch scripts are unaffected).
 > ```
 >
 > Leave the stop-time review gate off. `/codex:setup --enable-review-gate` makes Codex review each Claude turn when the turn stops. Instead, the agent suggests a review and its level when a unit of work is complete. See the "Review cadence" section of `dot_agents/AGENTS.md`.
+>
+> `codex-review-gate` lists and sets the gate for each workspace:
+> ```
+> codex-review-gate list [--enabled | --disabled] [--root DIR] [--json]
+> codex-review-gate disable PATH...
+> codex-review-gate enable PATH...
+> ```
+> `list` scans the home folder two levels deep and the worktrees of each repository that it finds. A gate whose workspace was not found shows as `(no workspace found: NAME)`. Such a gate cannot run until a repository is created at the same path again. `enable` and `disable` run the plugin's own `setup` command and need `node`.
 
 ## 🤖 Shared agent scaffold
 
