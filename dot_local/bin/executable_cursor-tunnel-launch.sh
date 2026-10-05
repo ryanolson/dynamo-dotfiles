@@ -301,14 +301,7 @@ display_tunnel_urls() {
 launch_claude() {
     local claude_args=("$@")
     
-    # Change to worktree directory if available
-    if [ -n "${CCMANAGER_WORKTREE_PATH:-}" ]; then
-        cd "$CCMANAGER_WORKTREE_PATH"
-        echo "[$(date)] Changed to worktree: $CCMANAGER_WORKTREE_PATH" >> "$TUNNEL_LOG"
-        echo "📂 Working directory: $CCMANAGER_WORKTREE_PATH"
-    else
-        echo "📁 Working directory: $(pwd)"
-    fi
+    echo "📁 Working directory: $(pwd)"
     
     # Display tunnel URLs if tunnel is running
     if [ -f "$NAME_FILE" ]; then

@@ -27,6 +27,16 @@ if [ -d "$HOME/.local/bin" ] ; then
 fi
 . "$HOME/.cargo/env"
 
+# npm globals (iou_codex, iou_pi) and pixi globals (node). fish adds these in
+# config.fish. Without them here, sh and bash logins and the hooks that they
+# start cannot find node, pi, or codex.
+if [ -d "$HOME/.npm-global/bin" ] ; then
+    PATH="$HOME/.npm-global/bin:$PATH"
+fi
+if [ -d "$HOME/.pixi/bin" ] ; then
+    PATH="$HOME/.pixi/bin:$PATH"
+fi
+
 # Arch-namespaced no-sudo layout — HPC nodes sharing $HOME across architectures
 # (x86_64 login + aarch64 compute). Prepended so it wins; no-op where absent.
 _arch="$(uname -m)"

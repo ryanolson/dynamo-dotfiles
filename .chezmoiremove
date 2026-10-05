@@ -5,6 +5,23 @@
 .config/ccmanager
 .config/ruler
 
+# Global npm installs of ccmanager, ruler, and gemini-cli outlived their removal from
+# team.yaml, because chezmoi cannot run `npm uninstall`. Deleting a global package's
+# directory and its bin link is the whole of what `npm uninstall -g` does for it.
+# The `.local/*/npm` entries cover the arch-namespaced no-sudo prefix.
+.npm-global/bin/ccmanager
+.npm-global/bin/gemini
+.npm-global/bin/ruler
+.npm-global/lib/node_modules/ccmanager
+.npm-global/lib/node_modules/@google/gemini-cli
+.npm-global/lib/node_modules/@intellectronica/ruler
+.local/*/npm/bin/ccmanager
+.local/*/npm/bin/gemini
+.local/*/npm/bin/ruler
+.local/*/npm/lib/node_modules/ccmanager
+.local/*/npm/lib/node_modules/@google/gemini-cli
+.local/*/npm/lib/node_modules/@intellectronica/ruler
+
 # Superseded by the shared agent scaffold in ~/.agents (dot_agents/).
 # ~/.skills was a placeholder wired to a `personal-skills` plugin marketplace that
 # never had a marketplace.json, so nothing ever loaded from it.

@@ -59,10 +59,6 @@ if command -v starship >/dev/null
     starship init fish | source
 end
 
-if command -v mise >/dev/null
-    mise activate fish | source
-end
-
 # Install Claude Code CLI via native installer — attempt once, not every shell.
 # bootstrap.sh installs it too; this is a fallback for shells on fresh machines.
 if not command -v claude >/dev/null
@@ -159,8 +155,5 @@ function fish_greeting
     set_color $fish_color_autosuggestion
     echo "Welcome to Dynamo development environment"
     echo "   Editor: helix | Shell: fish | Prompt: starship"
-    if command -v mise >/dev/null
-        echo "   Runtime manager: mise ("(mise ls --current 2>/dev/null | wc -l | string trim)" runtimes active)"
-    end
     set_color normal
 end
