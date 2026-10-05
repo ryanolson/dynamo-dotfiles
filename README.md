@@ -82,6 +82,8 @@ and `#!/bin/bash -l` SLURM batch scripts are unaffected).
 > /plugin install codex@openai-codex
 > /codex:setup
 > ```
+>
+> Leave the stop-time review gate off. `/codex:setup --enable-review-gate` makes Codex review each Claude turn when the turn stops. Instead, the agent suggests a review and its level when a unit of work is complete. See the "Review cadence" section of `dot_agents/AGENTS.md`.
 
 ## 🤖 Shared agent scaffold
 
@@ -115,7 +117,7 @@ Installed skills:
 | Skill | What it does |
 |---|---|
 | `thermo-nuclear-code-quality-review` | Strict adversarial review: correctness, hot-path performance, abstraction quality, file-size and spaghetti growth |
-| `wills-mega-review` | Iterates the above in fresh read-only subagents until clean, then tags the PR `human-review` |
+| `wills-mega-review` | Optional. Iterates the above in fresh read-only subagents until clean, then tags the PR `human-review` |
 | `full-code-review` | One consolidated general + thermo-nuclear pass |
 | `general-review` | Plans, designs, and documents rather than diffs |
 | `rust-code-review` | Rust systems and concurrency rules |

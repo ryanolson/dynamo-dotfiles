@@ -163,10 +163,14 @@ or through `gh`'s own credential helper; there is no third option.
 
 ## Review cadence
 
-Before asking for human review, run `wills-mega-review`: it drives
-`thermo-nuclear-code-quality-review` in a fresh read-only subagent, applies the findings, and
-repeats until a clean pass. Use `full-code-review` when a combined general and deep review is
-wanted in one shot, and `rust-code-review` for Rust-specific systems and concurrency rules.
+No review is mandatory. When a unit of work is complete, suggest a review if the change needs one, and name the level and the reason. Run it when I accept. Match the level to the risk of the change, not to its size.
+
+| Change | Suggested review |
+|---|---|
+| Small, local, and covered by tests: a fix, a doc change, a mechanical refactor | None, or `code-review` at low effort |
+| A feature or a behavior change in one area | `general-review`; `rust-code-review` for Rust systems and concurrency rules |
+| Concurrency, `unsafe`, hot paths, public interfaces, or a lifecycle across modules | `full-code-review` or `thermo-nuclear-code-quality-review` |
+| Significant new work that is ready for a human reviewer | Offer `wills-mega-review` as an option. It runs `thermo-nuclear-code-quality-review` in fresh read-only subagents, applies the findings, and repeats until a clean pass. |
 
 Treat AI review comments as adversarial claims, never as presumptions of correctness. Adjudicate
 each against the actual contract and code path before changing anything, and do not add guards,
