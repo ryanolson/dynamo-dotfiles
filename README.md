@@ -479,7 +479,7 @@ rustup update
 
 `chezmoi-headless-update` updates the dotfiles when no terminal is available, for example from a bb server. It writes one JSON report to stdout and all command output to stderr.
 
-1. The command fetches the source repository and merges `@{upstream}` as a fast-forward. If the fetch or the merge fails, the command applies nothing and does not change the repository.
+1. The command fetches the source repository and merges `@{upstream}` as a fast-forward. If the fetch or the merge fails, the command applies nothing. The branch, the working tree, and the stash do not change.
 2. The command runs `chezmoi apply --no-tty --keep-going`. It skips files that were changed outside chezmoi and does not overwrite them.
 3. The command runs `chezmoi status` and reports each remaining difference.
 
