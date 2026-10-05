@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+# ~/.pixi/bin comes first, as in config.fish: a zellij client attaches only to a
+# server of the same version, so this script must run the zellij that the panes run.
+export PATH="$HOME/.pixi/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 
 # This script runs over non-interactive SSH, where neither ~/.profile nor the
 # fish conf.d drop-in is sourced. The socket directory therefore has to be
