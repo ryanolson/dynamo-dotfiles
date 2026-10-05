@@ -475,6 +475,22 @@ sudo apt update && sudo apt upgrade
 rustup update
 ```
 
+### Headless update
+
+`chezmoi-headless-update` updates the dotfiles when no terminal is available, for example from a bb server. It writes one JSON report to stdout and all command output to stderr.
+
+1. The command fetches the source repository and merges `@{upstream}` as a fast-forward. If the fetch or the merge fails, the command applies nothing and does not change the repository.
+2. The command runs `chezmoi apply --no-tty --keep-going`. It skips files that were changed outside chezmoi and does not overwrite them.
+3. The command runs `chezmoi status` and reports each remaining difference.
+
+| Exit status | `result` | Meaning |
+|---|---|---|
+| 0 | `updated` | The update is complete. Nothing needs a person. |
+| 1 | `pull_failed` | `reasons` is `chezmoi_missing`, `source_missing`, `fetch_failed`, or `merge_failed`. Nothing was applied. |
+| 2 | `needs_attention` | The update was applied. `reasons` contains one or more of `apply_failed`, `status_failed`, `pending`, and `config_template_changed`. |
+
+The report also contains `before` and `after` (source commits), `pending` (status and path from `chezmoi status`), and `log_tail` (the last 40 output lines). The command does not regenerate the configuration with `chezmoi init`. If the report contains `config_template_changed`, run `chezmoi init` in a terminal. The `run_onchange` install script uses `sudo` on the `headless-sudo` and `primary` classes, so a headless update on those classes needs passwordless `sudo`.
+
 ## 🆚 Migration from Nix
 
 If you're migrating from our previous Nix-based setup:

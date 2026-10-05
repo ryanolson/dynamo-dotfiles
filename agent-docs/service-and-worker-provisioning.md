@@ -119,3 +119,11 @@ Kubernetes access, transport access, and bb enrollment are separate grants. A wo
 [Worker client certificates](worker-certificates.md) documents the implemented `bb-worker-cert` command. It supports SSH renewal and a copy/paste signing exchange. Signing profiles and worker activation profiles remain outside the repository. The worker keeps its private key in memory-backed storage; only the signing machine requires 1Password access.
 
 This command renews transport credentials. BB enrollment, proxy installation, provider login delivery, a guaranteed fresh approval challenge, and disconnect-based worker retirement remain separate work.
+
+## 2026-10-05 addendum: headless dotfiles update
+
+`chezmoi-headless-update` is the worker command for a server-initiated dotfiles update. The bb server runs it on a worker and reads one JSON report from stdout. The README section "Headless update" gives the exit statuses and the report fields. The command contains no server addresses, and it does not enroll a worker or grant access. Thus it obeys the contract above: installation and enrollment stay separate.
+
+The command does not use `chezmoi update`, because the `git pull --autostash --rebase` of that command leaves a rebase and a stash after a conflict. It uses a fetch and a fast-forward merge. It does not overwrite files that were changed outside chezmoi, and it does not run `chezmoi init`. Both conditions give exit status 2, and a person must resolve them.
+
+The transport that lets the server start the command on a worker is bb work.
