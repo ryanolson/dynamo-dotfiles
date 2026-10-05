@@ -34,6 +34,8 @@ On `headless-nosudo` the install is **pixi-centric**: nearly the whole toolset
 `starship`, `uv`, …) comes from [pixi](https://pixi.sh)/conda-forge — glibc-independent
 and arch-aware. Only `claude` (native installer) and `codex` (npm) are separate.
 
+On the sudo classes, `gh` also comes from pixi, in `~/.pixi/bin`. The install script links `~/.local/bin/gh` to it, because services and cron jobs often have `~/.local/bin` but not `~/.pixi/bin` in `PATH`. The script removes the `cli.github.com` apt repository and the apt `gh` package. Update `gh` with `pixi global update gh`.
+
 **Multi-architecture shared `$HOME`** (e.g. an x86_64 SLURM login node with aarch64
 GB200 compute nodes mounting the same home): everything installs under an
 **arch-namespaced root** `~/.local/<uname -m>/` (`bin`, `pixi`, `npm`), and the
