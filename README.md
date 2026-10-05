@@ -36,10 +36,10 @@ and arch-aware. Only `claude` (native installer) and `codex` (npm) are separate.
 
 On the sudo classes, the command-line tools also come from pixi, in `~/.pixi/bin`: `gh`, `bat`, `eza`, `ripgrep`, `fd`, `zoxide`, `dust`, `procs`, `helix`, `zellij`, `lazygit`, `yazi`, `broot`, `just`, `watchexec`, `hyperfine`, `tokei`, `starship`, and `rclone`. apt provides the login shell `fish`, the build dependencies, and small system tools. `kubectl` comes from the official download, `uv` and `rustup` from their own installers, and the 1Password CLI from its apt repository.
 
-- When pixi provides a tool, the install script removes its copy from `/usr/local/bin`, so one copy remains.
-- The script links `~/.local/bin/gh` and `~/.local/bin/rclone` to the pixi binaries and removes their apt packages. Services and cron jobs often have `~/.local/bin` but not `~/.pixi/bin` in `PATH`, and git's HTTPS credential helper runs `gh`.
-- If a pixi install fails, the script keeps the old copy and exits with an error. chezmoi then runs the script again on the next `chezmoi apply` or `chezmoi-headless-update`.
-- Update all pixi tools with `pixi global update`.
+- The install script links each tool into `~/.local/bin`. Services, cron jobs, and the agents that a bb server starts often have `~/.local/bin` but not `~/.pixi/bin` in `PATH`, and git's HTTPS credential helper runs `gh`.
+- After the link exists, the script removes the tool's copy from `/usr/local/bin`, and the apt packages of `gh` and `rclone`. Copies that you installed elsewhere, for example with `cargo install`, stay. In fish, `~/.pixi/bin` comes before them in `PATH`.
+- If a pixi install, a link, or a removal fails, the tool keeps its old copy and the script exits with an error. chezmoi then runs the script again on the next `chezmoi apply` or `chezmoi-headless-update`.
+- `pixi global install` does not update a tool that is already installed. Update all pixi tools with `pixi global update`.
 
 **Multi-architecture shared `$HOME`** (e.g. an x86_64 SLURM login node with aarch64
 GB200 compute nodes mounting the same home): everything installs under an
@@ -527,10 +527,9 @@ If you're migrating from our previous Nix-based setup:
 
 ### Adding New Tools
 1. Add to `.chezmoidata/team.yaml`
-2. Update package lists in `.chezmoidata/packages_*.yaml`  
-3. Update installation scripts in `run_onchange_*`
-4. Test on both macOS and Linux
-5. Submit pull request
+2. Add the conda-forge package and its binary to `PIXI_TOOLS` in `run_onchange_install-packages.sh.tmpl`, and the Homebrew name to its macOS list
+3. Test on both macOS and Linux
+4. Submit pull request
 
 ### Configuration Changes  
 1. Edit templates in `dot_config/`

@@ -15,13 +15,15 @@ PIXI = r'''
 if [ "$1 $2" = "global install" ]; then
     case " ${PIXI_FAIL:-} " in *" $3 "*) exit 1 ;; esac
     case "$3" in ripgrep) bin=rg ;; fd-find) bin=fd ;; helix) bin=hx ;; nodejs) bin=node ;; *) bin="$3" ;; esac
-    printf '#!/bin/sh\necho pixi-%s\n' "$bin" > "$(dirname "$0")/$bin"
-    chmod +x "$(dirname "$0")/$bin"
+    expose="${PIXI_HOME:-$HOME/.pixi}/bin"
+    mkdir -p "$expose"
+    printf '#!/bin/sh\necho pixi-%s\n' "$bin" > "$expose/$bin"
+    chmod +x "$expose/$bin"
 fi
 '''
 STUBS = {
     'sudo': '"$@"',
-    'apt-get': ':',
+    'apt-get': '[ "$1" = remove ] && [ -n "${APT_REMOVE_FAIL:-}" ] && exit 1; :',
     'dpkg': '[ "$1" = -s ] && [ -e "$APT_DIR/$2" ]',
     # The pixi installer honors PIXI_NO_PATH_UPDATE. Fail if the installer does not receive it.
     'curl': 'printf "%s\\n" \'[ "$PIXI_NO_PATH_UPDATE" = 1 ] || exit 9\' \'d="${PIXI_HOME:-$HOME/.pixi}/bin"; mkdir -p "$d"\''
@@ -98,15 +100,37 @@ class PixiTools(unittest.TestCase):
             self.assertTrue((self.pixi_bin() / name).exists(), name)
             self.assertFalse((self.system_bin / name).exists(), name)
         self.assertEqual((self.system_bin / 'kubectl').read_text(), 'release copy')
-        for tool in ('gh', 'rclone'):
-            link = self.home / '.local/bin' / tool
-            self.assertEqual(os.readlink(str(link)), str(self.pixi_bin() / tool))
-            self.assertIn('apt-get remove -y -qq {}'.format(tool), log)
+        # Every tool gets a link: services and agents that bb starts lack ~/.pixi/bin in PATH.
+        for name in MIGRATED_BINARIES:
+            link = self.home / '.local/bin' / name
+            self.assertEqual(os.readlink(str(link)), str(self.pixi_bin() / name), name)
+        removed = sorted(line.split()[-1] for line in log if line.startswith('apt-get remove'))
+        self.assertEqual(removed, ['gh', 'rclone'])
 
     def test_failed_tool_keeps_its_release_copy(self):
         self.run_steps('install_pixi_tools', PIXI_FAIL='zellij', expect=1)
         self.assertEqual((self.system_bin / 'zellij').read_text(), 'release copy')
         self.assertFalse((self.system_bin / 'bat').exists())
+
+    def test_pixi_found_on_path_still_uses_the_expose_folder(self):
+        # pixi on PATH outside ~/.pixi/bin (here: the stub folder) still exposes into ~/.pixi/bin.
+        log = self.run_steps('install_pixi_tools')
+        self.assertIn('pixi global install gh', log)
+        self.assertEqual(os.readlink(str(self.home / '.local/bin/gh')), str(self.pixi_bin() / 'gh'))
+        self.assertFalse((self.system_bin / 'bat').exists())
+
+    def test_failed_apt_removal_is_a_failure(self):
+        log = self.run_steps('install_pixi_tools', APT_REMOVE_FAIL='1', expect=1)
+        self.assertIn('apt-get remove -y -qq gh', log)
+        self.assertTrue((self.home / '.local/bin/gh').is_symlink())
+
+    def test_failed_link_keeps_the_release_copy(self):
+        # ~/.local/bin is a file, so no link can be made there.
+        (self.home / '.local').mkdir()
+        (self.home / '.local/bin').write_text('not a folder')
+        log = self.run_steps('install_pixi_tools', expect=1)
+        self.assertEqual((self.system_bin / 'bat').read_text(), 'release copy')
+        self.assertNotIn('apt-get remove -y -qq gh', log)
 
     def test_failed_gh_keeps_apt_gh(self):
         log = self.run_steps('install_pixi_tools', PIXI_FAIL='gh', expect=1)
