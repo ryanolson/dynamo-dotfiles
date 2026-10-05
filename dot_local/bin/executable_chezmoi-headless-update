@@ -33,7 +33,9 @@ def child_env():
     arch = os.path.join(home, '.local', platform.machine())
     dirs = [os.path.join(arch, 'bin'), os.path.join(arch, 'pixi', 'bin'), os.path.join(arch, 'npm', 'bin'),
             os.path.join(home, '.pixi', 'bin'), os.path.join(home, '.npm-global', 'bin'),
-            os.path.join(home, '.local', 'bin'), os.path.join(home, '.cargo', 'bin')]
+            os.path.join(home, '.local', 'bin'), os.path.join(home, '.cargo', 'bin'),
+            # Homebrew on Apple silicon and on Intel. A non-login SSH command on macOS has neither.
+            '/opt/homebrew/bin', '/usr/local/bin']
     env['PATH'] = os.pathsep.join(dirs + [env.get('PATH') or '/usr/bin:/bin'])
     # --no-tty covers only the prompts of chezmoi. git and ssh can still ask for credentials.
     env['GIT_TERMINAL_PROMPT'] = '0'
