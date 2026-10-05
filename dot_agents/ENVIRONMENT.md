@@ -21,6 +21,7 @@ Shell aliases and Fish functions are not portable commands. Prefer the executabl
 | Open a remote development session | `dev-remote [host] [session]`; `dev-remote refresh [host] [session]` | Uses SSH forwarding and the remote session helper. Can inject credentials and create or refresh a session. Read the source and README before changing remote state. |
 | Check GitHub access and signing configuration | `gh auth status`; `git-signing-status` | Use `gh` for GitHub credentials. Signing status checks configuration; a successful commit verifies signing. |
 | Install or update an agent CLI | `iou_claude`, `iou_codex`, `iou_cursor`, `iou_antigravity`, `iou_pi` | These change installed software. Use only for an authorized install or update. See the source README's Updating section. |
+| Update the dotfiles without a terminal | `chezmoi-headless-update` | Changes deployed files and can run install scripts. Use only for an authorized update. Exit status 0 is complete, 1 is a failed pull with nothing applied, and 2 needs a person. Read the JSON report on stdout. See the source README's Headless update section. |
 
 Fish provides convenience functions such as `cc`, `cx`, `ws`, `wnew`, `wrm`, `wcd`, `as`, and `ast`. `wt cd` is also a Fish function. In other shells, use the executable or change directory to the result of `wt path <name>`.
 
