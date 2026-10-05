@@ -182,7 +182,12 @@ main() {
         case "$1" in
             --ssh-key-ref|--signing-key-ref)
                 [[ $# -ge 2 && "$2" == op://* ]] || error "$1 requires an op:// field reference"
-                if [[ "$1" == --ssh-key-ref ]]; then SSH_KEY_REFS+=("$2"); else SIGNING_KEY_REF="$2"; fi
+                if [[ "$1" == --ssh-key-ref ]]; then
+                    SSH_KEY_REFS+=("$2")
+                else
+                    [[ -z "$SIGNING_KEY_REF" ]] || error 'Specify --signing-key-ref only once'
+                    SIGNING_KEY_REF="$2"
+                fi
                 shift 2 ;;
             --no-sudo) NO_SUDO=1; shift ;;
             --sudo)    NO_SUDO=0; shift ;;

@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -33,6 +34,13 @@ class ProvisionKeys(unittest.TestCase):
 
     def run_script(self, ref='op://Test/Key/private key'):
         return subprocess.run(['bash', str(SCRIPT), '--ssh-key-ref', ref], env=self.env, capture_output=True, text=True)
+
+    def render(self, path):
+        config = self.home / 'chezmoi.yaml'
+        config.write_text('data:\n  name: Test\n  email: test@example.com\n  onepassword:\n    enabled: true\n    ssh_agent: true\n    signing_public_key: ""\n')
+        return subprocess.run(['chezmoi', '--config', str(config), '--source', str(ROOT), 'execute-template'],
+                              input=(ROOT / path).read_text(), capture_output=True, text=True, check=True,
+                              env=self.env).stdout
 
     def test_provision_sign_and_repeat(self):
         result = self.run_script()
@@ -114,12 +122,7 @@ class ProvisionKeys(unittest.TestCase):
         self.assertEqual(subprocess.run(args, env=self.env, capture_output=True).returncode, 0)
 
     def test_templates_preserve_local_configuration(self):
-        config = self.home / 'chezmoi.yaml'
-        config.write_text('data:\n  name: Test\n  email: test@example.com\n  onepassword:\n    enabled: true\n    ssh_agent: true\n    signing_public_key: ""\n')
-        def render(path):
-            return subprocess.run(['chezmoi', '--config', str(config), '--source', str(ROOT), 'execute-template'],
-                                  input=(ROOT / path).read_text(), capture_output=True, text=True, check=True,
-                                  env=self.env).stdout
+        render = self.render
         (self.home / '.gitconfig').write_text(render('dot_gitconfig.tmpl'))
         self.assertEqual(self.run_script().returncode, 0)
         self.git('init', '-q')
@@ -149,6 +152,55 @@ class ProvisionKeys(unittest.TestCase):
         subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(self.key)], check=True)
         self.assertNotEqual(self.run_script().returncode, 0)
         self.assertEqual(target.read_bytes(), before)
+
+
+    def test_signature_failure_is_reported(self):
+        real = shutil.which('ssh-keygen')
+        fake = self.home / 'bin/ssh-keygen'
+        fake.write_text(f'#!/bin/sh\nfor arg in "$@"; do [ "$arg" = sign ] && exit 1; done\nexec {real} "$@"\n')
+        fake.chmod(0o700)
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('sign', result.stderr)
+        self.assertFalse((self.home / '.ssh/provisioned').exists())
+
+    def test_bootstrap_rejects_repeated_signing_key(self):
+        # No --ssh-key-ref: bootstrap stops at argument checks and installs nothing.
+        result = subprocess.run(['bash', str(ROOT / 'bootstrap.sh'),
+                                 '--signing-key-ref', 'op://Test/One/private key',
+                                 '--signing-key-ref', 'op://Test/Two/private key'],
+                                env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('only once', result.stdout + result.stderr)
+
+    def test_setup_secrets_upload_hint(self):
+        for name in ('openv', 'dev-remote', 'git-signing-status', 'gh'):
+            stub = self.home / 'bin' / name
+            stub.write_text('#!/bin/sh\nexit 0\n')
+            stub.chmod(0o700)
+        (self.home / 'bin/op').write_text('#!/bin/sh\nexit 0\n')
+        env_file = self.home / 'dev.env.op'
+        env_file.write_text('NGC_API_KEY=op://Test/NGC/credential\n')
+        env = {k: v for k, v in self.env.items() if 'TOKEN' not in k and 'PAT' not in k.split('_')}
+        env['DYNAMO_OP_ENV_FILE'] = str(env_file)
+        script = self.render('dot_local/bin/executable_setup-secrets.tmpl')
+        web = 'GitHub.com > Settings > SSH and GPG keys'
+
+        def check():
+            result = subprocess.run(['bash', '-c', script], env=env, cwd=self.home, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return result.stdout
+
+        output = check()
+        self.assertIn(web, output)
+        self.assertNotIn('Or: ' + web, output)
+        self.assertNotIn('gh ssh-key add', output)
+        provisioned = self.home / '.ssh/provisioned'
+        provisioned.mkdir(parents=True)
+        (provisioned / 'signing.pub').write_text('ssh-ed25519 AAAA\n')
+        output = check()
+        self.assertIn('gh ssh-key add ~/.ssh/provisioned/signing.pub', output)
+        self.assertIn('Or: ' + web, output)
 
 
 if __name__ == '__main__':

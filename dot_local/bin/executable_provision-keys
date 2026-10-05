@@ -79,8 +79,8 @@ cat > "$stage/gitconfig" <<'EOF'
 EOF
 # Check the complete signing path before making the directory visible.
 printf 'provision-keys check\n' > "$stage/message"
-SSH_AUTH_SOCK= ssh-keygen -Y sign -f "$stage/signing" -n git "$stage/message" >/dev/null 2>&1
-ssh-keygen -Y verify -f "$stage/allowed_signers" -I "$email" -n git -s "$stage/message.sig" < "$stage/message" >/dev/null 2>&1
+SSH_AUTH_SOCK= ssh-keygen -Y sign -f "$stage/signing" -n git "$stage/message" >/dev/null 2>&1 || fail 'Could not sign with the signing key.'
+ssh-keygen -Y verify -f "$stage/allowed_signers" -I "$email" -n git -s "$stage/message.sig" < "$stage/message" >/dev/null 2>&1 || fail 'Could not verify the signature against the allowed signers file.'
 rm "$stage/message" "$stage/message.sig"
 chmod 600 "$stage/"*
 if [[ -e "$target" || -L "$target" ]]; then
