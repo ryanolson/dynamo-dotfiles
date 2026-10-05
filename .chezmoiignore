@@ -11,7 +11,6 @@ LICENSE
 # Development files
 .chezmoi*
 .tool-versions
-.mise.toml
 
 # OS-specific files
 {{- if ne .chezmoi.os "darwin" }}
