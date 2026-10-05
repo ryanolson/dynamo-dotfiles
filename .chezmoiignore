@@ -30,6 +30,14 @@ LICENSE
 .aws/credentials
 .docker/config.json
 
+# Repository tests run from the source checkout. Without these rules chezmoi
+# deploys them to ~/test. A test that imports a script from dot_local/bin also
+# leaves a __pycache__ directory there, which would deploy to ~/.local/bin.
+test
+test/**
+**/__pycache__
+**/__pycache__/**
+
 # Local development files
 node_modules/
 .env
