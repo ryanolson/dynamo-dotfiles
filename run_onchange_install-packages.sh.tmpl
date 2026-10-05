@@ -318,6 +318,9 @@ pixi_cmd() {
         [[ -x "$PIXI_HOME/bin/pixi" ]] && echo "$PIXI_HOME/bin/pixi"
     elif command -v pixi >/dev/null 2>&1; then
         command -v pixi
+    elif [[ -x "$HOME/.pixi/bin/pixi" ]]; then
+        # ensure_pixi installs here, and this script's PATH does not contain it yet.
+        echo "$HOME/.pixi/bin/pixi"
     fi
 }
 
@@ -328,7 +331,7 @@ ensure_pixi() {
     if [[ -n "${PIXI_HOME:-}" ]]; then
         [[ -x "$PIXI_HOME/bin/pixi" ]] && return 0
     else
-        command -v pixi >/dev/null 2>&1 && return 0
+        [[ -n "$(pixi_cmd)" ]] && return 0
     fi
     log "Installing pixi${PIXI_HOME:+ into $PIXI_HOME}..."
     curl -fsSL https://pixi.sh/install.sh | PIXI_NO_PATH_UPDATE=1 bash || warn "Failed to install pixi"
@@ -361,10 +364,55 @@ install_codex() {
     log "   manual step: /plugin marketplace add openai/codex-plugin-cc"
 }
 
+# GitHub CLI via pixi on every Linux class. conda-forge carries current gh releases.
+# The cli.github.com apt repository failed its signature check (NO_PUBKEY
+# 5612B36462313325), so apt kept Ubuntu's much older gh.
+GH_APT_LIST="${GH_APT_LIST:-/etc/apt/sources.list.d/github-cli.list}"
+GH_APT_KEYRING="${GH_APT_KEYRING:-/usr/share/keyrings/githubcli-archive-keyring.gpg}"
+
+# Remove the repository before `apt-get update`, so apt stops reporting its failure.
+remove_gh_apt_repository() {
+    if [[ -e "$GH_APT_LIST" || -e "$GH_APT_KEYRING" ]]; then
+        log "Removing the GitHub CLI apt repository..."
+        sudo rm -f "$GH_APT_LIST" "$GH_APT_KEYRING"
+    fi
+}
+
+# The link in ~/.local/bin lets services and cron jobs find the same gh: their PATH
+# often has ~/.local/bin but not ~/.pixi/bin, and git's HTTPS credential helper runs
+# `gh` from PATH. Remove the apt gh only after the link points at the pixi gh, so
+# that one gh remains and no caller loses it.
+install_gh() {
+    ensure_pixi
+    local PIXI; PIXI="$(pixi_cmd)"
+    if [[ -z "$PIXI" ]]; then
+        warn "pixi unavailable — skipping GitHub CLI"
+        return
+    fi
+    log "pixi global install gh..."
+    if ! "$PIXI" global install gh; then
+        warn "Failed to pixi-install gh; keeping any other gh"
+        return
+    fi
+    local pixi_gh link="$HOME/.local/bin/gh"
+    pixi_gh="$(dirname "$PIXI")/gh"
+    if [[ -e "$link" && ! -L "$link" ]]; then
+        warn "$link is not a link; leaving it and any apt gh in place"
+        return
+    fi
+    mkdir -p "$(dirname "$link")"
+    ln -sfn "$pixi_gh" "$link"
+    if command -v dpkg &> /dev/null && dpkg -s gh &> /dev/null; then
+        log "Removing the apt gh package (pixi provides gh)..."
+        sudo apt-get remove -y -qq gh || warn "Failed to remove the apt gh package"
+    fi
+}
+
 # Linux path WITH sudo (headless-sudo / primary)
 install_linux_sudo() {
     log "📦 Installing packages on Linux (sudo)..."
     if command -v apt-get &> /dev/null; then
+        remove_gh_apt_repository
         sudo apt-get update -qq
         local apt_packages=(htop tree jq build-essential pkg-config libssl-dev fish unzip protobuf-compiler rclone age zstd)
         for package in "${apt_packages[@]}"; do
@@ -388,14 +436,7 @@ install_linux_sudo() {
         rm -f kubectl
     fi
 
-    # GitHub CLI via apt repository
-    if ! command -v gh &> /dev/null; then
-        log "Installing GitHub CLI..."
-        curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-        sudo apt-get update -qq
-        sudo apt-get install -y gh || warn "Failed to install GitHub CLI"
-    fi
+    install_gh
 
     # 1Password CLI — primary machines only
     if [[ "$MACHINE_CLASS" == "primary" ]] && ! command -v op &> /dev/null; then

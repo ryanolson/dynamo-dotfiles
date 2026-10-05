@@ -86,9 +86,8 @@ direct_install:
       method: "github_release"
       repo: "jesseduffield/lazygit"
       
-    - name: "gh" 
-      method: "apt_repo"
-      setup: "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg"
+    - name: "gh"
+      method: "pixi"
       
     - name: "just"
       method: "github_release"
