@@ -331,7 +331,7 @@ ensure_pixi() {
         command -v pixi >/dev/null 2>&1 && return 0
     fi
     log "Installing pixi${PIXI_HOME:+ into $PIXI_HOME}..."
-    PIXI_NO_PATH_UPDATE=1 curl -fsSL https://pixi.sh/install.sh | bash || warn "Failed to install pixi"
+    curl -fsSL https://pixi.sh/install.sh | PIXI_NO_PATH_UPDATE=1 bash || warn "Failed to install pixi"
 }
 
 # Codex CLI via npm (needs node >= 18.18). Node comes from pixi (current, sudo-free)
