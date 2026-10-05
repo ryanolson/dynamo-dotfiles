@@ -25,16 +25,21 @@ curl -fsSL https://raw.githubusercontent.com/ryanolson/dynamo-dotfiles/main/boot
 
 | Class             | Install path                | Sudo | 1Password / signing | Agent infra |
 |-------------------|-----------------------------|------|---------------------|-------------|
-| `headless-sudo`   | apt + `/usr/local/bin`      | yes  | no                  | yes         |
+| `headless-sudo`   | apt + pixi                  | yes  | no                  | yes         |
 | `headless-nosudo` | `~/.local/<arch>/` via pixi | no   | no                  | no          |
-| `primary`         | apt + `/usr/local/bin`      | yes  | **yes**             | yes         |
+| `primary`         | apt + pixi                  | yes  | **yes**             | yes         |
 
 On `headless-nosudo` the install is **pixi-centric**: nearly the whole toolset
 (`fish`, `node`, `git`, `gh`, `bat`, `ripgrep`, `fd`, `helix`, `zellij`, `lazygit`,
 `starship`, `uv`, …) comes from [pixi](https://pixi.sh)/conda-forge — glibc-independent
 and arch-aware. Only `claude` (native installer) and `codex` (npm) are separate.
 
-On the sudo classes, `gh` also comes from pixi, in `~/.pixi/bin`. The install script links `~/.local/bin/gh` to it, because services and cron jobs often have `~/.local/bin` but not `~/.pixi/bin` in `PATH`. The script removes the `cli.github.com` apt repository and the apt `gh` package. Update `gh` with `pixi global update gh`.
+On the sudo classes, the command-line tools also come from pixi, in `~/.pixi/bin`: `gh`, `bat`, `eza`, `ripgrep`, `fd`, `zoxide`, `dust`, `procs`, `helix`, `zellij`, `lazygit`, `yazi`, `broot`, `just`, `watchexec`, `hyperfine`, `tokei`, `starship`, and `rclone`. apt provides the login shell `fish`, the build dependencies, and small system tools. `kubectl` comes from the official download, `uv` and `rustup` from their own installers, and the 1Password CLI from its apt repository.
+
+- When pixi provides a tool, the install script removes its copy from `/usr/local/bin`, so one copy remains.
+- The script links `~/.local/bin/gh` and `~/.local/bin/rclone` to the pixi binaries and removes their apt packages. Services and cron jobs often have `~/.local/bin` but not `~/.pixi/bin` in `PATH`, and git's HTTPS credential helper runs `gh`.
+- If a pixi install fails, the script keeps the old copy and exits with an error. chezmoi then runs the script again on the next `chezmoi apply` or `chezmoi-headless-update`.
+- Update all pixi tools with `pixi global update`.
 
 **Multi-architecture shared `$HOME`** (e.g. an x86_64 SLURM login node with aarch64
 GB200 compute nodes mounting the same home): everything installs under an
