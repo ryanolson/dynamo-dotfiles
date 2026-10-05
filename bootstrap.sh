@@ -112,7 +112,9 @@ init_dotfiles() {
     # config from the template (re-applying the forced machine_class). Existing
     # name/email/etc. are remembered, so only unset prompts fire.
     chezmoi init "$REPO_URL" || error "Failed to initialize dotfiles"
-    chezmoi apply || error "Failed to apply dotfiles"
+    # --keep-going: one failed entry, such as a tool that pixi could not install, must not
+    # skip the entries after it. The install script runs again on the next apply.
+    chezmoi apply --keep-going || error "Some dotfiles entries failed; fix them, then run chezmoi apply again"
     success "✅ Dotfiles initialized and applied"
 }
 
