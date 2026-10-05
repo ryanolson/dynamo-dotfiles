@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ~/.pixi/bin comes first, as in config.fish: a zellij client attaches only to a
-# server of the same version, so this script must run the zellij that the panes run.
-export PATH="$HOME/.pixi/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+# A zellij client attaches only to a server of the same version, so this script must
+# run the zellij that the panes run. The order follows .profile and config.fish: the
+# arch-namespaced root of headless-nosudo first, because ~/.pixi/bin on a shared $HOME
+# can hold another architecture's binaries; then ~/.pixi/bin before ~/.cargo/bin.
+arch_root="$HOME/.local/$(uname -m)"
+export PATH="$arch_root/bin:$arch_root/pixi/bin:$HOME/.pixi/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 
 # This script runs over non-interactive SSH, where neither ~/.profile nor the
 # fish conf.d drop-in is sourced. The socket directory therefore has to be
@@ -19,6 +22,7 @@ usage() {
 Usage:
   dynamo-remote-session prime [--session NAME] [--refresh]
   dynamo-remote-session attach [--session NAME]
+  dynamo-remote-session check
 EOF
     exit 1
 }
@@ -82,6 +86,10 @@ load_payload() {
 }
 
 case "$command_name" in
+    check)
+        # Print the zellij that prime and attach run. setup-secrets calls this over SSH.
+        command -v zellij || { echo "zellij not found in $PATH" >&2; exit 1; }
+        ;;
     prime)
         load_payload
         refresh_auth_sock
