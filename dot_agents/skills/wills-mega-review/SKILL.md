@@ -1,6 +1,6 @@
 ---
 name: wills-mega-review
-description: Prepare a mostly working, tested PR for human review by iterating independent read-only thermonuclear code-quality reviews, fixes, and regression tests until the review is clean, then add the `human-review` PR tag. Use before asking a human to review, approve, or merge a PR.
+description: Prepare a mostly working, tested PR for human review by iterating independent read-only thermonuclear code-quality reviews, fixes, and regression tests until the review is clean, then add the `human-review` PR tag. Use when the user chooses this pass for significant new work. It is optional; offer it, do not run it unasked.
 ---
 
 # Will's Mega Review
