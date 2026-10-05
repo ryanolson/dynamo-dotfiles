@@ -34,19 +34,15 @@ case "$OSTYPE" in
     *)        error "Unsupported OS: $OSTYPE" ;;
 esac
 
-# Detect architecture and set naming variants used by different projects
+# Detect architecture and the name that kubectl downloads use for it
 ARCH="$(uname -m)"
 case "$ARCH" in
     x86_64)
-        ARCH_ALT="amd64"      # kubectl, gh
-        ARCH_RUST="x86_64"    # most Rust projects
-        ARCH_GO="x86_64"      # lazygit uses this for x86
+        ARCH_ALT="amd64"
         ;;
     aarch64|arm64)
         ARCH="aarch64"
         ARCH_ALT="arm64"
-        ARCH_RUST="aarch64"
-        ARCH_GO="arm64"       # lazygit uses arm64
         ;;
     *)
         error "Unsupported architecture: $ARCH"
@@ -60,12 +56,10 @@ log "Detected architecture: $ARCH ($ARCH_ALT)"
 # use /usr/local/bin (single-arch boxes).
 ARCH_RAW="$(uname -m)"          # x86_64 | aarch64
 BIN_DIR="/usr/local/bin"
-SUDO="sudo"
 ARCH_ROOT=""
 if [[ "$MACHINE_CLASS" == "headless-nosudo" ]]; then
     ARCH_ROOT="$HOME/.local/$ARCH_RAW"
     BIN_DIR="$ARCH_ROOT/bin"
-    SUDO=""
     export PIXI_HOME="$ARCH_ROOT/pixi"
     export NPM_CONFIG_PREFIX="$ARCH_ROOT/npm"
     export PATH="$BIN_DIR:$PIXI_HOME/bin:$NPM_CONFIG_PREFIX/bin:$PATH"
@@ -122,132 +116,9 @@ install_macos_packages() {
     success "✅ macOS packages installed"
 }
 
-# Download a GitHub-release binary into $BIN_DIR (uses $SUDO, empty on no-sudo nodes)
-# Fetch a repo's latest-release JSON. Prefer `gh api`: it uses the credential
-# `gh auth login` already stores, which lifts the anonymous 60 req/hr limit that
-# a fresh bootstrap blows through in this loop. Falls back to anonymous curl so
-# bootstrap still works before `gh auth login` has been run.
-#
-# This is the only authenticated path here on purpose. Never add an
-# `Authorization: token ...` header or read GITHUB_TOKEN -- see the GitHub auth
-# policy in README.md.
-github_release_json() {
-    local repo="$1"
-    if command -v gh &>/dev/null && gh auth status &>/dev/null; then
-        gh api "repos/$repo/releases/latest" 2>/dev/null && return 0
-    fi
-    curl -s "https://api.github.com/repos/$repo/releases/latest"
-}
-
-install_github_release() {
-    local repo="$1"
-    local name="$2"
-    local install_dir="$3"
-
-    case "$name" in
-        "ripgrep") command -v rg &>/dev/null && { log "✓ ripgrep (rg) already installed"; return; } ;;
-        "helix")   command -v hx &>/dev/null && { log "✓ helix (hx) already installed"; return; } ;;
-        *)         command -v "$name" &>/dev/null && { log "✓ $name already installed"; return; } ;;
-    esac
-
-    log "Installing $name from GitHub..."
-    local release_json
-    release_json=$(github_release_json "$repo")
-    local download_url=""
-    case "$name" in
-        "bat")       download_url=$(echo "$release_json" | grep "browser_download_url.*bat.*${ARCH_RUST}.*linux.*tar.gz" | cut -d'"' -f4 | head -1) ;;
-        "eza")       download_url=$(echo "$release_json" | grep "browser_download_url.*eza.*${ARCH_RUST}.*linux.*tar.gz" | cut -d'"' -f4 | head -1) ;;
-        "ripgrep")   download_url=$(echo "$release_json" | grep "browser_download_url.*ripgrep.*${ARCH_RUST}.*linux.*tar.gz" | cut -d'"' -f4 | head -1) ;;
-        "fd")        download_url=$(echo "$release_json" | grep "browser_download_url.*fd.*${ARCH_RUST}.*linux.*tar.gz" | cut -d'"' -f4 | head -1) ;;
-        "zoxide")    download_url=$(echo "$release_json" | grep "browser_download_url.*zoxide.*${ARCH_RUST}.*linux.*tar.gz" | cut -d'"' -f4 | head -1) ;;
-        "dust")      download_url=$(echo "$release_json" | grep "browser_download_url.*dust.*${ARCH_RUST}.*linux.*tar.gz" | cut -d'"' -f4 | head -1) ;;
-        "procs")     download_url=$(echo "$release_json" | grep "browser_download_url.*procs.*${ARCH_RUST}.*linux.*zip" | cut -d'"' -f4 | head -1) ;;
-        "helix")     download_url=$(echo "$release_json" | grep "browser_download_url.*helix.*${ARCH_RUST}.*linux.*tar.xz" | cut -d'"' -f4 | head -1) ;;
-        "zellij")    download_url=$(echo "$release_json" | grep "browser_download_url.*zellij.*${ARCH_RUST}.*linux.*tar.gz" | cut -d'"' -f4 | head -1) ;;
-        "lazygit")   download_url=$(echo "$release_json" | grep "browser_download_url.*lazygit.*Linux_${ARCH_GO}.tar.gz" | cut -d'"' -f4 | head -1) ;;
-        "just")      download_url=$(echo "$release_json" | grep "browser_download_url.*just.*${ARCH_RUST}.*linux.*tar.gz" | cut -d'"' -f4 | head -1) ;;
-        "watchexec") download_url=$(echo "$release_json" | grep "browser_download_url.*watchexec.*${ARCH_RUST}.*linux.*tar.xz" | cut -d'"' -f4 | head -1) ;;
-        "hyperfine") download_url=$(echo "$release_json" | grep "browser_download_url.*hyperfine.*${ARCH_RUST}.*linux.*tar.gz" | cut -d'"' -f4 | head -1) ;;
-        "tokei")     download_url=$(echo "$release_json" | grep "browser_download_url.*tokei.*${ARCH_RUST}.*linux.*tar.gz" | cut -d'"' -f4 | head -1) ;;
-    esac
-
-    if [[ -z "$download_url" ]]; then
-        warn "Download URL not found for $name (check GitHub releases)"
-        return 1
-    fi
-
-    local temp_dir; temp_dir=$(mktemp -d)
-    ( cd "$temp_dir"
-      curl -L "$download_url" -o archive || { warn "Failed to download $name"; exit 1; }
-      if file archive | grep -q "gzip"; then tar -xzf archive
-      elif file archive | grep -q "XZ"; then tar -xJf archive
-      elif file archive | grep -q "Zip"; then unzip -q archive; fi
-    ) || { rm -rf "$temp_dir"; return 1; }
-
-    local binary=""
-    case "$name" in
-        "ripgrep") binary=$(find "$temp_dir" -name "rg" -type f -executable | head -1) ;;
-        "helix")   binary=$(find "$temp_dir" -name "hx" -type f -executable | head -1) ;;
-        *)         binary=$(find "$temp_dir" -name "$name" -type f -executable | head -1) ;;
-    esac
-
-    if [[ -n "$binary" ]]; then
-        local target="$name"
-        [[ "$name" == "ripgrep" ]] && target="rg"
-        [[ "$name" == "helix" ]] && target="hx"
-        $SUDO cp "$binary" "$install_dir/$target"
-        $SUDO chmod +x "$install_dir/$target"
-        success "✓ $name installed as $target"
-    else
-        warn "Binary not found for $name"
-    fi
-    rm -rf "$temp_dir"
-}
-
-# GitHub-release tools shared by all Linux paths (sudo just changes $BIN_DIR/$SUDO)
-install_github_tools() {
-    local github_tools=(
-        "sharkdp/bat:bat"
-        "eza-community/eza:eza"
-        "BurntSushi/ripgrep:ripgrep"
-        "sharkdp/fd:fd"
-        "ajeetdsouza/zoxide:zoxide"
-        "bootandy/dust:dust"
-        "dalance/procs:procs"
-        "helix-editor/helix:helix"
-        "zellij-org/zellij:zellij"
-        "jesseduffield/lazygit:lazygit"
-        "casey/just:just"
-        "watchexec/watchexec:watchexec"
-        "sharkdp/hyperfine:hyperfine"
-        "XAMPPRocky/tokei:tokei"
-    )
-    for tool in "${github_tools[@]}"; do
-        IFS=':' read -r repo name <<< "$tool"
-        install_github_release "$repo" "$name" "$BIN_DIR" || warn "Skipping $name due to installation failure"
-    done
-
-    # yazi (release zip)
-    if ! command -v yazi &> /dev/null; then
-        log "Installing yazi..."
-        local td; td=$(mktemp -d)
-        if curl -fL "https://github.com/sxyazi/yazi/releases/latest/download/yazi-${ARCH_RUST}-unknown-linux-gnu.zip" -o "$td/yazi.zip"; then
-            unzip -q "$td/yazi.zip" -d "$td"
-            $SUDO cp "$td/yazi-${ARCH_RUST}-unknown-linux-gnu/yazi" "$BIN_DIR/"
-            $SUDO chmod +x "$BIN_DIR/yazi"
-        else
-            warn "Failed to download yazi"
-        fi
-        rm -rf "$td"
-    fi
-}
-
-# starship / uv / rustup — all support $HOME-local installs
+# uv and rustup keep their own installers, because each updates itself (`uv self
+# update`, `rustup update`).
 install_curl_tools() {
-    if ! command -v starship &> /dev/null; then
-        log "Installing starship..."
-        curl -sS https://starship.rs/install.sh | sh -s -- --yes -b "$BIN_DIR" || warn "Failed to install starship"
-    fi
     if ! command -v uv &> /dev/null; then
         log "Installing uv..."
         curl -LsSf https://astral.sh/uv/install.sh | sh || warn "Failed to install uv"
@@ -364,7 +235,22 @@ install_codex() {
     log "   manual step: /plugin marketplace add openai/codex-plugin-cc"
 }
 
-# GitHub CLI via pixi on every Linux class. conda-forge carries current gh releases.
+# Command-line tools from conda-forge through `pixi global`, on every Linux class.
+# Each entry is <conda-forge package>:<binary>. conda-forge's `fd` is a different
+# package (a LIGO frame library); the file finder is `fd-find`.
+PIXI_TOOLS=(
+    gh:gh bat:bat eza:eza ripgrep:rg fd-find:fd zoxide:zoxide dust:dust procs:procs
+    helix:hx zellij:zellij lazygit:lazygit yazi:yazi broot:broot just:just
+    watchexec:watchexec hyperfine:hyperfine tokei:tokei starship:starship rclone:rclone
+)
+# headless-nosudo has no apt and no shared uv, so pixi also provides these there.
+NOSUDO_PIXI_TOOLS=(fish:fish nodejs:node git:git uv:uv age:age zstd:zstd)
+# Services and cron jobs call these. Their PATH often has ~/.local/bin but not
+# ~/.pixi/bin, and git's HTTPS credential helper runs `gh` from PATH.
+SERVICE_TOOLS=(gh rclone)
+# A release binary here stays stale for every caller without ~/.pixi/bin in PATH.
+# Remove it once pixi provides the tool, so one copy remains.
+SYSTEM_BIN_DIR="${SYSTEM_BIN_DIR:-/usr/local/bin}"
 # The cli.github.com apt repository failed its signature check (NO_PUBKEY
 # 5612B36462313325), so apt kept Ubuntu's much older gh.
 GH_APT_LIST="${GH_APT_LIST:-/etc/apt/sources.list.d/github-cli.list}"
@@ -378,34 +264,59 @@ remove_gh_apt_repository() {
     fi
 }
 
-# The link in ~/.local/bin lets services and cron jobs find the same gh: their PATH
-# often has ~/.local/bin but not ~/.pixi/bin, and git's HTTPS credential helper runs
-# `gh` from PATH. Remove the apt gh only after the link points at the pixi gh, so
-# that one gh remains and no caller loses it.
-install_gh() {
-    ensure_pixi
-    local PIXI; PIXI="$(pixi_cmd)"
-    if [[ -z "$PIXI" ]]; then
-        warn "pixi unavailable — skipping GitHub CLI"
-        return
-    fi
-    log "pixi global install gh..."
-    if ! "$PIXI" global install gh; then
-        warn "Failed to pixi-install gh; keeping any other gh"
-        return
-    fi
-    local pixi_gh link="$HOME/.local/bin/gh"
-    pixi_gh="$(dirname "$PIXI")/gh"
+# Link ~/.local/bin/<bin> to the pixi binary, then remove the apt package of that name.
+# A file there that is not a link stays, and so does the apt package.
+link_service_tool() {
+    local bin="$1" pixi_dir="$2" link="$HOME/.local/bin/$1"
     if [[ -e "$link" && ! -L "$link" ]]; then
-        warn "$link is not a link; leaving it and any apt gh in place"
+        warn "$link is not a link; leaving it and any apt $bin in place"
         return
     fi
     mkdir -p "$(dirname "$link")"
-    ln -sfn "$pixi_gh" "$link"
-    if command -v dpkg &> /dev/null && dpkg -s gh &> /dev/null; then
-        log "Removing the apt gh package (pixi provides gh)..."
-        sudo apt-get remove -y -qq gh || warn "Failed to remove the apt gh package"
+    ln -sfn "$pixi_dir/$bin" "$link"
+    if command -v dpkg &> /dev/null && dpkg -s "$bin" &> /dev/null; then
+        log "Removing the apt $bin package (pixi provides $bin)..."
+        sudo apt-get remove -y -qq "$bin" || warn "Failed to remove the apt $bin package"
     fi
+}
+
+# Return 1 if a tool failed. chezmoi then does not record this run_onchange script as
+# done, and runs it again on the next apply, so a machine that updates headless gets
+# there in the end instead of keeping a half-done migration.
+install_pixi_tools() {
+    ensure_pixi
+    local PIXI; PIXI="$(pixi_cmd)"
+    if [[ -z "$PIXI" || ! -x "$PIXI" ]]; then
+        error "pixi unavailable — cannot install tools"
+        return 1
+    fi
+    local pixi_dir failed=0 entry package bin
+    pixi_dir="$(dirname "$PIXI")"
+    local tools=("${PIXI_TOOLS[@]}")
+    if [[ "$MACHINE_CLASS" == "headless-nosudo" ]]; then
+        tools+=("${NOSUDO_PIXI_TOOLS[@]}")
+    fi
+    for entry in "${tools[@]}"; do
+        package="${entry%%:*}"
+        bin="${entry#*:}"
+        log "pixi global install $package..."
+        if ! "$PIXI" global install "$package" || [[ ! -x "$pixi_dir/$bin" ]]; then
+            warn "Failed to pixi-install $package"
+            failed=1
+            continue
+        fi
+        # On headless-nosudo, ~/.local/bin is shared across architectures, and nothing
+        # was installed with sudo.
+        [[ "$MACHINE_CLASS" == "headless-nosudo" ]] && continue
+        if [[ -e "$SYSTEM_BIN_DIR/$bin" ]]; then
+            log "Removing $SYSTEM_BIN_DIR/$bin (pixi provides $bin)..."
+            sudo rm -f "$SYSTEM_BIN_DIR/$bin"
+        fi
+        if [[ " ${SERVICE_TOOLS[*]} " == *" $bin "* ]]; then
+            link_service_tool "$bin" "$pixi_dir"
+        fi
+    done
+    return "$failed"
 }
 
 # Linux path WITH sudo (headless-sudo / primary)
@@ -414,7 +325,7 @@ install_linux_sudo() {
     if command -v apt-get &> /dev/null; then
         remove_gh_apt_repository
         sudo apt-get update -qq
-        local apt_packages=(htop tree jq build-essential pkg-config libssl-dev fish unzip protobuf-compiler rclone age zstd)
+        local apt_packages=(htop tree jq build-essential pkg-config libssl-dev fish unzip protobuf-compiler age zstd)
         for package in "${apt_packages[@]}"; do
             if dpkg -l | grep -q "^ii  $package "; then
                 log "✓ $package already installed"
@@ -425,7 +336,8 @@ install_linux_sudo() {
         done
     fi
 
-    install_github_tools
+    local status=0
+    install_pixi_tools || status=1
     install_curl_tools
 
     # kubectl
@@ -435,8 +347,6 @@ install_linux_sudo() {
         sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
         rm -f kubectl
     fi
-
-    install_gh
 
     # 1Password CLI — primary machines only
     if [[ "$MACHINE_CLASS" == "primary" ]] && ! command -v op &> /dev/null; then
@@ -455,13 +365,12 @@ install_linux_sudo() {
         sudo apt-get install -y 1password-cli || warn "Failed to install 1Password CLI"
     fi
 
-    # Broot via snap if available
-    if command -v snap &> /dev/null && ! command -v broot &> /dev/null; then
-        sudo snap install broot || warn "Failed to install broot"
-    fi
-
     install_claude
     install_codex
+    if [[ $status -ne 0 ]]; then
+        error "Some pixi tools failed; chezmoi runs this script again on the next apply"
+        return 1
+    fi
     success "✅ Linux packages installed"
 }
 
@@ -474,31 +383,16 @@ install_linux_nosudo() {
     log "📦 Installing packages into $ARCH_ROOT (no sudo, arch=$ARCH_RAW)"
     command -v curl >/dev/null || { error "curl is required but not found"; return 1; }
 
-    # IMPORTANT: never trust `command -v pixi` here — a stale x86 ~/.pixi/bin/pixi
-    # is often on PATH on the aarch64 node. Install + invoke the arch one by path.
-    ensure_pixi
-    local PIXI; PIXI="$(pixi_cmd)"
-    if [[ -z "$PIXI" || ! -x "$PIXI" ]]; then
-        error "pixi unavailable at $PIXI_HOME/bin/pixi — cannot install fish/node"; return 1
-    fi
-    log "Using pixi: $PIXI"
-
-    # conda-forge package names (a few differ from the binary they ship).
-    local pkgs=(
-        fish nodejs git gh
-        bat eza ripgrep fd zoxide dust procs
-        helix zellij lazygit yazi
-        just watchexec hyperfine tokei
-        starship uv rclone age zstd
-    )
-    # pixi global install is idempotent (no-ops if already present).
-    for p in "${pkgs[@]}"; do
-        log "pixi global install $p..."
-        "$PIXI" global install "$p" || warn "Failed to pixi-install $p"
-    done
-
+    # pixi_cmd uses only the arch pixi in $PIXI_HOME. A stale x86 ~/.pixi/bin/pixi is
+    # often on PATH on the aarch64 node.
+    local status=0
+    install_pixi_tools || status=1
     install_claude     # native installer; per-arch (launcher in ~/.local/bin, store in ~/.claude)
     install_codex      # npm -g under the arch-namespaced NPM prefix
+    if [[ $status -ne 0 ]]; then
+        error "Some pixi tools failed; chezmoi runs this script again on the next apply"
+        return 1
+    fi
     success "✅ No-sudo packages installed under $ARCH_ROOT"
 }
 
