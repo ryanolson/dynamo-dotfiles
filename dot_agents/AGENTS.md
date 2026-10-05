@@ -128,7 +128,7 @@ feels. A workflow that runs every stage on the largest model is not more correct
 | Use | For |
 |---|---|
 | **Opus** (`claude-opus-5`) | Load-bearing reasoning: judging whether an invariant holds, designing a type that makes an invalid state unrepresentable, tracing a lifecycle across modules, deciding whether a finding is real. Anything where being wrong is expensive and the answer is not lookup-shaped. |
-| **Sonnet** (`claude-sonnet-5`) | Bounded work with a checkable answer: does anything call this function, does this parse, mechanical refactors, running a suite and reporting failures, writing a test for a behavior already characterized. |
+| **Sonnet** (the newest Sonnet, `sonnet` alias; 5.5 as of 2026-09-29) | Bounded work with a checkable answer: does anything call this function, does this parse, mechanical refactors, running a suite and reporting failures, writing a test for a behavior already characterized. |
 | **Fable** (`claude-fable-5`) | Orchestrator, never the workhorse: planning milestones, authoring workflow scripts and the design rulings their stage briefs carry, synthesizing reports into documents, running the review cadence, gating and committing. |
 
 Two rules matter more than the table:
