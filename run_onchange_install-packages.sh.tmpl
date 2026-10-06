@@ -236,12 +236,19 @@ install_codex() {
 }
 
 # Command-line tools from conda-forge through `pixi global`, on every Linux class.
-# Each entry is <conda-forge package>:<binary>. conda-forge's `fd` is a different
-# package (a LIGO frame library); the file finder is `fd-find`.
+# Each entry is <conda-forge package>:<binary>[:<version>]. conda-forge's `fd` is a
+# different package (a LIGO frame library); the file finder is `fd-find`.
+#
+# A version marks a critical tool. Each machine installs exactly that version, and a
+# change to it reaches every machine on its next chezmoi update; zellij, for example,
+# attaches only to a server of the same version. A critical tool that fails makes this
+# script fail. The other tools float: run_after_update-pixi-tools updates them weekly,
+# and a failure only warns.
 PIXI_TOOLS=(
-    gh:gh bat:bat eza:eza ripgrep:rg fd-find:fd zoxide:zoxide dust:dust procs:procs
-    helix:hx zellij:zellij lazygit:lazygit yazi:yazi broot:broot just:just
-    watchexec:watchexec hyperfine:hyperfine tokei:tokei starship:starship rclone:rclone
+    gh:gh:2.102.0 zellij:zellij:0.45.1 rclone:rclone:1.75.1
+    bat:bat eza:eza ripgrep:rg fd-find:fd zoxide:zoxide dust:dust procs:procs
+    helix:hx lazygit:lazygit yazi:yazi broot:broot just:just
+    watchexec:watchexec hyperfine:hyperfine tokei:tokei starship:starship
 )
 # headless-nosudo has no apt and no shared uv, so pixi also provides these there.
 NOSUDO_PIXI_TOOLS=(fish:fish nodejs:node git:git uv:uv age:age zstd:zstd)
@@ -277,9 +284,9 @@ link_pixi_tool() {
     mkdir -p "$(dirname "$link")" && ln -sfn "$expose_dir/$bin" "$link"
 }
 
-# Return 1 if a tool failed. chezmoi then does not record this run_onchange script as
-# done, and runs it again on the next apply, so a machine that updates headless gets
-# there in the end instead of keeping a half-done migration.
+# Return 1 if a critical tool failed. chezmoi then does not record this run_onchange
+# script as done, and runs it again on the next apply, so a machine that updates
+# headless gets there in the end instead of keeping a half-done migration.
 install_pixi_tools() {
     ensure_pixi
     local PIXI; PIXI="$(pixi_cmd)"
@@ -289,18 +296,19 @@ install_pixi_tools() {
     fi
     # `pixi global` exposes binaries here, wherever the pixi executable itself is.
     local expose_dir="${PIXI_HOME:-$HOME/.pixi}/bin"
-    local failed=0 linked entry package bin
+    local failed=0 linked entry package bin version critical
     local tools=("${PIXI_TOOLS[@]}")
     if [[ "$MACHINE_CLASS" == "headless-nosudo" ]]; then
         tools+=("${NOSUDO_PIXI_TOOLS[@]}")
     fi
     for entry in "${tools[@]}"; do
-        package="${entry%%:*}"
-        bin="${entry#*:}"
-        log "pixi global install $package..."
-        if ! "$PIXI" global install "$package" || [[ ! -x "$expose_dir/$bin" ]]; then
+        IFS=: read -r package bin version <<< "$entry"
+        critical=0
+        [[ -n "$version" ]] && critical=1
+        log "pixi global install $package${version:+==$version}..."
+        if ! "$PIXI" global install "$package${version:+==$version}" || [[ ! -x "$expose_dir/$bin" ]]; then
             warn "Failed to pixi-install $package"
-            failed=1
+            failed=$((failed | critical))
             continue
         fi
         # On headless-nosudo, ~/.local/bin is shared across architectures, and nothing
@@ -311,17 +319,23 @@ install_pixi_tools() {
         link_pixi_tool "$bin" "$expose_dir" || linked=$?
         if [[ $linked -eq 1 ]]; then
             warn "Failed to link $HOME/.local/bin/$bin"
-            failed=1
+            failed=$((failed | critical))
             continue
         fi
         if [[ -e "$SYSTEM_BIN_DIR/$bin" ]]; then
             log "Removing $SYSTEM_BIN_DIR/$bin (pixi provides $bin)..."
-            sudo rm -f "$SYSTEM_BIN_DIR/$bin" || { warn "Failed to remove $SYSTEM_BIN_DIR/$bin"; failed=1; }
+            if ! sudo rm -f "$SYSTEM_BIN_DIR/$bin"; then
+                warn "Failed to remove $SYSTEM_BIN_DIR/$bin"
+                failed=$((failed | critical))
+            fi
         fi
         if [[ $linked -eq 0 && " ${APT_REPLACED[*]} " == *" $bin "* ]] \
             && command -v dpkg &> /dev/null && dpkg -s "$bin" &> /dev/null; then
             log "Removing the apt $bin package (pixi provides $bin)..."
-            sudo apt-get remove -y -qq "$bin" || { warn "Failed to remove the apt $bin package"; failed=1; }
+            if ! sudo apt-get remove -y -qq "$bin"; then
+                warn "Failed to remove the apt $bin package"
+                failed=$((failed | critical))
+            fi
         fi
     done
     return "$failed"
@@ -376,7 +390,7 @@ install_linux_sudo() {
     install_claude
     install_codex
     if [[ $status -ne 0 ]]; then
-        error "Some pixi tools failed; chezmoi runs this script again on the next apply"
+        error "A critical pixi tool failed; chezmoi runs this script again on the next apply"
         return 1
     fi
     success "✅ Linux packages installed"
@@ -398,7 +412,7 @@ install_linux_nosudo() {
     install_claude     # native installer; per-arch (launcher in ~/.local/bin, store in ~/.claude)
     install_codex      # npm -g under the arch-namespaced NPM prefix
     if [[ $status -ne 0 ]]; then
-        error "Some pixi tools failed; chezmoi runs this script again on the next apply"
+        error "A critical pixi tool failed; chezmoi runs this script again on the next apply"
         return 1
     fi
     success "✅ No-sudo packages installed under $ARCH_ROOT"

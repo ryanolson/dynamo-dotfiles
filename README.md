@@ -38,8 +38,9 @@ On the sudo classes, the command-line tools also come from pixi, in `~/.pixi/bin
 
 - The install script links each tool into `~/.local/bin`. Services, cron jobs, and the agents that a bb server starts often have `~/.local/bin` but not `~/.pixi/bin` in `PATH`, and git's HTTPS credential helper runs `gh`.
 - After the link exists, the script removes the tool's copy from `/usr/local/bin`, and the apt packages of `gh` and `rclone`. Copies that you installed elsewhere, for example with `cargo install`, stay. In fish, `~/.pixi/bin` comes before them in `PATH`.
-- If a pixi install, a link, or a removal fails, the tool keeps its old copy and the script exits with an error. chezmoi then runs the script again on the next `chezmoi apply` or `chezmoi-headless-update`.
-- `pixi global install` does not update a tool that is already installed. Update all pixi tools with `pixi global update`.
+- `gh`, `zellij`, and `rclone` are critical tools. `PIXI_TOOLS` pins each one to a version, and each machine installs that version. To update a critical tool, change its version in `PIXI_TOOLS`; each machine installs the new version on its next `chezmoi update`.
+- If a pixi install, a link, or a removal fails, the tool keeps its old copy. For a critical tool, the script also exits with an error, and chezmoi runs it again on the next `chezmoi apply` or `chezmoi-headless-update`. For the other tools, the script only warns.
+- `run_after_update-pixi-tools` runs `pixi global update` at most once per 7 days, on each `chezmoi apply` or `chezmoi update`. It updates the other tools and keeps the pins. A failed update only warns, and the next apply tries again.
 
 **Multi-architecture shared `$HOME`** (e.g. an x86_64 SLURM login node with aarch64
 GB200 compute nodes mounting the same home): everything installs under an
@@ -527,7 +528,7 @@ If you're migrating from our previous Nix-based setup:
 
 ### Adding New Tools
 1. Add to `.chezmoidata/team.yaml`
-2. Add the conda-forge package and its binary to `PIXI_TOOLS` in `run_onchange_install-packages.sh.tmpl`, and the Homebrew name to its macOS list
+2. Add the conda-forge package and its binary to `PIXI_TOOLS` in `run_onchange_install-packages.sh.tmpl`, with a version if the tool is critical, and the Homebrew name to its macOS list
 3. Test on both macOS and Linux
 4. Submit pull request
 

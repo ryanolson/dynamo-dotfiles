@@ -13,8 +13,9 @@ TEMPLATE = ROOT / 'run_onchange_install-packages.sh.tmpl'
 # as the real command does, unless PKG is in $PIXI_FAIL.
 PIXI = r'''
 if [ "$1 $2" = "global install" ]; then
-    case " ${PIXI_FAIL:-} " in *" $3 "*) exit 1 ;; esac
-    case "$3" in ripgrep) bin=rg ;; fd-find) bin=fd ;; helix) bin=hx ;; nodejs) bin=node ;; *) bin="$3" ;; esac
+    pkg="${3%%==*}"
+    case " ${PIXI_FAIL:-} " in *" $pkg "*) exit 1 ;; esac
+    case "$pkg" in ripgrep) bin=rg ;; fd-find) bin=fd ;; helix) bin=hx ;; nodejs) bin=node ;; *) bin="$pkg" ;; esac
     expose="${PIXI_HOME:-$HOME/.pixi}/bin"
     mkdir -p "$expose"
     printf '#!/bin/sh\necho pixi-%s\n' "$bin" > "$expose/$bin"
@@ -84,7 +85,8 @@ class PixiTools(unittest.TestCase):
         return self.log.read_text().splitlines() if self.log.exists() else []
 
     def installed(self, log):
-        return [line.split()[3] for line in log if re.match(r'pixi global install \S+$', line)]
+        """Return the package names that were installed, without version pins."""
+        return [line.split()[3].split('==')[0] for line in log if re.match(r'pixi global install \S+$', line)]
 
     def pixi_bin(self):
         return self.home / '.pixi/bin'
@@ -107,6 +109,17 @@ class PixiTools(unittest.TestCase):
         removed = sorted(line.split()[-1] for line in log if line.startswith('apt-get remove'))
         self.assertEqual(removed, ['gh', 'rclone'])
 
+    def test_critical_tools_are_pinned(self):
+        log = self.run_steps('install_pixi_tools')
+        pins = sorted(line.split()[3] for line in log if re.match(r'pixi global install \S+==\S+$', line))
+        self.assertEqual([pin.split('==')[0] for pin in pins], ['gh', 'rclone', 'zellij'])
+        self.assertIn('pixi global install bat', log)
+
+    def test_failed_floating_tool_only_warns(self):
+        self.run_steps('install_pixi_tools', PIXI_FAIL='tokei bat')
+        self.assertEqual((self.system_bin / 'bat').read_text(), 'release copy')
+        self.assertFalse((self.system_bin / 'eza').exists())
+
     def test_failed_tool_keeps_its_release_copy(self):
         self.run_steps('install_pixi_tools', PIXI_FAIL='zellij', expect=1)
         self.assertEqual((self.system_bin / 'zellij').read_text(), 'release copy')
@@ -115,7 +128,7 @@ class PixiTools(unittest.TestCase):
     def test_pixi_found_on_path_still_uses_the_expose_folder(self):
         # pixi on PATH outside ~/.pixi/bin (here: the stub folder) still exposes into ~/.pixi/bin.
         log = self.run_steps('install_pixi_tools')
-        self.assertIn('pixi global install gh', log)
+        self.assertIn('gh', self.installed(log))
         self.assertEqual(os.readlink(str(self.home / '.local/bin/gh')), str(self.pixi_bin() / 'gh'))
         self.assertFalse((self.system_bin / 'bat').exists())
 
