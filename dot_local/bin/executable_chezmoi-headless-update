@@ -97,7 +97,9 @@ def main():
     reasons = []
     if runner.run([chezmoi, 'apply', '--no-tty', '--keep-going'])[0] != 0:
         reasons.append('apply_failed')
-    code, out, _ = runner.run([chezmoi, 'status'])
+    # chezmoi status lists each run_ script on every call, whether or not it failed. A failed
+    # script already makes apply exit with an error, so leave scripts out of `pending`.
+    code, out, _ = runner.run([chezmoi, 'status', '--exclude=scripts'])
     # Each line is two status letters, a space, and a target path.
     pending = [{'status': line[:2], 'path': line[3:]} for line in out.splitlines() if line.strip()]
     if code != 0:

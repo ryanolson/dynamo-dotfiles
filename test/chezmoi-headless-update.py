@@ -117,6 +117,20 @@ class HeadlessUpdate(unittest.TestCase):
         # chezmoi applies the working tree, not HEAD, as an interactive `chezmoi apply` does.
         self.assertEqual(self.target('.a'), 'dirty\n')
 
+    def test_script_that_runs_on_each_apply_is_not_pending(self):
+        # chezmoi status lists a run_ script on every call. Only a failed run is a problem, and apply reports that.
+        self.push({'run_after_always.sh': '#!/bin/sh\nexit 0\n', 'dot_b': 'b1\n'})
+        code, report, stderr = self.update()
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(report['pending'], [])
+
+    def test_failed_script_is_reported(self):
+        self.push({'run_after_fail.sh': '#!/bin/sh\nexit 3\n', 'dot_b': 'b1\n'})
+        code, report, _ = self.update()
+        self.assertEqual(code, 2)
+        self.assertIn('apply_failed', report['reasons'])
+        self.assertEqual(self.target('.b'), 'b1\n')
+
     def test_changed_config_template_is_reported(self):
         self.push({'.chezmoi.json.tmpl': '{"data": {"changed": true}}\n', 'dot_b': 'b1\n'})
         code, report, _ = self.update()
