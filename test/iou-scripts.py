@@ -1,5 +1,6 @@
 """Exercise installer routing and failure handling without network access."""
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -15,8 +16,8 @@ class Installers(unittest.TestCase):
         self.home = Path(self.tmp.name)
         self.bin = self.home / 'bin'
         self.bin.mkdir()
-        for name in ('bash', 'mktemp', 'rm', 'mkdir', 'mv'):
-            (self.bin / name).symlink_to('/usr/bin/' + name)
+        for name in ('bash', 'mktemp', 'rm', 'mkdir', 'mv', 'chmod'):
+            (self.bin / name).symlink_to(shutil.which(name))
         self.env = dict(os.environ, HOME=str(self.home), PATH=str(self.bin))
         self.env.pop('NPM_CONFIG_PREFIX', None)
 
@@ -27,6 +28,31 @@ class Installers(unittest.TestCase):
 
     def run_helper(self, name):
         return subprocess.run(['/bin/bash', str(ROOT / 'dot_local/bin' / ('executable_iou_' + name))], env=self.env, capture_output=True, text=True)
+
+    def test_q_builds_all_binaries_before_installing(self):
+        repo = self.home / 'repos/q'
+        repo.mkdir(parents=True)
+        (repo / 'Cargo.toml').write_text('[package]')
+        (repo / 'Cargo.lock').write_text('')
+        for name in ('install', 'sed'):
+            (self.bin / name).symlink_to(shutil.which(name))
+        self.stub('rustc', 'echo "host: test-platform"')
+        self.stub('cargo', 'test "$PWD" = "$HOME/repos/q"\nprintf \'%s\\n\' "$*" > "$HOME/build-args"\nif [ "${FAIL:-0}" != 0 ]; then exit "$FAIL"; fi\nmkdir -p target/iou-q/test-platform/release\nfor name in q q-proxy q-launch; do\n  printf \'#!/bin/bash\\necho native\\n\' > "target/iou-q/test-platform/release/$name"\ndone')
+        target = self.home / '.local/bin/q'
+        target.parent.mkdir(parents=True)
+        target.write_text('previous')
+        self.env['FAIL'] = '17'
+        self.assertEqual(self.run_helper('q').returncode, 17)
+        self.assertEqual(target.read_text(), 'previous')
+        del self.env['FAIL']
+        result = self.run_helper('q')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('--release --locked --bins', (self.home / 'build-args').read_text())
+        self.assertIn('--target test-platform', (self.home / 'build-args').read_text())
+        for name in ('q', 'q-proxy', 'q-launch'):
+            binary = target.parent / name
+            self.assertIn('native', binary.read_text())
+            self.assertTrue(os.access(binary, os.X_OK))
 
     def test_npm_prefix_and_errors(self):
         self.stub('npm', 'printf "%s|%s\\n" "$NPM_CONFIG_PREFIX" "$*"; exit "${FAIL:-0}"')
@@ -75,7 +101,7 @@ class Installers(unittest.TestCase):
 set -eu
 test "$1" = --dir
 printf "#!/bin/bash\\necho updated\\n" > "$2/agy"
-/usr/bin/chmod +x "$2/agy"
+chmod +x "$2/agy"
 '
 printf '%s' "$cat_script" > "$4"''')
         target = self.home / '.local/bin/agy'

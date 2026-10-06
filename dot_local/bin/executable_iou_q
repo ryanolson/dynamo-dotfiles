@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
+    echo 'Usage: iou_q [checkout]'
+    echo 'Build q, q-proxy, and q-launch from a local checkout (default: ~/repos/q).'
+    echo 'Install native release binaries into ~/.local/bin. Does not fetch or change Git branches.'
+    exit 0
+fi
+if [[ $# -gt 1 ]]; then
+    echo 'Usage: iou_q [checkout]' >&2
+    exit 2
+fi
+repo="${1:-$HOME/repos/q}"
+if [[ ! -f "$repo/Cargo.toml" || ! -f "$repo/Cargo.lock" ]]; then
+    echo "iou_q: Rust checkout with Cargo.lock required: $repo" >&2
+    exit 1
+fi
+cd "$repo"
+platform="$(rustc -vV | sed -n 's/^host: //p')"
+if [[ -z "$platform" ]]; then
+    echo 'iou_q: Cannot determine the native Rust target' >&2
+    exit 1
+fi
+cargo build --release --locked --bins --target "$platform" --target-dir target/iou-q
+mkdir -p "$HOME/.local/bin"
+staging="$(mktemp -d "$HOME/.local/bin/.iou-q.XXXXXX")"
+trap 'rm -rf "$staging"' EXIT
+for binary in q q-proxy q-launch; do
+    install -m 755 "target/iou-q/$platform/release/$binary" "$staging/$binary"
+done
+for binary in q q-proxy q-launch; do
+    mv -f "$staging/$binary" "$HOME/.local/bin/$binary"
+done
+echo 'Installed q, q-proxy, and q-launch into ~/.local/bin'

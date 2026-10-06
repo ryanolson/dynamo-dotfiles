@@ -455,9 +455,12 @@ iou_codex
 iou_antigravity
 iou_cursor
 iou_pi
+iou_q
 ```
 
 Claude and Cursor use their native installers and update commands. Antigravity uses its native installer and replaces `agy` after installation succeeds. Codex and Pi use npm and preserve `NPM_CONFIG_PREFIX`, with `~/.npm-global` as the default. Pi requires Node.js 22.19 or newer. Cursor refers to Cursor Agent CLI. Pi refers to the coding agent from [pi.dev](https://pi.dev).
+
+`iou_q [checkout]` builds `q`, `q-proxy`, and `q-launch` with Cargo on the current platform. It installs release binaries into `~/.local/bin`. The checkout defaults to `~/repos/q`. Rust and the locked dependencies are required. The helper does not fetch source or change Git branches.
 
 The environment auto-updates when team configuration changes. To manually update:
 
