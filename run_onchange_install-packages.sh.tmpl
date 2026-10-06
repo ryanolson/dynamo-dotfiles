@@ -245,11 +245,11 @@ PIXI_TOOLS=(
 )
 # headless-nosudo has no apt and no shared uv, so pixi also provides these there.
 NOSUDO_PIXI_TOOLS=(fish:fish nodejs:node git:git uv:uv age:age zstd:zstd)
-# Services and cron jobs call these. Their PATH often has ~/.local/bin but not
-# ~/.pixi/bin, and git's HTTPS credential helper runs `gh` from PATH.
-SERVICE_TOOLS=(gh rclone)
+# apt installed these on the sudo classes. Remove the apt package once pixi provides
+# the tool and ~/.local/bin links to it.
+APT_REPLACED=(gh rclone)
 # A release binary here stays stale for every caller without ~/.pixi/bin in PATH.
-# Remove it once pixi provides the tool, so one copy remains.
+# Remove it once ~/.local/bin links to the pixi tool.
 SYSTEM_BIN_DIR="${SYSTEM_BIN_DIR:-/usr/local/bin}"
 # The cli.github.com apt repository failed its signature check (NO_PUBKEY
 # 5612B36462313325), so apt kept Ubuntu's much older gh.
@@ -264,20 +264,17 @@ remove_gh_apt_repository() {
     fi
 }
 
-# Link ~/.local/bin/<bin> to the pixi binary, then remove the apt package of that name.
-# A file there that is not a link stays, and so does the apt package.
-link_service_tool() {
-    local bin="$1" pixi_dir="$2" link="$HOME/.local/bin/$1"
+# Link ~/.local/bin/<bin> to the pixi binary. Services, cron jobs, and the agents that
+# a bb server starts often have ~/.local/bin but not ~/.pixi/bin in PATH, and git's
+# HTTPS credential helper runs `gh` from PATH. Return 1 if the link failed, and 2 if a
+# file that is not a link is in the way; that file stays.
+link_pixi_tool() {
+    local bin="$1" expose_dir="$2" link="$HOME/.local/bin/$1"
     if [[ -e "$link" && ! -L "$link" ]]; then
-        warn "$link is not a link; leaving it and any apt $bin in place"
-        return
+        warn "$link is not a link; leaving it in place"
+        return 2
     fi
-    mkdir -p "$(dirname "$link")"
-    ln -sfn "$pixi_dir/$bin" "$link"
-    if command -v dpkg &> /dev/null && dpkg -s "$bin" &> /dev/null; then
-        log "Removing the apt $bin package (pixi provides $bin)..."
-        sudo apt-get remove -y -qq "$bin" || warn "Failed to remove the apt $bin package"
-    fi
+    mkdir -p "$(dirname "$link")" && ln -sfn "$expose_dir/$bin" "$link"
 }
 
 # Return 1 if a tool failed. chezmoi then does not record this run_onchange script as
@@ -290,8 +287,9 @@ install_pixi_tools() {
         error "pixi unavailable — cannot install tools"
         return 1
     fi
-    local pixi_dir failed=0 entry package bin
-    pixi_dir="$(dirname "$PIXI")"
+    # `pixi global` exposes binaries here, wherever the pixi executable itself is.
+    local expose_dir="${PIXI_HOME:-$HOME/.pixi}/bin"
+    local failed=0 linked entry package bin
     local tools=("${PIXI_TOOLS[@]}")
     if [[ "$MACHINE_CLASS" == "headless-nosudo" ]]; then
         tools+=("${NOSUDO_PIXI_TOOLS[@]}")
@@ -300,7 +298,7 @@ install_pixi_tools() {
         package="${entry%%:*}"
         bin="${entry#*:}"
         log "pixi global install $package..."
-        if ! "$PIXI" global install "$package" || [[ ! -x "$pixi_dir/$bin" ]]; then
+        if ! "$PIXI" global install "$package" || [[ ! -x "$expose_dir/$bin" ]]; then
             warn "Failed to pixi-install $package"
             failed=1
             continue
@@ -308,12 +306,22 @@ install_pixi_tools() {
         # On headless-nosudo, ~/.local/bin is shared across architectures, and nothing
         # was installed with sudo.
         [[ "$MACHINE_CLASS" == "headless-nosudo" ]] && continue
+        # Link before removal, so a caller always finds one copy.
+        linked=0
+        link_pixi_tool "$bin" "$expose_dir" || linked=$?
+        if [[ $linked -eq 1 ]]; then
+            warn "Failed to link $HOME/.local/bin/$bin"
+            failed=1
+            continue
+        fi
         if [[ -e "$SYSTEM_BIN_DIR/$bin" ]]; then
             log "Removing $SYSTEM_BIN_DIR/$bin (pixi provides $bin)..."
-            sudo rm -f "$SYSTEM_BIN_DIR/$bin"
+            sudo rm -f "$SYSTEM_BIN_DIR/$bin" || { warn "Failed to remove $SYSTEM_BIN_DIR/$bin"; failed=1; }
         fi
-        if [[ " ${SERVICE_TOOLS[*]} " == *" $bin "* ]]; then
-            link_service_tool "$bin" "$pixi_dir"
+        if [[ $linked -eq 0 && " ${APT_REPLACED[*]} " == *" $bin "* ]] \
+            && command -v dpkg &> /dev/null && dpkg -s "$bin" &> /dev/null; then
+            log "Removing the apt $bin package (pixi provides $bin)..."
+            sudo apt-get remove -y -qq "$bin" || { warn "Failed to remove the apt $bin package"; failed=1; }
         fi
     done
     return "$failed"
