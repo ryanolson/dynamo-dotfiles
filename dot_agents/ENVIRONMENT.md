@@ -1,6 +1,6 @@
 # Workstation environment
 
-This guide serves Claude and Codex. It describes capabilities provided by the dotfiles and separately installed tooling. Availability depends on the host and execution shell.
+This guide serves Claude, Codex, and q. It describes capabilities provided by the dotfiles and separately installed tooling. Availability depends on the host and execution shell.
 
 ## Discover before use
 
@@ -25,6 +25,19 @@ Shell aliases and Fish functions are not portable commands. Prefer the executabl
 Fish provides convenience functions such as `cc`, `cx`, `ws`, `wnew`, `wrm`, `wcd`, `as`, and `ast`. `wt cd` is also a Fish function. In other shells, use the executable or change directory to the result of `wt path <name>`.
 
 The `headless-nosudo` profile excludes `wt`, `agent-spawn`, `agent-status`, and the related Fish shortcuts. Shared instructions and skills still deploy. No-sudo installations can use architecture-specific directories under `~/.local/<arch>/`; do not hardcode one machine's PATH into another.
+
+## q environment context
+
+q reads this guide through its client configuration:
+
+```toml
+[context]
+files = ["~/.agents/ENVIRONMENT.md"]
+```
+
+The source is `dot_agents/ENVIRONMENT.md` in the chezmoi repository. New q requests reload the deployed guide. Jev, the answer model, local actions, and new agent sessions receive it as shared context. Resumed agent sessions retain their saved context.
+
+The guide describes capabilities, not authorization or current service access. q's action tools remain limited by its configured file roots and fixed command list. Local file results reach the configured model. The `iou_q` helper installs the binaries; it does not change the client configuration.
 
 ## BB: use and ownership
 
