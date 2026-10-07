@@ -4,6 +4,7 @@ set -euo pipefail
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
     echo 'Usage: iou_q [checkout]'
     echo 'Build q, q-proxy, and q-launch from a local checkout (default: ~/repos/q).'
+    echo 'Install/update NeMo Relay with iou_relay, then install q binaries.'
     echo 'Install native release binaries into ~/.local/bin. Does not fetch or change Git branches.'
     exit 0
 fi
@@ -29,6 +30,7 @@ trap 'rm -rf "$staging"' EXIT
 for binary in q q-proxy q-launch; do
     install -m 755 "target/iou-q/$platform/release/$binary" "$staging/$binary"
 done
+iou_relay
 for binary in q q-proxy q-launch; do
     mv -f "$staging/$binary" "$HOME/.local/bin/$binary"
 done

@@ -20,7 +20,7 @@ Shell aliases and Fish functions are not portable commands. Prefer the executabl
 | Request an independent model check | Read the `phone-a-friend` skill and use its runner | Requires its runtime, adapter, and backend authentication. Its verification mode selects planning mode; this is not a strict filesystem write barrier. |
 | Open a remote development session | `dev-remote [host] [session]`; `dev-remote refresh [host] [session]` | Uses SSH forwarding and the remote session helper. Can inject credentials and create or refresh a session. Read the source and README before changing remote state. |
 | Check GitHub access and signing configuration | `gh auth status`; `git-signing-status` | Use `gh` for GitHub credentials. Signing status checks configuration; a successful commit verifies signing. |
-| Install or update an agent CLI | `iou_claude`, `iou_codex`, `iou_cursor`, `iou_antigravity`, `iou_pi`, `iou_q` | These change installed software. Use only for an authorized install or update. See the source README's Updating section. |
+| Install or update an agent CLI | `iou_claude`, `iou_codex`, `iou_cursor`, `iou_antigravity`, `iou_pi`, `iou_relay`, `iou_q` | These change installed software. Use only for an authorized install or update. See the source README's Updating section. |
 
 Fish provides convenience functions such as `cc`, `cx`, `ws`, `wnew`, `wrm`, `wcd`, `as`, and `ast`. `wt cd` is also a Fish function. In other shells, use the executable or change directory to the result of `wt path <name>`.
 
@@ -37,7 +37,7 @@ files = ["~/.agents/ENVIRONMENT.md"]
 
 The source is `dot_agents/ENVIRONMENT.md` in the chezmoi repository. New q requests reload the deployed guide. Jev, the answer model, local actions, and new agent sessions receive it as shared context. Resumed agent sessions retain their saved context.
 
-The guide describes capabilities, not authorization or current service access. q's action tools remain limited by its configured file roots and fixed command list. Local file results reach the configured model. The `iou_q` helper installs the binaries; it does not change the client configuration.
+The guide describes capabilities, not authorization or current service access. q's action tools remain limited by its configured file roots and fixed command list. Local file results reach the configured model. The `iou_q` helper builds q and runs `iou_relay` to install the latest stable NeMo Relay release. `iou_relay` uses authenticated `gh` access and checks the downloaded SHA-256 before installation. These helpers do not change the client configuration.
 
 ## BB: use and ownership
 

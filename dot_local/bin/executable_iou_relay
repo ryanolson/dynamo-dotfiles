@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
+    echo 'Usage: iou_relay'
+    echo 'Install the latest stable NVIDIA/NeMo-Relay release into ~/.local/bin.'
+    echo 'Requires gh and shasum. Verifies SHA-256 before replacing nemo-relay.'
+    exit 0
+fi
+if [[ $# -ne 0 ]]; then
+    echo 'Usage: iou_relay' >&2
+    exit 2
+fi
+case "$(uname -s)/$(uname -m)" in
+    Darwin/arm64) platform=aarch64-apple-darwin ;;
+    Darwin/x86_64) platform=x86_64-apple-darwin ;;
+    Linux/aarch64|Linux/arm64) platform=aarch64-unknown-linux-musl ;;
+    Linux/x86_64) platform=x86_64-unknown-linux-musl ;;
+    *) echo 'iou_relay: Unsupported operating system or architecture' >&2; exit 1 ;;
+esac
+release="$(gh api repos/NVIDIA/NeMo-Relay/releases/latest --jq '.tag_name')"
+if [[ ! "$release" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo 'iou_relay: Latest release has an unsupported version tag' >&2
+    exit 1
+fi
+asset="nemo-relay-cli-$platform-${release#v}"
+mkdir -p "$HOME/.local/bin"
+staging="$(mktemp -d "$HOME/.local/bin/.iou-relay.XXXXXX")"
+trap 'rm -rf "$staging"' EXIT
+for name in "$asset" "$asset.sha256"; do
+    gh release download "$release" --repo NVIDIA/NeMo-Relay --pattern "$name" --dir "$staging"
+done
+read -r expected filename < "$staging/$asset.sha256"
+if [[ ! "$expected" =~ ^[[:xdigit:]]{64}$ ]]; then
+    echo 'iou_relay: Invalid SHA-256 file' >&2
+    exit 1
+fi
+actual="$(shasum -a 256 "$staging/$asset")"
+actual="${actual%% *}"
+if [[ "$actual" != "$expected" ]]; then
+    echo 'iou_relay: SHA-256 mismatch; existing binary was not changed' >&2
+    exit 1
+fi
+chmod 755 "$staging/$asset"
+"$staging/$asset" --version
+mv -f "$staging/$asset" "$HOME/.local/bin/nemo-relay"
+echo "Installed NeMo Relay $release into ~/.local/bin/nemo-relay"
