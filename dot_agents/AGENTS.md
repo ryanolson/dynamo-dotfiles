@@ -128,7 +128,7 @@ feels. A workflow that runs every stage on the largest model is not more correct
 | Use | For |
 |---|---|
 | **Opus** (`claude-opus-5`) | Load-bearing reasoning: judging whether an invariant holds, designing a type that makes an invalid state unrepresentable, tracing a lifecycle across modules, deciding whether a finding is real. Anything where being wrong is expensive and the answer is not lookup-shaped. |
-| **Sonnet** (`claude-sonnet-5`) | Bounded work with a checkable answer: does anything call this function, does this parse, mechanical refactors, running a suite and reporting failures, writing a test for a behavior already characterized. |
+| **Sonnet** (the newest Sonnet, `sonnet` alias; 5.5 as of 2026-09-29) | Bounded work with a checkable answer: does anything call this function, does this parse, mechanical refactors, running a suite and reporting failures, writing a test for a behavior already characterized. |
 | **Fable** (`claude-fable-5`) | Orchestrator, never the workhorse: planning milestones, authoring workflow scripts and the design rulings their stage briefs carry, synthesizing reports into documents, running the review cadence, gating and committing. |
 
 Two rules matter more than the table:
@@ -163,10 +163,14 @@ or through `gh`'s own credential helper; there is no third option.
 
 ## Review cadence
 
-Before asking for human review, run `wills-mega-review`: it drives
-`thermo-nuclear-code-quality-review` in a fresh read-only subagent, applies the findings, and
-repeats until a clean pass. Use `full-code-review` when a combined general and deep review is
-wanted in one shot, and `rust-code-review` for Rust-specific systems and concurrency rules.
+No review is mandatory. When a unit of work is complete, suggest a review if the change needs one, and name the level and the reason. Run it when I accept. Match the level to the risk of the change, not to its size.
+
+| Change | Suggested review |
+|---|---|
+| Small, local, and covered by tests: a fix, a doc change, a mechanical refactor | None, or `code-review` at low effort |
+| A feature or a behavior change in one area | `general-review`; `rust-code-review` for Rust systems and concurrency rules |
+| Concurrency, `unsafe`, hot paths, public interfaces, or a lifecycle across modules | `full-code-review` or `thermo-nuclear-code-quality-review` |
+| Significant new work that is ready for a human reviewer | Offer `wills-mega-review` as an option. It runs `thermo-nuclear-code-quality-review` in fresh read-only subagents, applies the findings, and repeats until a clean pass. |
 
 Treat AI review comments as adversarial claims, never as presumptions of correctness. Adjudicate
 each against the actual contract and code path before changing anything, and do not add guards,

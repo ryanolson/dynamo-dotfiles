@@ -25,14 +25,22 @@ curl -fsSL https://raw.githubusercontent.com/ryanolson/dynamo-dotfiles/main/boot
 
 | Class             | Install path                | Sudo | 1Password / signing | Agent infra |
 |-------------------|-----------------------------|------|---------------------|-------------|
-| `headless-sudo`   | apt + `/usr/local/bin`      | yes  | no                  | yes         |
+| `headless-sudo`   | apt + pixi                  | yes  | no                  | yes         |
 | `headless-nosudo` | `~/.local/<arch>/` via pixi | no   | no                  | no          |
-| `primary`         | apt + `/usr/local/bin`      | yes  | **yes**             | yes         |
+| `primary`         | apt + pixi                  | yes  | **yes**             | yes         |
 
 On `headless-nosudo` the install is **pixi-centric**: nearly the whole toolset
 (`fish`, `node`, `git`, `gh`, `bat`, `ripgrep`, `fd`, `helix`, `zellij`, `lazygit`,
 `starship`, `uv`, …) comes from [pixi](https://pixi.sh)/conda-forge — glibc-independent
 and arch-aware. Only `claude` (native installer) and `codex` (npm) are separate.
+
+On the sudo classes, the command-line tools also come from pixi, in `~/.pixi/bin`: `gh`, `bat`, `eza`, `ripgrep`, `fd`, `zoxide`, `dust`, `procs`, `helix`, `zellij`, `lazygit`, `yazi`, `broot`, `just`, `watchexec`, `hyperfine`, `tokei`, `starship`, and `rclone`. apt provides the login shell `fish`, the build dependencies, and small system tools. `kubectl` comes from the official download, `uv` and `rustup` from their own installers, and the 1Password CLI from its apt repository.
+
+- The install script links each tool into `~/.local/bin`. Services, cron jobs, and the agents that a bb server starts often have `~/.local/bin` but not `~/.pixi/bin` in `PATH`, and git's HTTPS credential helper runs `gh`.
+- After the link exists, the script removes the tool's copy from `/usr/local/bin`, and the apt packages of `gh` and `rclone`. Copies that you installed elsewhere, for example with `cargo install`, stay. In fish, `~/.pixi/bin` comes before them in `PATH`.
+- `gh`, `zellij`, and `rclone` are critical tools. `PIXI_TOOLS` pins each one to a version, and each machine installs that version. To update a critical tool, change its version in `PIXI_TOOLS`; each machine installs the new version on its next `chezmoi update`.
+- If a pixi install, a link, or a removal fails, the tool keeps its old copy. For a critical tool, the script also exits with an error, and chezmoi runs it again on the next `chezmoi apply` or `chezmoi-headless-update`. For the other tools, the script only warns.
+- `run_after_update-pixi-tools` runs `pixi global update` at most once per 7 days, on each `chezmoi apply` or `chezmoi update`. It updates the other tools and keeps the pins. A failed update only warns, and the next apply tries again.
 
 **Multi-architecture shared `$HOME`** (e.g. an x86_64 SLURM login node with aarch64
 GB200 compute nodes mounting the same home): everything installs under an
@@ -82,6 +90,16 @@ and `#!/bin/bash -l` SLURM batch scripts are unaffected).
 > /plugin install codex@openai-codex
 > /codex:setup
 > ```
+>
+> Leave the stop-time review gate off. `/codex:setup --enable-review-gate` makes Codex review each Claude turn when the turn stops. Instead, the agent suggests a review and its level when a unit of work is complete. See the "Review cadence" section of `dot_agents/AGENTS.md`.
+>
+> `codex-review-gate` lists and sets the gate for each workspace:
+> ```
+> codex-review-gate list [--enabled | --disabled] [--root DIR] [--json]
+> codex-review-gate disable PATH...
+> codex-review-gate enable PATH...
+> ```
+> `list` scans the home folder two levels deep and the worktrees of each repository that it finds. A gate whose workspace was not found shows as `(no workspace found: NAME)`. Such a gate cannot run until a repository is created at the same path again. `enable` and `disable` run the plugin's own `setup` command and need `node`.
 
 ## 🤖 Shared agent scaffold
 
@@ -115,7 +133,7 @@ Installed skills:
 | Skill | What it does |
 |---|---|
 | `thermo-nuclear-code-quality-review` | Strict adversarial review: correctness, hot-path performance, abstraction quality, file-size and spaghetti growth |
-| `wills-mega-review` | Iterates the above in fresh read-only subagents until clean, then tags the PR `human-review` |
+| `wills-mega-review` | Optional. Iterates the above in fresh read-only subagents until clean, then tags the PR `human-review` |
 | `full-code-review` | One consolidated general + thermo-nuclear pass |
 | `general-review` | Plans, designs, and documents rather than diffs |
 | `rust-code-review` | Rust systems and concurrency rules |
@@ -481,6 +499,22 @@ sudo apt update && sudo apt upgrade
 rustup update
 ```
 
+### Headless update
+
+`chezmoi-headless-update` updates the dotfiles when no terminal is available, for example from a bb server. It writes one JSON report to stdout and all command output to stderr.
+
+1. The command fetches the source repository and merges `@{upstream}` as a fast-forward. If the fetch or the merge fails, the command applies nothing. The branch, the working tree, and the stash do not change.
+2. The command runs `chezmoi apply --no-tty --keep-going`. It skips files that were changed outside chezmoi and does not overwrite them.
+3. The command runs `chezmoi status --exclude=scripts` and reports each remaining difference. A failed script gives `apply_failed`.
+
+| Exit status | `result` | Meaning |
+|---|---|---|
+| 0 | `updated` | The update is complete. Nothing needs a person. |
+| 1 | `pull_failed` | `reasons` is `chezmoi_missing`, `source_missing`, `fetch_failed`, or `merge_failed`. Nothing was applied. |
+| 2 | `needs_attention` | The update was applied. `reasons` contains one or more of `apply_failed`, `status_failed`, `pending`, and `config_template_changed`. |
+
+The report also contains `before` and `after` (source commits), `pending` (status and path from `chezmoi status`), and `log_tail` (the last 40 output lines). The command does not regenerate the configuration with `chezmoi init`. If the report contains `config_template_changed`, run `chezmoi init` in a terminal. The `run_onchange` install script uses `sudo` on the `headless-sudo` and `primary` classes, so a headless update on those classes needs passwordless `sudo`.
+
 ## 🆚 Migration from Nix
 
 If you're migrating from our previous Nix-based setup:
@@ -500,10 +534,9 @@ If you're migrating from our previous Nix-based setup:
 
 ### Adding New Tools
 1. Add to `.chezmoidata/team.yaml`
-2. Update package lists in `.chezmoidata/packages_*.yaml`  
-3. Update installation scripts in `run_onchange_*`
-4. Test on both macOS and Linux
-5. Submit pull request
+2. Add the conda-forge package and its binary to `PIXI_TOOLS` in `run_onchange_install-packages.sh.tmpl`, with a version if the tool is critical, and the Homebrew name to its macOS list
+3. Test on both macOS and Linux
+4. Submit pull request
 
 ### Configuration Changes  
 1. Edit templates in `dot_config/`

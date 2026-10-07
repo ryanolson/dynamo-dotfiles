@@ -1,0 +1,31 @@
+{{ if eq .chezmoi.os "linux" -}}
+#!/bin/bash
+# Update the floating pixi tools at most once per 7 days. chezmoi runs this script on
+# each apply, so `chezmoi update` and chezmoi-headless-update keep the tools current.
+# The critical tools that run_onchange_install-packages pins stay at their pin, because
+# `pixi global update` keeps each environment's version spec.
+#
+# A failure only warns and does not write the stamp, so the next apply tries again.
+set -uo pipefail
+
+if [[ "{{ .machine_class }}" == "headless-nosudo" ]]; then
+    # Same layout as the install script: $HOME is shared across architectures, so each
+    # architecture has its own pixi, and ~/.pixi/bin can hold another one's binaries.
+    export PIXI_HOME="$HOME/.local/$(uname -m)/pixi"
+fi
+pixi="${PIXI_HOME:-$HOME/.pixi}/bin/pixi"
+[[ -x "$pixi" ]] || exit 0
+
+stamp="${XDG_STATE_HOME:-$HOME/.local/state}/dotfiles/pixi-update-$(uname -m)"
+if [[ -n "$(find "$stamp" -mtime -7 2>/dev/null)" ]]; then
+    exit 0
+fi
+
+echo "Updating pixi tools (weekly)..."
+if "$pixi" global update; then
+    mkdir -p "$(dirname "$stamp")" && touch "$stamp"
+else
+    echo "WARN: pixi global update failed; the next chezmoi apply tries again" >&2
+fi
+exit 0
+{{ end -}}

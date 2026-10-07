@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""List and toggle the stop-time review gate of the Codex Claude Code plugin, per workspace.
+
+The plugin keeps the gate in one state folder per workspace, named for the folder name and a
+hash of the real path. The state does not record the path, so `list` finds repositories and
+their worktrees and computes the same names to map each state folder back to its workspace.
+
+`enable` and `disable` run the plugin's own `setup --cwd PATH` command, so this tool never
+writes plugin state. Only `list` depends on the folder naming. If the plugin changes that
+naming, `list` shows each workspace as unresolved; toggles still work.
+
+Uses only the standard library and Python 3.6 features.
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+PLUGIN_ID = 'codex@openai-codex'
+DEFAULT_DEPTH = 2
+
+
+def fail(message):
+    sys.stderr.write('codex-review-gate: {}\n'.format(message))
+    return 1
+
+
+class Plugin(object):
+    def __init__(self):
+        claude = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.join(os.path.expanduser('~'), '.claude')
+        record_file = os.path.join(claude, 'plugins', 'installed_plugins.json')
+        try:
+            with open(record_file) as handle:
+                install = json.load(handle)['plugins'][PLUGIN_ID][0]['installPath']
+        except (OSError, ValueError, KeyError, IndexError, TypeError):
+            raise LookupError('{} is not installed (no entry in {})'.format(PLUGIN_ID, record_file))
+        self.script = os.path.join(install, 'scripts', 'codex-companion.mjs')
+        if not os.path.isfile(self.script):
+            raise LookupError('{} has no {}'.format(PLUGIN_ID, self.script))
+        # Claude Code gives each plugin the data folder <name>-<marketplace> and exports it as CLAUDE_PLUGIN_DATA.
+        self.data = os.path.join(claude, 'plugins', 'data', re.sub(r'[^A-Za-z0-9_-]', '-', PLUGIN_ID))
+
+    def states(self):
+        """Yield (state folder name, gate enabled) for each workspace that the plugin knows."""
+        root = os.path.join(self.data, 'state')
+        names = sorted(os.listdir(root)) if os.path.isdir(root) else []
+        for name in names:
+            try:
+                with open(os.path.join(root, name, 'state.json')) as handle:
+                    config = json.load(handle).get('config') or {}
+            except (OSError, ValueError):
+                continue
+            yield name, bool(config.get('stopReviewGate'))
+
+    def set_gate(self, path, enabled):
+        """Run the plugin's setup in path. Return the gate value that the plugin reports."""
+        node = shutil.which('node')
+        if node is None:
+            raise LookupError('node is not on PATH')
+        env = dict(os.environ, CLAUDE_PLUGIN_DATA=self.data)
+        flag = '--enable-review-gate' if enabled else '--disable-review-gate'
+        proc = subprocess.Popen([node, self.script, 'setup', flag, '--cwd', path, '--json'], env=env,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                universal_newlines=True)
+        out, err = proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError('plugin setup failed in {}: {}'.format(path, err.strip() or out.strip()))
+        return bool(json.loads(out).get('reviewGateEnabled'))
+
+
+def state_name(path):
+    """Return the plugin's state folder name for the workspace root path."""
+    slug = re.sub(r'[^a-zA-Z0-9._-]+', '-', os.path.basename(path)).strip('-') or 'workspace'
+    return '{}-{}'.format(slug, hashlib.sha256(os.path.realpath(path).encode()).hexdigest()[:16])
+
+
+def find_workspaces(roots, depth):
+    """Return {state folder name: path} for repositories under roots and all of their worktrees."""
+    repos = []
+    for root in roots:
+        pending = [(os.path.abspath(root), 0)]
+        while pending:
+            folder, level = pending.pop()
+            if os.path.exists(os.path.join(folder, '.git')):
+                repos.append(folder)
+            if level >= depth:
+                continue
+            try:
+                entries = list(os.scandir(folder))
+            except OSError:
+                continue
+            for entry in entries:
+                if not entry.name.startswith('.') and entry.is_dir(follow_symlinks=False):
+                    pending.append((entry.path, level + 1))
+    found = {}
+    for repo in repos:
+        found[state_name(repo)] = repo
+        proc = subprocess.Popen(['git', '-C', repo, 'worktree', 'list', '--porcelain'], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True)
+        out = proc.communicate()[0]
+        for line in out.splitlines():
+            if line.startswith('worktree ') and os.path.isdir(line[9:]):
+                found[state_name(line[9:])] = line[9:]
+    return found
+
+
+def cmd_list(plugin, args):
+    states = list(plugin.states())
+    found = find_workspaces(args.root or [os.path.expanduser('~')], args.depth) if states else {}
+    rows = [{'state': name, 'path': found.get(name), 'enabled': enabled} for name, enabled in states
+            if args.enabled is None or enabled == args.enabled]
+    rows.sort(key=lambda row: (row['path'] is None, row['path'] or row['state']))
+    if args.json:
+        json.dump(rows, sys.stdout, indent=2)
+        sys.stdout.write('\n')
+    else:
+        for row in rows:
+            where = row['path'] or '(no workspace found: {})'.format(row['state'])
+            sys.stdout.write('{:<4}{}\n'.format('on' if row['enabled'] else 'off', where))
+    return 0
+
+
+def cmd_set(plugin, args):
+    status = 0
+    for path in args.paths:
+        if not os.path.isdir(path):
+            status = fail('{} is not a folder'.format(path))
+            continue
+        try:
+            enabled = plugin.set_gate(os.path.abspath(path), args.enable)
+        except (LookupError, RuntimeError, ValueError) as error:
+            status = fail(str(error))
+            continue
+        if enabled != args.enable:
+            status = fail('plugin reports the gate {} in {}'.format('on' if enabled else 'off', path))
+            continue
+        sys.stdout.write('{:<4}{}\n'.format('on' if enabled else 'off', path))
+    return status
+
+
+def main():
+    parser = argparse.ArgumentParser(prog='codex-review-gate', description=__doc__.split('\n\n')[0])
+    sub = parser.add_subparsers(dest='command')
+    sub.required = True
+    show = sub.add_parser('list', help='list workspaces and their gate setting')
+    pick = show.add_mutually_exclusive_group()
+    pick.add_argument('--enabled', dest='enabled', action='store_const', const=True, help='only gates that are on')
+    pick.add_argument('--disabled', dest='enabled', action='store_const', const=False, help='only gates that are off')
+    show.add_argument('--root', action='append', metavar='DIR',
+                      help='folder to scan for repositories; repeatable (default: home folder)')
+    show.add_argument('--depth', type=int, default=DEFAULT_DEPTH,
+                      help='folder levels to scan below each root (default: %(default)s)')
+    show.add_argument('--json', action='store_true', help='write a JSON list of {state, path, enabled}')
+    show.set_defaults(func=cmd_list)
+    for name, enable in (('enable', True), ('disable', False)):
+        toggle = sub.add_parser(name, help='turn the gate {} for the workspaces that contain PATH'.format(
+            'on' if enable else 'off'))
+        toggle.add_argument('paths', nargs='+', metavar='PATH')
+        toggle.set_defaults(func=cmd_set, enable=enable)
+    args = parser.parse_args()
+    try:
+        plugin = Plugin()
+    except LookupError as error:
+        return fail(str(error))
+    return args.func(plugin, args)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
