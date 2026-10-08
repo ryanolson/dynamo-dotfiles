@@ -191,6 +191,22 @@ validation, or fallback behavior merely to satisfy a reviewer.
 ## Secrets
 
 Secrets live in 1Password and are injected on demand: `openv <cmd>` runs a command under
-`op run --env-file ~/.config/dynamo/dev.env.op`. Never inline a secret, never write one to disk,
-and never echo one into a transcript or a log. If a command needs a credential, wrap it in `openv`
-rather than exporting the value into the shell.
+`op run --env-file ~/.config/dynamo/dev.env.op`. Never inline a secret, never echo one into a
+transcript or a log, and never write one to disk except as below. If a command needs a credential,
+wrap it in `openv` rather than exporting the value into the shell.
+
+**The one on-disk exception: a rendered `.env`.** A tool that must run without prompts (an MCP
+server, a daemon) may read a `.env` that is gitignored, mode 600, and generated from a mapping of
+`op://` references kept outside the repo, at the path the repo names (else
+`~/.config/<repo>/<name>.env.tpl`; wcep-experiments uses `~/.config/wcep/mcp.env.tpl`): the repo's
+`.env.example` with each secret value replaced by `{{ op://<vault>/<item>/<field> }}`. Render with
+the repo's render script if it has one, else `op inject -i <mapping> -o <.env>` and `chmod 600`.
+Because 1Password is my store, build and maintain the mapping yourself rather than asking me for
+values: find items by title (`op item list`) and fields by label (`op item get <item> --format
+json`), never print a value, and ask only when the right item is ambiguous. Known items:
+
+- NGC personal key, NIM Operations (`goirlvsxnepa`): `op://Development/NGC NIM Operations PAT/credential`.
+  An `nvapi-` key; works for the API gateway and the `ngc` CLI in that org.
+- GitLab PAT for `gitlab-master.nvidia.com`: `op://Personal/glab pat/credential`. Log `glab` in
+  with `op read ... | glab auth login --hostname gitlab-master.nvidia.com --stdin`.
+- `Development/NGC` and `Corp/NGC` are legacy NGC keys: the API gateway rejects them (401).
