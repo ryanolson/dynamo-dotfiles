@@ -7,8 +7,9 @@ if [[ -z "$signing_key" ]]; then
     exit 1
 fi
 
-if [[ "$signing_key" == '~/.ssh/provisioned/signing' || "$signing_key" == "$HOME/.ssh/provisioned/signing" ]]; then
-    if [[ -r "$HOME/.ssh/provisioned/signing" && -r "$HOME/.ssh/provisioned/allowed_signers" ]]; then
+signing_key="${signing_key/#\~\//$HOME/}"
+if [[ "$signing_key" == "$HOME/.ssh/provisioned/"* ]]; then
+    if [[ -r "$signing_key" && -r "$HOME/.ssh/provisioned/allowed_signers" ]]; then
         echo "ready: local SSH signing key is configured"
         exit 0
     fi

@@ -284,9 +284,9 @@ For bootstrap with an authenticated `op` session, pass the same references as fl
 bash bootstrap.sh --ssh-key-ref 'op://Private/My SSH Key/private key' --signing-key-ref 'op://Private/Git Signing Key/private key'
 ```
 
-Repeat `--ssh-key-ref` to install multiple authentication keys. Omit `--signing-key-ref` to use the first authentication key for signing. The references contain vault and item names, not private key contents.
+Repeat `--ssh-key-ref` to install multiple authentication keys. Omit `--signing-key-ref` to use the first authentication key for signing. A signing reference that is the same as an authentication reference uses that key file, and the command makes no second copy. The references contain vault and item names, not private key contents.
 
-The command stores unencrypted private keys and derived public keys in `~/.ssh/provisioned`. The directory has mode `700`. Its files have mode `600`. It checks a signature before installation and refuses to replace different existing files. Identical repeat runs succeed. Private key contents never enter chezmoi templates or diffs.
+The command stores unencrypted private keys and derived public keys in `~/.ssh/provisioned`. Each key file has the name of its 1Password item in lowercase, with a hyphen in place of each run of other characters. For example, the item `Git Signing Key` gives the files `git-signing-key` and `git-signing-key.pub`. The comment of the public key is the item name as written. The command stops when two references give the same file name, or when an item gives the name `config` or `gitconfig`. The directory has mode `700`. Its files have mode `600`. It checks a signature before installation and refuses to replace different existing files. Identical repeat runs succeed. Private key contents never enter chezmoi templates or diffs.
 
 Chezmoi includes the local SSH configuration before agent settings and the local Git configuration after agent settings. These includes survive `chezmoi apply`. Local provisioning disables agent use for SSH and supplies the authentication keys for all hosts. Explicit host-specific identity files remain additive. Git signing uses the local private key without a forwarded agent. GitHub HTTPS URLs use SSH with this key.
 
