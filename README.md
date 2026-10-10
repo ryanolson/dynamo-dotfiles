@@ -472,12 +472,13 @@ iou_claude
 iou_codex
 iou_antigravity
 iou_cursor
+iou_devin
 iou_pi
 iou_relay
 iou_q
 ```
 
-Claude and Cursor use their native installers and update commands. Antigravity uses its native installer and replaces `agy` after installation succeeds. Codex and Pi use npm and preserve `NPM_CONFIG_PREFIX`, with `~/.npm-global` as the default. Pi requires Node.js 22.19 or newer. Cursor refers to Cursor Agent CLI. Pi refers to the coding agent from [pi.dev](https://pi.dev).
+Claude, Cursor, and Devin use their native installers and update commands. `iou_devin` installs the Devin CLI when `devin` is missing, then runs `devin update`. Antigravity uses its native installer and replaces `agy` after installation succeeds. Codex and Pi use npm and preserve `NPM_CONFIG_PREFIX`, with `~/.npm-global` as the default. Pi requires Node.js 22.19 or newer. Cursor refers to Cursor Agent CLI. Pi refers to the coding agent from [pi.dev](https://pi.dev).
 
 `iou_relay` queries GitHub's latest stable release for `NVIDIA/NeMo-Relay` through `gh`. It downloads the current platform's binary and SHA-256 file from the same resolved tag. It verifies the checksum before replacing `~/.local/bin/nemo-relay`. Downloads and verification failures leave the existing binary intact. It requires authenticated `gh` access and `shasum`. Linux uses the musl release assets; macOS uses the Darwin assets. A missing platform asset produces an error.
 

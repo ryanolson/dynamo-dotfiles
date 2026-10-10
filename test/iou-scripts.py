@@ -137,6 +137,24 @@ fi""")
                 self.assertEqual(result.returncode, 13)
                 (self.bin / command).unlink()
 
+    def test_devin_installs_then_updates(self):
+        self.stub('curl', 'printf \'printf "#!/bin/bash\\\\necho \\\\"\\\\$*\\\\"\\\\n" > "$HOME/.local/bin/devin"; chmod 755 "$HOME/.local/bin/devin"\\n\' > "$4"; exit "${FAIL:-0}"')
+        (self.home / '.local/bin').mkdir(parents=True)
+        result = self.run_helper('devin')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'update')
+        self.env['FAIL'] = '22'
+        (self.home / '.local/bin/devin').unlink()
+        result = self.run_helper('devin')
+        self.assertEqual(result.returncode, 22)
+        self.assertEqual(result.stdout, '')
+
+    def test_devin_updates_in_place_when_installed(self):
+        self.stub('devin', 'echo "$*"; exit 13')
+        result = self.run_helper('devin')
+        self.assertEqual(result.stdout.strip(), 'update')
+        self.assertEqual(result.returncode, 13)
+
     def test_antigravity_preserves_binary_on_download_failure(self):
         target = self.home / '.local/bin/agy'
         target.parent.mkdir(parents=True)
