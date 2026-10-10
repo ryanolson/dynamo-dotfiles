@@ -86,7 +86,7 @@ Codex can discover user skills directly under `~/.agents/skills`. The scaffold a
 6. Preview with `chezmoi diff --recursive <target>...` and `chezmoi apply --dry-run <target>...`. Inspect any scheduled scripts. If using a separate worktree, pass `--source <worktree>` to every chezmoi preview and apply command.
 7. Apply the same explicit targets. Check scoped status, deployed contents, executable modes, and relevant links. For templates, compare against rendered output rather than raw source.
 8. Check discovery and use in fresh Claude and Codex sessions. Distinguish startup context, on-demand file reads, successful commands, and service access.
-9. Commit only the intended source changes and push the working branch. Use draft PRs for non-trivial changes. Report the commit, branch, deployment result, and any unfinished step.
+9. Commit only the intended source changes and push to `main`. Open a pull request only when the user asks for one. See `AGENTS.md` in the source repository. Report the commit, branch, deployment result, and any unfinished step.
 
 A content-only skill edit needs an apply but no relink. To add a shared skill, create its source directory and add its name to the roster. Roster changes also require the linker script to run; file-only applies do not establish link installation. Preview that script explicitly before running it. To remove a skill, inspect both deployed files and links; removing a roster entry only prunes scaffold-owned links.
 

@@ -2,6 +2,8 @@
 # These files won't be managed by chezmoi
 
 README.md
+AGENTS.md
+CLAUDE.md
 bootstrap.sh
 agent-docs
 agent-docs/**
