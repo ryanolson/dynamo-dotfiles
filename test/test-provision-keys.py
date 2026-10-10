@@ -32,6 +32,10 @@ class ProvisionKeys(unittest.TestCase):
         return subprocess.run(['git', *args], env=self.env, cwd=self.home,
                               capture_output=True, text=True, check=True)
 
+    @staticmethod
+    def key_material(path):
+        return path.read_text().split()[:2]
+
     def run_script(self, ref='op://Test/Key/private key'):
         return subprocess.run(['bash', str(SCRIPT), '--ssh-key-ref', ref], env=self.env, capture_output=True, text=True)
 
@@ -46,15 +50,19 @@ class ProvisionKeys(unittest.TestCase):
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
         target = self.home / '.ssh/provisioned'
-        self.assertEqual((target / 'authentication').stat().st_mode & 0o777, 0o600)
+        self.assertEqual((target / 'key').stat().st_mode & 0o777, 0o600)
         self.assertEqual(target.stat().st_mode & 0o777, 0o700)
         self.assertNotIn('PRIVATE KEY', result.stdout + result.stderr)
         self.git('init', '-q')
         self.git('commit', '--allow-empty', '-m', 'test')
         self.git('verify-commit', 'HEAD')
-        before = (target / 'authentication').read_bytes()
+        before = (target / 'key').read_bytes()
         self.assertEqual(self.run_script().returncode, 0)
-        self.assertEqual((target / 'authentication').read_bytes(), before)
+        self.assertEqual((target / 'key').read_bytes(), before)
+        self.assertEqual(sorted(p.name for p in target.iterdir()),
+                         ['allowed_signers', 'config', 'gitconfig', 'key', 'key.pub'])
+        self.assertEqual(self.git('config', '--global', '--includes', 'user.signingkey').stdout.strip(),
+                         '~/.ssh/provisioned/key')
         status = subprocess.run(['bash', str(ROOT / 'dot_local/bin/executable_git-signing-status')],
                                 env=self.env, capture_output=True, text=True)
         self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
@@ -94,10 +102,53 @@ class ProvisionKeys(unittest.TestCase):
                                 env=self.env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         target = self.home / '.ssh/provisioned'
-        self.assertNotEqual((target / 'authentication.pub').read_text(), (target / 'signing.pub').read_text())
+        self.assertNotEqual(self.key_material(target / 'key.pub'), self.key_material(target / 'other.pub'))
+        self.assertIn('signingkey = ~/.ssh/provisioned/other\n', (target / 'gitconfig').read_text())
         self.git('init', '-q')
         self.git('commit', '--allow-empty', '-m', 'separate signing key')
         self.git('verify-commit', 'HEAD')
+
+    def test_signing_key_shared_with_a_later_login_key(self):
+        other = self.home / 'other'
+        subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(other)], check=True)
+        (self.home / 'bin/op').write_text('#!/bin/sh\ncase "$2" in\n  *Other*) cat "$HOME/other" ;;\n  *) cat "$HOME/fixture" ;;\nesac\n')
+        result = subprocess.run(['bash', str(SCRIPT), '--ssh-key-ref', 'op://Test/Key/private key',
+                                 '--ssh-key-ref', 'op://Test/Other/private key',
+                                 '--signing-key-ref', 'op://Test/Other/private key'],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        target = self.home / '.ssh/provisioned'
+        self.assertEqual(sorted(p.name for p in target.iterdir()),
+                         ['allowed_signers', 'config', 'gitconfig', 'key', 'key.pub', 'other', 'other.pub'])
+        self.assertIn('signingkey = ~/.ssh/provisioned/other\n', (target / 'gitconfig').read_text())
+        self.git('init', '-q')
+        self.git('commit', '--allow-empty', '-m', 'shared signing key')
+        self.git('verify-commit', 'HEAD')
+
+    def test_unusable_file_names_are_rejected(self):
+        (self.home / 'bin/op').write_text('#!/bin/sh\ncat "$HOME/fixture"\n')
+        cases = {
+            'same name': ['--ssh-key-ref', 'op://Test/My Key/private key', '--ssh-key-ref', 'op://Other/my-key/private key'],
+            'same name as signing': ['--ssh-key-ref', 'op://Test/My Key/private key', '--signing-key-ref', 'op://Other/my_key/private key'],
+            'repeated': ['--ssh-key-ref', 'op://Test/Key/private key', '--ssh-key-ref', 'op://Test/Key/private key'],
+            'reserved': ['--ssh-key-ref', 'op://Test/Config/private key'],
+            'reserved git': ['--ssh-key-ref', 'op://Test/gitconfig/private key'],
+            'empty': ['--ssh-key-ref', 'op://Test/!!!/private key'],
+        }
+        for name, args in cases.items():
+            with self.subTest(name):
+                result = subprocess.run(['bash', str(SCRIPT), *args], env=self.env, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('file name', result.stderr)
+                self.assertFalse((self.home / '.ssh/provisioned').exists())
+
+    def test_signing_status_needs_the_named_key_file(self):
+        self.assertEqual(self.run_script().returncode, 0)
+        (self.home / '.ssh/provisioned/key').rename(self.home / 'moved')
+        status = subprocess.run(['bash', str(ROOT / 'dot_local/bin/executable_git-signing-status')],
+                                env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(status.returncode, 0)
+        self.assertIn('degraded: local signing key', status.stdout)
 
     def test_two_login_keys_and_separate_signing_key(self):
         for name in ('brev', 'mbp-nv16', 'signer'):
@@ -110,12 +161,16 @@ class ProvisionKeys(unittest.TestCase):
         result = subprocess.run(args, env=self.env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         target = self.home / '.ssh/provisioned'
-        self.assertEqual((target / 'authentication.pub').read_text(), (self.home / 'brev.pub').read_text())
-        self.assertEqual((target / 'authentication-2.pub').read_text(), (self.home / 'mbp-nv16.pub').read_text())
-        self.assertEqual((target / 'signing.pub').read_text(), (self.home / 'signer.pub').read_text())
+        for installed, source in (('brev', 'brev'), ('mbp-nv16', 'mbp-nv16'), ('git-signing-key', 'signer')):
+            self.assertEqual((target / installed).read_bytes(), (self.home / source).read_bytes())
+            self.assertEqual(self.key_material(target / (installed + '.pub')), self.key_material(self.home / (source + '.pub')))
+        # The public key comment carries the 1Password item name as written.
+        self.assertEqual((target / 'git-signing-key.pub').read_text().split(None, 2)[2], 'Git Signing Key\n')
+        self.assertEqual((target / 'mbp-nv16.pub').read_text().split(None, 2)[2], 'mbp-nv16\n')
         ssh_config = (target / 'config').read_text()
-        self.assertEqual(ssh_config.count('IdentityFile '), 2)
-        self.assertNotIn('IdentityFile ~/.ssh/provisioned/signing', ssh_config)
+        self.assertEqual([line.strip() for line in ssh_config.splitlines() if 'IdentityFile' in line],
+                         ['IdentityFile ~/.ssh/provisioned/brev', 'IdentityFile ~/.ssh/provisioned/mbp-nv16'])
+        self.assertIn('signingkey = ~/.ssh/provisioned/git-signing-key\n', (target / 'gitconfig').read_text())
         self.git('init', '-q')
         self.git('commit', '--allow-empty', '-m', 'three keys')
         self.git('verify-commit', 'HEAD')
@@ -146,7 +201,7 @@ class ProvisionKeys(unittest.TestCase):
 
     def test_different_key_is_not_overwritten(self):
         self.assertEqual(self.run_script().returncode, 0)
-        target = self.home / '.ssh/provisioned/authentication'
+        target = self.home / '.ssh/provisioned/key'
         before = target.read_bytes()
         self.key.unlink()
         subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(self.key)], check=True)
@@ -197,9 +252,10 @@ class ProvisionKeys(unittest.TestCase):
         self.assertNotIn('gh ssh-key add', output)
         provisioned = self.home / '.ssh/provisioned'
         provisioned.mkdir(parents=True)
-        (provisioned / 'signing.pub').write_text('ssh-ed25519 AAAA\n')
+        (provisioned / 'git-signing-key.pub').write_text('ssh-ed25519 AAAA\n')
+        self.git('config', '--global', 'user.signingkey', '~/.ssh/provisioned/git-signing-key')
         output = check()
-        self.assertIn('gh ssh-key add ~/.ssh/provisioned/signing.pub', output)
+        self.assertIn('gh ssh-key add ~/.ssh/provisioned/git-signing-key.pub', output)
         self.assertIn('Or: ' + web, output)
 
 

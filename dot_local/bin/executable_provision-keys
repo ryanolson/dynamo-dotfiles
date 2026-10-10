@@ -25,6 +25,39 @@ while [[ $# -gt 0 ]]; do
 done
 [[ ${#auth_refs[@]} -gt 0 ]] || fail 'At least one --ssh-key-ref is required.'
 signing_ref="${signing_ref:-${auth_refs[0]}}"
+
+# Files carry the 1Password item name so a key on disk can be traced to its item.
+# The name is reduced to lowercase letters, digits, and hyphens because the paths
+# go unquoted into the SSH and Git configuration.
+item_of() { local item="${1#op://}"; item="${item#*/}"; printf '%s' "${item%%/*}"; }
+file_name_of() {
+    local name
+    name=$(item_of "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C sed -e 's/[^a-z0-9][^a-z0-9]*/-/g' -e 's/^-//' -e 's/-$//')
+    case "$name" in
+        '') fail "Cannot derive a file name from the item in $1." ;;
+        config|gitconfig) fail "The item in $1 gives the file name '$name', which provisioning reserves." ;;
+    esac
+    for used in ${keys[@]+"${keys[@]}"}; do
+        [[ "$used" != "$name" ]] || fail "Two key references give the file name '$name'. Rename an item or drop the repeated reference."
+    done
+    printf '%s' "$name"
+}
+keys=()
+for ref in "${auth_refs[@]}"; do
+    name=$(file_name_of "$ref")
+    keys+=("$name")
+done
+signing=""
+for ((i=0; i<${#auth_refs[@]}; i++)); do
+    if [[ "${auth_refs[$i]}" == "$signing_ref" ]]; then signing="${keys[$i]}"; fi
+done
+fetch_refs=("${auth_refs[@]}")
+fetch_names=("${keys[@]}")
+if [[ -z "$signing" ]]; then
+    signing=$(file_name_of "$signing_ref")
+    fetch_refs+=("$signing_ref")
+    fetch_names+=("$signing")
+fi
 for cmd in op ssh-keygen git; do
     command -v "$cmd" >/dev/null || fail "$cmd is required. Install it before provisioning."
 done
@@ -42,31 +75,23 @@ stage=$(mktemp -d "$HOME/.ssh/.provision-XXXXXXXX")
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-keys=()
-for ((i=0; i<${#auth_refs[@]}; i++)); do
-    key=authentication
-    if [[ $i -gt 0 ]]; then key="authentication-$((i+1))"; fi
-    keys+=("$key")
-    op read "${auth_refs[$i]}?ssh-format=openssh" > "$stage/$key"
+for ((i=0; i<${#fetch_refs[@]}; i++)); do
+    key="${fetch_names[$i]}"
+    op read "${fetch_refs[$i]}?ssh-format=openssh" > "$stage/$key"
+    public=$(ssh-keygen -y -P '' -f "$stage/$key") || fail 'Could not read an unencrypted OpenSSH private key.'
+    read -r key_type key_blob _ <<< "$public"
+    printf '%s %s %s\n' "$key_type" "$key_blob" "$(item_of "${fetch_refs[$i]}")" > "$stage/$key.pub"
 done
-if [[ "$signing_ref" == "${auth_refs[0]}" ]]; then
-    cp "$stage/authentication" "$stage/signing"
-else
-    op read "$signing_ref?ssh-format=openssh" > "$stage/signing"
-fi
-for key in "${keys[@]}" signing; do
-    ssh-keygen -y -P '' -f "$stage/$key" > "$stage/$key.pub" || fail 'Could not read an unencrypted OpenSSH private key.'
-done
-printf '%s %s\n' "$email" "$(cat "$stage/signing.pub")" > "$stage/allowed_signers"
+printf '%s %s\n' "$email" "$(cut -d' ' -f1,2 "$stage/$signing.pub")" > "$stage/allowed_signers"
 {
     printf '%s\n' 'Host *' '    IdentityAgent none' '    IdentitiesOnly yes'
     for key in "${keys[@]}"; do
         printf '    IdentityFile ~/.ssh/provisioned/%s\n' "$key"
     done
 } > "$stage/config"
-cat > "$stage/gitconfig" <<'EOF'
+cat > "$stage/gitconfig" <<EOF
 [user]
-    signingkey = ~/.ssh/provisioned/signing
+    signingkey = ~/.ssh/provisioned/$signing
 [gpg]
     format = ssh
 [gpg "ssh"]
@@ -79,7 +104,7 @@ cat > "$stage/gitconfig" <<'EOF'
 EOF
 # Check the complete signing path before making the directory visible.
 printf 'provision-keys check\n' > "$stage/message"
-SSH_AUTH_SOCK= ssh-keygen -Y sign -f "$stage/signing" -n git "$stage/message" >/dev/null 2>&1 || fail 'Could not sign with the signing key.'
+SSH_AUTH_SOCK= ssh-keygen -Y sign -f "$stage/$signing" -n git "$stage/message" >/dev/null 2>&1 || fail 'Could not sign with the signing key.'
 ssh-keygen -Y verify -f "$stage/allowed_signers" -I "$email" -n git -s "$stage/message.sig" < "$stage/message" >/dev/null 2>&1 || fail 'Could not verify the signature against the allowed signers file.'
 rm "$stage/message" "$stage/message.sig"
 chmod 600 "$stage/"*
