@@ -335,6 +335,8 @@ The timer is a launchd agent on macOS, a systemd user timer on Linux, or a cront
 
 Chezmoi includes `~/.ssh/fleet/config` before the local provisioning file. The fleet file sets an agent only for `github.com`, so local provisioning still applies to other hosts. By default, enrollment adds a `cert-authority` line to `~/.ssh/authorized_keys` for the principal `ryan`. Use `--principal NAME` to accept a different principal. Use `--no-trust` on a machine that must not accept fleet logins, for example the CA host. Other lines in `authorized_keys` do not change.
 
+No `sshd` presents a fleet host certificate yet, so the fleet file trusts fleet hosts on first use. For the broker's aliases, tailnet addresses (`100.64.0.0/10`), and `*.ts.net` names, it sets `StrictHostKeyChecking accept-new`: ssh records a new host key without asking and still refuses a changed one. Other hosts, such as GitHub, keep the normal prompt. When `tailscale status` reports a MagicDNS suffix, the file also makes ssh expand a bare name such as `mac-mini-m6` to its `ts.net` name, so bare tailnet names get the same rule. Names that do not resolve in the tailnet fall back to normal lookup.
+
 `fleet status` shows the name, the serial number, and the expiry times. Serials are base62 (`0-9A-Za-z`). `fleet list --json` also gives `serial_decimal`, which is the form that `step` uses. To cut off a machine, run `fleet revoke SERIAL` on a laptop with the base62 serial.
 
 CAUTION: Revocation does not end access immediately. The machine cannot renew, but it keeps its SSH certificate, and it can get new SSH certificates until its client certificate expires. Access ends within about 24 hours.

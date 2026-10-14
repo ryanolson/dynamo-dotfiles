@@ -118,7 +118,7 @@ The step-ca X5C provisioner does not check revocation. A revoked client certific
 
 `fleet` (`dot_local/bin/executable_fleet`) implements enrollment, renewal, SSH trust, and revocation. The README section "Fleet certificates" describes its use. Keys are files with mode `0600` in `~/.local/state/fleet`. They are not in memory-backed storage, because a reboot would then need a new token from a person, and always-on machines must renew without a person. This differs from `bb-worker-cert`.
 
-Host certificates in `sshd` are not implemented. A host certificate cannot outlive the 24-hour client certificate, so `sshd` needs a daily renewal as root.
+Host certificates in `sshd` are not implemented. A host certificate cannot outlive the 24-hour client certificate, so `sshd` needs a daily renewal as root. Until then, `fleet` writes `StrictHostKeyChecking accept-new` for fleet aliases, tailnet addresses, and `*.ts.net` names (2026-10-14). WireGuard authenticates tailnet peers, so the first connection is not open to an attacker outside the tailnet.
 
 ## 2026-10-14 addendum: broker and admin certificates
 

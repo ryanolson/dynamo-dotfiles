@@ -194,7 +194,7 @@ ssh_aliases() {
         [[ "$jump" == - ]] && jump=""
         [[ -z "$jump" || "$jump" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || continue
         [[ -z "$key_alias" || "$key_alias" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] || continue
-        printf 'Host %s\n    HostName %s\n    User %s\n' "$alias" "$host" "$user"
+        printf 'Host %s\n    HostName %s\n    User %s\n    StrictHostKeyChecking accept-new\n' "$alias" "$host" "$user"
         # if, not &&: a false test as the loop's last command would fail renew under set -e.
         if [[ -n "$jump" ]]; then printf '    ProxyJump %s\n' "$jump"; fi
         if [[ -n "$key_alias" ]]; then printf '    HostKeyAlias %s\n' "$key_alias"; fi
@@ -215,6 +215,8 @@ write_ssh_config() {
     for key in id_ed25519 id_ecdsa id_ecdsa_sk id_ed25519_sk id_rsa; do
         [[ -f "$HOME/.ssh/$key" ]] && identities+=("$HOME/.ssh/$key")
     done
+    local suffix
+    suffix=$(tailnet_suffix)
     {
         # OpenSSH uses the first IdentityAgent, so the GitHub block must precede Host *.
         if [[ -f "$SSH_FLEET/agent" && -f "$SSH_FLEET/agent-auth.pub" ]]; then
@@ -224,7 +226,17 @@ write_ssh_config() {
             printf '    IdentitiesOnly yes\n'
         fi
         ssh_aliases
+        # No sshd presents a fleet host certificate yet, so a fleet host is trusted on first use. A
+        # changed key still fails. WireGuard already authenticates tailnet peers, which keeps the
+        # first connection safe; scoping to the tailnet keeps GitHub and other hosts strict.
+        local patterns="*.ts.net" octet
+        for ((octet = 64; octet < 128; octet++)); do patterns+=" 100.$octet.*"; done
+        printf 'Host %s\n    StrictHostKeyChecking accept-new\n' "$patterns"
         printf '%s\n' 'Host *'
+        # A bare tailnet name matches no pattern above until ssh expands it to its ts.net name.
+        if [[ -n "$suffix" ]]; then
+            printf '    CanonicalizeHostname yes\n    CanonicalDomains %s\n    CanonicalizeMaxDots 0\n' "$suffix"
+        fi
         printf '    IdentityFile %s\n' "${identities[@]}"
         printf '    CertificateFile %s\n' "$STATE/id_fleet-cert.pub"
         printf '    UserKnownHostsFile %s %s\n' "$HOME/.ssh/known_hosts" "$SSH_FLEET/known_hosts"
@@ -733,6 +745,25 @@ find_pylon() {
         [[ -n "$candidate" && -x "$candidate" ]] && { PYLON="$candidate"; return 0; }
     done
     return 1
+}
+
+find_tailscale() {
+    local candidate candidates=("${FLEET_TAILSCALE:-}")
+    [[ -n "${FLEET_TAILSCALE:-}" ]] || candidates=("$(command -v tailscale 2>/dev/null || true)"
+        /Applications/Tailscale.app/Contents/MacOS/Tailscale)
+    for candidate in "${candidates[@]}"; do
+        [[ -n "$candidate" && -x "$candidate" ]] && { TAILSCALE="$candidate"; return 0; }
+    done
+    return 1
+}
+
+# Print the tailnet's MagicDNS suffix, or nothing when tailscale is missing, stopped, or odd.
+tailnet_suffix() {
+    local suffix=""
+    find_tailscale || return 0
+    suffix=$("$TAILSCALE" status --json 2>/dev/null |
+        sed -n 's/^ *"MagicDNSSuffix": *"\([^"]*\)".*/\1/p' | head -n 1) || true
+    if [[ "$suffix" =~ ^[a-z0-9-]+(\.[a-z0-9-]+)*\.ts\.net$ ]]; then printf '%s\n' "$suffix"; fi
 }
 
 find_socat() {

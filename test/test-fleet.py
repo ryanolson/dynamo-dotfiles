@@ -80,7 +80,7 @@ class FleetBase(unittest.TestCase):
         self.env = dict(os.environ, HOME=str(self.home), PATH=f'{bin_dir}:{os.environ["PATH"]}',
                         STEP_LOG=str(self.log), EXPECT_TOKEN=TOKEN, USER_CA=USER_CA, HOST_CA=HOST_CA,
                         XDG_CONFIG_HOME=str(self.home / '.config'), XDG_STATE_HOME=str(self.home / '.local/state'),
-                        FLEET_PYLON=str(self.home / 'no-pylon'))
+                        FLEET_PYLON=str(self.home / 'no-pylon'), FLEET_TAILSCALE=str(self.home / 'no-tailscale'))
         self.state = self.home / '.local/state/fleet'
 
     def fleet(self, *args, stdin=None, **env):
@@ -225,11 +225,11 @@ class Fleet(FleetBase):
         self.assertEqual(self.fleet('renew').returncode, 0)
         config = self.home / '.ssh/fleet/config'
         text = config.read_text()
-        self.assertIn('Host bb\n    HostName brev.example.ts.net\n    User ubuntu\n', text)
+        self.assertIn('Host bb\n    HostName brev.example.ts.net\n    User ubuntu\n    StrictHostKeyChecking accept-new\n', text)
         self.assertNotIn('ProxyCommand', text)
-        self.assertIn('Host gpu\n    HostName gpu.corp.example\n    User ryan\n    ProxyJump bb\n', text)
+        self.assertIn('Host gpu\n    HostName gpu.corp.example\n    User ryan\n    StrictHostKeyChecking accept-new\n    ProxyJump bb\n', text)
         self.assertNotIn('Host evil', text)
-        self.assertIn('Host ip\n    HostName 100.64.0.7\n    User u\n    HostKeyAlias ip-host.example.ts.net\n', text)
+        self.assertIn('Host ip\n    HostName 100.64.0.7\n    User u\n    StrictHostKeyChecking accept-new\n    HostKeyAlias ip-host.example.ts.net\n', text)
         self.assertNotIn('ProxyJump -', text)
         self.assertLess(text.index('Host bb'), text.index('Host *'))
         resolved = subprocess.run(['ssh', '-G', '-F', str(config), 'bb'], capture_output=True, text=True, check=True).stdout
@@ -240,7 +240,7 @@ class Fleet(FleetBase):
         curl.write_text('#!/bin/sh\ncase "$*" in *v1/ssh-hosts*) printf "ip 100.64.0.7 u - k.example\\nbb h ubuntu\\n" ;; esac\n')
         result = self.fleet('renew')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('Host bb\n    HostName h\n    User ubuntu\nHost *', config.read_text())
+        self.assertIn('Host bb\n    HostName h\n    User ubuntu\n    StrictHostKeyChecking accept-new\nHost *.ts.net ', config.read_text())
         curl.write_text('#!/bin/sh\ncase "$*" in *v1/ssh-hosts*) [ -f "$HOME/broker-down" ] && exit 7\n'
                         '  printf "bb brev.example.ts.net ubuntu\\n" ;; esac\n')
         self.assertEqual(self.fleet('renew').returncode, 0)
@@ -248,6 +248,43 @@ class Fleet(FleetBase):
         (self.home / 'broker-down').write_text('')
         self.assertEqual(self.fleet('renew').returncode, 0)
         self.assertIn('Host bb\n', config.read_text())
+
+    def test_ssh_config_accepts_new_host_keys_only_for_fleet_hosts(self):
+        self.enroll()
+        curl = self.home / 'bin/curl'
+        curl.write_text('#!/bin/sh\ncase "$*" in *v1/ssh-hosts*) printf "bb 100.112.0.5 ubuntu - brev.example.ts.net\\n" ;; esac\n')
+        curl.chmod(0o700)
+        tailscale = self.home / 'bin/tailscale'
+        tailscale.write_text('#!/bin/sh\n[ "$1 $2" = "status --json" ] || exit 1\n'
+                             'printf \'{\\n  "MagicDNSSuffix": "tail1.ts.net",\\n  "Self": {}\\n}\\n\'\n')
+        tailscale.chmod(0o700)
+        self.assertEqual(self.fleet('renew', FLEET_TAILSCALE=str(tailscale)).returncode, 0)
+        config = self.home / '.ssh/fleet/config'
+        text = config.read_text()
+        self.assertIn('    CanonicalDomains tail1.ts.net\n', text)
+        self.assertIn('    CanonicalizeMaxDots 0\n', text)
+
+        def checking(host):
+            out = subprocess.run(['ssh', '-G', '-F', str(config), host], capture_output=True, text=True,
+                                 check=True).stdout
+            return next(line.split()[1] for line in out.splitlines() if line.startswith('stricthostkeychecking '))
+
+        for host in ['bb', '100.64.0.1', '100.127.255.254', 'node.tail1.ts.net', 'other.ts.net']:
+            self.assertEqual(checking(host), 'accept-new', host)
+        for host in ['github.com', 'example.com', '100.63.1.1', '100.128.0.1', '10.0.0.1']:
+            self.assertEqual(checking(host), 'ask', host)
+
+        # Without tailscale, bare names stay as typed, and addresses and ts.net names still accept new keys.
+        self.assertEqual(self.fleet('renew', FLEET_TAILSCALE=str(self.home / 'no-tailscale')).returncode, 0)
+        text = config.read_text()
+        self.assertNotIn('Canonical', text)
+        self.assertEqual(checking('100.100.1.2'), 'accept-new')
+        self.assertEqual(checking('example.com'), 'ask')
+
+        # A malformed suffix is ignored rather than written into the config.
+        tailscale.write_text('#!/bin/sh\nprintf \'{"MagicDNSSuffix": "x y\\\\nHost *"}\'\n')
+        self.assertEqual(self.fleet('renew', FLEET_TAILSCALE=str(tailscale)).returncode, 0)
+        self.assertNotIn('Canonical', config.read_text())
 
     def test_renew_without_enrollment_fails(self):
         result = self.fleet('renew')
