@@ -363,6 +363,10 @@ timeout 300 python3 test/test-fleet.py
 timeout 300 python3 test/test-join.py
 ```
 
+### Remove a machine from the fleet
+
+`fleet uninstall` (or `fleet remove`) revokes the machine's certificate, stops the renew timer, the agent, and every tunnel, removes the CA line from `~/.ssh/authorized_keys`, and deletes `~/.ssh/fleet`, the fleet state, and the fleet settings. It asks first; pass `--yes` when there is no terminal. `--keep-cert` skips the revocation. It does not remove `pylon` or a bb host daemon.
+
 ### Fleet SSH names
 
 `fleet renew` also writes short SSH names from the broker into `~/.ssh/fleet/config`, for example `ssh bb`. The broker holds the list, so host names stay out of this repository. If the broker does not answer, `fleet` keeps the last list.

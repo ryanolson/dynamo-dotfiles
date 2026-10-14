@@ -577,6 +577,54 @@ class Fleet(FleetBase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('pylon or socat', result.stderr)
 
+    def test_uninstall_removes_every_fleet_piece(self):
+        ssh = self.home / '.ssh'
+        ssh.mkdir(mode=0o700)
+        (ssh / 'authorized_keys').write_text('ssh-ed25519 AAAAOTHERKEY me@laptop\n')
+        sock, _ = self.start_real_agent()
+        self.enroll()
+        self.socat_stub()
+        self.assertEqual(self.fleet('timer', 'install').returncode, 0)
+        self.assertEqual(self.fleet('agent', 'install', FLEET_AGENT_SOCK=str(sock)).returncode, 0)
+        self.assertEqual(self.fleet('tunnel', 'add', 'bb', '--mode', 'client', '--listen', '127.0.0.1:38900',
+                                    '--to', 'h:8461', '--peer', 'p').returncode, 0)
+        self.assertIn('BEGIN fleet', (ssh / 'authorized_keys').read_text())
+        self.log.unlink()
+        result = self.fleet('uninstall', '--yes', FLEET_AGENT_SOCK=str(sock))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        revoke = [c for c in self.calls() if c[:2] == ['ca', 'revoke']]
+        self.assertEqual(len(revoke), 1)
+        self.assertIn('--cert', revoke[0])
+        for gone in [self.state, self.home / '.config/fleet', ssh / 'fleet']:
+            self.assertFalse(gone.exists(), gone)
+        self.assertEqual((ssh / 'authorized_keys').read_text(), 'ssh-ed25519 AAAAOTHERKEY me@laptop\n')
+        scheduler = (self.home / 'scheduler.log').read_text()
+        for label in ['dev.fleet.renew', 'dev.fleet.agent', 'dev.fleet.tunnel.bb']:
+            self.assertIn(label, scheduler)
+        for plist in ['dev.fleet.renew', 'dev.fleet.agent', 'dev.fleet.tunnel.bb']:
+            self.assertFalse((self.home / f'Library/LaunchAgents/{plist}.plist').exists(), plist)
+        self.assertIn('removed', result.stdout)
+
+    def test_uninstall_needs_confirmation_and_can_keep_the_certificate(self):
+        self.enroll()
+        result = self.fleet('uninstall', stdin='')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.state / 'node.crt').exists())
+        self.log.unlink()
+        result = self.fleet('uninstall', '--yes', '--keep-cert')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse([c for c in self.calls() if c[:2] == ['ca', 'revoke']])
+        self.assertFalse(self.state.exists())
+
+    def test_uninstall_cleans_leftovers_without_an_enrollment(self):
+        (self.home / '.ssh/fleet').mkdir(parents=True)
+        (self.home / '.ssh/fleet/config').write_text('Host *\n')
+        result = self.fleet('uninstall', '--yes')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.home / '.ssh/fleet').exists())
+        self.assertNotIn('remove', self.fleet('uninstall', '--bogus').stdout)
+        self.assertNotEqual(self.fleet('uninstall', '--bogus').returncode, 0)
+
     def test_status_reports_missing_enrollment(self):
         result = self.fleet('status')
         self.assertNotEqual(result.returncode, 0)

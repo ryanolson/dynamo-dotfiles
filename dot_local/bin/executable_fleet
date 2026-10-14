@@ -69,6 +69,9 @@ Any machine:
   trust [--principal NAME] | untrust    Add or remove the CA line in ~/.ssh/authorized_keys.
   timer install | timer remove          Schedule renew every hour.
   status
+  uninstall [--yes] [--keep-cert]       Revoke this machine's certificate, stop the fleet services
+                                        (renew, agent, tunnels), remove the authorized_keys CA line,
+                                        and delete the fleet keys and settings. Alias: remove.
   install-step                          Linux: install the pinned step CLI into ~/.local/<arch>/bin.
 EOF
 }
@@ -999,6 +1002,54 @@ cmd_tunnel() {
     esac
 }
 
+# Remove everything fleet set up on this machine. The dotfiles still own the fleet script and the
+# Include line in ~/.ssh/config, which is harmless once ~/.ssh/fleet is gone.
+cmd_uninstall() {
+    local yes=0 keep=0 answer f
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --yes) yes=1; shift ;;
+            --keep-cert) keep=1; shift ;;
+            *) fail 'usage: fleet uninstall [--yes] [--keep-cert]' ;;
+        esac
+    done
+    load_config
+    if [[ "$yes" == 0 ]]; then
+        [[ -t 0 ]] || fail 'refusing to uninstall without a terminal to confirm; pass --yes'
+        printf 'Remove fleet from this machine%s: revoke its certificate, stop its services, and delete its keys? [y/N] ' \
+            "${name:+ ($name)}"
+        read -r answer
+        [[ "$answer" =~ ^[Yy] ]] || fail 'cancelled'
+    fi
+    local revoked=kept
+    if [[ "$keep" == 0 && -f "$STATE/node.crt" && -n "$ca_url" ]]; then
+        # Revoke with the certificate itself, so a removed machine is cut off now, not in 24 hours.
+        if find_step && "$STEP" ca revoke --cert "$STATE/node.crt" --key "$STATE/node.key" --ca-url "$ca_url" \
+                --root "$STATE/root_ca.crt" >/dev/null 2>&1; then
+            revoked=revoked
+        else
+            revoked='not revoked (the CA did not answer; it expires within 24 hours)'
+        fi
+    fi
+    for f in "$TUNNELS"/*; do
+        [[ -f "$f" ]] && cmd_tunnel remove "${f##*/}"
+    done
+    if [[ "$(uname -s)" == Darwin ]]; then
+        launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/dev.fleet.agent.plist" 2>/dev/null || true
+        rm -f "$HOME/Library/LaunchAgents/dev.fleet.agent.plist"
+    elif systemctl --user show-environment >/dev/null 2>&1; then
+        systemctl --user disable --now fleet-agent.service 2>/dev/null || true
+        rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/fleet-agent.service"
+        systemctl --user daemon-reload 2>/dev/null || true
+    fi
+    rm -f "$(agent_sock)"
+    cmd_timer remove
+    edit_authorized_keys ""
+    rm -rf "$SSH_FLEET" "$STATE" "$CONFIG_DIR"
+    printf 'fleet removed from this machine%s. Certificate: %s.\n' "${name:+ ($name)}" "$revoked"
+    printf 'Not removed: pylon (~/.local/bin/pylon) and any bb host daemon. Remove the machine from bb with bb machine remove.\n'
+}
+
 cmd_agent() {
     case "${1:-run}" in
         run) agent_run ;;
@@ -1067,6 +1118,7 @@ case "$command" in
     list) cmd_list "$@" ;;
     secret) cmd_secret "$@" ;;
     tunnel) cmd_tunnel "$@" ;;
+    uninstall|remove) cmd_uninstall "$@" ;;
     claude) cmd_secret env CLAUDE_CODE_OAUTH_TOKEN=claude-oauth-token -- claude "$@" ;;
     agent) cmd_agent "$@" ;;
     install-step) install_step ;;
