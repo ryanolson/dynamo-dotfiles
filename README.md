@@ -363,6 +363,10 @@ timeout 300 python3 test/test-fleet.py
 timeout 300 python3 test/test-join.py
 ```
 
+### Fleet SSH names
+
+`fleet renew` also writes short SSH names from the broker into `~/.ssh/fleet/config`, for example `ssh bb`. The broker holds the list, so host names stay out of this repository. If the broker does not answer, `fleet` keeps the last list.
+
 ### Fleet secrets
 
 The broker serves named secrets to fleet machines. A policy on the CA host decides which machine names can read each secret. Values are not printed by `fleet secret env` or `fleet claude`.

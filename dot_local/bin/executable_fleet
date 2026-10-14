@@ -164,6 +164,24 @@ issue_ssh() {
         fail 'could not get an SSH certificate'
 }
 
+# Short SSH names (`ssh bb`) come from the broker, so tailnet host names stay out of this
+# public script. A broker outage keeps the last list. Each line is checked again here, so a
+# line cannot add other SSH options.
+ssh_aliases() {
+    local list="$SSH_FLEET/hosts" fresh alias host user
+    need_broker
+    if fresh=$(curl -fsS --connect-timeout 3 --max-time 5 --cert "$STATE/node.crt" --key "$STATE/node.key" \
+            --cacert "$STATE/root_ca.crt" -H 'Accept: text/plain' "$broker_url/v1/ssh-hosts" 2>/dev/null); then
+        printf '%s\n' "$fresh" > "$list.tmp" && mv "$list.tmp" "$list"
+    fi
+    [[ -f "$list" ]] || return 0
+    while read -r alias host user _; do
+        [[ "$alias" =~ ^[a-z0-9][a-z0-9-]{0,62}$ && "$host" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ &&
+           "$user" =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]] || continue
+        printf 'Host %s\n    HostName %s\n    User %s\n' "$alias" "$host" "$user"
+    done < "$list"
+}
+
 write_ssh_config() {
     ca_flags
     local host_ca
@@ -186,6 +204,7 @@ write_ssh_config() {
             printf '    IdentityFile %s\n' "$SSH_FLEET/agent-auth.pub"
             printf '    IdentitiesOnly yes\n'
         fi
+        ssh_aliases
         printf '%s\n' 'Host *'
         printf '    IdentityFile %s\n' "${identities[@]}"
         printf '    CertificateFile %s\n' "$STATE/id_fleet-cert.pub"

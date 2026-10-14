@@ -216,6 +216,27 @@ class Fleet(FleetBase):
         self.assertIn(['ca', 'renew'], [c[:2] for c in self.calls()])
         self.assertFalse((self.home / 'pylon-args').exists())
 
+    def test_renew_writes_ssh_aliases_from_the_broker(self):
+        self.enroll()
+        curl = self.home / 'bin/curl'
+        curl.write_text('#!/bin/sh\ncase "$*" in *v1/ssh-hosts*) [ -f "$HOME/broker-down" ] && exit 7\n'
+                        '  printf "bb brev.example.ts.net ubuntu\\nbad ProxyCommand=x u\\n" ;; esac\n')
+        curl.chmod(0o700)
+        self.assertEqual(self.fleet('renew').returncode, 0)
+        config = self.home / '.ssh/fleet/config'
+        text = config.read_text()
+        self.assertIn('Host bb\n    HostName brev.example.ts.net\n    User ubuntu\n', text)
+        self.assertNotIn('ProxyCommand', text)
+        self.assertLess(text.index('Host bb'), text.index('Host *'))
+        resolved = subprocess.run(['ssh', '-G', '-F', str(config), 'bb'], capture_output=True, text=True, check=True).stdout
+        self.assertIn('hostname brev.example.ts.net\n', resolved)
+        self.assertIn('user ubuntu\n', resolved)
+        self.assertIn(f'certificatefile {self.state}/id_fleet-cert.pub', resolved)
+        # A broker outage keeps the last list instead of dropping the aliases.
+        (self.home / 'broker-down').write_text('')
+        self.assertEqual(self.fleet('renew').returncode, 0)
+        self.assertIn('Host bb\n', config.read_text())
+
     def test_renew_without_enrollment_fails(self):
         result = self.fleet('renew')
         self.assertNotEqual(result.returncode, 0)
