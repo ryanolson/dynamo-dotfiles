@@ -127,3 +127,7 @@ This command renews transport credentials. BB enrollment, proxy installation, pr
 The command does not use `chezmoi update`, because the `git pull --autostash --rebase` of that command leaves a rebase and a stash after a conflict. It uses a fetch and a fast-forward merge. It does not overwrite files that were changed outside chezmoi, and it does not run `chezmoi init`. Both conditions give exit status 2, and a person must resolve them.
 
 The transport that lets the server start the command on a worker is bb work.
+
+## 2026-10-13 addendum: fleet identity
+
+[Fleet identity, SSH, signing, and secrets](fleet-identity.md) records the target design for per-machine certificates, SSH certificates, remote Git signing, the secrets broker, and Claude token delivery. It answers the open question about certificate revocation with step-ca on `spark-p`. Lifetimes remain open.
