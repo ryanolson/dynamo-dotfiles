@@ -363,6 +363,18 @@ timeout 300 python3 test/test-fleet.py
 timeout 300 python3 test/test-join.py
 ```
 
+### Fleet secrets
+
+The broker serves named secrets to fleet machines. A policy on the CA host decides which machine names can read each secret. Values are not printed by `fleet secret env` or `fleet claude`.
+
+```bash
+fleet secret get NAME                          # print the value
+fleet secret env VAR=NAME... -- CMD...         # run CMD with the values in its environment
+fleet claude [ARGS...]                         # run claude with CLAUDE_CODE_OAUTH_TOKEN from the secret claude-oauth-token
+```
+
+A machine needs `broker_url` in `~/.config/fleet/config` (`fleet init --broker-url`).
+
 ### bb server
 
 `bb-server-service` runs a bb server as a systemd user service on an always-on Linux machine. It needs Node.js 22.19, 24, or 26, which `chezmoi apply` installs through pixi.

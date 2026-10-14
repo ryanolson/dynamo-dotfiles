@@ -56,6 +56,9 @@ Any machine:
   renew [--loop]                        Renew certificates that are close to expiry.
   agent [run|install|remove]            Bridge a local ssh-agent socket to the broker (pylon, else socat).
                                         install runs it as a launchd or systemd user service.
+  secret get NAME                       Print a secret from the broker, if the policy allows this machine.
+  secret env VAR=NAME... -- CMD...      Run CMD with secrets in its environment. Values are not printed.
+  claude [ARGS...]                      Run claude with CLAUDE_CODE_OAUTH_TOKEN from the secret claude-oauth-token.
   trust [--principal NAME] | untrust    Add or remove the CA line in ~/.ssh/authorized_keys.
   timer install | timer remove          Schedule renew every hour.
   status
@@ -621,6 +624,40 @@ cmd_list() {
         fail 'the broker refused the request; fleet list needs a certificate from fleet login'
 }
 
+valid_secret() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]]; }
+
+secret_value() {
+    valid_secret "$1" || fail "invalid secret name: $1"
+    need_enrollment
+    [[ -n "$broker_url" ]] || fail 'run fleet init --broker-url https://HOST:PORT first'
+    curl -fsS --cert "$STATE/node.crt" --key "$STATE/node.key" --cacert "$STATE/root_ca.crt" \
+        -H 'Accept: application/octet-stream' "$broker_url/v1/secrets/$1" ||
+        fail "the broker did not return the secret $1"
+}
+
+cmd_secret() {
+    case "${1:-}" in
+        get)
+            [[ $# -eq 2 ]] || fail 'usage: fleet secret get NAME'
+            secret_value "$2" ;;
+        env)
+            shift
+            local pair var value
+            local -a pairs=()
+            while [[ $# -gt 0 && "$1" != -- ]]; do pairs+=("$1"); shift; done
+            [[ "${1:-}" == -- && $# -ge 2 && ${#pairs[@]} -gt 0 ]] || fail 'usage: fleet secret env VAR=NAME... -- CMD...'
+            shift
+            for pair in "${pairs[@]}"; do
+                var="${pair%%=*}"
+                [[ "$var" =~ ^[A-Z_][A-Z0-9_]*$ && "$pair" == *=* ]] || fail "invalid VAR=NAME: $pair"
+                value=$(secret_value "${pair#*=}") || exit 1
+                export "$var=$value"
+            done
+            exec "$@" ;;
+        *) fail 'usage: fleet secret get NAME | fleet secret env VAR=NAME... -- CMD...' ;;
+    esac
+}
+
 # Unix socket paths are limited to 104 bytes on macOS and 108 on Linux.
 agent_sock() {
     if [[ -n "${FLEET_AGENT_SOCK:-}" ]]; then
@@ -813,6 +850,8 @@ case "$command" in
     timer) cmd_timer "$@" ;;
     status) cmd_status ;;
     list) cmd_list "$@" ;;
+    secret) cmd_secret "$@" ;;
+    claude) cmd_secret env CLAUDE_CODE_OAUTH_TOKEN=claude-oauth-token -- claude "$@" ;;
     agent) cmd_agent "$@" ;;
     install-step) install_step ;;
     -h|--help|help|"") usage ;;

@@ -524,6 +524,49 @@ class FleetLaptop(FleetBase):
         self.assertNotEqual(self.fleet('list', '--bogus').returncode, 0)
 
 
+    def secret_curl(self):
+        curl = self.home / 'bin/curl'
+        curl.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$HOME/curl-args"\n'
+                        'case "$*" in *v1/secrets/missing*) exit 22 ;; esac\nprintf "tok-123"\n')
+        curl.chmod(0o700)
+        self.enroll()
+        self.init('--broker-url', 'https://ca.example:8443')
+
+    def test_secret_get_asks_the_broker_for_the_raw_value(self):
+        self.secret_curl()
+        result = self.fleet('secret', 'get', 'claude-oauth-token')
+        self.assertEqual((result.returncode, result.stdout), (0, 'tok-123'), result.stderr)
+        args = (self.home / 'curl-args').read_text().splitlines()
+        self.assertEqual(args[-1], 'https://ca.example:8443/v1/secrets/claude-oauth-token')
+        self.assertIn('Accept: application/octet-stream', args)
+        self.assertEqual(args[args.index('--cert') + 1], f'{self.state}/node.crt')
+        self.assertNotEqual(self.fleet('secret', 'get', 'missing').returncode, 0)
+        for bad in ['../x', 'A', '']:
+            (self.home / 'curl-args').unlink(missing_ok=True)
+            self.assertNotEqual(self.fleet('secret', 'get', bad).returncode, 0)
+            self.assertFalse((self.home / 'curl-args').exists())
+
+    def test_secret_env_runs_a_command_without_printing_the_value(self):
+        self.secret_curl()
+        out = self.home / 'out'
+        result = self.fleet('secret', 'env', 'TOKEN=claude-oauth-token', '--', 'sh', '-c', f'printf %s "$TOKEN" > {out}')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(out.read_text(), 'tok-123')
+        self.assertNotIn('tok-123', result.stdout + result.stderr)
+        self.assertNotEqual(self.fleet('secret', 'env', 'TOKEN=missing', '--', 'true').returncode, 0)
+        self.assertNotEqual(self.fleet('secret', 'env', 'bad-var=x', '--', 'true').returncode, 0)
+
+    def test_claude_launcher_supplies_the_oauth_token(self):
+        self.secret_curl()
+        claude = self.home / 'bin/claude'
+        claude.write_text('#!/bin/sh\nprintf "%s %s" "$CLAUDE_CODE_OAUTH_TOKEN" "$*" > "$HOME/claude-run"\n')
+        claude.chmod(0o700)
+        result = self.fleet('claude', '--version')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.home / 'claude-run').read_text(), 'tok-123 --version')
+        self.assertTrue((self.home / 'curl-args').read_text().splitlines()[-1].endswith('/v1/secrets/claude-oauth-token'))
+
+
 class FleetEphemeral(FleetBase):
     def start(self, *extra):
         runtime = self.home / 'run'
