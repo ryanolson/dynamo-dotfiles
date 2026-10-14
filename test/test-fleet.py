@@ -188,6 +188,34 @@ class Fleet(FleetBase):
         self.assertEqual(self.fleet('renew').returncode, 0)
         self.assertIn(['ssh', 'certificate'], [c[:2] for c in self.calls()])
 
+    def pylon_stub(self, supports_renew=True):
+        pylon = self.home / 'bin/pylon'
+        renew = 'printf "%s\\n" "$@" > "$HOME/pylon-args"' if supports_renew else 'exit 2'
+        pylon.write_text(f'#!/bin/sh\nif [ "$1" = renew ]; then\n  [ "$2" = --help ] && {{ {"exit 0" if supports_renew else "exit 2"}; }}\n'
+                         f'  {renew}\nfi\n')
+        pylon.chmod(0o700)
+        return pylon
+
+    def test_renew_uses_pylon_when_it_can_renew(self):
+        self.enroll()
+        self.log.unlink()
+        pylon = self.pylon_stub()
+        result = self.fleet('renew', FLEET_PYLON=str(pylon))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.home / 'pylon-args').read_text().splitlines(),
+                         ['renew', '--ca-url', 'https://ca.example', '--state', str(self.state),
+                          '--name', 'node-1.fleet'])
+        self.assertFalse([c for c in self.calls() if c[:2] in (['ca', 'renew'], ['ssh', 'certificate'])])
+
+    def test_renew_falls_back_to_step_for_an_older_pylon(self):
+        self.enroll()
+        self.log.unlink()
+        pylon = self.pylon_stub(supports_renew=False)
+        result = self.fleet('renew', FLEET_PYLON=str(pylon), NEEDS_X509='0', NEEDS_SSH='0')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(['ca', 'renew'], [c[:2] for c in self.calls()])
+        self.assertFalse((self.home / 'pylon-args').exists())
+
     def test_renew_without_enrollment_fails(self):
         result = self.fleet('renew')
         self.assertNotEqual(result.returncode, 0)

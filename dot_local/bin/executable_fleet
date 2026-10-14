@@ -499,6 +499,14 @@ cmd_renew() {
     need_enrollment
     need_step
     ca_flags
+    # pylon renews both certificates with the same rules, without one step process per call.
+    # An older pylon has no renew command, so ask first.
+    if find_pylon && "$PYLON" renew --help >/dev/null 2>&1; then
+        "$PYLON" renew --ca-url "$ca_url" --state "$STATE" --name "$name" >/dev/null ||
+            fail 'renewal failed; the certificate is expired or revoked. Enroll again: fleet login on a laptop, or a new token.'
+        write_ssh_config
+        return
+    fi
     local rc=0 ssh_due=0
     "$STEP" certificate needs-renewal "$STATE/node.crt" --expires-in "$X509_RENEW_BEFORE" >/dev/null 2>&1 || rc=$?
     case "$rc" in
