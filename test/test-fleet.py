@@ -220,13 +220,15 @@ class Fleet(FleetBase):
         self.enroll()
         curl = self.home / 'bin/curl'
         curl.write_text('#!/bin/sh\ncase "$*" in *v1/ssh-hosts*) [ -f "$HOME/broker-down" ] && exit 7\n'
-                        '  printf "bb brev.example.ts.net ubuntu\\nbad ProxyCommand=x u\\n" ;; esac\n')
+                        '  printf "bb brev.example.ts.net ubuntu\\nbad ProxyCommand=x u\\ngpu gpu.corp.example ryan bb\\nevil h u -oProxyCommand=x\\n" ;; esac\n')
         curl.chmod(0o700)
         self.assertEqual(self.fleet('renew').returncode, 0)
         config = self.home / '.ssh/fleet/config'
         text = config.read_text()
         self.assertIn('Host bb\n    HostName brev.example.ts.net\n    User ubuntu\n', text)
         self.assertNotIn('ProxyCommand', text)
+        self.assertIn('Host gpu\n    HostName gpu.corp.example\n    User ryan\n    ProxyJump bb\n', text)
+        self.assertNotIn('Host evil', text)
         self.assertLess(text.index('Host bb'), text.index('Host *'))
         resolved = subprocess.run(['ssh', '-G', '-F', str(config), 'bb'], capture_output=True, text=True, check=True).stdout
         self.assertIn('hostname brev.example.ts.net\n', resolved)

@@ -175,10 +175,12 @@ ssh_aliases() {
         printf '%s\n' "$fresh" > "$list.tmp" && mv "$list.tmp" "$list"
     fi
     [[ -f "$list" ]] || return 0
-    while read -r alias host user _; do
+    while read -r alias host user jump _; do
         [[ "$alias" =~ ^[a-z0-9][a-z0-9-]{0,62}$ && "$host" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ &&
            "$user" =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]] || continue
+        [[ -z "$jump" || "$jump" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || continue
         printf 'Host %s\n    HostName %s\n    User %s\n' "$alias" "$host" "$user"
+        [[ -n "$jump" ]] && printf '    ProxyJump %s\n' "$jump"
     done < "$list"
 }
 
