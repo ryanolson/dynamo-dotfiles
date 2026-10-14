@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# Run a bb server as a systemd user service on an always-on Linux machine.
+set -euo pipefail
+
+fail() { printf 'bb-server-service: %s\n' "$*" >&2; exit 1; }
+
+PREFIX="${BB_SERVER_PREFIX:-$HOME/.local/share/bb-server}"
+DATA_DIR="${BB_SERVER_DATA_DIR:-$HOME/.bb}"
+PORT="${BB_SERVER_PORT:-38886}"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+UNIT="$UNIT_DIR/bb-server.service"
+# npm 12 blocks install scripts by default, and bb needs these three native add-ons.
+ALLOW_SCRIPTS=better-sqlite3,node-pty,@parcel/watcher
+
+usage() {
+    cat <<'EOF'
+usage: bb-server-service install [--version VERSION|TAG] [--serve]
+       bb-server-service status
+       bb-server-service remove
+
+install  Install bb-app at an exact version under ~/.local/share/bb-server and start
+         bb-server.service. The default is the version that the npm tag "latest" names now.
+         --serve also publishes the server on the tailnet with Tailscale Serve (HTTPS 443)
+         and sets BB_APP_URL to that address.
+EOF
+}
+
+need_node() {
+    command -v node >/dev/null && command -v npm >/dev/null || fail 'node and npm are required. Run chezmoi apply.'
+    local major minor
+    IFS=. read -r major minor _ <<<"$(node -p 'process.versions.node')"
+    if ! { (( major == 22 && minor >= 19 )) || (( major == 24 || major == 26 )); }; then
+        fail "bb needs Node.js 22.19, 24, or 26; found $(node -v)"
+    fi
+}
+
+need_systemd() {
+    systemctl --user show-environment >/dev/null 2>&1 || fail 'no systemd user session. Log in again, or run loginctl enable-linger.'
+}
+
+cmd_install() {
+    local version=latest serve=0
+    while (( $# )); do
+        case "$1" in
+            --version) version="${2:?--version needs a value}"; shift 2 ;;
+            --serve) serve=1; shift ;;
+            *) usage >&2; exit 2 ;;
+        esac
+    done
+    need_node
+    need_systemd
+    # Pin the exact version so that a restart never changes what runs. bb updates itself later.
+    local exact
+    exact=$(npm view "bb-app@$version" version 2>/dev/null | tail -1)
+    [[ "$exact" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || fail "npm has no bb-app version for $version"
+    mkdir -p "$PREFIX" "$DATA_DIR" "$UNIT_DIR"
+    # npm 11 refuses --allow-scripts for a --prefix install, but reads the same setting from .npmrc.
+    printf 'allow-scripts=%s\n' "$ALLOW_SCRIPTS" > "$PREFIX/.npmrc"
+    (cd "$PREFIX" && npm install --silent --no-fund --no-audit --prefix "$PREFIX" "bb-app@$exact") \
+        || fail "npm could not install bb-app@$exact"
+    local bin="$PREFIX/node_modules/.bin/bb-app" node_dir
+    [[ -x "$bin" ]] || fail "bb-app is missing after the install: $bin"
+    node_dir=$(dirname "$(command -v node)")
+    cat > "$UNIT" <<EOF
+[Unit]
+Description=bb server
+After=network-online.target
+
+[Service]
+Environment=PATH=$node_dir:/usr/local/bin:/usr/bin:/bin
+ExecStart=$bin start --data-dir $DATA_DIR --server-port $PORT
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+    if command -v loginctl >/dev/null && [[ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != yes ]]; then
+        loginctl enable-linger "$USER" 2>/dev/null || sudo -n loginctl enable-linger "$USER" 2>/dev/null ||
+            printf 'bb-server-service: linger is off, so the server stops at logout. Run: sudo loginctl enable-linger %s\n' "$USER" >&2
+    fi
+    systemctl --user daemon-reload
+    systemctl --user enable --now bb-server.service
+    systemctl --user restart bb-server.service
+    printf 'bb-server.service runs bb-app %s on 127.0.0.1:%s\n' "$exact" "$PORT"
+    if (( serve )); then
+        serve_tailnet
+    fi
+}
+
+serve_tailnet() {
+    command -v tailscale >/dev/null || fail 'tailscale is not installed'
+    local dns
+    dns=$(tailscale status --json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).Self.DNSName.replace(/\.$/,"")))')
+    [[ -n "$dns" ]] || fail 'tailscale reports no DNS name for this machine'
+    tailscale serve --bg --https=443 "http://127.0.0.1:$PORT" 2>/dev/null ||
+        sudo -n tailscale serve --bg --https=443 "http://127.0.0.1:$PORT" ||
+        fail 'tailscale serve failed. Run: sudo tailscale set --operator=$USER'
+    "$PREFIX/node_modules/.bin/bb-app" --data-dir "$DATA_DIR" config set BB_APP_URL "https://$dns"
+    systemctl --user restart bb-server.service
+    printf 'bb is at https://%s on the tailnet\n' "$dns"
+}
+
+cmd_status() {
+    systemctl --user --no-pager status bb-server.service 2>&1 | head -5 || true
+    if curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:$PORT/"; then
+        printf 'http://127.0.0.1:%s answers\n' "$PORT"
+    else
+        printf 'http://127.0.0.1:%s does not answer\n' "$PORT"
+        return 1
+    fi
+}
+
+cmd_remove() {
+    systemctl --user disable --now bb-server.service 2>/dev/null || true
+    rm -f "$UNIT"
+    systemctl --user daemon-reload 2>/dev/null || true
+    printf 'bb-server.service is removed. The data in %s and the install in %s remain.\n' "$DATA_DIR" "$PREFIX"
+}
+
+case "${1:-}" in
+    install) shift; cmd_install "$@" ;;
+    status) cmd_status ;;
+    remove) cmd_remove ;;
+    -h|--help|help) usage ;;
+    *) usage >&2; exit 2 ;;
+esac

@@ -363,6 +363,19 @@ timeout 300 python3 test/test-fleet.py
 timeout 300 python3 test/test-join.py
 ```
 
+### bb server
+
+`bb-server-service` runs a bb server as a systemd user service on an always-on Linux machine. It needs Node.js 22.19, 24, or 26, which `chezmoi apply` installs through pixi.
+
+```bash
+bb-server-service install            # bb-app at the exact version that "latest" names now
+bb-server-service install --serve    # also publish it on the tailnet with Tailscale Serve
+bb-server-service status
+bb-server-service remove             # keeps ~/.bb and the install
+```
+
+The script installs `bb-app` under `~/.local/share/bb-server` and writes `bb-server.service`. The server listens on `127.0.0.1:38886`. `--serve` publishes it at `https://<machine>.<tailnet>.ts.net` and sets `BB_APP_URL` to that address. npm 11 refuses `--allow-scripts` for a `--prefix` install, so the script writes the setting to `.npmrc` in the install directory.
+
 ### GitHub auth policy
 
 **`gh auth login` only. Never a personal access token.** No `GITHUB_TOKEN`, `GH_TOKEN`, or
