@@ -79,7 +79,8 @@ class FleetBase(unittest.TestCase):
         self.log = self.home / 'step.log'
         self.env = dict(os.environ, HOME=str(self.home), PATH=f'{bin_dir}:{os.environ["PATH"]}',
                         STEP_LOG=str(self.log), EXPECT_TOKEN=TOKEN, USER_CA=USER_CA, HOST_CA=HOST_CA,
-                        XDG_CONFIG_HOME=str(self.home / '.config'), XDG_STATE_HOME=str(self.home / '.local/state'))
+                        XDG_CONFIG_HOME=str(self.home / '.config'), XDG_STATE_HOME=str(self.home / '.local/state'),
+                        FLEET_PYLON=str(self.home / 'no-pylon'))
         self.state = self.home / '.local/state/fleet'
 
     def fleet(self, *args, stdin=None, **env):
@@ -290,6 +291,21 @@ class Fleet(FleetBase):
         self.assertEqual(args[-1], f'OPENSSL:ca.example:8444,cert={self.state}/node.crt,key={self.state}/node.key,'
                                    f'cafile={self.state}/root_ca.crt,verify=1')
 
+    def test_agent_prefers_pylon(self):
+        self.enroll()
+        self.socat_stub()
+        pylon = self.home / 'bin/pylon'
+        pylon.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$HOME/pylon-args"\n')
+        pylon.chmod(0o700)
+        sock = self.home / 'a.sock'
+        result = self.fleet('agent', FLEET_PYLON=str(pylon), FLEET_AGENT_SOCK=str(sock))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.home / 'pylon-args').read_text().splitlines(),
+                         ['agent', '--socket', str(sock), '--broker', 'ca.example:8444',
+                          '--cert', f'{self.state}/node.crt', '--key', f'{self.state}/node.key',
+                          '--ca', f'{self.state}/root_ca.crt'])
+        self.assertFalse((self.home / 'socat-args').exists())
+
     def test_agent_refuses_a_socket_path_that_is_too_long(self):
         self.enroll()
         self.socat_stub()
@@ -394,7 +410,7 @@ class Fleet(FleetBase):
         self.enroll()
         result = self.fleet('agent', FLEET_SOCAT=str(self.home / 'no-socat'))
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('socat', result.stderr)
+        self.assertIn('pylon or socat', result.stderr)
 
     def test_status_reports_missing_enrollment(self):
         result = self.fleet('status')

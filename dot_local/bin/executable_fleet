@@ -54,7 +54,7 @@ Any machine:
                                         Enroll in memory-backed storage and renew in the
                                         foreground. On exit, revoke and remove everything.
   renew [--loop]                        Renew certificates that are close to expiry.
-  agent [run|install|remove]            Bridge a local ssh-agent socket to the broker with socat.
+  agent [run|install|remove]            Bridge a local ssh-agent socket to the broker (pylon, else socat).
                                         install runs it as a launchd or systemd user service.
   trust [--principal NAME] | untrust    Add or remove the CA line in ~/.ssh/authorized_keys.
   timer install | timer remove          Schedule renew every hour.
@@ -632,6 +632,15 @@ agent_sock() {
     fi
 }
 
+find_pylon() {
+    local candidate candidates=("${FLEET_PYLON:-}")
+    [[ -n "${FLEET_PYLON:-}" ]] || candidates=("$(command -v pylon 2>/dev/null || true)" "$HOME/.local/bin/pylon")
+    for candidate in "${candidates[@]}"; do
+        [[ -n "$candidate" && -x "$candidate" ]] && { PYLON="$candidate"; return 0; }
+    done
+    return 1
+}
+
 find_socat() {
     local candidate candidates=("${FLEET_SOCAT:-}")
     [[ -n "${FLEET_SOCAT:-}" ]] || candidates=("$(command -v socat 2>/dev/null || true)" /opt/homebrew/bin/socat
@@ -639,26 +648,35 @@ find_socat() {
     for candidate in "${candidates[@]}"; do
         [[ -n "$candidate" && -x "$candidate" ]] && { SOCAT="$candidate"; return 0; }
     done
-    fail 'socat is missing. Run chezmoi apply, or install socat.'
+    return 1
+}
+
+# pylon keeps a warm connection and caches the key list (about 0.15 s per signature). socat opens
+# a new mTLS connection for each agent client (about 0.5 s). Both read the renewed certificate.
+find_bridge() {
+    find_pylon || find_socat || fail 'pylon or socat is required. Run chezmoi apply, or install one of them.'
 }
 
 agent_run() {
     need_enrollment
-    find_socat
     local sock host addr
     sock=$(agent_sock)
     (( ${#sock} <= 100 )) || fail "the agent socket path is too long (${#sock} bytes): $sock. Set FLEET_AGENT_SOCK."
+    find_bridge
     host="${ca_url#https://}"; host="${host%%/*}"; host="${host%%:*}"
     addr="${FLEET_AGENT_ADDR:-$host:8444}"
     mkdir -p "$(dirname "$sock")"
-    # socat opens a new mTLS connection for each agent client, so it reads the renewed certificate every time.
+    if [[ -n "${PYLON:-}" ]]; then
+        exec "$PYLON" agent --socket "$sock" --broker "$addr" \
+            --cert "$STATE/node.crt" --key "$STATE/node.key" --ca "$STATE/root_ca.crt"
+    fi
     exec "$SOCAT" "UNIX-LISTEN:$sock,fork,unlink-early,mode=600" \
         "OPENSSL:$addr,cert=$STATE/node.crt,key=$STATE/node.key,cafile=$STATE/root_ca.crt,verify=1"
 }
 
 agent_install() {
     need_enrollment
-    find_socat
+    find_bridge
     local sock
     sock=$(agent_sock)
     if [[ "$(uname -s)" == Darwin ]]; then

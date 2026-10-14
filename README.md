@@ -339,7 +339,7 @@ Chezmoi includes `~/.ssh/fleet/config` before the local provisioning file. The f
 
 CAUTION: Revocation does not end access immediately. The machine cannot renew, but it keeps its SSH certificate, and it can get new SSH certificates until its client certificate expires. Access ends within about 24 hours.
 
-`fleet agent` gives an enrolled machine an ssh-agent whose private keys stay in the CA's KMS. It runs `socat` to connect a local socket to the broker's agent service over mTLS with the machine certificate. `fleet agent install` runs it as a launchd agent or a systemd user service. The socket is `$XDG_RUNTIME_DIR/fleet-agent.sock` on Linux and `~/.ssh/fleet/agent.sock` otherwise. Use it with `SSH_AUTH_SOCK`:
+`fleet agent` gives an enrolled machine an ssh-agent whose private keys stay in the CA's KMS. It connects a local socket to the broker's agent service over mTLS with the machine certificate. It runs `pylon` when `pylon` is on `PATH` or in `~/.local/bin`, and `socat` otherwise. `pylon` keeps a warm connection and caches the key list. `socat` opens a new connection for each agent client. `fleet agent install` runs it as a launchd agent or a systemd user service. The socket is `$XDG_RUNTIME_DIR/fleet-agent.sock` on Linux and `~/.ssh/fleet/agent.sock` otherwise. Use it with `SSH_AUTH_SOCK`:
 
 ```bash
 fleet agent install
@@ -352,7 +352,7 @@ The agent lists the keys that the broker policy allows for this machine, and it 
 - `~/.ssh/fleet/allowed_signers` holds the lines of `~/.ssh/allowed_signers` and the agent key, so `git log --show-signature` verifies both.
 - `~/.ssh/fleet/config` gets a `Host github.com` block with `IdentityAgent` set to the fleet agent. Other hosts keep their agent.
 
-`fleet agent remove` deletes these files, and Git and SSH return to the previous settings. `git-signing-status` reports whether the fleet agent holds the signing key. Each signature is a request to the CA host: about 0.5 seconds through `socat` from a laptop in the measured test. If the CA host is down, signing with these keys stops; fleet certificates still work for SSH between fleet machines.
+`fleet agent remove` deletes these files, and Git and SSH return to the previous settings. `git-signing-status` reports whether the fleet agent holds the signing key. Each signature is a request to the CA host. From a laptop in the measured test, a signature took about 0.15 seconds through `pylon` and about 0.5 seconds through `socat`. If the CA host is down, signing with these keys stops; fleet certificates still work for SSH between fleet machines.
 
 When the 1Password agent is active, OpenSSH offers the agent keys before the fleet certificate. A server that accepts one of those keys can still cause a 1Password approval.
 
