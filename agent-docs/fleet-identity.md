@@ -8,7 +8,7 @@ This note records the target design for machine identity across the fleet. It do
 
 - Laptops, the iPhone, and the iPad are thin terminals. They are usually not headless.
 - Always-on machines do the work: public VMs, private servers (DGX Spark, DGX Station), Slurm login nodes, and Kubernetes clusters. These machines are usually headless.
-- Corp machines are reachable through the jump host `spark-p`. `spark-p` is a member of the tailnet.
+- Corp machines are reachable through a jump host. The jump host is a member of the tailnet.
 - Some machines keep a persistent home directory and shell, for example Slurm login nodes. Others are ephemeral, for example a container in a Kubernetes pod.
 - SSH between machines must not need a password or a 1Password biometric approval for each connection.
 - SSH to tailnet machines must use SSH keys for authentication, not the Tailscale browser login.
@@ -21,9 +21,9 @@ This note records the target design for machine identity across the fleet. It do
 
 | Topic | Decision |
 |---|---|
-| Central host | `spark-p` runs the certificate authority and the broker. It is on the tailnet and on the corp network. |
+| Central host | The corp jump host runs the certificate authority and the broker. It is on the tailnet and on the corp network. Superseded on 2026-10-14; see the addendum. |
 | Certificate authority | [step-ca](https://smallstep.com/docs/step-ca). It issues X.509 client certificates and SSH user and host certificates. It also does renewal and revocation. |
-| Broker | A small service on `spark-p` that accepts only mTLS clients with certificates from the fleet CA. It reads 1Password through a service account. |
+| Broker | A small service on the central host that accepts only mTLS clients with certificates from the fleet CA. It reads 1Password through a service account. |
 | Git signing | Remote signing. The signing key stays on the central host. A machine sends the data to sign to the broker over mTLS. |
 | Tailscale SSH | Mixed. Machines with sshd turn off Tailscale SSH and use OpenSSH with certificates. Tagged ephemeral containers without sshd can keep Tailscale SSH with the `accept` action. |
 
@@ -34,7 +34,7 @@ flowchart LR
   subgraph thin[Thin terminals]
     L[Laptop with 1Password<br/>approves enrollment]
   end
-  subgraph central[spark-p]
+  subgraph central[Central host]
     CA[step-ca<br/>X.509 and SSH CA]
     BR[Broker, mTLS only<br/>secrets, signing, Claude tokens]
     OP[(1Password<br/>service account, fleet vault)]
@@ -45,7 +45,7 @@ flowchart LR
   N -- renew over mTLS --> CA
   N -- mTLS --> BR
   N -- SSH certificate --> M[Other machines]
-  L -- ProxyJump spark-p --> C[Corp machines]
+  L -- ProxyJump jump host --> C[Corp machines]
 ```
 
 ### Enrollment and renewal
@@ -62,7 +62,7 @@ The SSH user CA signs a user certificate for each machine. Servers trust the CA,
 
 - On machines with sudo, sshd trusts the CA through `TrustedUserCAKeys`. The host CA signs the host key, and clients trust it through a `@cert-authority` line in `known_hosts`.
 - On machines without sudo, for example Slurm login nodes, `~/.ssh/authorized_keys` trusts the CA through a `cert-authority,principals="..."` line.
-- Corp machines use `ProxyJump spark-p`. Agent forwarding is not necessary.
+- Corp machines use `ProxyJump` through the jump host. Agent forwarding is not necessary.
 
 Tailscale SSH authenticates with the tailnet identity, not with SSH keys. The browser login comes from the `check` action in the tailnet policy.
 
@@ -87,7 +87,7 @@ The broker resolves `op://` references for a machine according to a policy for t
 ## Phases
 
 1. This design note.
-2. step-ca on `spark-p`. Chezmoi installs the `step` CLI and the enrollment and renewal commands.
+2. step-ca on the central host. Chezmoi installs the `step` CLI and the enrollment and renewal commands.
 3. SSH certificates, CA trust lines, `ProxyJump` blocks, and the Tailscale SSH setting.
 4. The remote signer and the Git signing program.
 5. The secrets broker and the broker backend for `openv`.
@@ -97,7 +97,25 @@ The broker resolves `op://` references for a machine according to a policy for t
 
 - Open question: what lifetimes do user, host, and client certificates get?
 - Open question: what principals do SSH user certificates carry, and which hosts accept each principal?
-- Open question: how do corp machines reach the CA and the broker on `spark-p`: over the corp network address or through a forwarded port?
+- Open question: how do corp machines reach the CA and the broker: over the corp network address or through a forwarded port?
 - Open question: how many Claude tokens are necessary, for example one for each trust level? How is one token revoked?
-- Open question: is `spark-p` an acceptable place for the CA keys, given that it is also the corp jump host? Where are the root CA key and its backup kept?
-- Open question: how does step-ca on `spark-p` get the password for its intermediate key at startup without a person present?
+- Open question: is the corp jump host an acceptable place for the CA keys? Where are the root CA key and its backup kept?
+- Open question: how does step-ca get the password for its intermediate key at startup without a person present?
+
+## 2026-10-14 addendum: CA host and the `fleet` command
+
+The CA does not run on the corp jump host. The jump host is shared corp infrastructure, so a compromise of it would expose the CA keys. The CA runs on a small cloud VM in a cloud account that the user owns. Corp machines have outbound internet access, so they reach the CA directly on TCP 443 with mTLS. The jump host is not in the CA path.
+
+The intermediate key and the SSH user and host CA keys are cloud KMS keys. The VM can sign with the keys, but the keys cannot leave the KMS. This answers the startup password question: step-ca needs no key password. The root key and the enrollment provisioner key are only in 1Password. The project has a monthly spending cap that disables billing. The deployment values are in a private repository, not here.
+
+Answers to the open questions:
+
+- Client certificates last 24 hours. SSH user certificates last 16 hours. Host certificates cannot outlive the client certificate.
+- SSH user certificates carry fixed principals from the CA template. A requested principal is ignored. Host certificate principals are the DNS names in the client certificate.
+- Corp machines reach the CA over the internet.
+
+The step-ca X5C provisioner does not check revocation. A revoked client certificate cannot renew, but it can get SSH certificates until it expires. The 24-hour client lifetime limits this gap.
+
+`fleet` (`dot_local/bin/executable_fleet`) implements enrollment, renewal, SSH trust, and revocation. The README section "Fleet certificates" describes its use. Keys are files with mode `0600` in `~/.local/state/fleet`. They are not in memory-backed storage, because a reboot would then need a new token from a person, and always-on machines must renew without a person. This differs from `bb-worker-cert`.
+
+Host certificates in `sshd` are not implemented. A host certificate cannot outlive the 24-hour client certificate, so `sshd` needs a daily renewal as root.

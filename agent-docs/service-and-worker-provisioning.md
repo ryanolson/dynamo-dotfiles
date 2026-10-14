@@ -130,4 +130,4 @@ The transport that lets the server start the command on a worker is bb work.
 
 ## 2026-10-13 addendum: fleet identity
 
-[Fleet identity, SSH, signing, and secrets](fleet-identity.md) records the target design for per-machine certificates, SSH certificates, remote Git signing, the secrets broker, and Claude token delivery. It answers the open question about certificate revocation with step-ca on `spark-p`. Lifetimes remain open.
+[Fleet identity, SSH, signing, and secrets](fleet-identity.md) records the target design for per-machine certificates, SSH certificates, remote Git signing, the secrets broker, and Claude token delivery. It answers the open questions about certificate lifetime and revocation with step-ca.
