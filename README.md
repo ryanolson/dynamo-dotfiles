@@ -346,7 +346,13 @@ fleet agent install
 SSH_AUTH_SOCK=~/.ssh/fleet/agent.sock ssh-add -L
 ```
 
-The agent lists the keys that the broker policy allows for this machine, and it only signs. `ssh` and `git` (SSH commit signing) can use it without a 1Password approval. Each signature is a request to the CA host: about 0.5 seconds through `socat` from a laptop in the measured test. If the CA host is down, signing with these keys stops; fleet certificates still work for SSH between fleet machines.
+The agent lists the keys that the broker policy allows for this machine, and it only signs. `fleet agent install` also connects Git and GitHub to it, without a 1Password approval:
+
+- `~/.ssh/fleet/gitconfig` sets the signing key to the agent's `fleet agent-signing` key and `gpg.ssh.program` to `fleet-ssh-keygen`. That wrapper signs through the fleet agent, whatever `SSH_AUTH_SOCK` the shell has. `~/.gitconfig` includes the file last, so it overrides the 1Password signing settings. Git skips the include when the file is missing.
+- `~/.ssh/fleet/allowed_signers` holds the lines of `~/.ssh/allowed_signers` and the agent key, so `git log --show-signature` verifies both.
+- `~/.ssh/fleet/config` gets a `Host github.com` block with `IdentityAgent` set to the fleet agent. Other hosts keep their agent.
+
+`fleet agent remove` deletes these files, and Git and SSH return to the previous settings. `git-signing-status` reports whether the fleet agent holds the signing key. Each signature is a request to the CA host: about 0.5 seconds through `socat` from a laptop in the measured test. If the CA host is down, signing with these keys stops; fleet certificates still work for SSH between fleet machines.
 
 When the 1Password agent is active, OpenSSH offers the agent keys before the fleet certificate. A server that accepts one of those keys can still cause a 1Password approval.
 

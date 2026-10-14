@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# git runs this as gpg.ssh.program. Signing uses the fleet agent, whatever SSH_AUTH_SOCK the shell
+# has: a 1Password or forwarded agent does not hold the fleet signing key.
+set -euo pipefail
+if [[ "${1:-}" == -Y && "${2:-}" == sign ]]; then
+    sock="${FLEET_AGENT_SOCK:-}"
+    if [[ -z "$sock" && -f "$HOME/.ssh/fleet/agent" ]]; then
+        sock=$(<"$HOME/.ssh/fleet/agent")
+    fi
+    if [[ -z "$sock" || ! -S "$sock" ]]; then
+        printf 'fleet-ssh-keygen: the fleet agent socket %s is missing. Run: fleet agent install\n' "${sock:-(none)}" >&2
+        exit 1
+    fi
+    SSH_AUTH_SOCK="$sock" exec ssh-keygen "$@"
+fi
+exec ssh-keygen "$@"

@@ -101,3 +101,8 @@
 # Local provisioning overrides the agent settings when this file exists.
 [include]
     path = ~/.ssh/provisioned/gitconfig
+
+# `fleet agent install` writes this file: commit signing through the fleet agent. It comes
+# last so it wins. Git skips a missing include, so machines without the agent are unchanged.
+[include]
+    path = ~/.ssh/fleet/gitconfig

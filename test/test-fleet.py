@@ -299,14 +299,92 @@ class Fleet(FleetBase):
         self.assertFalse((self.home / 'socat-args').exists())
 
     def test_agent_install_schedules_a_service(self):
+        sock, _ = self.start_real_agent()
         self.enroll()
         self.socat_stub()
-        result = self.fleet('agent', 'install')
+        result = self.fleet('agent', 'install', FLEET_AGENT_SOCK=str(sock))
         self.assertEqual(result.returncode, 0, result.stderr)
         scheduled = (self.home / 'scheduler.log').read_text()
         self.assertTrue('launchctl bootstrap' in scheduled or 'systemctl --user enable --now fleet-agent.service' in scheduled,
                         scheduled)
         self.assertIn('SSH_AUTH_SOCK=', result.stdout)
+
+    def start_real_agent(self):
+        sock = Path(tempfile.mkdtemp(dir='/tmp')) / 'a.sock'
+        self.addCleanup(lambda: sock.parent.exists() and __import__('shutil').rmtree(sock.parent))
+        out = subprocess.run(['ssh-agent', '-a', str(sock)], capture_output=True, text=True, check=True).stdout
+        pid = int(out.split('SSH_AGENT_PID=')[1].split(';')[0])
+        self.addCleanup(lambda: subprocess.run(['kill', str(pid)]))
+        key = self.home / 'agent-signing'
+        subprocess.run(['ssh-keygen', '-q', '-t', 'ecdsa', '-b', '256', '-N', '', '-C', 'fleet agent-signing',
+                        '-f', str(key)], check=True)
+        subprocess.run(['ssh-add', '-q', str(key)], env=dict(os.environ, SSH_AUTH_SOCK=str(sock)), check=True)
+        return sock, (self.home / 'agent-signing.pub').read_text().split()[:2]
+
+    def test_agent_install_wires_git_signing_and_github(self):
+        sock, pub = self.start_real_agent()
+        ssh = self.home / '.ssh'
+        ssh.mkdir(mode=0o700)
+        (ssh / 'allowed_signers').write_text('me@example.com ssh-ed25519 AAAAOLDKEY\n')
+        self.enroll()
+        self.socat_stub()
+        env = dict(FLEET_AGENT_SOCK=str(sock))
+        result = self.fleet('agent', 'install', **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        fragment = (ssh / 'fleet/gitconfig').read_text()
+        self.assertIn(f'signingkey = key::{" ".join(pub)}\n', fragment)
+        self.assertIn(f'program = {self.home}/.local/bin/fleet-ssh-keygen\n', fragment)
+        self.assertIn('gpgsign = true\n', fragment)
+        signers = (ssh / 'fleet/allowed_signers').read_text()
+        self.assertIn('me@example.com ssh-ed25519 AAAAOLDKEY\n', signers)
+        self.assertIn(f'* {" ".join(pub)}\n', signers)
+        config = ssh / 'fleet/config'
+        github = subprocess.run(['ssh', '-G', '-F', str(config), 'github.com'], capture_output=True, text=True,
+                                check=True).stdout
+        self.assertIn(f'identityagent {sock}\n', github)
+        other = subprocess.run(['ssh', '-G', '-F', str(config), 'example.com'], capture_output=True, text=True,
+                               check=True).stdout
+        self.assertNotIn(str(sock), other)
+        self.assertEqual(self.fleet('renew', **env).returncode, 0)
+        self.assertIn('Host github.com', config.read_text())
+
+        wrapper = self.home / '.local/bin/fleet-ssh-keygen'
+        wrapper.parent.mkdir(parents=True, exist_ok=True)
+        wrapper.write_text((ROOT / 'dot_local/bin/executable_fleet-ssh-keygen').read_text())
+        wrapper.chmod(0o755)
+        repo = self.home / 'repo'
+        repo.mkdir()
+        genv = dict(os.environ, HOME=str(self.home), SSH_AUTH_SOCK='/nonexistent', FLEET_AGENT_SOCK=str(sock),
+                    GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=str(self.home / '.gitconfig'))
+        (self.home / '.gitconfig').write_text(f'[user]\n    name = T\n    email = t@example.com\n'
+                                              f'[include]\n    path = {ssh}/fleet/gitconfig\n')
+        git = lambda *a: subprocess.run(['git', '-C', str(repo), *a], env=genv, capture_output=True, text=True)
+        git('init', '-q')
+        commit = git('commit', '--allow-empty', '-m', 'signed')
+        self.assertEqual(commit.returncode, 0, commit.stderr)
+        verify = git('verify-commit', 'HEAD')
+        self.assertEqual(verify.returncode, 0, verify.stderr)
+        self.assertIn('Good "git" signature', verify.stderr)
+        status = lambda: subprocess.run(['bash', str(ROOT / 'dot_local/bin/executable_git-signing-status')],
+                                        env=genv, capture_output=True, text=True)
+        self.assertEqual(status().stdout.strip(), 'ready: the fleet agent holds the signing key')
+        genv['FLEET_AGENT_SOCK'] = str(self.home / 'gone.sock')
+        self.assertTrue(status().stdout.startswith('degraded: the fleet agent'))
+        genv['FLEET_AGENT_SOCK'] = str(sock)
+
+        self.assertEqual(self.fleet('agent', 'remove', **env).returncode, 0)
+        self.assertFalse((ssh / 'fleet/gitconfig').exists())
+        self.assertFalse((ssh / 'fleet/allowed_signers').exists())
+        self.assertNotIn('Host github.com', config.read_text())
+
+    def test_agent_install_fails_without_a_signing_key(self):
+        self.enroll()
+        self.socat_stub()
+        result = self.fleet('agent', 'install', FLEET_AGENT_SOCK=str(self.home / 'missing.sock'),
+                            FLEET_AGENT_WAIT='1')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('agent-signing', result.stderr)
+        self.assertFalse((self.home / '.ssh/fleet/gitconfig').exists())
 
     def test_agent_needs_socat(self):
         self.enroll()
@@ -472,6 +550,21 @@ class FleetEphemeral(FleetBase):
                             stdin=TOKEN + '\n')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('persistent', result.stderr)
+
+
+class GitconfigInclude(unittest.TestCase):
+    def test_gitconfig_includes_the_fleet_fragment_last(self):
+        for data in ['data:\n  name: T\n  email: t@example.com\n',
+                     'data:\n  name: T\n  email: t@example.com\n  onepassword:\n    enabled: true\n'
+                     '    ssh_agent: true\n    signing_public_key: "ssh-ed25519 AAAA"\n']:
+            with tempfile.TemporaryDirectory() as tmp, self.subTest(data=data):
+                config = Path(tmp) / 'chezmoi.yaml'
+                config.write_text(data)
+                text = subprocess.run(['chezmoi', '--config', str(config), '--source', str(ROOT), 'execute-template'],
+                                      input=(ROOT / 'dot_gitconfig.tmpl').read_text(), capture_output=True, text=True,
+                                      check=True, env=dict(os.environ, HOME=tmp)).stdout
+                includes = [l.strip() for l in text.splitlines() if l.strip().startswith('path =')]
+                self.assertEqual(includes[-1], 'path = ~/.ssh/fleet/gitconfig')
 
 
 class SshConfigInclude(unittest.TestCase):
