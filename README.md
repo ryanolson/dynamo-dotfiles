@@ -301,7 +301,8 @@ Each machine makes its own private keys, and the keys do not leave the machine. 
 On a laptop, install `step` (`brew install step`) and record the deployment values once:
 
 ```bash
-fleet init --ca-url https://CA --fingerprint ROOT_SHA256 --enroll-item 'op://VAULT/ITEM'
+fleet init --ca-url https://CA --fingerprint ROOT_SHA256 --enroll-item 'op://VAULT/ENROLL_ITEM' \
+  --admin-item 'op://VAULT/ADMIN_ITEM' --broker-url https://CA:8443
 ```
 
 To enroll a new machine, print a join command on the laptop:
@@ -318,7 +319,9 @@ Run the printed command on the new machine within 15 minutes. It works in bash, 
 
 The token is on the command line of the new machine for the duration of `join.sh`. To keep it off the command line, use `fleet enroll-remote HOST NAME` for a machine that you can reach with SSH. That command sends the token on stdin. If the laptop cannot reach the machine, run `fleet token NAME` on the laptop. Then run `fleet enroll NAME --ca-url https://CA --fingerprint ROOT_SHA256` on the machine and paste the token. After `enroll-remote` or a manual `enroll`, run `fleet timer install` on the machine.
 
-To enroll the laptop itself, run `fleet login`. It mints its own token through 1Password and does not add login trust. A laptop that sleeps longer than 24 hours has an expired certificate. Run `fleet login` again.
+To enroll the laptop itself, run `fleet login`. It mints its own token through 1Password with the admin provisioner, and it does not add login trust. A laptop that sleeps longer than 24 hours has an expired certificate. Run `fleet login` again.
+
+`fleet list` shows each enrolled machine: its state (active, expired, or revoked), its expiry, its last issue or renewal, and its serial. The command asks the fleet broker, an mTLS service on the CA host. The broker accepts only certificates from the fleet CA that are not on the CA's revocation list. It lists machines only for a certificate from the admin provisioner, that is, a laptop after `fleet login`.
 
 The timer is a launchd agent on macOS, a systemd user timer on Linux, or a crontab entry when systemd is not available. In a container without a scheduler, run `fleet renew --loop` under the container supervisor. On Linux, `fleet` installs a pinned `step` release into `~/.local/<arch>/bin` if `step` is missing. It checks the download against a SHA-256 value in the script.
 

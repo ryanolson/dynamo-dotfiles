@@ -119,3 +119,9 @@ The step-ca X5C provisioner does not check revocation. A revoked client certific
 `fleet` (`dot_local/bin/executable_fleet`) implements enrollment, renewal, SSH trust, and revocation. The README section "Fleet certificates" describes its use. Keys are files with mode `0600` in `~/.local/state/fleet`. They are not in memory-backed storage, because a reboot would then need a new token from a person, and always-on machines must renew without a person. This differs from `bb-worker-cert`.
 
 Host certificates in `sshd` are not implemented. A host certificate cannot outlive the 24-hour client certificate, so `sshd` needs a daily renewal as root.
+
+## 2026-10-14 addendum: broker and admin certificates
+
+The broker runs on the CA host. It is an mTLS service on TCP 8443. Its first endpoints are `/v1/whoami` and `/v1/machines`. `fleet list` uses the second one. The broker reads the step-ca log, because step-ca has no API that lists issued certificates. The broker refuses a certificate that is on the CA's CRL, so a revocation takes effect at the broker within one minute. The broker fails closed when the CRL is unavailable or out of date.
+
+Admin rights come from a second JWK provisioner, `admin`. step-ca records the issuing provisioner in an extension of each certificate (OID `1.3.6.1.4.1.37476.9000.64.1`), and renewal keeps the extension. `fleet login` uses the admin provisioner. `enroll`, `invite`, and `enroll-remote` use the enroll provisioner. Each provisioner key is in its own 1Password item. A name allowlist was rejected because the holder of the enroll key chooses machine names. Tailscale capability grants were rejected for now because they tie admin calls to the tailnet.

@@ -29,14 +29,16 @@ usage() {
 Usage: fleet <command> [options]
 
 Laptop (has 1Password):
-  init --ca-url URL --fingerprint SHA256 [--enroll-item op://VAULT/ITEM] [--principal NAME]
+  init --ca-url URL --fingerprint SHA256 [--enroll-item op://VAULT/ITEM] [--admin-item op://VAULT/ITEM]
+       [--broker-url URL] [--principal NAME]
+  list [--json]                         List the fleet. Needs a certificate from fleet login.
   token NAME [--san NAME]...            Print a 5-minute enrollment token.
   enroll-remote HOST NAME [--san NAME]... [--no-trust] [--principal NAME]
                                         Mint a token and enroll HOST over SSH.
   invite NAME [--san NAME]... [--dotfiles] [--ephemeral] [--no-trust] [--principal NAME]
                                         Print a curl command that enrolls a new machine.
-  login [NAME]                          Enroll this laptop (no login trust) with a token
-                                        from 1Password. Use it when the certificate expired.
+  login [NAME]                          Enroll this laptop with the admin provisioner and no
+                                        login trust. Use it again when the certificate expired.
   revoke SERIAL                         Revoke a client certificate. Renewal and new SSH
                                         certificates stop within 24 hours.
 
@@ -61,7 +63,7 @@ valid_principal() { [[ "$1" =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]]; }
 valid_item() { [[ "$1" =~ ^op://[A-Za-z0-9\ ._-]+/[A-Za-z0-9\ ._-]+$ ]]; }
 valid_token() { [[ "$1" =~ ^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; }
 
-declare ca_url="" fingerprint="" name="" enroll_item="" principal=""
+declare ca_url="" fingerprint="" name="" enroll_item="" admin_item="" broker_url="" principal=""
 
 load_config() {
     [[ -f "$CONFIG" ]] || return 0
@@ -72,6 +74,8 @@ load_config() {
             fingerprint) valid_fingerprint "$value" && fingerprint="$value" ;;
             name) valid_name "$value" && name="$value" ;;
             enroll_item) valid_item "$value" && enroll_item="$value" ;;
+            admin_item) valid_item "$value" && admin_item="$value" ;;
+            broker_url) valid_url "$value" && broker_url="$value" ;;
             principal) valid_principal "$value" && principal="$value" ;;
         esac
     done < "$CONFIG"
@@ -87,6 +91,8 @@ save_config() {
         [[ -n "$fingerprint" ]] && printf 'fingerprint=%s\n' "$fingerprint"
         [[ -n "$name" ]] && printf 'name=%s\n' "$name"
         [[ -n "$enroll_item" ]] && printf 'enroll_item=%s\n' "$enroll_item"
+        [[ -n "$admin_item" ]] && printf 'admin_item=%s\n' "$admin_item"
+        [[ -n "$broker_url" ]] && printf 'broker_url=%s\n' "$broker_url"
         [[ -n "$principal" ]] && printf 'principal=%s\n' "$principal"
         true
     } > "$tmp"
@@ -218,6 +224,8 @@ cmd_init() {
             --ca-url) valid_url "${2:-}" || fail 'invalid --ca-url (https only)'; ca_url="$2"; shift 2 ;;
             --fingerprint) valid_fingerprint "${2:-}" || fail 'invalid --fingerprint (64 hex digits)'; fingerprint="$2"; shift 2 ;;
             --enroll-item) valid_item "${2:-}" || fail 'invalid --enroll-item (op://VAULT/ITEM)'; enroll_item="$2"; shift 2 ;;
+            --admin-item) valid_item "${2:-}" || fail 'invalid --admin-item (op://VAULT/ITEM)'; admin_item="$2"; shift 2 ;;
+            --broker-url) valid_url "${2:-}" || fail 'invalid --broker-url (https only)'; broker_url="$2"; shift 2 ;;
             --principal) valid_principal "${2:-}" || fail 'invalid principal'; principal="$2"; shift 2 ;;
             *) fail "unknown option $1" ;;
         esac
@@ -227,20 +235,23 @@ cmd_init() {
 }
 
 # Sets ENROLL to a scratch directory holding the CA root and the provisioner key and password.
+# The enroll provisioner issues machine certificates; the admin provisioner issues laptop certificates.
 enroll_secrets() {
-    [[ -n "$ca_url" && -n "$fingerprint" && -n "$enroll_item" ]] ||
+    local item="${1:-$enroll_item}"
+    PROVISIONER="${2:-enroll}"
+    [[ -n "$ca_url" && -n "$fingerprint" && -n "$item" ]] ||
         fail 'run fleet init with --ca-url, --fingerprint, and --enroll-item first'
     command -v op >/dev/null || fail 'op is required on this machine'
     need_step
     scratch; ENROLL="$SCRATCH"
     "$STEP" ca root "$ENROLL/root.crt" --ca-url "$ca_url" --fingerprint "$fingerprint" >/dev/null 2>&1 ||
         fail 'could not fetch and check the CA root'
-    op read "$enroll_item/jwk_encrypted" > "$ENROLL/key"
-    op read "$enroll_item/password" > "$ENROLL/password"
+    op read "$item/jwk_encrypted" > "$ENROLL/key"
+    op read "$item/password" > "$ENROLL/password"
 }
 
 provisioner_token() {
-    "$STEP" ca token "$@" --provisioner enroll --key "$ENROLL/key" --password-file "$ENROLL/password" \
+    "$STEP" ca token "$@" --provisioner "$PROVISIONER" --key "$ENROLL/key" --password-file "$ENROLL/password" \
         --not-after "$TOKEN_TTL" --ca-url "$ca_url" --root "$ENROLL/root.crt" 2>/dev/null || fail 'could not mint a token'
 }
 
@@ -325,7 +336,8 @@ cmd_login() {
     load_config
     local node="${1:-${name:-$(hostname -s)}}"
     valid_name "$node" || fail 'usage: fleet login [NAME]'
-    enroll_secrets
+    [[ -n "$admin_item" ]] || fail 'run fleet init --admin-item op://VAULT/ITEM first'
+    enroll_secrets "$admin_item" admin
     local token
     token=$(provisioner_token "$node" --san "$node")
     cmd_enroll "$node" --token "$token" --no-trust
@@ -544,6 +556,16 @@ serial_of() {
     fi
 }
 
+cmd_list() {
+    local accept='text/plain'
+    [[ "${1:-}" == --json ]] && accept='application/json'
+    need_enrollment
+    [[ -n "$broker_url" ]] || fail 'run fleet init --broker-url https://HOST:PORT first'
+    curl -fsS --cert "$STATE/node.crt" --key "$STATE/node.key" --cacert "$STATE/root_ca.crt" \
+        -H "Accept: $accept" "$broker_url/v1/machines" ||
+        fail 'the broker refused the request; fleet list needs a certificate from fleet login'
+}
+
 cmd_status() {
     load_config
     if [[ -z "$name" || ! -f "$STATE/node.crt" ]]; then
@@ -581,6 +603,7 @@ case "$command" in
     untrust) cmd_untrust ;;
     timer) cmd_timer "$@" ;;
     status) cmd_status ;;
+    list) cmd_list "$@" ;;
     install-step) install_step ;;
     -h|--help|help|"") usage ;;
     *) usage >&2; exit 2 ;;

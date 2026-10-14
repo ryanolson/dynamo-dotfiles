@@ -52,6 +52,8 @@ OP_STUB = r'''#!/bin/sh
 case "$2" in
   "op://Vault/Enroll/jwk_encrypted") printf 'JWE-KEY' ;;
   "op://Vault/Enroll/password") printf 'PASSWORD' ;;
+  "op://Vault/Admin/jwk_encrypted") printf 'ADMIN-KEY' ;;
+  "op://Vault/Admin/password") printf 'ADMIN-PASSWORD' ;;
   *) exit 2 ;;
 esac
 '''
@@ -263,9 +265,9 @@ class Fleet(FleetBase):
 
 
 class FleetLaptop(FleetBase):
-    def init(self):
+    def init(self, *extra):
         result = self.fleet('init', '--ca-url', 'https://ca.example', '--fingerprint', 'ab' * 32,
-                            '--enroll-item', 'op://Vault/Enroll')
+                            '--enroll-item', 'op://Vault/Enroll', *extra)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def source_repo(self, pushed=True):
@@ -304,15 +306,41 @@ class FleetLaptop(FleetBase):
         self.assertIn('push', result.stderr)
         self.assertFalse([c for c in self.calls() if c[:2] == ['ca', 'token']])
 
-    def test_login_enrolls_this_machine_without_trust(self):
-        self.init()
+    def test_login_uses_the_admin_provisioner_without_trust(self):
+        self.init('--admin-item', 'op://Vault/Admin')
         result = self.fleet('login', 'laptop-1')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('CERT laptop-1', (self.state / 'node.crt').read_text())
         self.assertFalse((self.home / '.ssh/authorized_keys').exists())
         seen = json.loads((self.home / 'token-seen.json').read_text())
+        self.assertEqual((seen['key'], seen['password']), ('ADMIN-KEY', 'ADMIN-PASSWORD'))
         self.assertFalse(Path(seen['key_path']).exists())
+        token = [c for c in self.calls() if c[:2] == ['ca', 'token']][0]
+        self.assertEqual(token[token.index('--provisioner') + 1], 'admin')
         self.assertEqual(self.fleet('login').returncode, 0)
+
+    def test_login_needs_an_admin_item(self):
+        self.init()
+        result = self.fleet('login', 'laptop-1')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('--admin-item', result.stderr)
+
+    def test_list_asks_the_broker_with_this_machines_certificate(self):
+        self.enroll()
+        self.init('--broker-url', 'https://ca.example:8443')
+        curl = self.home / 'bin/curl'
+        curl.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$HOME/curl-args"\nprintf "NAME STATE\\nspark-d active\\n"\n')
+        curl.chmod(0o700)
+        result = self.fleet('list')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('spark-d active', result.stdout)
+        args = (self.home / 'curl-args').read_text().splitlines()
+        for flag, value in [('--cert', f'{self.state}/node.crt'), ('--key', f'{self.state}/node.key'),
+                            ('--cacert', f'{self.state}/root_ca.crt'), ('-H', 'Accept: text/plain')]:
+            self.assertEqual(args[args.index(flag) + 1], value)
+        self.assertEqual(args[-1], 'https://ca.example:8443/v1/machines')
+        self.fleet('list', '--json')
+        self.assertIn('Accept: application/json', (self.home / 'curl-args').read_text())
 
 
 class FleetEphemeral(FleetBase):
