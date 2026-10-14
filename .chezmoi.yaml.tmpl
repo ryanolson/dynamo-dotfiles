@@ -12,7 +12,7 @@
 {{- end -}}
 {{- $machineSeed := promptChoiceOnce . "machine_seed" "Per-machine fish seed (creates conf.d/local.fish once, then unsynced)" (list "blank" "cuda") "blank" -}}
 {{- $defaultHost := .chezmoi.hostname -}}
-{{- $cursorSSHHost := promptStringOnce . "cursor_ssh_host" (printf "SSH hostname for Cursor deep links [leave blank to use: %s]" $defaultHost) -}}
+{{- $cursorSSHHost := promptStringOnce . "cursor_ssh_host" (printf "SSH hostname for Cursor deep links [leave blank to use: %s]" $defaultHost) "" -}}
 {{- if eq $cursorSSHHost "" -}}{{- $cursorSSHHost = $defaultHost -}}{{- end -}}
 {{/* Derived capabilities — primary is the only class with 1Password + commit signing. */}}
 {{- $isPrimary := eq $machineClass "primary" -}}
