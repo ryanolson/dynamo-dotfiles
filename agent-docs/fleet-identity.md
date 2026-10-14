@@ -139,3 +139,9 @@ The Rust agent is `pylon agent`, in the private `agentic-control` workspace (`cr
 ## Addendum 2026-10-14: revocation check for X5C
 
 This supersedes the revocation gap that line 117 describes. The broker now serves a step-ca authorizing webhook on loopback of the CA host. The X5C provisioner for SSH certificates calls it, and the broker refuses a revoked client certificate. A second X5C provisioner issues 1-hour client certificates from a current machine certificate. It is the first part of a two-certificate model: a long-lived machine credential that only gets short access certificates. step-ca reads `webhooks` from the top level of the provisioner `options`. Inside `options.x509`, step-ca ignores it without an error.
+
+## Addendum 2026-10-14: secrets from the broker
+
+The broker serves named secrets over the same mTLS port as the machine list. A policy on the CA host lists, for each secret, its source in a cloud secret store and the machine-name patterns that can read it. An unknown or forbidden name gives the same 404, so a machine cannot discover the other names. The broker reads the value on each request and logs only the name and the caller. The CA host's service account can read only the listed secrets.
+
+`fleet secret get NAME` prints a value. `fleet secret env VAR=NAME -- CMD` runs a command with values in its environment. `fleet claude` is the launcher for remote Claude sessions: it sets `CLAUDE_CODE_OAUTH_TOKEN` from a secret that holds a token from `claude setup-token`. 1Password stays the place where a person keeps secrets. The cloud store is the copy that machines can reach without a person.
