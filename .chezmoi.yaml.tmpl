@@ -57,6 +57,6 @@ data:
     enabled: {{ $isPrimary }}
     ssh_agent: {{ $isPrimary }}
     signing_public_key: {{ $opSigningKey | quote }}
-    vault: "Development"
+    vault: {{ dig "onepassword" "vault" "Development" . | quote }}
     # secrets: override in ~/.config/chezmoi/chezmoi.yaml
     # defaults from .chezmoidata/team.yaml
