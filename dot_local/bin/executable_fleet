@@ -698,8 +698,10 @@ cmd_secret() {
 agent_sock() {
     if [[ -n "${FLEET_AGENT_SOCK:-}" ]]; then
         printf '%s' "$FLEET_AGENT_SOCK"
-    elif [[ "$(uname -s)" == Linux && -n "${XDG_RUNTIME_DIR:-}" && -d "${XDG_RUNTIME_DIR:-}" ]]; then
-        printf '%s' "$XDG_RUNTIME_DIR/fleet-agent.sock"
+    elif [[ "$(uname -s)" == Linux && -d "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" ]]; then
+        # The systemd user service always has XDG_RUNTIME_DIR. Some SSH sessions (Tailscale SSH)
+        # do not, so fall back to the same directory, or install looks for the wrong socket.
+        printf '%s' "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/fleet-agent.sock"
     else
         printf '%s' "$SSH_FLEET/agent.sock"
     fi
