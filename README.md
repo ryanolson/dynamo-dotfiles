@@ -292,6 +292,55 @@ Chezmoi includes the local SSH configuration before agent settings and the local
 
 To return to agent configuration, move `~/.ssh/provisioned` out of that path. To replace keys, move the directory aside and run `provision-keys` again. Existing public-key registrations remain valid when you copy the same keys.
 
+### Fleet certificates
+
+`fleet` gives each machine its own short-lived identity from a [step-ca](https://smallstep.com/docs/step-ca) certificate authority. A machine with an identity can SSH to other enrolled machines without a password and without a 1Password approval. The design is in `agent-docs/fleet-identity.md`. The CA address, the root fingerprint, and the 1Password item are deployment values. They are not in this repository.
+
+Each machine makes its own private keys, and the keys do not leave the machine. A person approves the first certificate with a one-time token from a laptop that has 1Password.
+
+On a laptop, install `step` (`brew install step`) and record the deployment values once:
+
+```bash
+fleet init --ca-url https://CA --fingerprint ROOT_SHA256 --enroll-item 'op://VAULT/ITEM'
+```
+
+To enroll a machine that you can reach with SSH:
+
+```bash
+fleet enroll-remote HOST NAME
+```
+
+The token travels on stdin, not on the command line. If the laptop cannot reach the machine, run `fleet token NAME` on the laptop. Then run `fleet enroll NAME --ca-url https://CA --fingerprint ROOT_SHA256` on the machine and paste the token.
+
+After enrollment, schedule renewal on the machine:
+
+```bash
+fleet timer install
+```
+
+The timer is a launchd agent on macOS, a systemd user timer on Linux, or a crontab entry when systemd is not available. In a container without a scheduler, run `fleet renew --loop` under the container supervisor. On Linux, `fleet` installs a pinned `step` release into `~/.local/<arch>/bin` if `step` is missing. It checks the download against a SHA-256 value in the script.
+
+| Item | Lifetime | Location |
+|---|---|---|
+| Client certificate and key | 24 hours, renewed over mTLS | `~/.local/state/fleet/node.crt`, `node.key` |
+| SSH key and user certificate | 16 hours | `~/.local/state/fleet/id_fleet`, `id_fleet-cert.pub` |
+| SSH client settings and host CA | Rewritten at enrollment | `~/.ssh/fleet/config`, `~/.ssh/fleet/known_hosts` |
+| Login trust | Until `fleet untrust` | A `# BEGIN fleet` block in `~/.ssh/authorized_keys` |
+
+Chezmoi includes `~/.ssh/fleet/config` after the local provisioning file. By default, enrollment adds a `cert-authority` line to `~/.ssh/authorized_keys` for the principal `ryan`. Use `--principal NAME` to accept a different principal. Use `--no-trust` on a machine that must not accept fleet logins, for example the CA host. Other lines in `authorized_keys` do not change.
+
+`fleet status` shows the name, the serial number, and the expiry times. To cut off a machine, run `fleet revoke SERIAL` on a laptop.
+
+CAUTION: Revocation does not end access immediately. The machine cannot renew, but it keeps its SSH certificate, and it can get new SSH certificates until its client certificate expires. Access ends within about 24 hours.
+
+When the 1Password agent is active, OpenSSH offers the agent keys before the fleet certificate. A server that accepts one of those keys can still cause a 1Password approval.
+
+Verification:
+
+```bash
+timeout 300 python3 test/test-fleet.py
+```
+
 ### GitHub auth policy
 
 **`gh auth login` only. Never a personal access token.** No `GITHUB_TOKEN`, `GH_TOKEN`, or

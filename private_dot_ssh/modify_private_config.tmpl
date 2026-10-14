@@ -1,8 +1,8 @@
 #!/bin/bash
 # OpenSSH uses the first value; local provisioning must precede agent settings.
 CONFIG="$(cat)"
-printf '%s\n' 'Include ~/.ssh/provisioned/config'
-CONFIG="$(printf '%s\n' "$CONFIG" | sed '\|^Include ~/.ssh/provisioned/config$|d')"
+printf '%s\n' 'Include ~/.ssh/provisioned/config' 'Include ~/.ssh/fleet/config'
+CONFIG="$(printf '%s\n' "$CONFIG" | sed -e '\|^Include ~/.ssh/provisioned/config$|d' -e '\|^Include ~/.ssh/fleet/config$|d')"
 {{- if and (hasKey . "onepassword") .onepassword.ssh_agent }}
 {{- if eq .chezmoi.os "darwin" }}
 # macOS: inject 1Password IdentityAgent if not present

@@ -1,0 +1,474 @@
+#!/usr/bin/env bash
+# Keep tokens and keys out of shell traces.
+set +x
+set -euo pipefail
+umask 077
+
+STEP_VERSION=0.31.0
+STEP_SHA256_amd64=2bc654b26ca467848edb764620d6f17febea9d7d3629368b76dd20ce40c6ef32
+STEP_SHA256_arm64=3252032aded050abe93a642681995d3e36c66eaf1979da1980bf71b5e8973516
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fleet"
+CONFIG="$CONFIG_DIR/config"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/fleet"
+SSH_FLEET="$HOME/.ssh/fleet"
+SELF="$HOME/.local/bin/fleet"
+X509_RENEW_BEFORE=16h
+SSH_RENEW_BEFORE=8h
+
+CLEANUP=()
+trap 'rm -rf "${CLEANUP[@]+"${CLEANUP[@]}"}"' EXIT
+fail() { printf 'fleet: %s\n' "$*" >&2; exit 1; }
+# Sets SCRATCH in the caller; a $(...) subshell would lose the cleanup entry.
+scratch() { SCRATCH=$(mktemp -d "${1:-${TMPDIR:-/tmp}}/.fleet.XXXXXX"); CLEANUP+=("$SCRATCH"); }
+
+usage() {
+    cat <<'EOF'
+Usage: fleet <command> [options]
+
+Laptop (has 1Password):
+  init --ca-url URL --fingerprint SHA256 [--enroll-item op://VAULT/ITEM] [--principal NAME]
+  token NAME [--san NAME]...            Print a 5-minute enrollment token.
+  enroll-remote HOST NAME [--san NAME]... [--no-trust] [--principal NAME]
+                                        Mint a token and enroll HOST over SSH.
+  revoke SERIAL                         Revoke a client certificate. Renewal and new SSH
+                                        certificates stop within 24 hours.
+
+Any machine:
+  enroll NAME [--ca-url URL --fingerprint SHA256] [--token TOKEN] [--no-trust] [--principal NAME]
+                                        Without --token, read the token from stdin.
+  renew [--loop]                        Renew certificates that are close to expiry.
+  trust [--principal NAME] | untrust    Add or remove the CA line in ~/.ssh/authorized_keys.
+  timer install | timer remove          Schedule renew every hour.
+  status
+  install-step                          Linux: install the pinned step CLI into ~/.local/<arch>/bin.
+EOF
+}
+
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]]; }
+valid_url() { [[ "$1" =~ ^https://[A-Za-z0-9.:-]+(/[A-Za-z0-9._/-]*)?$ ]]; }
+valid_fingerprint() { [[ "$1" =~ ^[0-9a-f]{64}$ ]]; }
+valid_principal() { [[ "$1" =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]]; }
+valid_item() { [[ "$1" =~ ^op://[A-Za-z0-9\ ._-]+/[A-Za-z0-9\ ._-]+$ ]]; }
+valid_token() { [[ "$1" =~ ^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; }
+
+declare ca_url="" fingerprint="" name="" enroll_item="" principal=""
+
+load_config() {
+    [[ -f "$CONFIG" ]] || return 0
+    local key value
+    while IFS='=' read -r key value; do
+        case "$key" in
+            ca_url) valid_url "$value" && ca_url="$value" ;;
+            fingerprint) valid_fingerprint "$value" && fingerprint="$value" ;;
+            name) valid_name "$value" && name="$value" ;;
+            enroll_item) valid_item "$value" && enroll_item="$value" ;;
+            principal) valid_principal "$value" && principal="$value" ;;
+        esac
+    done < "$CONFIG"
+    return 0
+}
+
+save_config() {
+    mkdir -p "$CONFIG_DIR"
+    local tmp
+    tmp=$(mktemp "$CONFIG_DIR/.config.XXXXXX")
+    {
+        [[ -n "$ca_url" ]] && printf 'ca_url=%s\n' "$ca_url"
+        [[ -n "$fingerprint" ]] && printf 'fingerprint=%s\n' "$fingerprint"
+        [[ -n "$name" ]] && printf 'name=%s\n' "$name"
+        [[ -n "$enroll_item" ]] && printf 'enroll_item=%s\n' "$enroll_item"
+        [[ -n "$principal" ]] && printf 'principal=%s\n' "$principal"
+        true
+    } > "$tmp"
+    mv "$tmp" "$CONFIG"
+}
+
+step_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo amd64 ;;
+        aarch64|arm64) echo arm64 ;;
+        *) fail "unsupported architecture $(uname -m)" ;;
+    esac
+}
+
+# Timers run with a minimal PATH, and no-sudo hosts keep step in an arch directory.
+find_step() {
+    local candidate
+    for candidate in "$(command -v step 2>/dev/null || true)" "$HOME/.local/$(uname -m)/bin/step" \
+                     /opt/homebrew/bin/step /usr/local/bin/step /usr/bin/step; do
+        [[ -n "$candidate" && -x "$candidate" ]] && { STEP="$candidate"; return 0; }
+    done
+    return 1
+}
+
+install_step() {
+    [[ "$(uname -s)" == Linux ]] || fail 'install step with Homebrew on macOS: brew install step'
+    local arch sum_var sum dir work
+    arch=$(step_arch)
+    sum_var="STEP_SHA256_$arch"; sum="${!sum_var}"
+    dir="$HOME/.local/$(uname -m)/bin"
+    scratch; work="$SCRATCH"
+    curl -fsSL -o "$work/step.tgz" "https://github.com/smallstep/cli/releases/download/v$STEP_VERSION/step_linux_$arch.tar.gz"
+    printf '%s  %s\n' "$sum" "$work/step.tgz" | sha256sum -c - >/dev/null || fail 'step download checksum mismatch'
+    tar -xzf "$work/step.tgz" -C "$work"
+    mkdir -p "$dir"
+    install -m 0755 "$work/step_linux_$arch/bin/step" "$dir/step"
+    STEP="$dir/step"
+    printf 'installed %s\n' "$("$STEP" version | head -1)"
+}
+
+need_step() {
+    find_step && return 0
+    [[ "$(uname -s)" == Linux ]] || fail 'step is missing: brew install step'
+    install_step
+}
+
+need_enrollment() {
+    load_config
+    [[ -n "$ca_url" && -n "$name" && -f "$STATE/node.crt" && -f "$STATE/node.key" ]] ||
+        fail 'not enrolled: run fleet enroll NAME'
+}
+
+ca_flags() { CA=(--ca-url "$ca_url" --root "$STATE/root_ca.crt"); }
+
+issue_ssh() {
+    ca_flags
+    "$STEP" ssh certificate "$name" "$STATE/id_fleet.pub" --sign --force --provisioner fleet \
+        --x5c-cert "$STATE/node.crt" --x5c-key "$STATE/node.key" "${CA[@]}" >/dev/null 2>&1 ||
+        fail 'could not get an SSH certificate'
+}
+
+write_ssh_config() {
+    ca_flags
+    local host_ca
+    host_ca=$("$STEP" ssh config --host --roots "${CA[@]}") || fail 'could not read the SSH host CA'
+    mkdir -p "$SSH_FLEET"
+    chmod 700 "$HOME/.ssh" "$SSH_FLEET"
+    printf '@cert-authority * %s\n' "$host_ca" > "$SSH_FLEET/known_hosts.tmp"
+    mv "$SSH_FLEET/known_hosts.tmp" "$SSH_FLEET/known_hosts"
+    # Naming any IdentityFile drops the OpenSSH defaults, so list them again.
+    {
+        printf '%s\n' 'Host *'
+        printf '    IdentityFile %s\n' "$STATE/id_fleet" "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_ecdsa" "$HOME/.ssh/id_rsa"
+        printf '    CertificateFile %s\n' "$STATE/id_fleet-cert.pub"
+        printf '    UserKnownHostsFile %s %s\n' "$HOME/.ssh/known_hosts" "$SSH_FLEET/known_hosts"
+    } > "$SSH_FLEET/config.tmp"
+    mv "$SSH_FLEET/config.tmp" "$SSH_FLEET/config"
+}
+
+edit_authorized_keys() {
+    local block="$1" keys="$HOME/.ssh/authorized_keys" tmp
+    [[ ! -L "$HOME/.ssh" && ! -L "$keys" ]] || fail 'refusing a symlink at ~/.ssh or ~/.ssh/authorized_keys'
+    mkdir -p "$HOME/.ssh"
+    chmod 700 "$HOME/.ssh"
+    tmp=$(mktemp "$HOME/.ssh/.authorized_keys.XXXXXX")
+    if [[ -f "$keys" ]]; then
+        awk '/^# BEGIN fleet$/{skip=1; next} /^# END fleet$/{skip=0; next} !skip' "$keys" > "$tmp"
+    fi
+    if [[ -n "$block" ]]; then
+        printf '%s\n' "$block" >> "$tmp"
+    fi
+    if [[ ! -s "$tmp" && ! -f "$keys" ]]; then
+        rm -f "$tmp"
+        return 0
+    fi
+    chmod 600 "$tmp"
+    mv "$tmp" "$keys"
+}
+
+cmd_trust() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --principal) valid_principal "${2:-}" || fail 'invalid principal'; principal="$2"; shift 2 ;;
+            *) fail "unknown option $1" ;;
+        esac
+    done
+    local wanted="$principal" user_ca
+    need_enrollment
+    principal="${wanted:-${principal:-ryan}}"
+    local p="$principal"
+    need_step
+    save_config
+    ca_flags
+    user_ca=$("$STEP" ssh config --roots "${CA[@]}") || fail 'could not read the SSH user CA'
+    edit_authorized_keys "$(printf '# BEGIN fleet\ncert-authority,principals="%s" %s\n# END fleet' "$p" "$user_ca")"
+}
+
+cmd_untrust() { edit_authorized_keys ""; }
+
+cmd_init() {
+    load_config
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ca-url) valid_url "${2:-}" || fail 'invalid --ca-url (https only)'; ca_url="$2"; shift 2 ;;
+            --fingerprint) valid_fingerprint "${2:-}" || fail 'invalid --fingerprint (64 hex digits)'; fingerprint="$2"; shift 2 ;;
+            --enroll-item) valid_item "${2:-}" || fail 'invalid --enroll-item (op://VAULT/ITEM)'; enroll_item="$2"; shift 2 ;;
+            --principal) valid_principal "${2:-}" || fail 'invalid principal'; principal="$2"; shift 2 ;;
+            *) fail "unknown option $1" ;;
+        esac
+    done
+    [[ -n "$ca_url" && -n "$fingerprint" ]] || fail 'init needs --ca-url and --fingerprint'
+    save_config
+}
+
+# Sets ENROLL to a scratch directory holding the CA root and the provisioner key and password.
+enroll_secrets() {
+    [[ -n "$ca_url" && -n "$fingerprint" && -n "$enroll_item" ]] ||
+        fail 'run fleet init with --ca-url, --fingerprint, and --enroll-item first'
+    command -v op >/dev/null || fail 'op is required on this machine'
+    need_step
+    scratch; ENROLL="$SCRATCH"
+    "$STEP" ca root "$ENROLL/root.crt" --ca-url "$ca_url" --fingerprint "$fingerprint" >/dev/null 2>&1 ||
+        fail 'could not fetch and check the CA root'
+    op read "$enroll_item/jwk_encrypted" > "$ENROLL/key"
+    op read "$enroll_item/password" > "$ENROLL/password"
+}
+
+provisioner_token() {
+    "$STEP" ca token "$@" --provisioner enroll --key "$ENROLL/key" --password-file "$ENROLL/password" \
+        --not-after 5m --ca-url "$ca_url" --root "$ENROLL/root.crt" 2>/dev/null || fail 'could not mint a token'
+}
+
+mint_token() {
+    local subject="$1"; shift
+    local san_flags=(--san "$subject")
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --san) valid_name "${2:-}" || fail 'invalid --san'; san_flags+=(--san "$2"); shift 2 ;;
+            *) fail "unknown option $1" ;;
+        esac
+    done
+    enroll_secrets
+    provisioner_token "$subject" "${san_flags[@]}"
+}
+
+cmd_revoke() {
+    [[ $# -eq 1 && "$1" =~ ^[0-9]{1,60}$ ]] || fail 'usage: fleet revoke SERIAL (decimal, from fleet status or the CA log)'
+    load_config
+    enroll_secrets
+    local token
+    token=$(provisioner_token "$1" --revoke)
+    "$STEP" ca revoke "$1" --token "$token" --ca-url "$ca_url" --root "$ENROLL/root.crt" >/dev/null 2>&1 ||
+        fail 'the CA did not revoke the certificate'
+    printf 'revoked %s\n' "$1"
+}
+
+cmd_token() {
+    [[ $# -ge 1 ]] || fail 'usage: fleet token NAME [--san NAME]...'
+    valid_name "$1" || fail 'invalid NAME'
+    load_config
+    mint_token "$@"
+}
+
+cmd_enroll() {
+    [[ $# -ge 1 ]] || fail 'usage: fleet enroll NAME [options]'
+    load_config
+    valid_name "$1" || fail 'invalid NAME'
+    name="$1"; shift
+    local token="" trust=1
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ca-url) valid_url "${2:-}" || fail 'invalid --ca-url (https only)'; ca_url="$2"; shift 2 ;;
+            --fingerprint) valid_fingerprint "${2:-}" || fail 'invalid --fingerprint (64 hex digits)'; fingerprint="$2"; shift 2 ;;
+            --token) token="${2:-}"; shift 2 ;;
+            --no-trust) trust=0; shift ;;
+            --principal) valid_principal "${2:-}" || fail 'invalid principal'; principal="$2"; shift 2 ;;
+            *) fail "unknown option $1" ;;
+        esac
+    done
+    [[ -n "$ca_url" && -n "$fingerprint" ]] || fail 'enroll needs --ca-url and --fingerprint'
+    if [[ -z "$token" ]]; then
+        [[ -t 0 ]] && printf 'Paste the enrollment token: ' >&2
+        IFS= read -r token || true
+    fi
+    valid_token "$token" || fail 'the token is not a valid JWT'
+    need_step
+    mkdir -p "$STATE"
+    chmod 700 "$STATE"
+    local stage
+    scratch "$STATE"; stage="$SCRATCH"
+    "$STEP" ca root "$stage/root_ca.crt" --ca-url "$ca_url" --fingerprint "$fingerprint" >/dev/null 2>&1 ||
+        fail 'could not fetch the CA root, or its fingerprint does not match'
+    "$STEP" ca certificate "$name" "$stage/node.crt" "$stage/node.key" --token "$token" \
+        --ca-url "$ca_url" --root "$stage/root_ca.crt" >/dev/null 2>&1 ||
+        fail 'the CA rejected the token'
+    chmod 600 "$stage/node.key"
+    mv -f "$stage/root_ca.crt" "$stage/node.crt" "$stage/node.key" "$STATE/"
+    if [[ ! -f "$STATE/id_fleet" ]]; then
+        ssh-keygen -q -t ed25519 -N '' -C "fleet:$name" -f "$STATE/id_fleet"
+    fi
+    save_config
+    issue_ssh
+    write_ssh_config
+    if [[ "$trust" == 1 ]]; then
+        cmd_trust
+    fi
+    printf 'enrolled %s. Run: fleet timer install\n' "$name"
+}
+
+cmd_enroll_remote() {
+    [[ $# -ge 2 ]] || fail 'usage: fleet enroll-remote HOST NAME [--san NAME]... [--no-trust] [--principal NAME]'
+    local host="$1" node="$2"; shift 2
+    [[ "$host" =~ ^[A-Za-z0-9@._-]+$ ]] || fail 'invalid HOST'
+    valid_name "$node" || fail 'invalid NAME'
+    load_config
+    local token_args=() remote_args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --san) token_args+=(--san "${2:-}"); shift 2 ;;
+            --no-trust) remote_args+=(--no-trust); shift ;;
+            --principal) valid_principal "${2:-}" || fail 'invalid principal'; remote_args+=(--principal "$2"); shift 2 ;;
+            *) fail "unknown option $1" ;;
+        esac
+    done
+    local out
+    scratch; out="$SCRATCH"
+    mint_token "$node" "${token_args[@]+"${token_args[@]}"}" > "$out/token"
+    ssh "$host" < "$out/token" "~/.local/bin/fleet enroll $node --ca-url $ca_url --fingerprint $fingerprint ${remote_args[*]-}"
+}
+
+cmd_renew() {
+    local loop=0
+    [[ "${1:-}" == --loop ]] && loop=1
+    if [[ "$loop" == 1 ]]; then
+        while true; do
+            "$SELF" renew || printf 'fleet: renew failed; retrying in 1h\n' >&2
+            sleep 3600
+        done
+    fi
+    need_enrollment
+    need_step
+    ca_flags
+    local rc=0 ssh_due=0
+    "$STEP" certificate needs-renewal "$STATE/node.crt" --expires-in "$X509_RENEW_BEFORE" >/dev/null 2>&1 || rc=$?
+    case "$rc" in
+        0) "$STEP" ca renew "$STATE/node.crt" "$STATE/node.key" --force "${CA[@]}" >/dev/null 2>&1 ||
+               fail 'renewal failed; the certificate is expired or revoked. Enroll again with a new token.'
+           ssh_due=1 ;;
+        1) ;;
+        *) fail 'could not read the client certificate' ;;
+    esac
+    if [[ "$ssh_due" == 0 && -f "$STATE/id_fleet-cert.pub" ]]; then
+        rc=0
+        "$STEP" ssh needs-renewal "$STATE/id_fleet-cert.pub" --expires-in "$SSH_RENEW_BEFORE" >/dev/null 2>&1 || rc=$?
+        [[ "$rc" == 1 ]] || ssh_due=1
+    else
+        ssh_due=1
+    fi
+    if [[ "$ssh_due" == 1 ]]; then
+        issue_ssh
+    fi
+}
+
+timer_systemd() {
+    local dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    mkdir -p "$dir"
+    printf '%s\n' '[Unit]' 'Description=Renew fleet certificates' '' '[Service]' 'Type=oneshot' \
+        "ExecStart=$SELF renew" > "$dir/fleet-renew.service"
+    printf '%s\n' '[Unit]' 'Description=Renew fleet certificates every hour' '' '[Timer]' 'OnBootSec=2min' \
+        'OnUnitActiveSec=1h' 'Persistent=true' '' '[Install]' 'WantedBy=timers.target' > "$dir/fleet-renew.timer"
+    systemctl --user daemon-reload
+    systemctl --user enable --now fleet-renew.timer
+    if [[ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || true)" != yes ]]; then
+        loginctl enable-linger "$USER" 2>/dev/null ||
+            printf 'fleet: linger is off, so the timer stops at logout. Ask an admin for: loginctl enable-linger %s\n' "$USER" >&2
+    fi
+}
+
+timer_launchd() {
+    local plist="$HOME/Library/LaunchAgents/dev.fleet.renew.plist"
+    mkdir -p "$(dirname "$plist")"
+    cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>dev.fleet.renew</string>
+    <key>ProgramArguments</key><array><string>$SELF</string><string>renew</string></array>
+    <key>StartInterval</key><integer>3600</integer>
+    <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+EOF
+    launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$plist"
+}
+
+timer_cron() {
+    command -v crontab >/dev/null || fail 'no systemd user session, launchd, or crontab. Run: fleet renew --loop'
+    { crontab -l 2>/dev/null | grep -v '# fleet-renew$' || true
+      printf '17 * * * * %s renew >/dev/null 2>&1 # fleet-renew\n' "$SELF"; } | crontab -
+}
+
+cmd_timer() {
+    case "${1:-}" in
+        install)
+            if [[ "$(uname -s)" == Darwin ]]; then timer_launchd
+            elif systemctl --user show-environment >/dev/null 2>&1; then timer_systemd
+            else timer_cron
+            fi ;;
+        remove)
+            if [[ "$(uname -s)" == Darwin ]]; then
+                launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/dev.fleet.renew.plist" 2>/dev/null || true
+                rm -f "$HOME/Library/LaunchAgents/dev.fleet.renew.plist"
+            fi
+            if systemctl --user show-environment >/dev/null 2>&1; then
+                systemctl --user disable --now fleet-renew.timer 2>/dev/null || true
+                rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/fleet-renew."{service,timer}
+            fi
+            if command -v crontab >/dev/null && crontab -l 2>/dev/null | grep -q '# fleet-renew$'; then
+                crontab -l | grep -v '# fleet-renew$' | crontab -
+            fi ;;
+        *) fail 'usage: fleet timer install|remove' ;;
+    esac
+}
+
+# fleet revoke takes the decimal serial that step prints; fall back to hex without bc.
+serial_of() {
+    local hex
+    hex=$(openssl x509 -noout -serial -in "$1" 2>/dev/null | sed 's/^serial=//') || true
+    if [[ -z "$hex" ]]; then echo unknown
+    elif command -v bc >/dev/null; then echo "ibase=16; $hex" | bc | tr -d '\\\n'; echo
+    else echo "0x$hex (install bc for the decimal form)"
+    fi
+}
+
+cmd_status() {
+    load_config
+    if [[ -z "$name" || ! -f "$STATE/node.crt" ]]; then
+        printf 'not enrolled\n'
+        [[ -n "$ca_url" ]] && printf 'ca: %s\n' "$ca_url"
+        return 1
+    fi
+    printf 'name: %s\nca: %s\nserial: %s\n' "$name" "$ca_url" "$(serial_of "$STATE/node.crt")"
+    printf 'client certificate: %s\n' "$(openssl x509 -noout -enddate -in "$STATE/node.crt" 2>/dev/null | sed 's/^notAfter=/expires /' || echo unreadable)"
+    if [[ -f "$STATE/id_fleet-cert.pub" ]]; then
+        printf 'ssh certificate: %s\n' "$(ssh-keygen -Lf "$STATE/id_fleet-cert.pub" 2>/dev/null | sed -n 's/^ *Valid: //p' || echo unreadable)"
+    else
+        printf 'ssh certificate: missing\n'
+    fi
+    if grep -q '^# BEGIN fleet$' "$HOME/.ssh/authorized_keys" 2>/dev/null; then
+        printf 'trust: authorized_keys accepts principal %s\n' "${principal:-ryan}"
+    else
+        printf 'trust: off\n'
+    fi
+}
+
+command="${1:-}"
+[[ $# -gt 0 ]] && shift
+case "$command" in
+    init) cmd_init "$@" ;;
+    token) cmd_token "$@" ;;
+    enroll) cmd_enroll "$@" ;;
+    enroll-remote) cmd_enroll_remote "$@" ;;
+    revoke) cmd_revoke "$@" ;;
+    renew) cmd_renew "$@" ;;
+    trust) cmd_trust "$@" ;;
+    untrust) cmd_untrust ;;
+    timer) cmd_timer "$@" ;;
+    status) cmd_status ;;
+    install-step) install_step ;;
+    -h|--help|help|"") usage ;;
+    *) usage >&2; exit 2 ;;
+esac
