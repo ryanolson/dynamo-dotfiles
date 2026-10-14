@@ -245,18 +245,27 @@ class Fleet(FleetBase):
     def test_revoke_uses_a_revoke_token(self):
         self.fleet('init', '--ca-url', 'https://ca.example', '--fingerprint', 'ab' * 32,
                    '--enroll-item', 'op://Vault/Enroll')
-        result = self.fleet('revoke', '1234567890')
+        result = self.fleet('revoke', '7mrlHuilZFCgm5n26BWUDU')
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls()
         token = [c for c in calls if c[:2] == ['ca', 'token']][0]
-        self.assertEqual(token[2], '1234567890')
+        self.assertEqual(token[2], '340142925354073613744636653243438135724')
         self.assertIn('--revoke', token)
         revoke = [c for c in calls if c[:2] == ['ca', 'revoke']][0]
-        self.assertEqual(revoke[2:4], ['1234567890', '--token'])
+        self.assertEqual(revoke[2:4], ['340142925354073613744636653243438135724', '--token'])
         self.assertEqual(revoke[4], TOKEN)
         seen = json.loads((self.home / 'token-seen.json').read_text())
         self.assertFalse(Path(seen['key_path']).exists())
-        self.assertNotEqual(self.fleet('revoke', '12ab').returncode, 0)
+        self.assertNotEqual(self.fleet('revoke', '12a-b').returncode, 0)
+
+    def test_status_shows_the_serial_in_base62(self):
+        self.enroll()
+        subprocess.run(['openssl', 'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes',
+                        '-keyout', '/dev/null', '-subj', '/CN=t', '-days', '1',
+                        '-set_serial', '340142925354073613744636653243438135724',
+                        '-out', str(self.state / 'node.crt')], check=True, capture_output=True)
+        result = self.fleet('status')
+        self.assertIn('serial: 7mrlHuilZFCgm5n26BWUDU\n', result.stdout)
 
     def test_status_reports_missing_enrollment(self):
         result = self.fleet('status')

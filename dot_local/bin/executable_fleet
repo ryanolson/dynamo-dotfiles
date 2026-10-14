@@ -31,8 +31,8 @@ Usage: fleet <command> [options]
 Laptop (has 1Password):
   init --ca-url URL --fingerprint SHA256 [--enroll-item op://VAULT/ITEM] [--admin-item op://VAULT/ITEM]
        [--broker-url URL] [--principal NAME]
-  list [-a] [--json]                    List active machines; -a adds expired ones. Revoked
-                                        machines are not listed. Needs a certificate from fleet login.
+  list [-a] [--json]                    List active machines; -a adds expired and revoked ones.
+                                        Needs a certificate from fleet login.
   token NAME [--san NAME]...            Print a 5-minute enrollment token.
   enroll-remote HOST NAME [--san NAME]... [--no-trust] [--principal NAME]
                                         Mint a token and enroll HOST over SSH.
@@ -270,12 +270,14 @@ mint_token() {
 }
 
 cmd_revoke() {
-    [[ $# -eq 1 && "$1" =~ ^[0-9]{1,60}$ ]] || fail 'usage: fleet revoke SERIAL (decimal, from fleet status or the CA log)'
+    [[ $# -eq 1 && "$1" =~ ^[0-9A-Za-z]{1,30}$ ]] || fail 'usage: fleet revoke SERIAL (base62, from fleet list or fleet status)'
+    local serial
+    serial=$(base62_to_decimal "$1")
     load_config
     enroll_secrets
     local token
-    token=$(provisioner_token "$1" --revoke)
-    "$STEP" ca revoke "$1" --token "$token" --ca-url "$ca_url" --root "$ENROLL/root.crt" >/dev/null 2>&1 ||
+    token=$(provisioner_token "$serial" --revoke)
+    "$STEP" ca revoke "$serial" --token "$token" --ca-url "$ca_url" --root "$ENROLL/root.crt" >/dev/null 2>&1 ||
         fail 'the CA did not revoke the certificate'
     printf 'revoked %s\n' "$1"
 }
@@ -547,14 +549,28 @@ cmd_timer() {
     esac
 }
 
-# fleet revoke takes the decimal serial that step prints; fall back to hex without bc.
+B62=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz
+
+# Serials are 128-bit, too large for shell arithmetic.
 serial_of() {
     local hex
     hex=$(openssl x509 -noout -serial -in "$1" 2>/dev/null | sed 's/^serial=//') || true
     if [[ -z "$hex" ]]; then echo unknown
-    elif command -v bc >/dev/null; then echo "ibase=16; $hex" | bc | tr -d '\\\n'; echo
-    else echo "0x$hex (install bc for the decimal form)"
+    elif command -v python3 >/dev/null; then
+        python3 -c 'import sys; n=int(sys.argv[1], 16); d=sys.argv[2]; o=""
+while True:
+    n, r = divmod(n, 62); o = d[r] + o
+    if not n: break
+print(o)' "$hex" "$B62"
+    else echo "0x$hex (install python3 for the base62 form)"
     fi
+}
+
+base62_to_decimal() {
+    command -v python3 >/dev/null || fail 'python3 is required to read a base62 serial'
+    python3 -c 'import sys; d=sys.argv[2]; n=0
+for ch in sys.argv[1]: n = n * 62 + d.index(ch)
+print(n)' "$1" "$B62"
 }
 
 cmd_list() {
