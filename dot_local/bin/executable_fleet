@@ -31,7 +31,8 @@ Usage: fleet <command> [options]
 Laptop (has 1Password):
   init --ca-url URL --fingerprint SHA256 [--enroll-item op://VAULT/ITEM] [--admin-item op://VAULT/ITEM]
        [--broker-url URL] [--principal NAME]
-  list [--json]                         List the fleet. Needs a certificate from fleet login.
+  list [-a] [--json]                    List active machines; -a adds expired ones. Revoked
+                                        machines are not listed. Needs a certificate from fleet login.
   token NAME [--san NAME]...            Print a 5-minute enrollment token.
   enroll-remote HOST NAME [--san NAME]... [--no-trust] [--principal NAME]
                                         Mint a token and enroll HOST over SSH.
@@ -557,12 +558,18 @@ serial_of() {
 }
 
 cmd_list() {
-    local accept='text/plain'
-    [[ "${1:-}" == --json ]] && accept='application/json'
+    local accept='text/plain' query=''
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) accept='application/json'; shift ;;
+            -a|--all) query='?all=1'; shift ;;
+            *) fail "unknown option $1" ;;
+        esac
+    done
     need_enrollment
     [[ -n "$broker_url" ]] || fail 'run fleet init --broker-url https://HOST:PORT first'
     curl -fsS --cert "$STATE/node.crt" --key "$STATE/node.key" --cacert "$STATE/root_ca.crt" \
-        -H "Accept: $accept" "$broker_url/v1/machines" ||
+        -H "Accept: $accept" "$broker_url/v1/machines$query" ||
         fail 'the broker refused the request; fleet list needs a certificate from fleet login'
 }
 

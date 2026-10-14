@@ -341,6 +341,15 @@ class FleetLaptop(FleetBase):
         self.assertEqual(args[-1], 'https://ca.example:8443/v1/machines')
         self.fleet('list', '--json')
         self.assertIn('Accept: application/json', (self.home / 'curl-args').read_text())
+        for flag in ['-a', '--all']:
+            self.assertEqual(self.fleet('list', flag).returncode, 0)
+            self.assertEqual((self.home / 'curl-args').read_text().splitlines()[-1],
+                             'https://ca.example:8443/v1/machines?all=1')
+        self.fleet('list', '-a', '--json')
+        args = (self.home / 'curl-args').read_text()
+        self.assertIn('Accept: application/json', args)
+        self.assertIn('/v1/machines?all=1', args)
+        self.assertNotEqual(self.fleet('list', '--bogus').returncode, 0)
 
 
 class FleetEphemeral(FleetBase):
