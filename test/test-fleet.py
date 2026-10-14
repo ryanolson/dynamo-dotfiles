@@ -220,7 +220,7 @@ class Fleet(FleetBase):
         self.enroll()
         curl = self.home / 'bin/curl'
         curl.write_text('#!/bin/sh\ncase "$*" in *v1/ssh-hosts*) [ -f "$HOME/broker-down" ] && exit 7\n'
-                        '  printf "bb brev.example.ts.net ubuntu\\nbad ProxyCommand=x u\\ngpu gpu.corp.example ryan bb\\nevil h u -oProxyCommand=x\\n" ;; esac\n')
+                        '  printf "bb brev.example.ts.net ubuntu\\nbad ProxyCommand=x u\\ngpu gpu.corp.example ryan bb\\nevil h u -oProxyCommand=x\\nip 100.64.0.7 u - ip-host.example.ts.net\\n" ;; esac\n')
         curl.chmod(0o700)
         self.assertEqual(self.fleet('renew').returncode, 0)
         config = self.home / '.ssh/fleet/config'
@@ -229,11 +229,21 @@ class Fleet(FleetBase):
         self.assertNotIn('ProxyCommand', text)
         self.assertIn('Host gpu\n    HostName gpu.corp.example\n    User ryan\n    ProxyJump bb\n', text)
         self.assertNotIn('Host evil', text)
+        self.assertIn('Host ip\n    HostName 100.64.0.7\n    User u\n    HostKeyAlias ip-host.example.ts.net\n', text)
+        self.assertNotIn('ProxyJump -', text)
         self.assertLess(text.index('Host bb'), text.index('Host *'))
         resolved = subprocess.run(['ssh', '-G', '-F', str(config), 'bb'], capture_output=True, text=True, check=True).stdout
         self.assertIn('hostname brev.example.ts.net\n', resolved)
         self.assertIn('user ubuntu\n', resolved)
         self.assertIn(f'certificatefile {self.state}/id_fleet-cert.pub', resolved)
+        # The last alias has no jump and no host key alias: renew must still succeed.
+        curl.write_text('#!/bin/sh\ncase "$*" in *v1/ssh-hosts*) printf "ip 100.64.0.7 u - k.example\\nbb h ubuntu\\n" ;; esac\n')
+        result = self.fleet('renew')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Host bb\n    HostName h\n    User ubuntu\nHost *', config.read_text())
+        curl.write_text('#!/bin/sh\ncase "$*" in *v1/ssh-hosts*) [ -f "$HOME/broker-down" ] && exit 7\n'
+                        '  printf "bb brev.example.ts.net ubuntu\\n" ;; esac\n')
+        self.assertEqual(self.fleet('renew').returncode, 0)
         # A broker outage keeps the last list instead of dropping the aliases.
         (self.home / 'broker-down').write_text('')
         self.assertEqual(self.fleet('renew').returncode, 0)

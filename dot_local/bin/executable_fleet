@@ -182,12 +182,19 @@ ssh_aliases() {
         printf '%s\n' "$fresh" > "$list.tmp" && mv "$list.tmp" "$list"
     fi
     [[ -f "$list" ]] || return 0
-    while read -r alias host user jump _; do
+    # Fields: alias hostname user [jump or -] [host key alias]. A tailnet IP as the hostname, with
+    # the name as the host key alias, works where a corporate DNS agent hides tailnet names.
+    local key_alias
+    while read -r alias host user jump key_alias _; do
         [[ "$alias" =~ ^[a-z0-9][a-z0-9-]{0,62}$ && "$host" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ &&
            "$user" =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]] || continue
+        [[ "$jump" == - ]] && jump=""
         [[ -z "$jump" || "$jump" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || continue
+        [[ -z "$key_alias" || "$key_alias" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] || continue
         printf 'Host %s\n    HostName %s\n    User %s\n' "$alias" "$host" "$user"
-        [[ -n "$jump" ]] && printf '    ProxyJump %s\n' "$jump"
+        # if, not &&: a false test as the loop's last command would fail renew under set -e.
+        if [[ -n "$jump" ]]; then printf '    ProxyJump %s\n' "$jump"; fi
+        if [[ -n "$key_alias" ]]; then printf '    HostKeyAlias %s\n' "$key_alias"; fi
     done < "$list"
 }
 
