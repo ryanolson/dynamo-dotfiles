@@ -373,7 +373,7 @@ fleet secret env VAR=NAME... -- CMD...         # run CMD with the values in its 
 fleet claude [ARGS...]                         # run claude with CLAUDE_CODE_OAUTH_TOKEN from the secret claude-oauth-token
 ```
 
-A machine needs `broker_url` in `~/.config/fleet/config` (`fleet init --broker-url`).
+The broker URL defaults to port 8443 on the CA host. `fleet init --broker-url` overrides it.
 
 ### bb server
 

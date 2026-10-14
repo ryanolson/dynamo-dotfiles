@@ -618,7 +618,7 @@ cmd_list() {
         esac
     done
     need_enrollment
-    [[ -n "$broker_url" ]] || fail 'run fleet init --broker-url https://HOST:PORT first'
+    need_broker
     curl -fsS --cert "$STATE/node.crt" --key "$STATE/node.key" --cacert "$STATE/root_ca.crt" \
         -H "Accept: $accept" "$broker_url/v1/machines$query" ||
         fail 'the broker refused the request; fleet list needs a certificate from fleet login'
@@ -626,10 +626,19 @@ cmd_list() {
 
 valid_secret() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]]; }
 
+# The broker runs on the CA host, as the agent port does. A saved broker_url overrides this.
+need_broker() {
+    if [[ -z "$broker_url" ]]; then
+        local host="${ca_url#https://}"; host="${host%%/*}"; host="${host%%:*}"
+        [[ -n "$host" ]] || fail 'run fleet init --broker-url https://HOST:PORT first'
+        broker_url="https://$host:8443"
+    fi
+}
+
 secret_value() {
     valid_secret "$1" || fail "invalid secret name: $1"
     need_enrollment
-    [[ -n "$broker_url" ]] || fail 'run fleet init --broker-url https://HOST:PORT first'
+    need_broker
     curl -fsS --cert "$STATE/node.crt" --key "$STATE/node.key" --cacert "$STATE/root_ca.crt" \
         -H 'Accept: application/octet-stream' "$broker_url/v1/secrets/$1" ||
         fail "the broker did not return the secret $1"

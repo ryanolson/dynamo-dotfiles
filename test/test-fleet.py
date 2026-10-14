@@ -546,6 +546,16 @@ class FleetLaptop(FleetBase):
             self.assertNotEqual(self.fleet('secret', 'get', bad).returncode, 0)
             self.assertFalse((self.home / 'curl-args').exists())
 
+    def test_broker_url_defaults_to_the_ca_host(self):
+        self.enroll()
+        curl = self.home / 'bin/curl'
+        curl.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$HOME/curl-args"\nprintf ok\n')
+        curl.chmod(0o700)
+        result = self.fleet('secret', 'get', 'fleet-selftest')
+        self.assertEqual((result.returncode, result.stdout), (0, 'ok'), result.stderr)
+        self.assertEqual((self.home / 'curl-args').read_text().splitlines()[-1],
+                         'https://ca.example:8443/v1/secrets/fleet-selftest')
+
     def test_secret_env_runs_a_command_without_printing_the_value(self):
         self.secret_curl()
         out = self.home / 'out'
