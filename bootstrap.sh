@@ -111,7 +111,18 @@ init_dotfiles() {
     # `chezmoi init` is safe to re-run: it pulls the source and regenerates the
     # config from the template (re-applying the forced machine_class). Existing
     # name/email/etc. are remembered, so only unset prompts fire.
-    chezmoi init "$REPO_URL" || error "Failed to initialize dotfiles"
+    # Without a terminal (provisioning over SSH stdin, a container entrypoint), prompts cannot
+    # be answered: take their defaults, and the name and email from the environment.
+    local init_args=()
+    if [[ -n "${DOTFILES_NAME:-}" || -n "${DOTFILES_EMAIL:-}" ]]; then
+        init_args+=(--promptString "name=${DOTFILES_NAME:-},email=${DOTFILES_EMAIL:-}")
+    fi
+    if [[ ! -t 0 ]]; then
+        [[ -n "${DOTFILES_NAME:-}" && -n "${DOTFILES_EMAIL:-}" ]] ||
+            error "No terminal for prompts: set DOTFILES_NAME and DOTFILES_EMAIL"
+        init_args+=(--no-tty --promptDefaults)
+    fi
+    chezmoi init "${init_args[@]+"${init_args[@]}"}" "$REPO_URL" || error "Failed to initialize dotfiles"
     # --keep-going: one failed entry, such as a tool that pixi could not install, must not
     # skip the entries after it. The install script runs again on the next apply.
     chezmoi apply --keep-going || error "Some dotfiles entries failed; fix them, then run chezmoi apply again"
