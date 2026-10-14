@@ -848,6 +848,25 @@ cmd_status() {
     else
         printf 'trust: off\n'
     fi
+    if [[ -f "$SSH_FLEET/agent" ]]; then
+        local sock bridge=socat keys
+        sock=$(agent_sock)
+        find_pylon && bridge=pylon
+        if keys=$(SSH_AUTH_SOCK="$sock" ssh-add -L 2>/dev/null); then
+            printf 'agent: %s on %s, %s keys\n' "$bridge" "$sock" "$(grep -c . <<<"$keys")"
+        else
+            printf 'agent: %s on %s, not answering\n' "$bridge" "$sock"
+        fi
+    else
+        printf 'agent: off\n'
+    fi
+    need_broker
+    if [[ "$(curl -fsS --max-time 5 --cert "$STATE/node.crt" --key "$STATE/node.key" --cacert "$STATE/root_ca.crt" \
+            -H 'Accept: application/octet-stream' "$broker_url/v1/secrets/fleet-selftest" 2>/dev/null)" == ok ]]; then
+        printf 'broker: ok\n'
+    else
+        printf 'broker: no answer\n'
+    fi
 }
 
 command="${1:-}"

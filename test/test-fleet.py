@@ -294,6 +294,26 @@ class Fleet(FleetBase):
         self.assertFalse(Path(seen['key_path']).exists())
         self.assertNotEqual(self.fleet('revoke', '12a-b').returncode, 0)
 
+    def test_status_reports_the_agent_and_the_broker(self):
+        self.enroll()
+        curl = self.home / 'bin/curl'
+        curl.write_text('#!/bin/sh\nprintf ok\n')
+        curl.chmod(0o700)
+        result = self.fleet('status')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('agent: off\n', result.stdout)
+        self.assertIn('broker: ok\n', result.stdout)
+        sock, _ = self.start_real_agent()
+        (self.home / '.ssh/fleet').mkdir(parents=True, exist_ok=True)
+        (self.home / '.ssh/fleet/agent').write_text(f'{sock}\n')
+        pylon = self.home / 'bin/pylon'
+        pylon.write_text('#!/bin/sh\nexit 0\n')
+        pylon.chmod(0o700)
+        curl.write_text('#!/bin/sh\nexit 7\n')
+        result = self.fleet('status', FLEET_PYLON=str(pylon), FLEET_AGENT_SOCK=str(sock))
+        self.assertIn(f'agent: pylon on {sock}, 2 keys\n', result.stdout)
+        self.assertIn('broker: no answer\n', result.stdout)
+
     def test_status_shows_the_serial_in_base62(self):
         self.enroll()
         subprocess.run(['openssl', 'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes',
