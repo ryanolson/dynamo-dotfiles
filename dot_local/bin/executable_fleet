@@ -787,9 +787,12 @@ wire_agent() {
         printf '* %s\n' "$pub"
     } > "$SSH_FLEET/allowed_signers.tmp"
     mv "$SSH_FLEET/allowed_signers.tmp" "$SSH_FLEET/allowed_signers"
+    # A key file rather than key::<key>: git before 2.35 (Ubuntu 22.04 ships 2.34) treats the
+    # key:: form as a path and cannot sign.
+    printf '%s fleet agent-signing\n' "$pub" > "$SSH_FLEET/agent-signing.pub"
     cat > "$SSH_FLEET/gitconfig.tmp" <<EOF
 [user]
-    signingkey = key::$pub
+    signingkey = $SSH_FLEET/agent-signing.pub
 [gpg]
     format = ssh
 [gpg "ssh"]
@@ -813,7 +816,7 @@ agent_remove() {
         rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/fleet-agent.service"
     fi
     rm -f "$(agent_sock)" "$SSH_FLEET/agent" "$SSH_FLEET/gitconfig" "$SSH_FLEET/allowed_signers" \
-        "$SSH_FLEET/agent-auth.pub"
+        "$SSH_FLEET/agent-auth.pub" "$SSH_FLEET/agent-signing.pub"
     load_config
     if [[ -n "$ca_url" && -f "$STATE/node.crt" ]] && find_step; then
         write_ssh_config

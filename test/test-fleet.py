@@ -397,7 +397,9 @@ class Fleet(FleetBase):
         result = self.fleet('agent', 'install', **env)
         self.assertEqual(result.returncode, 0, result.stderr)
         fragment = (ssh / 'fleet/gitconfig').read_text()
-        self.assertIn(f'signingkey = key::{" ".join(pub)}\n', fragment)
+        # A file path, not key::: git before 2.35 (Ubuntu 22.04 has 2.34) reads key:: as a path.
+        self.assertIn(f'signingkey = {ssh}/fleet/agent-signing.pub\n', fragment)
+        self.assertEqual((ssh / 'fleet/agent-signing.pub').read_text().split()[:2], pub)
         self.assertIn(f'program = {self.home}/.local/bin/fleet-ssh-keygen\n', fragment)
         self.assertIn('gpgsign = true\n', fragment)
         signers = (ssh / 'fleet/allowed_signers').read_text()
@@ -443,6 +445,7 @@ class Fleet(FleetBase):
         self.assertFalse((ssh / 'fleet/gitconfig').exists())
         self.assertFalse((ssh / 'fleet/allowed_signers').exists())
         self.assertFalse((ssh / 'fleet/agent-auth.pub').exists())
+        self.assertFalse((ssh / 'fleet/agent-signing.pub').exists())
         self.assertNotIn('Host github.com', config.read_text())
 
     def test_agent_install_fails_without_a_signing_key(self):
