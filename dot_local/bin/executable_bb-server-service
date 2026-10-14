@@ -68,6 +68,9 @@ After=network-online.target
 
 [Service]
 Environment=PATH=$node_dir:/usr/local/bin:/usr/bin:/bin
+# bb sends usage telemetry to PostHog by default. Off at startup, it sends no event at all; turning
+# it off later in Settings sends one last telemetry_disabled event.
+Environment=BB_TELEMETRY=false
 ExecStart=$bin start --data-dir $DATA_DIR --server-port $PORT
 Restart=always
 RestartSec=5

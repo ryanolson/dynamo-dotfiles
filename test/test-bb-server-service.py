@@ -56,6 +56,8 @@ class BbServerService(unittest.TestCase):
         self.assertIn('npm view bb-app@latest version', log)
         self.assertIn('bb-app@0.46.0', log)
         self.assertIn('systemctl --user enable --now bb-server.service', log)
+        # Set at startup, bb's telemetry is a no-op: it sends nothing, not even a disabled event.
+        self.assertIn('Environment=BB_TELEMETRY=false\n', unit)
         self.assertIn('allow-scripts=better-sqlite3,node-pty,@parcel/watcher',
                       (self.home / 'npmrc-seen').read_text())
 
