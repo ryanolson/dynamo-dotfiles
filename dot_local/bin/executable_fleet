@@ -372,7 +372,7 @@ ephemeral_exit() {
     local rc=$?
     trap - EXIT INT TERM
     local job
-    for job in $(jobs -p); do kill "$job" 2>/dev/null || true; done
+    for job in $(jobs -p); do kill "$job" 2>/dev/null || true; wait "$job" 2>/dev/null || true; done
     if [[ -n "${STEP:-}" && -f "$STATE/node.crt" ]]; then
         "$STEP" ca revoke --cert "$STATE/node.crt" --key "$STATE/node.key" --ca-url "$ca_url" \
             --root "$STATE/root_ca.crt" >/dev/null 2>&1 ||

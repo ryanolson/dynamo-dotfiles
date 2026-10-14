@@ -331,6 +331,7 @@ class FleetEphemeral(FleetBase):
         self.assertIn('# BEGIN fleet', keys.read_text())
         proc.terminate()
         self.assertEqual(proc.wait(timeout=20), 0, self.stderr_path.read_text())
+        self.assertNotIn('Terminated', self.stderr_path.read_text())
         self.assertFalse(state[0].exists())
         self.assertFalse((self.home / '.ssh/fleet').exists())
         self.assertEqual(keys.read_text(), 'ssh-ed25519 AAAAEXISTING laptop\n')
