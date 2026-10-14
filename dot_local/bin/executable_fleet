@@ -54,6 +54,8 @@ Any machine:
                                         Enroll in memory-backed storage and renew in the
                                         foreground. On exit, revoke and remove everything.
   renew [--loop]                        Renew certificates that are close to expiry.
+  agent [run|install|remove]            Bridge a local ssh-agent socket to the broker with socat.
+                                        install runs it as a launchd or systemd user service.
   trust [--principal NAME] | untrust    Add or remove the CA line in ~/.ssh/authorized_keys.
   timer install | timer remove          Schedule renew every hour.
   status
@@ -612,6 +614,97 @@ cmd_list() {
         fail 'the broker refused the request; fleet list needs a certificate from fleet login'
 }
 
+# Unix socket paths are limited to 104 bytes on macOS and 108 on Linux.
+agent_sock() {
+    if [[ -n "${FLEET_AGENT_SOCK:-}" ]]; then
+        printf '%s' "$FLEET_AGENT_SOCK"
+    elif [[ "$(uname -s)" == Linux && -n "${XDG_RUNTIME_DIR:-}" && -d "${XDG_RUNTIME_DIR:-}" ]]; then
+        printf '%s' "$XDG_RUNTIME_DIR/fleet-agent.sock"
+    else
+        printf '%s' "$SSH_FLEET/agent.sock"
+    fi
+}
+
+find_socat() {
+    local candidate candidates=("${FLEET_SOCAT:-}")
+    [[ -n "${FLEET_SOCAT:-}" ]] || candidates=("$(command -v socat 2>/dev/null || true)" /opt/homebrew/bin/socat
+        /usr/local/bin/socat "$HOME/.pixi/bin/socat" "$HOME/.local/$(uname -m)/pixi/bin/socat" /usr/bin/socat)
+    for candidate in "${candidates[@]}"; do
+        [[ -n "$candidate" && -x "$candidate" ]] && { SOCAT="$candidate"; return 0; }
+    done
+    fail 'socat is missing. Run chezmoi apply, or install socat.'
+}
+
+agent_run() {
+    need_enrollment
+    find_socat
+    local sock host addr
+    sock=$(agent_sock)
+    (( ${#sock} <= 100 )) || fail "the agent socket path is too long (${#sock} bytes): $sock. Set FLEET_AGENT_SOCK."
+    host="${ca_url#https://}"; host="${host%%/*}"; host="${host%%:*}"
+    addr="${FLEET_AGENT_ADDR:-$host:8444}"
+    mkdir -p "$(dirname "$sock")"
+    # socat opens a new mTLS connection for each agent client, so it reads the renewed certificate every time.
+    exec "$SOCAT" "UNIX-LISTEN:$sock,fork,unlink-early,mode=600" \
+        "OPENSSL:$addr,cert=$STATE/node.crt,key=$STATE/node.key,cafile=$STATE/root_ca.crt,verify=1"
+}
+
+agent_install() {
+    need_enrollment
+    find_socat
+    local sock
+    sock=$(agent_sock)
+    if [[ "$(uname -s)" == Darwin ]]; then
+        local plist="$HOME/Library/LaunchAgents/dev.fleet.agent.plist"
+        mkdir -p "$(dirname "$plist")" "$HOME/Library/Logs"
+        cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>dev.fleet.agent</string>
+    <key>ProgramArguments</key><array><string>$SELF</string><string>agent</string></array>
+    <key>KeepAlive</key><true/>
+    <key>RunAtLoad</key><true/>
+    <key>StandardErrorPath</key><string>$HOME/Library/Logs/fleet-agent.log</string>
+</dict>
+</plist>
+EOF
+        launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || true
+        launchctl bootstrap "gui/$(id -u)" "$plist"
+    elif systemctl --user show-environment >/dev/null 2>&1; then
+        local dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+        mkdir -p "$dir"
+        printf '%s\n' '[Unit]' 'Description=Fleet SSH agent bridge' '' '[Service]' "ExecStart=$SELF agent" \
+            'Restart=always' 'RestartSec=5' '' '[Install]' 'WantedBy=default.target' > "$dir/fleet-agent.service"
+        systemctl --user daemon-reload
+        systemctl --user enable --now fleet-agent.service
+    else
+        fail 'no launchd or systemd user session. Run fleet agent in the foreground, for example in a Zellij pane.'
+    fi
+    printf 'agent running. Use it with: export SSH_AUTH_SOCK=%s\n' "$sock"
+}
+
+agent_remove() {
+    if [[ "$(uname -s)" == Darwin ]]; then
+        launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/dev.fleet.agent.plist" 2>/dev/null || true
+        rm -f "$HOME/Library/LaunchAgents/dev.fleet.agent.plist"
+    elif systemctl --user show-environment >/dev/null 2>&1; then
+        systemctl --user disable --now fleet-agent.service 2>/dev/null || true
+        rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/fleet-agent.service"
+    fi
+    rm -f "$(agent_sock)"
+}
+
+cmd_agent() {
+    case "${1:-run}" in
+        run) agent_run ;;
+        install) agent_install ;;
+        remove) agent_remove ;;
+        *) fail 'usage: fleet agent [run|install|remove]' ;;
+    esac
+}
+
 cmd_status() {
     load_config
     if [[ -z "$name" || ! -f "$STATE/node.crt" ]]; then
@@ -650,6 +743,7 @@ case "$command" in
     timer) cmd_timer "$@" ;;
     status) cmd_status ;;
     list) cmd_list "$@" ;;
+    agent) cmd_agent "$@" ;;
     install-step) install_step ;;
     -h|--help|help|"") usage ;;
     *) usage >&2; exit 2 ;;

@@ -274,6 +274,46 @@ class Fleet(FleetBase):
         result = self.fleet('status')
         self.assertIn('serial: 7mrlHuilZFCgm5n26BWUDU\n', result.stdout)
 
+    def socat_stub(self):
+        socat = self.home / 'bin/socat'
+        socat.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$HOME/socat-args"\n')
+        socat.chmod(0o700)
+
+    def test_agent_bridges_a_local_socket_to_the_broker(self):
+        self.enroll()
+        self.socat_stub()
+        result = self.fleet('agent', XDG_RUNTIME_DIR=str(self.home / 'run'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = (self.home / 'socat-args').read_text().splitlines()
+        sock = self.home / 'run/fleet-agent.sock' if os.uname().sysname == 'Linux' else self.home / '.ssh/fleet/agent.sock'
+        self.assertEqual(args[-2], f'UNIX-LISTEN:{sock},fork,unlink-early,mode=600')
+        self.assertEqual(args[-1], f'OPENSSL:ca.example:8444,cert={self.state}/node.crt,key={self.state}/node.key,'
+                                   f'cafile={self.state}/root_ca.crt,verify=1')
+
+    def test_agent_refuses_a_socket_path_that_is_too_long(self):
+        self.enroll()
+        self.socat_stub()
+        result = self.fleet('agent', FLEET_AGENT_SOCK='/tmp/' + 'x' * 120)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('too long', result.stderr)
+        self.assertFalse((self.home / 'socat-args').exists())
+
+    def test_agent_install_schedules_a_service(self):
+        self.enroll()
+        self.socat_stub()
+        result = self.fleet('agent', 'install')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        scheduled = (self.home / 'scheduler.log').read_text()
+        self.assertTrue('launchctl bootstrap' in scheduled or 'systemctl --user enable --now fleet-agent.service' in scheduled,
+                        scheduled)
+        self.assertIn('SSH_AUTH_SOCK=', result.stdout)
+
+    def test_agent_needs_socat(self):
+        self.enroll()
+        result = self.fleet('agent', FLEET_SOCAT=str(self.home / 'no-socat'))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('socat', result.stderr)
+
     def test_status_reports_missing_enrollment(self):
         result = self.fleet('status')
         self.assertNotEqual(result.returncode, 0)
