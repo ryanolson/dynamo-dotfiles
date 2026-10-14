@@ -114,8 +114,11 @@ init_dotfiles() {
     # Without a terminal (provisioning over SSH stdin, a container entrypoint), prompts cannot
     # be answered: take their defaults, and the name and email from the environment.
     local init_args=()
+    # chezmoi matches --promptString on the prompt text, not the data key, and splits the
+    # value on commas.
     if [[ -n "${DOTFILES_NAME:-}" || -n "${DOTFILES_EMAIL:-}" ]]; then
-        init_args+=(--promptString "name=${DOTFILES_NAME:-},email=${DOTFILES_EMAIL:-}")
+        [[ "${DOTFILES_NAME:-}${DOTFILES_EMAIL:-}" != *[,=\"]* ]] || error 'DOTFILES_NAME and DOTFILES_EMAIL cannot contain , = or "'
+        init_args+=(--promptString "Your full name=${DOTFILES_NAME:-},Your email address=${DOTFILES_EMAIL:-}")
     fi
     if [[ ! -t 0 ]]; then
         [[ -n "${DOTFILES_NAME:-}" && -n "${DOTFILES_EMAIL:-}" ]] ||
