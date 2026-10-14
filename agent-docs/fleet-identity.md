@@ -135,3 +135,7 @@ The first client is `socat`, which opens a new mTLS connection for each agent cl
 ## Addendum 2026-10-14: the Rust agent
 
 The Rust agent is `pylon agent`, in the private `agentic-control` workspace (`crates/pylon`). It keeps pooled mTLS connections to the broker, retries once on a new connection when a pooled one is dead, and caches the key list for 300 seconds. A keepalive refreshes the list every 120 seconds, below the broker's 300-second idle timeout. Four signatures from a laptop took 0.14 to 0.17 seconds, against 0.51 to 0.54 seconds through `socat`. `fleet agent` starts `pylon` when it is installed and `socat` otherwise. `pylon` has no release binaries yet, so each machine builds it with `cargo`.
+
+## Addendum 2026-10-14: revocation check for X5C
+
+This supersedes the revocation gap that line 117 describes. The broker now serves a step-ca authorizing webhook on loopback of the CA host. The X5C provisioner for SSH certificates calls it, and the broker refuses a revoked client certificate. A second X5C provisioner issues 1-hour client certificates from a current machine certificate. It is the first part of a two-certificate model: a long-lived machine credential that only gets short access certificates. step-ca reads `webhooks` from the top level of the provisioner `options`. Inside `options.x509`, step-ca ignores it without an error.
