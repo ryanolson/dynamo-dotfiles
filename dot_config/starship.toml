@@ -3,7 +3,7 @@
 
 # Main prompt format
 format = """
-$all$character"""
+$directory$all$character"""
 
 # Right-hand side prompt
 right_format = """$time"""
@@ -113,10 +113,15 @@ symbol = "🐳 "
 style = "blue bold"
 
 [kubernetes]
-format = 'on [$symbol$context( $namespace)]($style) '
+format = '[$symbol$context]($style) '
 symbol = "☸ "
 style = "cyan bold"
 disabled = false
+
+# nv-prd-dgxc.teleport.sh-dynamo-gcp-dev-02 -> dynamo-gcp-dev-02
+[[kubernetes.contexts]]
+context_pattern = '.*\.teleport\.sh-(?P<cluster>.+)'
+context_alias = '$cluster'
 
 # Cloud contexts
 [aws]
@@ -132,7 +137,7 @@ style = "yellow bold"
 
 # Memory usage
 [memory_usage]
-disabled = false
+disabled = true
 threshold = 70
 format = "using [$symbol${ram_pct}]($style) "
 symbol = "🐏 "
