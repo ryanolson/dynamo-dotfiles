@@ -404,25 +404,49 @@ class Fleet(FleetBase):
                                    f'key={self.state}/node.key,cafile={self.state}/root_ca.crt,verify=1')
         self.assertEqual(args[-1], 'TCP:127.0.0.1:38886')
 
-    def test_tunnel_bridge_authenticates_both_sides(self):
+    def test_tunnel_gate_admits_fleet_certificates_and_forwards_ciphertext(self):
         self.enroll()
         self.socat_stub()
-        r = self.tunnel('add', 'hop', '--mode', 'bridge', '--listen', '10.0.0.5:8461',
-                        '--to', 'bb-server.example:8461', '--peer', 'bb-server', '--allow', '10.0.0.9/32')
+        r = self.tunnel('add', 'hop', '--mode', 'gate', '--listen', '10.0.0.5:8461',
+                        '--to', 'bb-server.example:8461', '--allow', '10.0.0.9/32')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.tunnel('run', 'hop').returncode, 0)
         args = (self.home / 'socat-args').read_text().splitlines()
         tls = f'cert={self.state}/node.crt,key={self.state}/node.key,cafile={self.state}/root_ca.crt,verify=1'
         self.assertEqual(args[-2], f'OPENSSL-LISTEN:8461,bind=10.0.0.5,reuseaddr,fork,{tls},range=10.0.0.9/32')
-        self.assertEqual(args[-1], f'OPENSSL:bb-server.example:8461,{tls},commonname=bb-server')
+        # The inner TLS between client and server passes through unread.
+        self.assertEqual(args[-1], 'TCP:bb-server.example:8461')
+
+    def test_tunnel_client_via_a_gate_nests_tls(self):
+        self.enroll()
+        calls = self.home / 'socat-calls'
+        socat = self.home / 'bin/socat'
+        socat.write_text('#!/bin/sh\n{ for a in "$@"; do printf "%s\\t" "$a"; done; echo; } >> "$HOME/socat-calls"\n')
+        socat.chmod(0o700)
+        r = self.tunnel('add', 'bb', '--mode', 'client', '--listen', '127.0.0.1:38900', '--to', 'door.example:8461',
+                        '--peer', 'bb-server', '--via', 'gate.example:8461', '--via-peer', 'gate')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # Both socat processes are stubs that exit at once. run exits non-zero when either one
+        # ends, so the service manager restarts the pair.
+        self.assertEqual(self.tunnel('run', 'bb').returncode, 1)
+        tls = f'cert={self.state}/node.crt,key={self.state}/node.key,cafile={self.state}/root_ca.crt,verify=1'
+        lines = sorted(l.rstrip('\t') for l in calls.read_text().splitlines())
+        self.assertEqual(lines, sorted([
+            # Outer layer: a loopback hop that wraps the inner stream in mTLS to the gate.
+            f'TCP-LISTEN:38901,bind=127.0.0.1,reuseaddr,fork\tOPENSSL:gate.example:8461,{tls},commonname=gate',
+            # Inner layer: mTLS to the server, checked against its fleet name, through the hop.
+            f'TCP-LISTEN:38900,bind=127.0.0.1,reuseaddr,fork\tOPENSSL:127.0.0.1:38901,{tls},commonname=bb-server',
+        ]))
+        self.assertNotEqual(self.tunnel('add', 'bb', '--mode', 'client', '--listen', '127.0.0.1:38900',
+                                        '--to', 'd:1', '--peer', 'p', '--via', 'g:1').returncode, 0)
 
     def test_tunnel_has_no_unauthenticated_relay(self):
         self.enroll()
         self.assertNotEqual(self.tunnel('add', 'hop', '--mode', 'relay', '--listen', '10.0.0.5:8461',
                                         '--to', 'h:8461').returncode, 0)
         for allow in ['10.0.0.9/32,exec=sh', 'any', '10.0.0.0/99']:
-            self.assertNotEqual(self.tunnel('add', 'hop', '--mode', 'bridge', '--listen', '10.0.0.5:8461',
-                                            '--to', 'h:8461', '--peer', 'p', '--allow', allow).returncode, 0, allow)
+            self.assertNotEqual(self.tunnel('add', 'hop', '--mode', 'gate', '--listen', '10.0.0.5:8461',
+                                            '--to', 'h:8461', '--allow', allow).returncode, 0, allow)
 
     def test_tunnel_rejects_bad_arguments(self):
         self.enroll()

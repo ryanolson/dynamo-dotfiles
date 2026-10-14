@@ -56,10 +56,12 @@ Any machine:
   renew [--loop]                        Renew certificates that are close to expiry.
   agent [run|install|remove]            Bridge a local ssh-agent socket to the broker (pylon, else socat).
                                         install runs it as a launchd or systemd user service.
-  tunnel add NAME --mode client|server|bridge --listen HOST:PORT --to HOST:PORT [--peer NAME] [--allow CIDR]
+  tunnel add NAME --mode client|server|gate --listen HOST:PORT --to HOST:PORT [--peer NAME] [--allow CIDR]
+       [--via HOST:PORT --via-peer NAME]
                                         Carry a TCP service over fleet mTLS and run it as a service.
                                         client: loopback -> server; server: fleet certificates only;
-                                        bridge: fleet certificates in, mTLS out. --allow CIDR limits sources.
+                                        gate: fleet certificates in, ciphertext through. --via sends a
+                                        client through a gate with TLS inside TLS. --allow limits sources.
   tunnel run NAME | remove NAME | list
   secret get NAME                       Print a secret from the broker, if the policy allows this machine.
   secret env VAR=NAME... -- CMD...      Run CMD with secrets in its environment. Values are not printed.
@@ -854,8 +856,10 @@ agent_remove() {
 # Tunnels carry a TCP service between fleet machines, gated by fleet certificates:
 #   client  loopback listener -> mTLS to a server, which must present the certificate of --peer
 #   server  mTLS listener that accepts only fleet certificates -> a local TCP service
-#   bridge  mTLS listener (fleet certificates only, optional source allowlist) -> mTLS to a server,
-#           for a machine on two networks. Nothing unauthenticated crosses to the second network.
+#   gate    mTLS listener (fleet certificates only, optional source allowlist) -> TCP to a server,
+#           for a machine on two networks. A client reaches the server through it with --via: the
+#           client's TLS to the server runs inside its TLS to the gate, so the gate admits only
+#           fleet machines and never sees the traffic, and the server sees the client's own name.
 # socat reads the certificate when each client connection opens. A server reads it at start,
 # so its service restarts every 6 hours, well inside the 24-hour lifetime.
 TUNNELS="$CONFIG_DIR/tunnels"
@@ -904,9 +908,9 @@ cmd_tunnel() {
     local sub="${1:-}"; shift || true
     case "$sub" in
         add)
-            local tname="${1:-}" mode="" listen="" to="" peer="" allow=""
+            local tname="${1:-}" mode="" listen="" to="" peer="" allow="" via="" via_peer=""
             shift || true
-            [[ "$tname" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || fail 'usage: fleet tunnel add NAME --mode client|server|bridge --listen HOST:PORT --to HOST:PORT [--peer NAME] [--allow CIDR]'
+            [[ "$tname" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || fail 'usage: fleet tunnel add NAME --mode client|server|gate --listen HOST:PORT --to HOST:PORT [--peer NAME] [--via HOST:PORT --via-peer NAME] [--allow CIDR]'
             while [[ $# -gt 0 ]]; do
                 case "$1" in
                     --mode) mode="${2:-}"; shift 2 ;;
@@ -914,26 +918,33 @@ cmd_tunnel() {
                     --to) to="${2:-}"; shift 2 ;;
                     --peer) peer="${2:-}"; shift 2 ;;
                     --allow) allow="${2:-}"; shift 2 ;;
+                    --via) via="${2:-}"; shift 2 ;;
+                    --via-peer) via_peer="${2:-}"; shift 2 ;;
                     *) fail "unknown option $1" ;;
                 esac
             done
-            [[ "$mode" =~ ^(client|server|bridge)$ ]] || fail '--mode must be client, server, or bridge'
+            [[ "$mode" =~ ^(client|server|gate)$ ]] || fail '--mode must be client, server, or gate'
             valid_addr "$listen" || fail 'invalid --listen (HOST:PORT)'
             valid_addr "$to" || fail 'invalid --to (HOST:PORT)'
-            if [[ "$mode" != server ]]; then
-                valid_name "$peer" || fail "a $mode tunnel needs --peer: the fleet name of the server"
+            if [[ "$mode" == client ]]; then
+                valid_name "$peer" || fail 'a client tunnel needs --peer: the fleet name of the server'
+            fi
+            if [[ -n "$via" || -n "$via_peer" ]]; then
+                [[ "$mode" == client ]] && valid_addr "$via" && valid_name "$via_peer" ||
+                    fail '--via HOST:PORT and --via-peer NAME go together, on a client tunnel'
             fi
             [[ -z "$allow" ]] || valid_cidr "$allow" || fail 'invalid --allow (IPv4 CIDR, for example 10.0.0.9/32)'
             need_enrollment
             mkdir -p "$TUNNELS"
-            printf 'mode=%s\nlisten=%s\nto=%s\npeer=%s\nallow=%s\n' "$mode" "$listen" "$to" "$peer" "$allow" > "$TUNNELS/$tname"
+            printf 'mode=%s\nlisten=%s\nto=%s\npeer=%s\nallow=%s\nvia=%s\nvia_peer=%s\n' \
+                "$mode" "$listen" "$to" "$peer" "$allow" "$via" "$via_peer" > "$TUNNELS/$tname"
             tunnel_unit_install "$tname" "$mode"
             printf 'tunnel %s: %s %s -> %s\n' "$tname" "$mode" "$listen" "$to" ;;
         run)
-            local tname="${1:-}" key value mode="" listen="" to="" peer="" allow=""
+            local tname="${1:-}" key value mode="" listen="" to="" peer="" allow="" via="" via_peer=""
             [[ "$tname" =~ ^[a-z0-9][a-z0-9-]{0,30}$ && -f "$TUNNELS/$tname" ]] || fail "no tunnel named ${tname:-?}"
             while IFS='=' read -r key value; do
-                case "$key" in mode) mode="$value" ;; listen) listen="$value" ;; to) to="$value" ;; peer) peer="$value" ;; allow) allow="$value" ;; esac
+                case "$key" in mode) mode="$value" ;; listen) listen="$value" ;; to) to="$value" ;; peer) peer="$value" ;; allow) allow="$value" ;; via) via="$value" ;; via_peer) via_peer="$value" ;; esac
             done < "$TUNNELS/$tname"
             valid_addr "$listen" && valid_addr "$to" || fail "tunnel $tname has an invalid address"
             [[ -z "$allow" ]] || valid_cidr "$allow" || fail "tunnel $tname has an invalid allow list"
@@ -944,12 +955,22 @@ cmd_tunnel() {
             case "$mode" in
                 client)
                     valid_name "$peer" || fail "tunnel $tname has no valid peer"
-                    exec "$SOCAT" "TCP-LISTEN:$lport,bind=$lhost,reuseaddr,fork" "OPENSSL:$to,$tls,commonname=$peer" ;;
+                    [[ -n "$via" ]] || exec "$SOCAT" "TCP-LISTEN:$lport,bind=$lhost,reuseaddr,fork" "OPENSSL:$to,$tls,commonname=$peer"
+                    valid_addr "$via" && valid_name "$via_peer" || fail "tunnel $tname has an invalid via"
+                    # Two socat processes: the inner one speaks TLS to the server through a loopback
+                    # hop, and the hop wraps that stream in TLS to the gate. The server's name is
+                    # checked on the inner connection, so the gate cannot impersonate it.
+                    local hop=$((lport + 1)) a b
+                    "$SOCAT" "TCP-LISTEN:$hop,bind=127.0.0.1,reuseaddr,fork" "OPENSSL:$via,$tls,commonname=$via_peer" & b=$!
+                    "$SOCAT" "TCP-LISTEN:$lport,bind=$lhost,reuseaddr,fork" "OPENSSL:127.0.0.1:$hop,$tls,commonname=$peer" & a=$!
+                    trap 'kill "$a" "$b" 2>/dev/null' EXIT INT TERM
+                    # macOS ships bash 3.2, which has no wait -n: poll, and stop when either exits.
+                    while kill -0 "$a" 2>/dev/null && kill -0 "$b" 2>/dev/null; do sleep 2; done
+                    exit 1 ;;
                 server)
                     exec "$SOCAT" "OPENSSL-LISTEN:$lport,bind=$lhost,reuseaddr,fork,$tls$range" "TCP:$to" ;;
-                bridge)
-                    valid_name "$peer" || fail "tunnel $tname has no valid peer"
-                    exec "$SOCAT" "OPENSSL-LISTEN:$lport,bind=$lhost,reuseaddr,fork,$tls$range" "OPENSSL:$to,$tls,commonname=$peer" ;;
+                gate)
+                    exec "$SOCAT" "OPENSSL-LISTEN:$lport,bind=$lhost,reuseaddr,fork,$tls$range" "TCP:$to" ;;
                 *) fail "tunnel $tname has an invalid mode" ;;
             esac ;;
         remove)
