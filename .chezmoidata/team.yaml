@@ -2,10 +2,9 @@
 # These tools and configurations form the baseline development environment
 
 # Machine class (override in ~/.config/chezmoi/chezmoi.yaml)
-#   headless-sudo   | headless node with sudo (apt install path)
-#   headless-nosudo | headless node without sudo (everything into $HOME; SLURM login node)
-#   primary         | personal machine with 1Password CLI + commit signing
-machine_class: "headless-sudo"
+#   sudo   | node with sudo (apt install path)
+#   nosudo | node without sudo (everything into $HOME; SLURM login node)
+machine_class: "sudo"
 
 # Per-machine fish seed: which template materializes once into conf.d/local.fish
 #   blank | cuda  (see .chezmoitemplates/seed-*.fish)

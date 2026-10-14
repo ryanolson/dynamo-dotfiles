@@ -1,23 +1,33 @@
 {{- $name := promptStringOnce . "name" "Your full name" -}}
 {{- $email := promptStringOnce . "email" "Your email address" -}}
-{{/* bootstrap.sh exports DOTFILES_MACHINE_CLASS when it detects no usable sudo.
+{{/* The class selects only the install layout: sudo or nosudo.
+     bootstrap.sh exports DOTFILES_MACHINE_CLASS when it detects no usable sudo.
      When set it is AUTHORITATIVE (not just a prompt default), so re-running
-     bootstrap on a node with a stale machine_class self-corrects. */}}
+     bootstrap on a node with a stale machine_class self-corrects.
+     Configs written before 2026-10-14 hold primary, headless-sudo, or headless-nosudo;
+     init converts them once. See agent-docs/machine-classes-and-fleet.md. */}}
 {{- $envClass := env "DOTFILES_MACHINE_CLASS" -}}
+{{- $oldClass := dig "machine_class" "" . -}}
 {{- $machineClass := "" -}}
 {{- if ne $envClass "" -}}
 {{-   $machineClass = $envClass -}}
+{{- else if has $oldClass (list "primary" "headless-sudo") -}}
+{{-   $machineClass = "sudo" -}}
+{{- else if eq $oldClass "headless-nosudo" -}}
+{{-   $machineClass = "nosudo" -}}
 {{- else -}}
-{{-   $machineClass = promptChoiceOnce . "machine_class" "Machine class" (list "headless-sudo" "headless-nosudo" "primary") "headless-sudo" -}}
+{{-   $machineClass = promptChoiceOnce . "machine_class" "Machine class" (list "sudo" "nosudo") "sudo" -}}
 {{- end -}}
 {{- $machineSeed := promptChoiceOnce . "machine_seed" "Per-machine fish seed (creates conf.d/local.fish once, then unsynced)" (list "blank" "cuda") "blank" -}}
 {{- $defaultHost := .chezmoi.hostname -}}
 {{- $cursorSSHHost := promptStringOnce . "cursor_ssh_host" (printf "SSH hostname for Cursor deep links [leave blank to use: %s]" $defaultHost) "" -}}
 {{- if eq $cursorSSHHost "" -}}{{- $cursorSSHHost = $defaultHost -}}{{- end -}}
-{{/* Derived capabilities — primary is the only class with 1Password + commit signing. */}}
-{{- $isPrimary := eq $machineClass "primary" -}}
+{{/* 1Password is a separate setting, kept across init. Fleet does signing and SSH on
+     enrolled machines; op is still needed to administer the fleet (fleet login, token). */}}
+{{- $opEnabled := promptBoolOnce . "onepassword.enabled" "Does this machine have the 1Password CLI and administer the fleet" false -}}
+{{- $opSSHAgent := dig "onepassword" "ssh_agent" $opEnabled . -}}
 {{- $opSigningKey := "" -}}
-{{- if $isPrimary -}}
+{{- if $opEnabled -}}
 {{-   $opSigningKey = promptStringOnce . "onepassword.signing_public_key" "SSH signing public key (from 1Password item public key field; empty to skip signing)" -}}
 {{- end -}}
 
@@ -45,17 +55,16 @@ cd:
 data:
   name: {{ $name | quote }}
   email: {{ $email | quote }}
-  # Machine class: headless-sudo | headless-nosudo | primary
-  #   headless-nosudo => no sudo, everything installs into $HOME (SLURM login node)
-  #   primary         => 1Password CLI + commit signing enabled
+  # Machine class: sudo | nosudo
+  #   nosudo => no sudo, everything installs into $HOME (SLURM login node)
   machine_class: {{ $machineClass | quote }}
   # Per-machine fish seed picked at init; materialized once into conf.d/local.fish
   machine_seed: {{ $machineSeed | quote }}
   cursor_ssh_host: {{ $cursorSSHHost | quote }}
   onepassword:
-    # Auto-enabled on primary machines; override in ~/.config/chezmoi/chezmoi.yaml
-    enabled: {{ $isPrimary }}
-    ssh_agent: {{ $isPrimary }}
+    # Asked once at init and kept; override in ~/.config/chezmoi/chezmoi.yaml
+    enabled: {{ $opEnabled }}
+    ssh_agent: {{ $opSSHAgent }}
     signing_public_key: {{ $opSigningKey | quote }}
     vault: {{ dig "onepassword" "vault" "Development" . | quote }}
     # secrets: override in ~/.config/chezmoi/chezmoi.yaml

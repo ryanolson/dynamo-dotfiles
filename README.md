@@ -21,15 +21,16 @@ curl -fsSL https://raw.githubusercontent.com/ryanolson/dynamo-dotfiles/main/boot
 
 ### Machine classes
 
-`chezmoi init` prompts for a **machine class** that selects the install path and features:
+`chezmoi init` prompts for a **machine class** that selects the install path:
 
-| Class             | Install path                | Sudo | 1Password / signing | Agent infra |
-|-------------------|-----------------------------|------|---------------------|-------------|
-| `headless-sudo`   | apt + pixi                  | yes  | no                  | yes         |
-| `headless-nosudo` | `~/.local/<arch>/` via pixi | no   | no                  | no          |
-| `primary`         | apt + pixi                  | yes  | **yes**             | yes         |
+| Class    | Install path                | Sudo | Agent infra |
+|----------|-----------------------------|------|-------------|
+| `sudo`   | apt + pixi                  | yes  | yes         |
+| `nosudo` | `~/.local/<arch>/` via pixi | no   | no          |
 
-On `headless-nosudo` the install is **pixi-centric**: nearly the whole toolset
+`chezmoi init` also asks once whether the machine has the 1Password CLI and administers the fleet. The answer sets `onepassword.enabled`, and later runs of `chezmoi init` keep it. It turns on the 1Password CLI, `openv`, and commit signing with a 1Password key. On a fleet machine, the fleet agent signs commits instead (see Fleet certificates). Configurations from before 2026-10-14 used the classes `primary`, `headless-sudo`, and `headless-nosudo`. `chezmoi init` converts them to `sudo` or `nosudo` and keeps their 1Password settings.
+
+On `nosudo` the install is **pixi-centric**: nearly the whole toolset
 (`fish`, `node`, `git`, `gh`, `bat`, `ripgrep`, `fd`, `helix`, `zellij`, `lazygit`,
 `starship`, `uv`, …) comes from [pixi](https://pixi.sh)/conda-forge — glibc-independent
 and arch-aware. Only `claude` (native installer) and `codex` (npm) are separate.
@@ -270,7 +271,7 @@ Run this command on a node after `chezmoi apply`. It copies an existing key from
 provision-keys --ssh-key-ref 'op://Private/My SSH Key/private key'
 ```
 
-The node needs `op`, an authenticated 1Password CLI session, Git 2.34 or later, and OpenSSH with SSH signing support. Bootstrap installs `op` on macOS and Linux `primary` machines. On other machine classes, install `op` before provisioning. Configure your Git name and email through chezmoi first.
+The node needs `op`, an authenticated 1Password CLI session, Git 2.34 or later, and OpenSSH with SSH signing support. Bootstrap installs `op` on macOS, and on Linux where `onepassword.enabled` is set. On other Linux machines, install `op` before provisioning. Configure your Git name and email through chezmoi first.
 
 To use a separate signing key, pass its reference with `--signing-key-ref`:
 
@@ -414,7 +415,7 @@ repository reads one, and the tooling actively pushes back if one appears:
 Authenticate once per machine:
 
 ```bash
-gh auth login -p ssh   # with the 1Password SSH agent (primary machines)
+gh auth login -p ssh   # with the 1Password SSH agent (onepassword.enabled)
 gh auth login          # device flow, everywhere else
 gh auth status         # verify
 ```
@@ -620,7 +621,7 @@ rustup update
 | 1 | `pull_failed` | `reasons` is `chezmoi_missing`, `source_missing`, `fetch_failed`, or `merge_failed`. Nothing was applied. |
 | 2 | `needs_attention` | The update was applied. `reasons` contains one or more of `apply_failed`, `status_failed`, `pending`, and `config_template_changed`. |
 
-The report also contains `before` and `after` (source commits), `pending` (status and path from `chezmoi status`), and `log_tail` (the last 40 output lines). The command does not regenerate the configuration with `chezmoi init`. If the report contains `config_template_changed`, run `chezmoi init` in a terminal. The `run_onchange` install script uses `sudo` on the `headless-sudo` and `primary` classes, so a headless update on those classes needs passwordless `sudo`.
+The report also contains `before` and `after` (source commits), `pending` (status and path from `chezmoi status`), and `log_tail` (the last 40 output lines). The command does not regenerate the configuration with `chezmoi init`. If the report contains `config_template_changed`, run `chezmoi init` in a terminal. The `run_onchange` install script uses `sudo` on the `sudo` class, so a headless update on that class needs passwordless `sudo`.
 
 ## 🆚 Migration from Nix
 

@@ -78,3 +78,11 @@ Each step is one commit with its tests.
 - Open question: what is the new key name? `machine_class` with new values keeps every reader working by name. A new key such as `install` is clearer.
 - Open question: which names does the broker policy serve? Step 4 needs one broker secret for each variable in `dev.env.op`. The policy is in the private deployment repository.
 - Open question: does any machine still need 1Password signing without fleet? If nv-mbp-16 stays outside the fleet, step 3 waits.
+
+## Addendum 2026-10-14: steps 1 and 2 done
+
+The key name stays `machine_class`. Its values are now `sudo` and `nosudo`. `chezmoi init` converts `primary` and `headless-sudo` to `sudo`, and `headless-nosudo` to `nosudo`. Step 5 removes this conversion.
+
+`onepassword.enabled` is now a separate question that `chezmoi init` asks once and then keeps. `onepassword.ssh_agent` keeps its existing value. On a new machine, it takes the value of `onepassword.enabled`. On Linux, the install script installs the 1Password CLI only when `onepassword.enabled` is set. `test/test-chezmoi-config.py` covers the conversion, the forced `nosudo` from `bootstrap.sh`, and the kept settings.
+
+Steps 1 and 2 are in one commit, because both change the same lines of `.chezmoi.yaml.tmpl`.

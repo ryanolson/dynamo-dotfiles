@@ -64,11 +64,12 @@ class PixiTools(unittest.TestCase):
 
     def render(self, machine_class):
         script = TEMPLATE.read_text().replace('{{ .machine_class }}', machine_class)
+        script = script.replace('{{ .onepassword.enabled }}', 'false')
         path = Path(self.tmp.name) / 'install-{}.sh'.format(machine_class)
         path.write_text(script.replace('{{ .chezmoi.arch }}', 'arm64'))
         return path
 
-    def run_steps(self, *steps, machine_class='headless-sudo', pixi_on_path=True, expect=0, **extra):
+    def run_steps(self, *steps, machine_class='sudo', pixi_on_path=True, expect=0, **extra):
         if pixi_on_path:
             pixi = self.stubs / 'pixi'
             pixi.write_bytes(self.pixi_template.read_bytes())
@@ -172,7 +173,7 @@ class PixiTools(unittest.TestCase):
         self.run_steps('remove_gh_apt_repository')
 
     def test_nosudo_installs_into_the_arch_root_only(self):
-        log = self.run_steps('install_pixi_tools', machine_class='headless-nosudo', pixi_on_path=False)
+        log = self.run_steps('install_pixi_tools', machine_class='nosudo', pixi_on_path=False)
         arch_pixi = self.home / '.local' / os.uname().machine / 'pixi/bin'
         self.assertTrue((arch_pixi / 'gh').exists())
         self.assertFalse(any(line.startswith(('sudo', 'apt-get')) for line in log), log)

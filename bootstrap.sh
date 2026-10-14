@@ -106,7 +106,7 @@ init_dotfiles() {
     # On a no-sudo node, force machine_class authoritatively (see .chezmoi.yaml.tmpl).
     # This corrects a stale config left by an earlier run, not just fresh installs.
     if [[ $NO_SUDO -eq 1 ]]; then
-        export DOTFILES_MACHINE_CLASS="headless-nosudo"
+        export DOTFILES_MACHINE_CLASS="nosudo"
     fi
     # `chezmoi init` is safe to re-run: it pulls the source and regenerates the
     # config from the template (re-applying the forced machine_class). Existing

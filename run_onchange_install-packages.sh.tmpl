@@ -3,12 +3,13 @@
 # This script installs all the tools defined in the team configuration.
 #
 # Branches on machine_class (templated by chezmoi):
-#   headless-sudo / primary  -> apt + /usr/local/bin (sudo)
-#   headless-nosudo          -> everything into $HOME, pixi for fish+node (no sudo)
+#   sudo    -> apt + /usr/local/bin (sudo)
+#   nosudo  -> everything into $HOME, pixi for fish+node (no sudo)
 
 set -euo pipefail
 
 MACHINE_CLASS="{{ .machine_class }}"
+OP_ENABLED="{{ .onepassword.enabled }}"
 # target-arch: {{ .chezmoi.arch }}
 # ^ embeds the rendering machine's arch so run_onchange's content hash differs
 #   per architecture. $HOME (and chezmoi's state) is shared across the x86_64
@@ -57,7 +58,7 @@ log "Detected architecture: $ARCH ($ARCH_ALT)"
 ARCH_RAW="$(uname -m)"          # x86_64 | aarch64
 BIN_DIR="/usr/local/bin"
 ARCH_ROOT=""
-if [[ "$MACHINE_CLASS" == "headless-nosudo" ]]; then
+if [[ "$MACHINE_CLASS" == "nosudo" ]]; then
     ARCH_ROOT="$HOME/.local/$ARCH_RAW"
     BIN_DIR="$ARCH_ROOT/bin"
     export PIXI_HOME="$ARCH_ROOT/pixi"
@@ -251,7 +252,7 @@ PIXI_TOOLS=(
     helix:hx lazygit:lazygit yazi:yazi broot:broot just:just
     watchexec:watchexec hyperfine:hyperfine tokei:tokei starship:starship socat:socat
 )
-# headless-nosudo has no apt and no shared uv, so pixi also provides these there.
+# nosudo has no apt and no shared uv, so pixi also provides these there.
 NOSUDO_PIXI_TOOLS=(fish:fish nodejs:node git:git uv:uv age:age zstd:zstd)
 # apt installed these on the sudo classes. Remove the apt package once pixi provides
 # the tool and ~/.local/bin links to it.
@@ -299,7 +300,7 @@ install_pixi_tools() {
     local expose_dir="${PIXI_HOME:-$HOME/.pixi}/bin"
     local failed=0 linked entry package bin version critical
     local tools=("${PIXI_TOOLS[@]}")
-    if [[ "$MACHINE_CLASS" == "headless-nosudo" ]]; then
+    if [[ "$MACHINE_CLASS" == "nosudo" ]]; then
         tools+=("${NOSUDO_PIXI_TOOLS[@]}")
     fi
     for entry in "${tools[@]}"; do
@@ -312,9 +313,9 @@ install_pixi_tools() {
             failed=$((failed | critical))
             continue
         fi
-        # On headless-nosudo, ~/.local/bin is shared across architectures, and nothing
+        # On nosudo, ~/.local/bin is shared across architectures, and nothing
         # was installed with sudo.
-        [[ "$MACHINE_CLASS" == "headless-nosudo" ]] && continue
+        [[ "$MACHINE_CLASS" == "nosudo" ]] && continue
         # Link before removal, so a caller always finds one copy.
         linked=0
         link_pixi_tool "$bin" "$expose_dir" || linked=$?
@@ -342,7 +343,7 @@ install_pixi_tools() {
     return "$failed"
 }
 
-# Linux path WITH sudo (headless-sudo / primary)
+# Linux path WITH sudo (class sudo)
 install_linux_sudo() {
     log "📦 Installing packages on Linux (sudo)..."
     if command -v apt-get &> /dev/null; then
@@ -371,8 +372,8 @@ install_linux_sudo() {
         rm -f kubectl
     fi
 
-    # 1Password CLI — primary machines only
-    if [[ "$MACHINE_CLASS" == "primary" ]] && ! command -v op &> /dev/null; then
+    # 1Password CLI — only where onepassword.enabled is set
+    if [[ "$OP_ENABLED" == true ]] && ! command -v op &> /dev/null; then
         log "Installing 1Password CLI..."
         curl -sS https://downloads.1password.com/linux/keys/1password.asc | \
             sudo gpg --dearmor --output /usr/share/keyrings/1password-archive-keyring.gpg
@@ -424,7 +425,7 @@ main() {
     case "$OS" in
         "macOS") install_macos_packages ;;
         "Linux")
-            if [[ "$MACHINE_CLASS" == "headless-nosudo" ]]; then
+            if [[ "$MACHINE_CLASS" == "nosudo" ]]; then
                 install_linux_nosudo
             else
                 install_linux_sudo

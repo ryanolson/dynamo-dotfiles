@@ -29,7 +29,7 @@ class RemoteSessionZellij(unittest.TestCase):
                               text=True, timeout=30)
 
     def test_arch_root_wins_over_a_shared_pixi_folder(self):
-        # headless-nosudo shares $HOME across architectures. ~/.pixi/bin can hold another arch's binaries.
+        # The nosudo class shares $HOME across architectures. ~/.pixi/bin can hold another arch's binaries.
         self.zellij('.pixi/bin')
         right = self.zellij('.local/{}/pixi/bin'.format(os.uname().machine))
         result = self.check()

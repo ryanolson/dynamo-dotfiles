@@ -30,7 +30,7 @@ class WeeklyUpdate(unittest.TestCase):
     def stamp(self):
         return self.home / '.local/state/dotfiles' / 'pixi-update-{}'.format(ARCH)
 
-    def run_script(self, machine_class='headless-sudo'):
+    def run_script(self, machine_class='sudo'):
         text = TEMPLATE.read_text().replace('{{ if eq .chezmoi.os "linux" -}}', '').replace('{{ end -}}', '')
         script = self.root / 'update.sh'
         script.write_text(text.replace('{{ .machine_class }}', machine_class))
@@ -69,7 +69,7 @@ class WeeklyUpdate(unittest.TestCase):
         # On a shared $HOME, ~/.pixi/bin can hold another architecture's pixi.
         self.pixi('.pixi/bin')
         arch_pixi = self.pixi('.local/{}/pixi/bin'.format(ARCH))
-        self.assertEqual(self.run_script('headless-nosudo'), ['{} global update'.format(arch_pixi)])
+        self.assertEqual(self.run_script('nosudo'), ['{} global update'.format(arch_pixi)])
 
 
 if __name__ == '__main__':

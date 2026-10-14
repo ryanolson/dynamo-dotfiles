@@ -28,7 +28,7 @@ Shell aliases and Fish functions are not portable commands. Prefer the executabl
 
 Fish provides convenience functions such as `cc`, `cx`, `ws`, `wnew`, `wrm`, `wcd`, `as`, and `ast`. `wt cd` is also a Fish function. In other shells, use the executable or change directory to the result of `wt path <name>`.
 
-The `headless-nosudo` profile excludes `wt`, `agent-spawn`, `agent-status`, and the related Fish shortcuts. Shared instructions and skills still deploy. No-sudo installations can use architecture-specific directories under `~/.local/<arch>/`; do not hardcode one machine's PATH into another.
+The `nosudo` machine class excludes `wt`, `agent-spawn`, `agent-status`, and the related Fish shortcuts. Shared instructions and skills still deploy. No-sudo installations can use architecture-specific directories under `~/.local/<arch>/`; do not hardcode one machine's PATH into another.
 
 ## q environment context
 

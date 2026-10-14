@@ -8,7 +8,7 @@
 # A failure only warns and does not write the stamp, so the next apply tries again.
 set -uo pipefail
 
-if [[ "{{ .machine_class }}" == "headless-nosudo" ]]; then
+if [[ "{{ .machine_class }}" == "nosudo" ]]; then
     # Same layout as the install script: $HOME is shared across architectures, so each
     # architecture has its own pixi, and ~/.pixi/bin can hold another one's binaries.
     export PIXI_HOME="$HOME/.local/$(uname -m)/pixi"

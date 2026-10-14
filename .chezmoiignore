@@ -66,9 +66,9 @@ Desktop.ini
 # NOTE: .chezmoiignore matches TARGET paths (relative to $HOME), not source
 # filenames. Use .config/..., .local/bin/..., NOT dot_config/executable_...
 #
-# Agent infrastructure — on any machine with sudo (headless-sudo + primary),
+# Agent infrastructure — on any machine with sudo (class sudo),
 # excluded only on no-sudo login nodes.
-{{- if eq .machine_class "headless-nosudo" }}
+{{- if eq .machine_class "nosudo" }}
 .local/bin/wt
 .local/bin/agent-spawn
 .local/bin/agent-status

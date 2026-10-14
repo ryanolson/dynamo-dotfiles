@@ -3,7 +3,7 @@ set -euo pipefail
 
 # A zellij client attaches only to a server of the same version, so this script must
 # run the zellij that the panes run. The order follows .profile and config.fish: the
-# arch-namespaced root of headless-nosudo first, because ~/.pixi/bin on a shared $HOME
+# arch-namespaced root of the nosudo class first, because ~/.pixi/bin on a shared $HOME
 # can hold another architecture's binaries; then ~/.pixi/bin before ~/.cargo/bin.
 arch_root="$HOME/.local/$(uname -m)"
 export PATH="$arch_root/bin:$arch_root/pixi/bin:$HOME/.pixi/bin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
