@@ -111,9 +111,25 @@ class Fleet(FleetBase):
                                 check=True, env=self.env)
         self.assertIn(f'certificatefile {self.state}/id_fleet-cert.pub\n', result.stdout)
         self.assertIn(f'identityfile {self.state}/id_fleet\n', result.stdout)
-        self.assertIn(f'identityfile {self.home}/.ssh/id_ed25519\n', result.stdout)
+        self.assertNotIn('/.ssh/id_', result.stdout)
         self.assertIn(f'{self.home}/.ssh/fleet/known_hosts', result.stdout)
         self.assertEqual((self.home / '.ssh/fleet/known_hosts').read_text(), f'@cert-authority * {HOST_CA}\n')
+
+    def test_existing_default_keys_stay_usable(self):
+        ssh = self.home / '.ssh'
+        ssh.mkdir(mode=0o700)
+        subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(ssh / 'id_ed25519')], check=True)
+        self.enroll()
+        fragment = (ssh / 'fleet/config').read_text()
+        self.assertIn(f'IdentityFile {ssh}/id_ed25519\n', fragment)
+        self.assertNotIn('id_rsa', fragment)
+
+    def test_renew_picks_up_a_new_default_key(self):
+        self.enroll()
+        ssh = self.home / '.ssh'
+        subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(ssh / 'id_ed25519')], check=True)
+        self.assertEqual(self.fleet('renew').returncode, 0)
+        self.assertIn(f'IdentityFile {ssh}/id_ed25519\n', (ssh / 'fleet/config').read_text())
 
     def test_trust_preserves_existing_keys_and_is_idempotent(self):
         ssh = self.home / '.ssh'

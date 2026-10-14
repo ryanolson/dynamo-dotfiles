@@ -156,10 +156,15 @@ write_ssh_config() {
     chmod 700 "$HOME/.ssh" "$SSH_FLEET"
     printf '@cert-authority * %s\n' "$host_ca" > "$SSH_FLEET/known_hosts.tmp"
     mv "$SSH_FLEET/known_hosts.tmp" "$SSH_FLEET/known_hosts"
-    # Naming any IdentityFile drops the OpenSSH defaults, so list them again.
+    # Naming any IdentityFile drops the OpenSSH defaults, so list the ones that exist.
+    # A missing IdentityFile makes every ssh command print a warning.
+    local identities=("$STATE/id_fleet") key
+    for key in id_ed25519 id_ecdsa id_ecdsa_sk id_ed25519_sk id_rsa; do
+        [[ -f "$HOME/.ssh/$key" ]] && identities+=("$HOME/.ssh/$key")
+    done
     {
         printf '%s\n' 'Host *'
-        printf '    IdentityFile %s\n' "$STATE/id_fleet" "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_ecdsa" "$HOME/.ssh/id_rsa"
+        printf '    IdentityFile %s\n' "${identities[@]}"
         printf '    CertificateFile %s\n' "$STATE/id_fleet-cert.pub"
         printf '    UserKnownHostsFile %s %s\n' "$HOME/.ssh/known_hosts" "$SSH_FLEET/known_hosts"
     } > "$SSH_FLEET/config.tmp"
@@ -463,6 +468,7 @@ cmd_renew() {
     if [[ "$ssh_due" == 1 ]]; then
         issue_ssh
     fi
+    write_ssh_config
 }
 
 timer_systemd() {
