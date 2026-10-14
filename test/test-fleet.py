@@ -421,7 +421,8 @@ class Fleet(FleetBase):
         self.enroll()
         calls = self.home / 'socat-calls'
         socat = self.home / 'bin/socat'
-        socat.write_text('#!/bin/sh\n{ for a in "$@"; do printf "%s\\t" "$a"; done; echo; } >> "$HOME/socat-calls"\n')
+        # The two socat processes run at once, so each call is one append, not one per argument.
+        socat.write_text('#!/bin/sh\nline=$(printf "%s\\t" "$@")\nprintf "%s\\n" "$line" >> "$HOME/socat-calls"\n')
         socat.chmod(0o700)
         r = self.tunnel('add', 'bb', '--mode', 'client', '--listen', '127.0.0.1:38900', '--to', 'door.example:8461',
                         '--peer', 'bb-server', '--via', 'gate.example:8461', '--via-peer', 'gate')
