@@ -145,3 +145,7 @@ This supersedes the revocation gap that line 117 describes. The broker now serve
 The broker serves named secrets over the same mTLS port as the machine list. A policy on the CA host lists, for each secret, its source in a cloud secret store and the machine-name patterns that can read it. An unknown or forbidden name gives the same 404, so a machine cannot discover the other names. The broker reads the value on each request and logs only the name and the caller. The CA host's service account can read only the listed secrets.
 
 `fleet secret get NAME` prints a value. `fleet secret env VAR=NAME -- CMD` runs a command with values in its environment. `fleet claude` is the launcher for remote Claude sessions: it sets `CLAUDE_CODE_OAUTH_TOKEN` from a secret that holds a token from `claude setup-token`. 1Password stays the place where a person keeps secrets. The cloud store is the copy that machines can reach without a person.
+
+## Addendum 2026-10-14: machine classes
+
+Fleet now does Git signing, GitHub SSH, and SSH between machines without 1Password. [machine-classes-and-fleet.md](machine-classes-and-fleet.md) is the plan to split `machine_class` into an install setting and a separate 1Password setting, and to give `openv` the broker backend that the "Secrets" section describes.
