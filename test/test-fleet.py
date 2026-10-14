@@ -377,6 +377,62 @@ class Fleet(FleetBase):
                           '--ca', f'{self.state}/root_ca.crt'])
         self.assertFalse((self.home / 'socat-args').exists())
 
+    def tunnel(self, *args, **env):
+        return self.fleet('tunnel', *args, FLEET_TUNNEL_NO_SERVICE='1', **env)
+
+    def test_tunnel_client_listens_on_loopback_and_dials_mtls(self):
+        self.enroll()
+        self.socat_stub()
+        r = self.tunnel('add', 'bb', '--mode', 'client', '--listen', '127.0.0.1:38900',
+                        '--to', 'relay.example:8461', '--peer', 'bb-server')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.tunnel('run', 'bb')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        args = (self.home / 'socat-args').read_text().splitlines()
+        self.assertEqual(args[-2], 'TCP-LISTEN:38900,bind=127.0.0.1,reuseaddr,fork')
+        self.assertEqual(args[-1], f'OPENSSL:relay.example:8461,cert={self.state}/node.crt,key={self.state}/node.key,'
+                                   f'cafile={self.state}/root_ca.crt,verify=1,commonname=bb-server')
+
+    def test_tunnel_server_accepts_only_fleet_certificates(self):
+        self.enroll()
+        self.socat_stub()
+        self.assertEqual(self.tunnel('add', 'door', '--mode', 'server', '--listen', '100.64.0.9:8461',
+                                     '--to', '127.0.0.1:38886').returncode, 0)
+        self.assertEqual(self.tunnel('run', 'door').returncode, 0)
+        args = (self.home / 'socat-args').read_text().splitlines()
+        self.assertEqual(args[-2], f'OPENSSL-LISTEN:8461,bind=100.64.0.9,reuseaddr,fork,cert={self.state}/node.crt,'
+                                   f'key={self.state}/node.key,cafile={self.state}/root_ca.crt,verify=1')
+        self.assertEqual(args[-1], 'TCP:127.0.0.1:38886')
+
+    def test_tunnel_bridge_authenticates_both_sides(self):
+        self.enroll()
+        self.socat_stub()
+        r = self.tunnel('add', 'hop', '--mode', 'bridge', '--listen', '10.0.0.5:8461',
+                        '--to', 'bb-server.example:8461', '--peer', 'bb-server', '--allow', '10.0.0.9/32')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.tunnel('run', 'hop').returncode, 0)
+        args = (self.home / 'socat-args').read_text().splitlines()
+        tls = f'cert={self.state}/node.crt,key={self.state}/node.key,cafile={self.state}/root_ca.crt,verify=1'
+        self.assertEqual(args[-2], f'OPENSSL-LISTEN:8461,bind=10.0.0.5,reuseaddr,fork,{tls},range=10.0.0.9/32')
+        self.assertEqual(args[-1], f'OPENSSL:bb-server.example:8461,{tls},commonname=bb-server')
+
+    def test_tunnel_has_no_unauthenticated_relay(self):
+        self.enroll()
+        self.assertNotEqual(self.tunnel('add', 'hop', '--mode', 'relay', '--listen', '10.0.0.5:8461',
+                                        '--to', 'h:8461').returncode, 0)
+        for allow in ['10.0.0.9/32,exec=sh', 'any', '10.0.0.0/99']:
+            self.assertNotEqual(self.tunnel('add', 'hop', '--mode', 'bridge', '--listen', '10.0.0.5:8461',
+                                            '--to', 'h:8461', '--peer', 'p', '--allow', allow).returncode, 0, allow)
+
+    def test_tunnel_rejects_bad_arguments(self):
+        self.enroll()
+        for args in [('add', 'x', '--mode', 'client', '--listen', '127.0.0.1:1', '--to', 'h:2'),
+                     ('add', 'x', '--mode', 'bogus', '--listen', '127.0.0.1:1', '--to', 'h:2'),
+                     ('add', 'x', '--mode', 'server', '--listen', '127.0.0.1:1', '--to', 'h:2,exec=sh'),
+                     ('add', '../x', '--mode', 'server', '--listen', '127.0.0.1:1', '--to', 'h:2'),
+                     ('run', 'missing')]:
+            self.assertNotEqual(self.tunnel(*args).returncode, 0, args)
+
     def test_agent_refuses_a_socket_path_that_is_too_long(self):
         self.enroll()
         self.socat_stub()

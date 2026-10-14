@@ -56,6 +56,11 @@ Any machine:
   renew [--loop]                        Renew certificates that are close to expiry.
   agent [run|install|remove]            Bridge a local ssh-agent socket to the broker (pylon, else socat).
                                         install runs it as a launchd or systemd user service.
+  tunnel add NAME --mode client|server|bridge --listen HOST:PORT --to HOST:PORT [--peer NAME] [--allow CIDR]
+                                        Carry a TCP service over fleet mTLS and run it as a service.
+                                        client: loopback -> server; server: fleet certificates only;
+                                        bridge: fleet certificates in, mTLS out. --allow CIDR limits sources.
+  tunnel run NAME | remove NAME | list
   secret get NAME                       Print a secret from the broker, if the policy allows this machine.
   secret env VAR=NAME... -- CMD...      Run CMD with secrets in its environment. Values are not printed.
   claude [ARGS...]                      Run claude with CLAUDE_CODE_OAUTH_TOKEN from the secret claude-oauth-token.
@@ -846,6 +851,126 @@ agent_remove() {
     fi
 }
 
+# Tunnels carry a TCP service between fleet machines, gated by fleet certificates:
+#   client  loopback listener -> mTLS to a server, which must present the certificate of --peer
+#   server  mTLS listener that accepts only fleet certificates -> a local TCP service
+#   bridge  mTLS listener (fleet certificates only, optional source allowlist) -> mTLS to a server,
+#           for a machine on two networks. Nothing unauthenticated crosses to the second network.
+# socat reads the certificate when each client connection opens. A server reads it at start,
+# so its service restarts every 6 hours, well inside the 24-hour lifetime.
+TUNNELS="$CONFIG_DIR/tunnels"
+valid_addr() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*:[0-9]{1,5}$ ]]; }
+valid_cidr() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]]; }
+
+tunnel_unit_install() {
+    local tname="$1" mode="$2"
+    [[ -n "${FLEET_TUNNEL_NO_SERVICE:-}" ]] && return 0
+    if [[ "$(uname -s)" == Darwin ]]; then
+        local plist="$HOME/Library/LaunchAgents/dev.fleet.tunnel.$tname.plist"
+        mkdir -p "$(dirname "$plist")" "$HOME/Library/Logs"
+        cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>dev.fleet.tunnel.$tname</string>
+    <key>ProgramArguments</key><array><string>$SELF</string><string>tunnel</string><string>run</string><string>$tname</string></array>
+    <key>KeepAlive</key><true/>
+    <key>RunAtLoad</key><true/>
+    <key>StandardErrorPath</key><string>$HOME/Library/Logs/fleet-tunnel-$tname.log</string>
+</dict>
+</plist>
+EOF
+        launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || true
+        launchctl bootstrap "gui/$(id -u)" "$plist"
+    elif systemctl --user show-environment >/dev/null 2>&1; then
+        local dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+        mkdir -p "$dir"
+        {
+            printf '%s\n' '[Unit]' "Description=Fleet tunnel $tname ($mode)" '' '[Service]' \
+                "ExecStart=$SELF tunnel run $tname" 'Restart=always' 'RestartSec=5'
+            [[ "$mode" != client ]] && printf '%s\n' 'RuntimeMaxSec=6h'
+            printf '%s\n' '' '[Install]' 'WantedBy=default.target'
+        } > "$dir/fleet-tunnel-$tname.service"
+        systemctl --user daemon-reload
+        systemctl --user enable --now "fleet-tunnel-$tname.service" >/dev/null
+        systemctl --user restart "fleet-tunnel-$tname.service"
+    else
+        fail 'no launchd or systemd user session. Run fleet tunnel run NAME in the foreground.'
+    fi
+}
+
+cmd_tunnel() {
+    local sub="${1:-}"; shift || true
+    case "$sub" in
+        add)
+            local tname="${1:-}" mode="" listen="" to="" peer="" allow=""
+            shift || true
+            [[ "$tname" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || fail 'usage: fleet tunnel add NAME --mode client|server|bridge --listen HOST:PORT --to HOST:PORT [--peer NAME] [--allow CIDR]'
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --mode) mode="${2:-}"; shift 2 ;;
+                    --listen) listen="${2:-}"; shift 2 ;;
+                    --to) to="${2:-}"; shift 2 ;;
+                    --peer) peer="${2:-}"; shift 2 ;;
+                    --allow) allow="${2:-}"; shift 2 ;;
+                    *) fail "unknown option $1" ;;
+                esac
+            done
+            [[ "$mode" =~ ^(client|server|bridge)$ ]] || fail '--mode must be client, server, or bridge'
+            valid_addr "$listen" || fail 'invalid --listen (HOST:PORT)'
+            valid_addr "$to" || fail 'invalid --to (HOST:PORT)'
+            if [[ "$mode" != server ]]; then
+                valid_name "$peer" || fail "a $mode tunnel needs --peer: the fleet name of the server"
+            fi
+            [[ -z "$allow" ]] || valid_cidr "$allow" || fail 'invalid --allow (IPv4 CIDR, for example 10.0.0.9/32)'
+            need_enrollment
+            mkdir -p "$TUNNELS"
+            printf 'mode=%s\nlisten=%s\nto=%s\npeer=%s\nallow=%s\n' "$mode" "$listen" "$to" "$peer" "$allow" > "$TUNNELS/$tname"
+            tunnel_unit_install "$tname" "$mode"
+            printf 'tunnel %s: %s %s -> %s\n' "$tname" "$mode" "$listen" "$to" ;;
+        run)
+            local tname="${1:-}" key value mode="" listen="" to="" peer="" allow=""
+            [[ "$tname" =~ ^[a-z0-9][a-z0-9-]{0,30}$ && -f "$TUNNELS/$tname" ]] || fail "no tunnel named ${tname:-?}"
+            while IFS='=' read -r key value; do
+                case "$key" in mode) mode="$value" ;; listen) listen="$value" ;; to) to="$value" ;; peer) peer="$value" ;; allow) allow="$value" ;; esac
+            done < "$TUNNELS/$tname"
+            valid_addr "$listen" && valid_addr "$to" || fail "tunnel $tname has an invalid address"
+            [[ -z "$allow" ]] || valid_cidr "$allow" || fail "tunnel $tname has an invalid allow list"
+            local range="${allow:+,range=$allow}"
+            find_socat || fail 'socat is required for tunnels'
+            local lhost="${listen%:*}" lport="${listen##*:}"
+            local tls="cert=$STATE/node.crt,key=$STATE/node.key,cafile=$STATE/root_ca.crt,verify=1"
+            case "$mode" in
+                client)
+                    valid_name "$peer" || fail "tunnel $tname has no valid peer"
+                    exec "$SOCAT" "TCP-LISTEN:$lport,bind=$lhost,reuseaddr,fork" "OPENSSL:$to,$tls,commonname=$peer" ;;
+                server)
+                    exec "$SOCAT" "OPENSSL-LISTEN:$lport,bind=$lhost,reuseaddr,fork,$tls$range" "TCP:$to" ;;
+                bridge)
+                    valid_name "$peer" || fail "tunnel $tname has no valid peer"
+                    exec "$SOCAT" "OPENSSL-LISTEN:$lport,bind=$lhost,reuseaddr,fork,$tls$range" "OPENSSL:$to,$tls,commonname=$peer" ;;
+                *) fail "tunnel $tname has an invalid mode" ;;
+            esac ;;
+        remove)
+            local tname="${1:-}"
+            [[ "$tname" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || fail 'usage: fleet tunnel remove NAME'
+            if [[ "$(uname -s)" == Darwin ]]; then
+                launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/dev.fleet.tunnel.$tname.plist" 2>/dev/null || true
+                rm -f "$HOME/Library/LaunchAgents/dev.fleet.tunnel.$tname.plist"
+            elif systemctl --user show-environment >/dev/null 2>&1; then
+                systemctl --user disable --now "fleet-tunnel-$tname.service" 2>/dev/null || true
+                rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/fleet-tunnel-$tname.service"
+                systemctl --user daemon-reload
+            fi
+            rm -f "$TUNNELS/$tname" ;;
+        list)
+            local f
+            for f in "$TUNNELS"/*; do [[ -f "$f" ]] && printf '%s: %s\n' "${f##*/}" "$(tr '\n' ' ' < "$f")"; done; true ;;
+        *) fail 'usage: fleet tunnel add|run|remove|list' ;;
+    esac
+}
+
 cmd_agent() {
     case "${1:-run}" in
         run) agent_run ;;
@@ -913,6 +1038,7 @@ case "$command" in
     status) cmd_status ;;
     list) cmd_list "$@" ;;
     secret) cmd_secret "$@" ;;
+    tunnel) cmd_tunnel "$@" ;;
     claude) cmd_secret env CLAUDE_CODE_OAUTH_TOKEN=claude-oauth-token -- claude "$@" ;;
     agent) cmd_agent "$@" ;;
     install-step) install_step ;;
