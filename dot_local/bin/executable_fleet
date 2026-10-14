@@ -15,6 +15,8 @@ SSH_FLEET="$HOME/.ssh/fleet"
 SELF="$HOME/.local/bin/fleet"
 X509_RENEW_BEFORE=16h
 TOKEN_TTL=5m
+# Laptops share 1Password, so a new laptop reads the deployment values from this item.
+CONFIG_ITEM="${FLEET_CONFIG_ITEM:-op://Personal/Fleet config}"
 ENROLL_QUIET=0
 SSH_RENEW_BEFORE=8h
 
@@ -38,8 +40,10 @@ Laptop (has 1Password):
                                         Mint a token and enroll HOST over SSH.
   invite NAME [--san NAME]... [--dotfiles] [--ephemeral] [--no-trust] [--principal NAME]
                                         Print a curl command that enrolls a new machine.
-  login [NAME]                          Enroll this laptop with the admin provisioner and no
-                                        login trust. Use it again when the certificate expired.
+  login [NAME]                          Enroll this laptop as an admin, without login trust, and
+                                        schedule renewal. Without fleet init, read the settings
+                                        from op://Personal/Fleet config. Run it again after the
+                                        certificate expired.
   revoke SERIAL                         Revoke a client certificate. Renewal and new SSH
                                         certificates stop within 24 hours.
 
@@ -335,15 +339,34 @@ cmd_enroll() {
     [[ "$ENROLL_QUIET" == 1 ]] || printf 'enrolled %s. Run: fleet timer install\n' "$name"
 }
 
+import_config() {
+    command -v op >/dev/null || fail 'op is required: install 1Password CLI, or run fleet init'
+    local field value
+    for field in ca_url fingerprint broker_url enroll_item admin_item; do
+        value=$(op read "$CONFIG_ITEM/$field") || fail "could not read $CONFIG_ITEM/$field"
+        case "$field" in
+            ca_url|broker_url) valid_url "$value" || fail "invalid $field in $CONFIG_ITEM" ;;
+            fingerprint) valid_fingerprint "$value" || fail "invalid $field in $CONFIG_ITEM" ;;
+            *) valid_item "$value" || fail "invalid $field in $CONFIG_ITEM" ;;
+        esac
+        printf -v "$field" '%s' "$value"
+    done
+    save_config
+}
+
 cmd_login() {
     load_config
+    [[ -n "$ca_url" ]] || import_config
     local node="${1:-${name:-$(hostname -s)}}"
     valid_name "$node" || fail 'usage: fleet login [NAME]'
     [[ -n "$admin_item" ]] || fail 'run fleet init --admin-item op://VAULT/ITEM first'
     enroll_secrets "$admin_item" admin
     local token
     token=$(provisioner_token "$node" --san "$node")
+    ENROLL_QUIET=1
     cmd_enroll "$node" --token "$token" --no-trust
+    cmd_timer install
+    printf 'logged in as %s (admin). Renewal runs every hour.\n' "$node"
 }
 
 cmd_invite() {

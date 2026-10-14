@@ -298,12 +298,13 @@ To return to agent configuration, move `~/.ssh/provisioned` out of that path. To
 
 Each machine makes its own private keys, and the keys do not leave the machine. A person approves the first certificate with a one-time token from a laptop that has 1Password.
 
-On a laptop, install `step` (`brew install step`) and record the deployment values once:
+On macOS, `chezmoi apply` installs `step` with Homebrew. A laptop that shares your 1Password needs one command:
 
 ```bash
-fleet init --ca-url https://CA --fingerprint ROOT_SHA256 --enroll-item 'op://VAULT/ENROLL_ITEM' \
-  --admin-item 'op://VAULT/ADMIN_ITEM' --broker-url https://CA:8443
+fleet login
 ```
+
+`fleet login` reads the deployment values from the 1Password item `op://Personal/Fleet config` (fields `ca_url`, `fingerprint`, `broker_url`, `enroll_item`, `admin_item`). Set `FLEET_CONFIG_ITEM` to use another item. Then it enrolls the laptop as an admin with the hostname as its name, and it schedules renewal. Pass a name to override the hostname. Without 1Password, record the values with `fleet init --ca-url ... --fingerprint ... --enroll-item ... --admin-item ... --broker-url ...`.
 
 To enroll a new machine, print a join command on the laptop:
 
@@ -319,7 +320,7 @@ Run the printed command on the new machine within 15 minutes. It works in bash, 
 
 The token is on the command line of the new machine for the duration of `join.sh`. To keep it off the command line, use `fleet enroll-remote HOST NAME` for a machine that you can reach with SSH. That command sends the token on stdin. If the laptop cannot reach the machine, run `fleet token NAME` on the laptop. Then run `fleet enroll NAME --ca-url https://CA --fingerprint ROOT_SHA256` on the machine and paste the token. After `enroll-remote` or a manual `enroll`, run `fleet timer install` on the machine.
 
-To enroll the laptop itself, run `fleet login`. It mints its own token through 1Password with the admin provisioner, and it does not add login trust. A laptop that sleeps longer than 24 hours has an expired certificate. Run `fleet login` again.
+`fleet login` mints its own token through 1Password with the admin provisioner, and it does not add login trust. A laptop that sleeps longer than 24 hours has an expired certificate. Run `fleet login` again.
 
 `fleet list` shows each active machine: its expiry, its last issue or renewal, its public address as the CA saw it, its Tailscale address, and its serial. `fleet list -a` adds machines whose latest certificate is expired or revoked. The broker drops such a machine from its inventory 7 days after the expiry or revocation. Add `--json` for scripts, for example `fleet list --json | jq -r '.machines[].name'`. The Tailscale address is empty for a machine whose name, or a name in its certificate, does not match a tailnet device. The command asks the fleet broker, an mTLS service on the CA host. The broker accepts only certificates from the fleet CA that are not on the CA's revocation list. It lists machines only for a certificate from the admin provisioner, that is, a laptop after `fleet login`.
 

@@ -54,6 +54,11 @@ case "$2" in
   "op://Vault/Enroll/password") printf 'PASSWORD' ;;
   "op://Vault/Admin/jwk_encrypted") printf 'ADMIN-KEY' ;;
   "op://Vault/Admin/password") printf 'ADMIN-PASSWORD' ;;
+  "op://Personal/Fleet config/ca_url") printf 'https://ca.example' ;;
+  "op://Personal/Fleet config/fingerprint") printf 'abababababababababababababababababababababababababababababababab' ;;
+  "op://Personal/Fleet config/broker_url") printf 'https://ca.example:8443' ;;
+  "op://Personal/Fleet config/enroll_item") printf 'op://Vault/Enroll' ;;
+  "op://Personal/Fleet config/admin_item") printf 'op://Vault/Admin' ;;
   *) exit 2 ;;
 esac
 '''
@@ -66,7 +71,9 @@ class FleetBase(unittest.TestCase):
         self.home = Path(self.tmp.name)
         bin_dir = self.home / 'bin'
         bin_dir.mkdir()
-        for name, body in [('step', STEP_STUB), ('op', OP_STUB)]:
+        recorder = '#!/bin/sh\nprintf "%s %s\\n" "$(basename "$0")" "$*" >> "$HOME/scheduler.log"\n'
+        for name, body in [('step', STEP_STUB), ('op', OP_STUB), ('launchctl', recorder), ('systemctl', recorder),
+                           ('loginctl', recorder), ('crontab', recorder)]:
             (bin_dir / name).write_text(body)
             (bin_dir / name).chmod(0o700)
         self.log = self.home / 'step.log'
@@ -333,6 +340,24 @@ class FleetLaptop(FleetBase):
         result = self.fleet('login', 'laptop-1')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('--admin-item', result.stderr)
+
+    def test_login_on_a_new_laptop_reads_the_config_from_1password_and_schedules_renewal(self):
+        result = self.fleet('login', 'laptop-2')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = (self.home / '.config/fleet/config').read_text()
+        for line in ['ca_url=https://ca.example', 'broker_url=https://ca.example:8443', 'admin_item=op://Vault/Admin',
+                     'enroll_item=op://Vault/Enroll', 'name=laptop-2']:
+            self.assertIn(line + '\n', config)
+        token = [c for c in self.calls() if c[:2] == ['ca', 'token']][0]
+        self.assertEqual(token[token.index('--provisioner') + 1], 'admin')
+        scheduled = (self.home / 'scheduler.log').read_text()
+        self.assertTrue('launchctl bootstrap' in scheduled or 'systemctl --user enable --now fleet-renew.timer' in scheduled,
+                        scheduled)
+
+    def test_login_keeps_an_existing_config(self):
+        self.init('--admin-item', 'op://Vault/Admin', '--broker-url', 'https://other.example:8443')
+        self.assertEqual(self.fleet('login', 'laptop-3').returncode, 0)
+        self.assertIn('broker_url=https://other.example:8443\n', (self.home / '.config/fleet/config').read_text())
 
     def test_list_asks_the_broker_with_this_machines_certificate(self):
         self.enroll()
