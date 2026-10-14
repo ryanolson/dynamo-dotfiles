@@ -333,7 +333,7 @@ The timer is a launchd agent on macOS, a systemd user timer on Linux, or a cront
 | SSH client settings and host CA | Rewritten at enrollment | `~/.ssh/fleet/config`, `~/.ssh/fleet/known_hosts` |
 | Login trust | Until `fleet untrust` | A `# BEGIN fleet` block in `~/.ssh/authorized_keys` |
 
-Chezmoi includes `~/.ssh/fleet/config` after the local provisioning file. By default, enrollment adds a `cert-authority` line to `~/.ssh/authorized_keys` for the principal `ryan`. Use `--principal NAME` to accept a different principal. Use `--no-trust` on a machine that must not accept fleet logins, for example the CA host. Other lines in `authorized_keys` do not change.
+Chezmoi includes `~/.ssh/fleet/config` before the local provisioning file. The fleet file sets an agent only for `github.com`, so local provisioning still applies to other hosts. By default, enrollment adds a `cert-authority` line to `~/.ssh/authorized_keys` for the principal `ryan`. Use `--principal NAME` to accept a different principal. Use `--no-trust` on a machine that must not accept fleet logins, for example the CA host. Other lines in `authorized_keys` do not change.
 
 `fleet status` shows the name, the serial number, and the expiry times. Serials are base62 (`0-9A-Za-z`). `fleet list --json` also gives `serial_decimal`, which is the form that `step` uses. To cut off a machine, run `fleet revoke SERIAL` on a laptop with the base62 serial.
 

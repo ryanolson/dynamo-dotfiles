@@ -177,9 +177,11 @@ write_ssh_config() {
     done
     {
         # OpenSSH uses the first IdentityAgent, so the GitHub block must precede Host *.
-        if [[ -f "$SSH_FLEET/agent" ]]; then
+        if [[ -f "$SSH_FLEET/agent" && -f "$SSH_FLEET/agent-auth.pub" ]]; then
             printf '%s\n' 'Host github.com'
             printf '    IdentityAgent %s\n' "$(<"$SSH_FLEET/agent")"
+            printf '    IdentityFile %s\n' "$SSH_FLEET/agent-auth.pub"
+            printf '    IdentitiesOnly yes\n'
         fi
         printf '%s\n' 'Host *'
         printf '    IdentityFile %s\n' "${identities[@]}"
@@ -693,14 +695,21 @@ EOF
 
 # Point git signing and GitHub SSH at the agent. The signing key comes from the agent itself.
 wire_agent() {
-    local sock="$1" pub="" i
+    local sock="$1" pub="" auth="" i keys
     for ((i = 0; i < ${FLEET_AGENT_WAIT:-15}; i++)); do
-        pub=$(SSH_AUTH_SOCK="$sock" ssh-add -L 2>/dev/null | awk '/ fleet agent-signing$/ {print $1, $2; exit}') || true
+        keys=$(SSH_AUTH_SOCK="$sock" ssh-add -L 2>/dev/null) || true
+        pub=$(awk '/ fleet agent-signing$/ {print $1, $2; exit}' <<<"$keys")
+        auth=$(awk '/ fleet agent-auth$/ {print; exit}' <<<"$keys")
         [[ -n "$pub" ]] && break
         sleep 1
     done
     [[ -n "$pub" ]] || fail "the agent at $sock does not list the fleet agent-signing key"
     mkdir -p "$SSH_FLEET"
+    if [[ -n "$auth" ]]; then
+        printf '%s\n' "$auth" > "$SSH_FLEET/agent-auth.pub"
+    else
+        rm -f "$SSH_FLEET/agent-auth.pub"
+    fi
     {
         [[ -f "$HOME/.ssh/allowed_signers" ]] && cat "$HOME/.ssh/allowed_signers"
         printf '* %s\n' "$pub"
@@ -731,7 +740,8 @@ agent_remove() {
         systemctl --user disable --now fleet-agent.service 2>/dev/null || true
         rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/fleet-agent.service"
     fi
-    rm -f "$(agent_sock)" "$SSH_FLEET/agent" "$SSH_FLEET/gitconfig" "$SSH_FLEET/allowed_signers"
+    rm -f "$(agent_sock)" "$SSH_FLEET/agent" "$SSH_FLEET/gitconfig" "$SSH_FLEET/allowed_signers" \
+        "$SSH_FLEET/agent-auth.pub"
     load_config
     if [[ -n "$ca_url" && -f "$STATE/node.crt" ]] && find_step; then
         write_ssh_config

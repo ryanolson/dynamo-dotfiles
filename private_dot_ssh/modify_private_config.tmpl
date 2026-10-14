@@ -1,7 +1,8 @@
 #!/bin/bash
-# OpenSSH uses the first value; local provisioning must precede agent settings.
+# OpenSSH uses the first value. The fleet file sets an agent only for github.com, so it goes
+# first; local provisioning then sets the agent for other hosts, before the agent settings below.
 CONFIG="$(cat)"
-printf '%s\n' 'Include ~/.ssh/provisioned/config' 'Include ~/.ssh/fleet/config'
+printf '%s\n' 'Include ~/.ssh/fleet/config' 'Include ~/.ssh/provisioned/config'
 CONFIG="$(printf '%s\n' "$CONFIG" | sed -e '\|^Include ~/.ssh/provisioned/config$|d' -e '\|^Include ~/.ssh/fleet/config$|d')"
 {{- if and (hasKey . "onepassword") .onepassword.ssh_agent }}
 {{- if eq .chezmoi.os "darwin" }}

@@ -315,10 +315,11 @@ class Fleet(FleetBase):
         out = subprocess.run(['ssh-agent', '-a', str(sock)], capture_output=True, text=True, check=True).stdout
         pid = int(out.split('SSH_AGENT_PID=')[1].split(';')[0])
         self.addCleanup(lambda: subprocess.run(['kill', str(pid)]))
-        key = self.home / 'agent-signing'
-        subprocess.run(['ssh-keygen', '-q', '-t', 'ecdsa', '-b', '256', '-N', '', '-C', 'fleet agent-signing',
-                        '-f', str(key)], check=True)
-        subprocess.run(['ssh-add', '-q', str(key)], env=dict(os.environ, SSH_AUTH_SOCK=str(sock)), check=True)
+        for name in ['agent-signing', 'agent-auth']:
+            key = self.home / name
+            subprocess.run(['ssh-keygen', '-q', '-t', 'ecdsa', '-b', '256', '-N', '', '-C', f'fleet {name}',
+                            '-f', str(key)], check=True)
+            subprocess.run(['ssh-add', '-q', str(key)], env=dict(os.environ, SSH_AUTH_SOCK=str(sock)), check=True)
         return sock, (self.home / 'agent-signing.pub').read_text().split()[:2]
 
     def test_agent_install_wires_git_signing_and_github(self):
@@ -342,6 +343,8 @@ class Fleet(FleetBase):
         github = subprocess.run(['ssh', '-G', '-F', str(config), 'github.com'], capture_output=True, text=True,
                                 check=True).stdout
         self.assertIn(f'identityagent {sock}\n', github)
+        self.assertIn('identitiesonly yes\n', github)
+        self.assertIn(f'identityfile {ssh}/fleet/agent-auth.pub\n', github)
         other = subprocess.run(['ssh', '-G', '-F', str(config), 'example.com'], capture_output=True, text=True,
                                check=True).stdout
         self.assertNotIn(str(sock), other)
@@ -375,6 +378,7 @@ class Fleet(FleetBase):
         self.assertEqual(self.fleet('agent', 'remove', **env).returncode, 0)
         self.assertFalse((ssh / 'fleet/gitconfig').exists())
         self.assertFalse((ssh / 'fleet/allowed_signers').exists())
+        self.assertFalse((ssh / 'fleet/agent-auth.pub').exists())
         self.assertNotIn('Host github.com', config.read_text())
 
     def test_agent_install_fails_without_a_signing_key(self):
@@ -582,9 +586,29 @@ class SshConfigInclude(unittest.TestCase):
                 text = subprocess.run(['bash', '-c', modifier], input=text, capture_output=True, text=True,
                                       check=True, env=env).stdout
             lines = text.splitlines()
-            self.assertEqual(lines[:2], ['Include ~/.ssh/provisioned/config', 'Include ~/.ssh/fleet/config'])
+            self.assertEqual(lines[:2], ['Include ~/.ssh/fleet/config', 'Include ~/.ssh/provisioned/config'])
             self.assertEqual(text.count('Include ~/.ssh/fleet/config'), 1)
+            self.assertEqual(text.count('Include ~/.ssh/provisioned/config'), 1)
             self.assertIn('Host example\n    User me\n', text)
+
+    def test_fleet_github_agent_wins_over_local_provisioning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / '.ssh/fleet').mkdir(parents=True)
+            (home / '.ssh/provisioned').mkdir()
+            (home / '.ssh/provisioned/config').write_text('Host *\n    IdentityAgent none\n    IdentitiesOnly yes\n'
+                                                         '    IdentityFile ~/.ssh/provisioned/key\n')
+            (home / '.ssh/fleet/config').write_text(f'Host github.com\n    IdentityAgent {home}/agent.sock\n'
+                                                   f'    IdentityFile {home}/.ssh/fleet/agent-auth.pub\n'
+                                                   '    IdentitiesOnly yes\nHost *\n    IdentityFile /x/id_fleet\n')
+            main = home / 'config'
+            main.write_text(f'Include {home}/.ssh/fleet/config\nInclude {home}/.ssh/provisioned/config\n')
+            github = subprocess.run(['ssh', '-G', '-F', str(main), 'github.com'], capture_output=True, text=True,
+                                    check=True).stdout
+            self.assertIn(f'identityagent {home}/agent.sock\n', github)
+            other = subprocess.run(['ssh', '-G', '-F', str(main), 'example.com'], capture_output=True, text=True,
+                                   check=True).stdout
+            self.assertIn('identityagent none\n', other)
 
 
 if __name__ == '__main__':
