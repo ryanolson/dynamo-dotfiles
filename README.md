@@ -304,19 +304,21 @@ On a laptop, install `step` (`brew install step`) and record the deployment valu
 fleet init --ca-url https://CA --fingerprint ROOT_SHA256 --enroll-item 'op://VAULT/ITEM'
 ```
 
-To enroll a machine that you can reach with SSH:
+To enroll a new machine, print a join command on the laptop:
 
 ```bash
-fleet enroll-remote HOST NAME
+fleet invite NAME [--san NAME]... [--dotfiles] [--ephemeral] [--no-trust]
 ```
 
-The token travels on stdin, not on the command line. If the laptop cannot reach the machine, run `fleet token NAME` on the laptop. Then run `fleet enroll NAME --ca-url https://CA --fingerprint ROOT_SHA256` on the machine and paste the token.
+Run the printed command on the new machine within 15 minutes. It works in bash, zsh, and fish. It downloads `join.sh` and `fleet` from GitHub at the commit that the laptop has checked out, so push that commit first. The token in the command works only once.
 
-After enrollment, schedule renewal on the machine:
+- Without options, `join.sh` installs `fleet` if it is missing, enrolls, and runs `fleet timer install`.
+- `--dotfiles` first runs `bootstrap.sh`, which installs these dotfiles from `main`.
+- `--ephemeral` runs `fleet ephemeral` in the foreground, for example in a Zellij pane. The keys are in memory-backed storage (`$XDG_RUNTIME_DIR` or `/dev/shm`), and renewal runs every hour. On exit or Ctrl-C, the command revokes its certificate and removes its keys, `~/.ssh/fleet`, and its `authorized_keys` block. It refuses to run on a machine with a persistent enrollment.
 
-```bash
-fleet timer install
-```
+The token is on the command line of the new machine for the duration of `join.sh`. To keep it off the command line, use `fleet enroll-remote HOST NAME` for a machine that you can reach with SSH. That command sends the token on stdin. If the laptop cannot reach the machine, run `fleet token NAME` on the laptop. Then run `fleet enroll NAME --ca-url https://CA --fingerprint ROOT_SHA256` on the machine and paste the token. After `enroll-remote` or a manual `enroll`, run `fleet timer install` on the machine.
+
+To enroll the laptop itself, run `fleet login`. It mints its own token through 1Password and does not add login trust. A laptop that sleeps longer than 24 hours has an expired certificate. Run `fleet login` again.
 
 The timer is a launchd agent on macOS, a systemd user timer on Linux, or a crontab entry when systemd is not available. In a container without a scheduler, run `fleet renew --loop` under the container supervisor. On Linux, `fleet` installs a pinned `step` release into `~/.local/<arch>/bin` if `step` is missing. It checks the download against a SHA-256 value in the script.
 
@@ -339,6 +341,7 @@ Verification:
 
 ```bash
 timeout 300 python3 test/test-fleet.py
+timeout 300 python3 test/test-join.py
 ```
 
 ### GitHub auth policy

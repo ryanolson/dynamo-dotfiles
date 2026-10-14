@@ -5,6 +5,7 @@ README.md
 AGENTS.md
 CLAUDE.md
 bootstrap.sh
+join.sh
 agent-docs
 agent-docs/**
 LICENSE

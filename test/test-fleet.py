@@ -57,7 +57,7 @@ esac
 '''
 
 
-class Fleet(unittest.TestCase):
+class FleetBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -89,6 +89,8 @@ class Fleet(unittest.TestCase):
     def mode(self, path):
         return stat.S_IMODE(path.stat().st_mode)
 
+
+class Fleet(FleetBase):
     def test_enroll_writes_identity_with_private_modes(self):
         self.enroll()
         self.assertEqual(self.mode(self.state), 0o700)
@@ -242,6 +244,106 @@ class Fleet(unittest.TestCase):
         result = self.fleet('status')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('not enrolled', result.stdout + result.stderr)
+
+
+class FleetLaptop(FleetBase):
+    def init(self):
+        result = self.fleet('init', '--ca-url', 'https://ca.example', '--fingerprint', 'ab' * 32,
+                            '--enroll-item', 'op://Vault/Enroll')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def source_repo(self, pushed=True):
+        repo = self.home / 'src'
+        repo.mkdir()
+        git = lambda *a: subprocess.run(['git', '-C', str(repo), *a], check=True, capture_output=True, text=True).stdout
+        git('init', '-q')
+        git('-c', 'user.name=T', '-c', 'user.email=t@example.com', 'commit', '-q', '--allow-empty', '-m', 'x')
+        git('remote', 'add', 'origin', 'git@github.com:owner/dots.git')
+        if pushed:
+            git('update-ref', 'refs/remotes/origin/main', 'HEAD')
+        return repo, git('rev-parse', 'HEAD').strip()
+
+    def test_invite_prints_a_pinned_join_command(self):
+        self.init()
+        repo, sha = self.source_repo()
+        result = self.fleet('invite', 'box', '--san', 'box.example', '--ephemeral', '--no-trust', FLEET_SOURCE=str(repo))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = result.stdout.strip().splitlines()[-1]
+        self.assertTrue(line.startswith("bash -c 'exec bash <(curl -fsSL \"$0\") \"$@\"' "))
+        self.assertIn(f'https://raw.githubusercontent.com/owner/dots/{sha}/join.sh', line)
+        for part in ['--repo owner/dots', f'--ref {sha}', '--name box', '--ca-url https://ca.example',
+                     f'--fingerprint {"ab" * 32}', f'--token {TOKEN}', '--ephemeral', '--no-trust']:
+            self.assertIn(part, line)
+        token = [c for c in self.calls() if c[:2] == ['ca', 'token']][0]
+        self.assertEqual(token[token.index('--not-after') + 1], '15m')
+        seen = json.loads((self.home / 'token-seen.json').read_text())
+        self.assertEqual(seen['sans'], ['box', 'box.example'])
+        self.assertFalse(Path(seen['key_path']).exists())
+
+    def test_invite_refuses_an_unpushed_commit(self):
+        self.init()
+        repo, _ = self.source_repo(pushed=False)
+        result = self.fleet('invite', 'box', FLEET_SOURCE=str(repo))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('push', result.stderr)
+        self.assertFalse([c for c in self.calls() if c[:2] == ['ca', 'token']])
+
+    def test_login_enrolls_this_machine_without_trust(self):
+        self.init()
+        result = self.fleet('login', 'laptop-1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('CERT laptop-1', (self.state / 'node.crt').read_text())
+        self.assertFalse((self.home / '.ssh/authorized_keys').exists())
+        seen = json.loads((self.home / 'token-seen.json').read_text())
+        self.assertFalse(Path(seen['key_path']).exists())
+        self.assertEqual(self.fleet('login').returncode, 0)
+
+
+class FleetEphemeral(FleetBase):
+    def start(self, *extra):
+        runtime = self.home / 'run'
+        runtime.mkdir(mode=0o700)
+        self.stderr_path = self.home / 'ephemeral.err'
+        stderr = self.stderr_path.open('w')
+        self.addCleanup(stderr.close)
+        proc = subprocess.Popen(['bash', str(SCRIPT), 'ephemeral', 'pod-1', '--ca-url', 'https://ca.example',
+                                 '--fingerprint', 'ab' * 32, *extra], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=stderr, text=True, env=dict(self.env, XDG_RUNTIME_DIR=str(runtime)))
+        self.addCleanup(proc.stdout.close)
+        proc.stdin.write(TOKEN + '\n')
+        proc.stdin.close()
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        line = proc.stdout.readline()
+        self.assertIn('ephemeral identity pod-1 is active', line, self.stderr_path.read_text())
+        return proc, runtime
+
+    def test_ephemeral_identity_lives_in_memory_and_is_removed_on_exit(self):
+        keys = self.home / '.ssh/authorized_keys'
+        keys.parent.mkdir(mode=0o700)
+        keys.write_text('ssh-ed25519 AAAAEXISTING laptop\n')
+        proc, runtime = self.start()
+        state = [p for p in runtime.iterdir() if p.name.startswith('fleet-ephemeral.')]
+        self.assertEqual(len(state), 1)
+        self.assertTrue((state[0] / 'state/fleet/node.key').exists())
+        self.assertFalse(self.state.exists())
+        fragment = (self.home / '.ssh/fleet/config').read_text()
+        self.assertIn(str(state[0]), fragment)
+        self.assertIn('# BEGIN fleet', keys.read_text())
+        proc.terminate()
+        self.assertEqual(proc.wait(timeout=20), 0, self.stderr_path.read_text())
+        self.assertFalse(state[0].exists())
+        self.assertFalse((self.home / '.ssh/fleet').exists())
+        self.assertEqual(keys.read_text(), 'ssh-ed25519 AAAAEXISTING laptop\n')
+        revoke = [c for c in self.calls() if c[:2] == ['ca', 'revoke']]
+        self.assertEqual(len(revoke), 1)
+        self.assertIn('--cert', revoke[0])
+
+    def test_ephemeral_refuses_a_persistent_enrollment(self):
+        self.enroll()
+        result = self.fleet('ephemeral', 'pod-1', '--ca-url', 'https://ca.example', '--fingerprint', 'ab' * 32,
+                            stdin=TOKEN + '\n')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('persistent', result.stderr)
 
 
 class SshConfigInclude(unittest.TestCase):

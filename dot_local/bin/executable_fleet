@@ -14,6 +14,8 @@ STATE="${XDG_STATE_HOME:-$HOME/.local/state}/fleet"
 SSH_FLEET="$HOME/.ssh/fleet"
 SELF="$HOME/.local/bin/fleet"
 X509_RENEW_BEFORE=16h
+TOKEN_TTL=5m
+ENROLL_QUIET=0
 SSH_RENEW_BEFORE=8h
 
 CLEANUP=()
@@ -31,12 +33,19 @@ Laptop (has 1Password):
   token NAME [--san NAME]...            Print a 5-minute enrollment token.
   enroll-remote HOST NAME [--san NAME]... [--no-trust] [--principal NAME]
                                         Mint a token and enroll HOST over SSH.
+  invite NAME [--san NAME]... [--dotfiles] [--ephemeral] [--no-trust] [--principal NAME]
+                                        Print a curl command that enrolls a new machine.
+  login [NAME]                          Enroll this laptop (no login trust) with a token
+                                        from 1Password. Use it when the certificate expired.
   revoke SERIAL                         Revoke a client certificate. Renewal and new SSH
                                         certificates stop within 24 hours.
 
 Any machine:
   enroll NAME [--ca-url URL --fingerprint SHA256] [--token TOKEN] [--no-trust] [--principal NAME]
                                         Without --token, read the token from stdin.
+  ephemeral NAME [--ca-url URL --fingerprint SHA256] [--no-trust] [--principal NAME]
+                                        Enroll in memory-backed storage and renew in the
+                                        foreground. On exit, revoke and remove everything.
   renew [--loop]                        Renew certificates that are close to expiry.
   trust [--principal NAME] | untrust    Add or remove the CA line in ~/.ssh/authorized_keys.
   timer install | timer remove          Schedule renew every hour.
@@ -227,7 +236,7 @@ enroll_secrets() {
 
 provisioner_token() {
     "$STEP" ca token "$@" --provisioner enroll --key "$ENROLL/key" --password-file "$ENROLL/password" \
-        --not-after 5m --ca-url "$ca_url" --root "$ENROLL/root.crt" 2>/dev/null || fail 'could not mint a token'
+        --not-after "$TOKEN_TTL" --ca-url "$ca_url" --root "$ENROLL/root.crt" 2>/dev/null || fail 'could not mint a token'
 }
 
 mint_token() {
@@ -304,7 +313,102 @@ cmd_enroll() {
     if [[ "$trust" == 1 ]]; then
         cmd_trust
     fi
-    printf 'enrolled %s. Run: fleet timer install\n' "$name"
+    [[ "$ENROLL_QUIET" == 1 ]] || printf 'enrolled %s. Run: fleet timer install\n' "$name"
+}
+
+cmd_login() {
+    load_config
+    local node="${1:-${name:-$(hostname -s)}}"
+    valid_name "$node" || fail 'usage: fleet login [NAME]'
+    enroll_secrets
+    local token
+    token=$(provisioner_token "$node" --san "$node")
+    cmd_enroll "$node" --token "$token" --no-trust
+}
+
+cmd_invite() {
+    [[ $# -ge 1 ]] || fail 'usage: fleet invite NAME [--san NAME]... [--dotfiles] [--ephemeral] [--no-trust] [--principal NAME] [--ref COMMIT]'
+    valid_name "$1" || fail 'invalid NAME'
+    local node="$1"; shift
+    load_config
+    local token_args=() join_args=() ref=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --san) token_args+=(--san "${2:-}"); shift 2 ;;
+            --dotfiles|--ephemeral|--no-trust) join_args+=("$1"); shift ;;
+            --principal) valid_principal "${2:-}" || fail 'invalid principal'; join_args+=(--principal "$2"); shift 2 ;;
+            --ref) [[ "${2:-}" =~ ^[0-9a-f]{40}$ ]] || fail 'invalid --ref (full commit SHA)'; ref="$2"; shift 2 ;;
+            *) fail "unknown option $1" ;;
+        esac
+    done
+    local src origin repo
+    src="${FLEET_SOURCE:-$(chezmoi source-path 2>/dev/null || true)}"
+    [[ -n "$src" && -d "$src/.git" ]] || fail 'cannot find the dotfiles source; set FLEET_SOURCE'
+    origin=$(git -C "$src" remote get-url origin)
+    case "$origin" in
+        git@github.com:*) repo="${origin#git@github.com:}" ;;
+        https://github.com/*) repo="${origin#https://github.com/}" ;;
+        *) fail "origin is not a GitHub repository: $origin" ;;
+    esac
+    repo="${repo%.git}"
+    [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "cannot parse the GitHub repository from $origin"
+    # The join script and fleet come from this commit, so it must be on GitHub.
+    if [[ -z "$ref" ]]; then
+        ref=$(git -C "$src" rev-parse HEAD)
+        git -C "$src" branch -r --contains "$ref" 2>/dev/null | grep -q 'origin/' ||
+            fail "commit $ref is not on origin; push it first or pass --ref"
+    fi
+    TOKEN_TTL=15m
+    local out
+    scratch; out="$SCRATCH"
+    mint_token "$node" "${token_args[@]+"${token_args[@]}"}" > "$out/token"
+    printf 'Run this on the new machine within 15 minutes. The token works once.\n\n' >&2
+    printf "bash -c 'exec bash <(curl -fsSL \"\$0\") \"\$@\"' %s --repo %s --ref %s --name %s --ca-url %s --fingerprint %s --token %s%s\n" \
+        "https://raw.githubusercontent.com/$repo/$ref/join.sh" "$repo" "$ref" "$node" "$ca_url" "$fingerprint" \
+        "$(<"$out/token")" "${join_args[*]+ ${join_args[*]}}"
+}
+
+ephemeral_exit() {
+    local rc=$?
+    trap - EXIT INT TERM
+    local job
+    for job in $(jobs -p); do kill "$job" 2>/dev/null || true; done
+    if [[ -n "${STEP:-}" && -f "$STATE/node.crt" ]]; then
+        "$STEP" ca revoke --cert "$STATE/node.crt" --key "$STATE/node.key" --ca-url "$ca_url" \
+            --root "$STATE/root_ca.crt" >/dev/null 2>&1 ||
+            printf 'fleet: could not revoke the certificate; it expires within 24 hours\n' >&2
+    fi
+    if [[ -n "${EPHEMERAL_ROOT:-}" ]]; then
+        edit_authorized_keys ""
+        rm -rf "$SSH_FLEET" "$EPHEMERAL_ROOT"
+    fi
+    rm -rf "${CLEANUP[@]+"${CLEANUP[@]}"}"
+    exit "$rc"
+}
+
+cmd_ephemeral() {
+    [[ $# -ge 1 ]] || fail 'usage: fleet ephemeral NAME --ca-url URL --fingerprint SHA256 [--no-trust] [--principal NAME]'
+    [[ ! -f "$STATE/node.crt" ]] || fail 'this machine has a persistent enrollment; use it instead'
+    [[ ! -e "$SSH_FLEET" ]] || fail '~/.ssh/fleet exists; another fleet identity owns the SSH settings'
+    local base
+    for base in "${XDG_RUNTIME_DIR:-}" /dev/shm "${TMPDIR:-/tmp}"; do
+        [[ -n "$base" && -d "$base" && -w "$base" ]] && break
+    done
+    EPHEMERAL_ROOT=$(mktemp -d "$base/fleet-ephemeral.XXXXXX")
+    STATE="$EPHEMERAL_ROOT/state/fleet"
+    CONFIG_DIR="$EPHEMERAL_ROOT/config/fleet"
+    CONFIG="$CONFIG_DIR/config"
+    trap ephemeral_exit EXIT
+    trap 'exit 0' INT TERM
+    ENROLL_QUIET=1
+    cmd_enroll "$@"
+    printf 'ephemeral identity %s is active. Keep this running; Ctrl-C revokes it and removes its files.\n' "$name"
+    while true; do
+        # A signal can land between the fork and $!, so the sleep must not hold this terminal's pipes.
+        sleep 3600 </dev/null >/dev/null 2>&1 &
+        wait $! || true
+        ( cmd_renew ) || printf 'fleet: renew failed; retrying in 1 hour\n' >&2
+    done
 }
 
 cmd_enroll_remote() {
@@ -344,7 +448,7 @@ cmd_renew() {
     "$STEP" certificate needs-renewal "$STATE/node.crt" --expires-in "$X509_RENEW_BEFORE" >/dev/null 2>&1 || rc=$?
     case "$rc" in
         0) "$STEP" ca renew "$STATE/node.crt" "$STATE/node.key" --force "${CA[@]}" >/dev/null 2>&1 ||
-               fail 'renewal failed; the certificate is expired or revoked. Enroll again with a new token.'
+               fail 'renewal failed; the certificate is expired or revoked. Enroll again: fleet login on a laptop, or a new token.'
            ssh_due=1 ;;
         1) ;;
         *) fail 'could not read the client certificate' ;;
@@ -462,6 +566,9 @@ case "$command" in
     token) cmd_token "$@" ;;
     enroll) cmd_enroll "$@" ;;
     enroll-remote) cmd_enroll_remote "$@" ;;
+    invite) cmd_invite "$@" ;;
+    login) cmd_login "$@" ;;
+    ephemeral) cmd_ephemeral "$@" ;;
     revoke) cmd_revoke "$@" ;;
     renew) cmd_renew "$@" ;;
     trust) cmd_trust "$@" ;;
