@@ -7,6 +7,12 @@ umask 077
 STEP_VERSION=0.31.0
 STEP_SHA256_amd64=2bc654b26ca467848edb764620d6f17febea9d7d3629368b76dd20ce40c6ef32
 STEP_SHA256_arm64=3252032aded050abe93a642681995d3e36c66eaf1979da1980bf71b5e8973516
+# pylon from agentic-control, served by the broker at /v1/artifacts/pylon/VERSION/TARGET.
+# fleet-config/artifacts/publish prints these values.
+PYLON_VERSION=0.1.0-4a1328e
+PYLON_SHA256_darwin_arm64=b517a4855e20ffdee3702aff2a78c53e7b12a3d63b8edae6184e7df8e7ef2a70
+PYLON_SHA256_linux_aarch64=698de2827e26685ea5b92d46353d8f6f02235ff41c89e119e4bed6b67f4c2188
+PYLON_SHA256_linux_x86_64=7073c34c7f0304beba2c45cbd73742092a58480a284a2ce79985bd7114831b35
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fleet"
 CONFIG="$CONFIG_DIR/config"
@@ -73,6 +79,7 @@ Any machine:
                                         (renew, agent, tunnels), remove the authorized_keys CA line,
                                         and delete the fleet keys and settings. Alias: remove.
   install-step                          Linux: install the pinned step CLI into ~/.local/bin (~/.local/<arch>/bin on no-sudo hosts).
+  install-pylon                         Install the pinned pylon from the broker into the same folder, and restart the agent.
 EOF
 }
 
@@ -137,14 +144,53 @@ find_step() {
     return 1
 }
 
+# The shell profiles turn on the no-sudo layout when ~/.local/<arch> exists. Use it only if it is
+# already there: on a no-sudo host ~/.local/bin can be shared by machines of other architectures.
+local_bin() {
+    if [[ -d "$HOME/.local/$(uname -m)" ]]; then echo "$HOME/.local/$(uname -m)/bin"; else echo "$HOME/.local/bin"; fi
+}
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi
+}
+
+install_pylon() {
+    local target sum_var sum dir have
+    target="$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)"
+    sum_var="PYLON_SHA256_${target//-/_}"
+    sum="${!sum_var:-}"
+    [[ -n "$sum" ]] || fail "no pylon build for $target"
+    dir=$(local_bin)
+    if [[ -x "$dir/pylon" ]]; then
+        have=$(sha256_of "$dir/pylon")
+        [[ "$have" == "$sum" ]] && { printf 'pylon %s is installed in %s\n' "$PYLON_VERSION" "$dir"; return 0; }
+    fi
+    need_enrollment
+    need_broker
+    mkdir -p "$dir"
+    scratch "$dir"
+    curl -fsS --cert "$STATE/node.crt" --key "$STATE/node.key" --cacert "$STATE/root_ca.crt" \
+        -o "$SCRATCH/pylon" "$broker_url/v1/artifacts/pylon/$PYLON_VERSION/$target" ||
+        fail "the broker did not return pylon $PYLON_VERSION for $target"
+    [[ "$(sha256_of "$SCRATCH/pylon")" == "$sum" ]] || fail "pylon download checksum mismatch; nothing installed"
+    chmod 0755 "$SCRATCH/pylon"
+    mv -f "$SCRATCH/pylon" "$dir/pylon"
+    printf 'installed pylon %s in %s\n' "$PYLON_VERSION" "$dir"
+    # A running agent keeps the old binary until it restarts.
+    if [[ "$(uname -s)" == Darwin ]]; then
+        launchctl print "gui/$(id -u)/dev.fleet.agent" >/dev/null 2>&1 &&
+            launchctl kickstart -k "gui/$(id -u)/dev.fleet.agent" || true
+    elif command -v systemctl >/dev/null 2>&1; then
+        systemctl --user try-restart fleet-agent.service 2>/dev/null || true
+    fi
+}
+
 install_step() {
     [[ "$(uname -s)" == Linux ]] || fail 'install step with Homebrew on macOS: brew install step'
     local arch sum_var sum dir work
     arch=$(step_arch)
     sum_var="STEP_SHA256_$arch"; sum="${!sum_var}"
-    # The shell profiles turn on the no-sudo layout when ~/.local/<arch> exists. Use it only if it is already there.
-    dir="$HOME/.local/bin"
-    [[ -d "$HOME/.local/$(uname -m)" ]] && dir="$HOME/.local/$(uname -m)/bin"
+    dir=$(local_bin)
     scratch; work="$SCRATCH"
     curl -fsSL -o "$work/step.tgz" "https://github.com/smallstep/cli/releases/download/v$STEP_VERSION/step_linux_$arch.tar.gz"
     printf '%s  %s\n' "$sum" "$work/step.tgz" | sha256sum -c - >/dev/null || fail 'step download checksum mismatch'
@@ -742,7 +788,7 @@ agent_sock() {
 
 find_pylon() {
     local candidate candidates=("${FLEET_PYLON:-}")
-    [[ -n "${FLEET_PYLON:-}" ]] || candidates=("$(command -v pylon 2>/dev/null || true)" "$HOME/.local/bin/pylon")
+    [[ -n "${FLEET_PYLON:-}" ]] || candidates=("$(command -v pylon 2>/dev/null || true)" "$(local_bin)/pylon")
     for candidate in "${candidates[@]}"; do
         [[ -n "$candidate" && -x "$candidate" ]] && { PYLON="$candidate"; return 0; }
     done
@@ -1155,6 +1201,7 @@ case "$command" in
     claude) cmd_secret env CLAUDE_CODE_OAUTH_TOKEN=claude-oauth-token -- claude "$@" ;;
     agent) cmd_agent "$@" ;;
     install-step) install_step ;;
+    install-pylon) install_pylon ;;
     -h|--help|help|"") usage ;;
     *) usage >&2; exit 2 ;;
 esac

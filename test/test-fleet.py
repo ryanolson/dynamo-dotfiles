@@ -1,6 +1,8 @@
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import tempfile
@@ -882,7 +884,7 @@ class InstallStep(FleetBase):
         bin_dir = self.home / 'bin'
         stubs = {
             'uname': '#!/bin/sh\n[ "$1" = -m ] && echo aarch64 || echo Linux\n',
-            'curl': '#!/bin/sh\nwhile [ "$1" != -o ]; do shift; done; : > "$2"\n',
+            'curl': '#!/bin/sh\nwhile [ $# -gt 0 ] && [ "$1" != -o ]; do shift; done; [ $# -ge 2 ] || exit 22; : > "$2"\n',
             'sha256sum': '#!/bin/sh\ncat >/dev/null\n',
             'tar': '#!/bin/sh\nd="$4/step_linux_arm64/bin"; mkdir -p "$d"\n'
                    'printf "#!/bin/sh\\necho Smallstep CLI\\n" > "$d/step"\n',
@@ -905,6 +907,75 @@ class InstallStep(FleetBase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.home / '.local/aarch64/bin/step').exists())
         self.assertFalse((self.home / '.local/bin/step').exists())
+
+
+class InstallPylon(FleetBase):
+    # A Linux aarch64 host. The curl stub writes $CURL_BODY to the -o file and logs the URL.
+    BODY = b'\x7fELF fake pylon'
+
+    def setUp(self):
+        super().setUp()
+        bin_dir = self.home / 'bin'
+        stubs = {
+            'uname': '#!/bin/sh\n[ "$1" = -m ] && echo aarch64 || echo Linux\n',
+            'curl': '#!/bin/sh\nprintf "%s\\n" "$*" >> "$HOME/curl.log"\n'
+                    'while [ $# -gt 0 ] && [ "$1" != -o ]; do shift; done; [ $# -ge 2 ] || exit 22\n'
+                    'cp "$CURL_BODY" "$2"\n',
+        }
+        for name, body in stubs.items():
+            (bin_dir / name).write_text(body)
+            (bin_dir / name).chmod(0o700)
+        self.body = self.home / 'body'
+        self.body.write_bytes(self.BODY)
+        # The pin is part of the script, so the test runs a copy with the pin of the fake binary.
+        text = SCRIPT.read_text()
+        self.version = re.search(r'^PYLON_VERSION=(\S+)$', text, re.M).group(1)
+        good = hashlib.sha256(self.BODY).hexdigest()
+        self.script = self.home / 'fleet'
+        self.script.write_text(re.sub(r'^(PYLON_SHA256_linux_aarch64=)\S+$', r'\g<1>' + good, text, flags=re.M))
+        self.enroll()
+
+    def install(self):
+        return subprocess.run(['bash', str(self.script), 'install-pylon'], capture_output=True, text=True,
+                              env=dict(self.env, CURL_BODY=str(self.body)))
+
+    def curls(self):
+        log = self.home / 'curl.log'
+        return [line for line in log.read_text().splitlines() if '/v1/artifacts/' in line] if log.exists() else []
+
+    def test_installs_the_pinned_binary_from_the_broker(self):
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pylon = self.home / '.local/bin/pylon'
+        self.assertEqual(pylon.read_bytes(), self.BODY)
+        self.assertEqual(self.mode(pylon), 0o755)
+        (curl,) = self.curls()
+        self.assertIn(f'https://ca.example:8443/v1/artifacts/pylon/{self.version}/linux-aarch64', curl)
+        self.assertIn(f'--cert {self.state}/node.crt', curl)
+        self.assertIn('systemctl --user try-restart fleet-agent.service', (self.home / 'scheduler.log').read_text())
+
+    def test_a_current_binary_is_not_downloaded_again(self):
+        self.install()
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.curls()), 1)
+
+    def test_a_wrong_checksum_installs_nothing(self):
+        pylon = self.home / '.local/bin/pylon'
+        pylon.parent.mkdir(parents=True, exist_ok=True)
+        pylon.write_text('old')
+        self.body.write_bytes(b'tampered')
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('checksum', result.stderr)
+        self.assertEqual(pylon.read_text(), 'old')
+        self.assertEqual(list(pylon.parent.glob('.fleet.*')), [])
+
+    def test_nosudo_host_installs_into_the_arch_folder(self):
+        (self.home / '.local/aarch64').mkdir(parents=True)
+        self.assertEqual(self.install().returncode, 0)
+        self.assertEqual((self.home / '.local/aarch64/bin/pylon').read_bytes(), self.BODY)
+        self.assertFalse((self.home / '.local/bin/pylon').exists())
 
 
 class GitconfigInclude(unittest.TestCase):
