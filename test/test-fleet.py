@@ -565,7 +565,7 @@ class Fleet(FleetBase):
 
     def start_real_agent(self):
         sock = Path(tempfile.mkdtemp(dir='/tmp')) / 'a.sock'
-        self.addCleanup(lambda: sock.parent.exists() and __import__('shutil').rmtree(sock.parent))
+        self.addCleanup(lambda: __import__('shutil').rmtree(sock.parent, ignore_errors=True))
         out = subprocess.run(['ssh-agent', '-a', str(sock)], capture_output=True, text=True, check=True).stdout
         pid = int(out.split('SSH_AGENT_PID=')[1].split(';')[0])
         self.addCleanup(lambda: subprocess.run(['kill', str(pid)]))
