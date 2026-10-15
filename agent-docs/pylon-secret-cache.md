@@ -2,7 +2,7 @@
 
 Date: 2026-10-15
 
-Status: done. Broker: fleet-config `0aaafe1`. Dotfiles: `14789b8`. pylon: agentic-control PR #184 (`pylon/secrets`, `83ed805`), released as `0.1.0-83ed805`.
+Status: done. Broker: fleet-config `0aaafe1`. Dotfiles: `14789b8`. pylon: agentic-control PR #184, squash-merged into `pylon/renew` as `634ffbc` after two review rounds, released as `0.1.0-634ffbc`.
 
 ## Goal
 
