@@ -818,6 +818,90 @@ class FleetLaptop(FleetBase):
         self.assertNotEqual(self.fleet('secret', 'env', 'TOKEN=missing', '--', 'true').returncode, 0)
         self.assertNotEqual(self.fleet('secret', 'env', 'bad-var=x', '--', 'true').returncode, 0)
 
+    REF = 'op://Fleet/NGC NIM Operations PAT/credential'
+    ENCODED = 'op%3A%2F%2FFleet%2FNGC%20NIM%20Operations%20PAT%2Fcredential'
+
+    def secrets_socket(self):
+        # A bound socket with no server: the curl stub plays pylon, so only the path must be a socket.
+        import socket as socketlib
+        path = self.home / '.ssh/fleet/secrets.sock'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        sock = socketlib.socket(socketlib.AF_UNIX)
+        sock.bind(str(path))
+        self.addCleanup(sock.close)
+        return path
+
+    def ref_curl(self):
+        # The curl stub answers as pylon for --unix-socket when $PYLON_UP is set, and as the broker otherwise.
+        self.secret_curl()
+        curl = self.home / 'bin/curl'
+        curl.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> "$HOME/curl-args"; echo == >> "$HOME/curl-args"\n'
+                        'case "$*" in *--unix-socket*) [ -n "$PYLON_UP" ] || exit 7; printf pylon-val; exit 0 ;; esac\n'
+                        'printf broker-val\n')
+        (self.home / 'curl-args').unlink(missing_ok=True)
+
+    def curl_calls(self):
+        return [c.strip().splitlines() for c in (self.home / 'curl-args').read_text().split('==') if c.strip()]
+
+    def test_secret_get_by_reference_asks_pylon_first(self):
+        self.ref_curl()
+        sock = self.secrets_socket()
+        result = self.fleet('secret', 'get', self.REF, PYLON_UP='1', FLEET_SECRETS_SOCK=str(sock))
+        self.assertEqual((result.returncode, result.stdout), (0, 'pylon-val'), result.stderr)
+        (call,) = self.curl_calls()
+        self.assertEqual(call[call.index('--unix-socket') + 1], str(sock))
+        self.assertEqual(call[-1], f'http://pylon/v1/secrets?ref={self.ENCODED}')
+
+    def test_secret_get_by_reference_falls_back_to_the_broker(self):
+        self.ref_curl()
+        sock = self.secrets_socket()
+        result = self.fleet('secret', 'get', self.REF, FLEET_SECRETS_SOCK=str(sock))
+        self.assertEqual((result.returncode, result.stdout), (0, 'broker-val'), result.stderr)
+        pylon, broker = self.curl_calls()
+        self.assertEqual(broker[-1], f'https://ca.example:8443/v1/secrets?ref={self.ENCODED}')
+        self.assertEqual(broker[broker.index('--cert') + 1], f'{self.state}/node.crt')
+        (self.home / 'curl-args').unlink()
+        result = self.fleet('secret', 'get', self.REF, FLEET_SECRETS_SOCK=str(self.home / 'none.sock'))
+        self.assertEqual(result.stdout, 'broker-val')
+        self.assertEqual(len(self.curl_calls()), 1)
+
+    def test_secret_env_takes_references(self):
+        self.ref_curl()
+        out = self.home / 'out'
+        result = self.fleet('secret', 'env', f'NGC_API_KEY={self.REF}', 'TOKEN=claude-oauth-token', '--',
+                            'sh', '-c', f'printf "%s|%s" "$NGC_API_KEY" "$TOKEN" > {out}')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(out.read_text(), 'broker-val|broker-val')
+
+    def test_invalid_references_are_refused_before_any_request(self):
+        self.ref_curl()
+        for bad in ['op://Fleet/x', 'op://Fleet/a/b/c/d', 'op://Fleet/a?b/c', 'op://Fleet/a/b;rm', 'op:/Fleet/a/b']:
+            self.assertNotEqual(self.fleet('secret', 'get', bad).returncode, 0, bad)
+        self.assertFalse((self.home / 'curl-args').exists())
+
+    def test_secret_flush_asks_pylon(self):
+        self.ref_curl()
+        sock = self.secrets_socket()
+        result = self.fleet('secret', 'flush', PYLON_UP='1', FLEET_SECRETS_SOCK=str(sock))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (call,) = self.curl_calls()
+        self.assertIn('POST', call)
+        self.assertEqual(call[-1], 'http://pylon/v1/flush')
+        self.assertNotEqual(self.fleet('secret', 'flush', FLEET_SECRETS_SOCK=str(self.home / 'none.sock')).returncode, 0)
+
+    def test_agent_turns_on_the_secrets_socket_when_pylon_has_it(self):
+        self.enroll()
+        pylon = self.home / 'bin/pylon'
+        pylon.write_text('#!/bin/sh\nif [ "$2" = --help ]; then echo "      --secrets-socket <PATH>"; exit 0; fi\n'
+                         'printf "%s\\n" "$@" > "$HOME/pylon-args"\n')
+        pylon.chmod(0o700)
+        result = self.fleet('agent', FLEET_PYLON=str(pylon), FLEET_AGENT_SOCK=str(self.home / 'a.sock'),
+                            FLEET_SECRETS_SOCK=str(self.home / 's.sock'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = (self.home / 'pylon-args').read_text().splitlines()
+        self.assertEqual(args[args.index('--secrets-socket') + 1], str(self.home / 's.sock'))
+        self.assertEqual(args[args.index('--broker-url') + 1], 'https://ca.example:8443')
+
     def test_claude_launcher_supplies_the_oauth_token(self):
         self.secret_curl()
         claude = self.home / 'bin/claude'

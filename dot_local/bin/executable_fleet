@@ -71,6 +71,9 @@ Any machine:
   tunnel run NAME | remove NAME | list
   secret get NAME                       Print a secret from the broker, if the policy allows this machine.
   secret env VAR=NAME... -- CMD...      Run CMD with secrets in its environment. Values are not printed.
+                                        NAME can be an op://VAULT/ITEM/[SECTION/]FIELD reference: pylon
+                                        answers it from its cache, else the broker looks it up.
+  secret flush                          Empty the secrets cache of the local pylon.
   claude [ARGS...]                      Run claude with CLAUDE_CODE_OAUTH_TOKEN from the secret claude-oauth-token.
   trust [--principal NAME] | untrust    Add or remove the CA line in ~/.ssh/authorized_keys.
   timer install | timer remove          Schedule renew every hour.
@@ -741,7 +744,52 @@ need_broker() {
     fi
 }
 
+valid_ref() {
+    local part='[A-Za-z0-9 ._-]+'
+    [[ "$1" =~ ^op://$part/$part/($part/)?$part$ ]]
+}
+
+# The characters that valid_ref allows need only these escapes in a query string.
+encode_ref() {
+    local s="${1// /%20}"
+    s="${s//:/%3A}"; s="${s//\//%2F}"
+    printf '%s' "$s"
+}
+
+secrets_sock() {
+    if [[ -n "${FLEET_SECRETS_SOCK:-}" ]]; then
+        printf '%s' "$FLEET_SECRETS_SOCK"
+    else
+        local agent; agent=$(agent_sock)
+        if [[ "$agent" == */fleet-agent.sock ]]; then
+            printf '%s' "${agent%/*}/fleet-secrets.sock"
+        else
+            printf '%s' "$SSH_FLEET/secrets.sock"
+        fi
+    fi
+}
+
+# pylon keeps values in memory for a short time. If it is not running or fails, ask the broker.
+ref_value() {
+    valid_ref "$1" || fail "invalid secret reference: $1"
+    local sock query
+    sock=$(secrets_sock)
+    query="ref=$(encode_ref "$1")"
+    if [[ -S "$sock" ]] && curl -fsS --unix-socket "$sock" "http://pylon/v1/secrets?$query" 2>/dev/null; then
+        return 0
+    fi
+    need_enrollment
+    need_broker
+    curl -fsS --cert "$STATE/node.crt" --key "$STATE/node.key" --cacert "$STATE/root_ca.crt" \
+        -H 'Accept: application/octet-stream' "$broker_url/v1/secrets?$query" ||
+        fail "the broker did not return the secret $1"
+}
+
 secret_value() {
+    if [[ "$1" == op://* ]]; then
+        ref_value "$1"
+        return
+    fi
     valid_secret "$1" || fail "invalid secret name: $1"
     need_enrollment
     need_broker
@@ -769,7 +817,12 @@ cmd_secret() {
                 export "$var=$value"
             done
             exec "$@" ;;
-        *) fail 'usage: fleet secret get NAME | fleet secret env VAR=NAME... -- CMD...' ;;
+        flush)
+            local sock; sock=$(secrets_sock)
+            [[ -S "$sock" ]] || fail "pylon does not serve secrets on $sock"
+            curl -fsS --unix-socket "$sock" -X POST http://pylon/v1/flush >/dev/null || fail 'pylon did not flush its cache'
+            echo 'flushed the pylon secrets cache' ;;
+        *) fail 'usage: fleet secret get NAME | fleet secret env VAR=NAME... -- CMD... | fleet secret flush' ;;
     esac
 }
 
@@ -840,8 +893,14 @@ agent_run() {
     addr="${FLEET_AGENT_ADDR:-$host:8444}"
     mkdir -p "$(dirname "$sock")"
     if [[ -n "${PYLON:-}" ]]; then
+        local -a secrets=()
+        # An older pylon has no secrets socket. Turn it on only when this pylon has the flag.
+        if "$PYLON" agent --help 2>/dev/null | grep -q -- --secrets-socket; then
+            need_broker
+            secrets=(--secrets-socket "$(secrets_sock)" --broker-url "$broker_url")
+        fi
         exec "$PYLON" agent --socket "$sock" --broker "$addr" \
-            --cert "$STATE/node.crt" --key "$STATE/node.key" --ca "$STATE/root_ca.crt"
+            --cert "$STATE/node.crt" --key "$STATE/node.key" --ca "$STATE/root_ca.crt" ${secrets[@]+"${secrets[@]}"}
     fi
     exec "$SOCAT" "UNIX-LISTEN:$sock,fork,unlink-early,mode=600" \
         "OPENSSL:$addr,cert=$STATE/node.crt,key=$STATE/node.key,cafile=$STATE/root_ca.crt,verify=1"

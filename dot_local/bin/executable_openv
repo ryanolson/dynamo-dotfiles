@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# A machine with 1Password has op:// references in dev.env.op. A machine without it has
-# VAR=name lines in dev.env.fleet, and the fleet broker serves each name. chezmoi writes
-# only one of the two with content, from onepassword.enabled.
-ENV_FILE="${DYNAMO_OP_ENV_FILE:-$HOME/.config/dynamo/dev.env.op}"
-FLEET_FILE="$HOME/.config/dynamo/dev.env.fleet"
+# Every machine has the same file of VAR=op://... lines. openv asks fleet for each value
+# (the local pylon cache, else the broker). If any value fails, or the machine is not
+# enrolled, op resolves the whole file. A command never gets values from both sources.
+REFS="$HOME/.config/dynamo/dev.env.fleet"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/fleet"
 
 usage() {
     echo "Usage: openv <command...>" >&2
@@ -14,29 +14,43 @@ usage() {
 
 [[ $# -gt 0 ]] || usage
 
-if [[ -f "$ENV_FILE" ]] && grep -Eq '^[A-Z_][A-Z0-9_]*=' "$ENV_FILE"; then
-    if ! command -v op >/dev/null 2>&1; then
-        echo "openv: 1Password CLI (op) is not installed" >&2
-        exit 1
-    fi
-    exec op run --env-file "$ENV_FILE" -- "$@"
-fi
-
-pairs=()
-if [[ -f "$FLEET_FILE" ]]; then
+part='[A-Za-z0-9 ._-]+'
+vars=()
+refs=()
+if [[ -f "$REFS" ]]; then
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ -z "$line" || "$line" == \#* ]] && continue
-        # A broker name cannot start with '-', so a line cannot add an option to fleet.
-        if [[ ! "$line" =~ ^[A-Z_][A-Z0-9_]*=[a-z0-9][a-z0-9-]*$ ]]; then
-            echo "openv: invalid line in $FLEET_FILE: $line" >&2
+        if [[ ! "$line" =~ ^([A-Z_][A-Z0-9_]*)=(op://$part/$part/($part/)?$part)$ ]]; then
+            echo "openv: invalid line in $REFS: $line" >&2
             exit 1
         fi
-        pairs+=("$line")
-    done < "$FLEET_FILE"
+        vars+=("${BASH_REMATCH[1]}")
+        refs+=("${BASH_REMATCH[2]}")
+    done < "$REFS"
 fi
-if [[ ${#pairs[@]} -eq 0 ]]; then
-    echo "openv: no secrets: $ENV_FILE has no references and $FLEET_FILE has no broker names" >&2
+if [[ ${#vars[@]} -eq 0 ]]; then
+    echo "openv: no secret references in $REFS" >&2
     exit 1
 fi
+
 fleet=$(command -v fleet || echo "$HOME/.local/bin/fleet")
-exec "$fleet" secret env "${pairs[@]}" -- "$@"
+if [[ -x "$fleet" && -f "$STATE/node.crt" ]]; then
+    values=()
+    for ref in "${refs[@]}"; do
+        value=$("$fleet" secret get "$ref" 2>/dev/null) || { values=(); break; }
+        values+=("$value")
+    done
+    if [[ ${#values[@]} -eq ${#vars[@]} ]]; then
+        for i in "${!vars[@]}"; do
+            export "${vars[$i]}=${values[$i]}"
+        done
+        unset values value
+        exec "$@"
+    fi
+fi
+
+if command -v op >/dev/null 2>&1; then
+    exec op run --env-file "$REFS" -- "$@"
+fi
+echo "openv: the fleet broker did not return the secrets, and the 1Password CLI (op) is not installed" >&2
+exit 1

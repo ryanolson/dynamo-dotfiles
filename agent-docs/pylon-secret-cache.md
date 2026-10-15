@@ -2,7 +2,7 @@
 
 Date: 2026-10-15
 
-Status: plan. Implementation in progress.
+Status: steps 1 and 2 done (fleet-config `0aaafe1`, dotfiles). Step 3 in progress.
 
 ## Goal
 
@@ -35,7 +35,8 @@ flowchart LR
   OP -->|no| X[error]
 ```
 
-- A command gets all of its values from one source, never a mix.
+- A command gets all of its values from one source, never a mix of broker and `op` values. pylon and the broker count as one source: pylon holds copies of broker values.
+- `openv` calls `fleet secret get` once for each variable. `fleet` asks pylon first and the broker when pylon fails.
 - `dev.env.op` stays for `openv-file` and for references outside `Fleet`. Open question: does any machine need a variable in `openv` that is not in `Fleet`? The local `credentials_*.yaml` overrides were not read.
 
 ## Broker: look up by reference

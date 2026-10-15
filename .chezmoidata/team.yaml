@@ -39,12 +39,11 @@ onepassword:
     # Deliberately no github_token. GitHub auth is 'gh auth login' only; see the
     # GitHub auth policy in README.md. Do not re-add one here.
 
-# Broker secret names for openv on machines without 1Password. Each variable in
-# onepassword.secrets has an entry. The broker policy in fleet-config/broker/secrets.json
-# maps each name to an item in the Fleet vault.
+# Secret references for openv on every machine. Each item is in the Fleet vault, so both the
+# fleet broker (fleet-config/broker/secrets.json) and op can read it.
 fleet_secrets:
-  hf_token: "hf-token"
-  ngc_api_key: "ngc-api-key"
+  hf_token: "op://Fleet/HuggingFace/credential"
+  ngc_api_key: "op://Fleet/NGC NIM Operations PAT/credential"
 
 tools:
   # Core development tools that everyone should have

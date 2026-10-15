@@ -85,11 +85,6 @@ Desktop.ini
 .npmrc
 {{- end }}
 
-# A machine with 1Password uses dev.env.op. The broker map is for the other machines.
-{{- if .onepassword.enabled }}
-.config/dynamo/dev.env.fleet
-{{- end }}
-
 # systemd only on Linux
 {{- if ne .chezmoi.os "linux" }}
 .config/systemd
