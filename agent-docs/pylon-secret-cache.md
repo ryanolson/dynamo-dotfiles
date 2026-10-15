@@ -57,7 +57,7 @@ The protocol is HTTP/1.1 on the socket. `curl --unix-socket` can call it, so the
 |---|---|
 | `GET /v1/secrets?ref=<URL-encoded reference>` | 200 with the raw value (`application/octet-stream`). The broker status for 404, 403, and 429. 503 when the broker cannot be reached. |
 | `POST /v1/flush` | 200 with `{"flushed": N}`. Removes every value from the cache. |
-| `GET /v1/status` | 200 with `{"entries": N, "ttl": S}`. No references and no values. |
+| `GET /v1/status` | 200 with `{"entries": N, "ttl": S, "version": V}`, where `V` is the pylon crate version. No references and no values. |
 
 Rules:
 
