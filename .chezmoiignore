@@ -79,6 +79,12 @@ Desktop.ini
 .config/fish/conf.d/ssh-auth-sock.fish
 {{- end }}
 
+# The npm prefix in ~/.npmrc is for one architecture. A no-sudo home can be shared
+# across architectures, so the shell's NPM_CONFIG_PREFIX stays the only setting there.
+{{- if eq .machine_class "nosudo" }}
+.npmrc
+{{- end }}
+
 # systemd only on Linux
 {{- if ne .chezmoi.os "linux" }}
 .config/systemd
