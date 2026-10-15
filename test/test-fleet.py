@@ -6,6 +6,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -1948,6 +1949,108 @@ class ExecutorApply(Executors):
         self.assertTrue(self.targets()[0].exists())
         self.assertEqual(self.executor('apply', new).returncode, 0)
         self.assertEqual(self.record(), {'fleet-apply': [new, '1700000100'], 'pylon-install': [old, '1700000000']})
+
+
+# cmp runs in executor_apply after the fence lock is taken. With $HOLD set, it waits for
+# $HOME/release, so a test holds one executor inside the lock while another starts.
+HOLDING_CMP = r'''#!/bin/sh
+echo "$PWD" >> "$HOME/cmp.log"
+if [ -n "$HOLD" ]; then
+  : > "$HOME/holding"
+  i=0; while [ ! -f "$HOME/release" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done
+fi
+exec /usr/bin/cmp "$@"
+'''
+
+
+class ExecutorConcurrency(Executors):
+    def start(self, command, sha, **env):
+        return subprocess.Popen(['bash', 'dot_local/bin/executable_fleet', 'executor', command], cwd=self.checkout(sha),
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                env=dict(self.env, **dict({'FLEET_PYLON_WAIT': '3'}, **env)))
+
+    def wait_for(self, path):
+        for _ in range(200):
+            if path.exists():
+                return
+            time.sleep(0.05)
+        self.fail(f'{path} did not appear')
+
+    def race(self, first, second):
+        """Run FIRST and hold it inside the fence lock, start SECOND, check that SECOND waits for the lock,
+        then let FIRST go. Returns both results as (returncode, stdout, stderr)."""
+        (self.home / 'bin/cmp').write_text(HOLDING_CMP)
+        (self.home / 'bin/cmp').chmod(0o700)
+        a = self.start('apply', first, HOLD='1')
+        self.wait_for(self.home / 'holding')
+        b = self.start('apply', second)
+        time.sleep(1.5)
+        self.assertIsNone(b.poll())
+        self.assertEqual(len((self.home / 'cmp.log').read_text().splitlines()), 1)
+        (self.home / 'release').write_text('')
+        out = []
+        for proc in (a, b):
+            stdout, stderr = proc.communicate(timeout=60)
+            out.append((proc.returncode, stdout, stderr))
+        return out
+
+    def test_an_older_commit_that_waits_for_a_newer_one_is_refused(self):
+        old = self.commit(1_700_000_000, marker='one')
+        new = self.commit(1_700_000_100, marker='two')
+        (rc_new, _, err_new), (rc_old, _, err_old) = self.race(new, old)
+        self.assertEqual(rc_new, 0, err_new)
+        self.assertNotEqual(rc_old, 0)
+        self.assertIn('older than', err_old)
+        self.assertTrue(self.targets()[0].read_text().endswith('# two\n'))
+        self.assertEqual(self.record(), {'fleet-apply': [new, '1700000100']})
+
+    def test_a_newer_commit_that_waits_for_an_older_one_applies_after_it(self):
+        old = self.commit(1_700_000_000, marker='one')
+        new = self.commit(1_700_000_100, marker='two')
+        (rc_old, _, err_old), (rc_new, _, err_new) = self.race(old, new)
+        self.assertEqual((rc_old, rc_new), (0, 0), err_old + err_new)
+        self.assertTrue(self.targets()[0].read_text().endswith('# two\n'))
+        self.assertEqual(self.record(), {'fleet-apply': [new, '1700000100']})
+
+
+# python3 for the fence record: with $KILL_AT_RECORD set, it kills the executor (its parent) with
+# SIGKILL before the record is written, as a crash or a power loss between apply and record would.
+KILLING_PYTHON = r'''#!/bin/sh
+if [ "$3" = fence-record ] && [ -n "$KILL_AT_RECORD" ]; then kill -9 $PPID; exit 1; fi
+exec {python} "$@"
+'''
+
+
+class ExecutorInterrupted(Executors):
+    def killed_before_record(self, command, sha):
+        tools = self.home / 'kill-bin'
+        tools.mkdir(exist_ok=True)
+        (tools / 'python3').write_text(KILLING_PYTHON.format(python=sys.executable))
+        (tools / 'python3').chmod(0o700)
+        result = self.executor(command, sha, KILL_AT_RECORD='1', PATH=f"{tools}:{self.env['PATH']}")
+        self.assertEqual(result.returncode, -9)
+        self.assertNotIn(command, self.record())
+
+    def test_fleet_apply_killed_before_its_record_applies_and_records_on_rerun(self):
+        sha = self.commit(1_700_000_000, marker='one')
+        self.killed_before_record('apply', sha)
+        self.assertTrue(self.targets()[0].read_text().endswith('# one\n'))
+        self.targets()[1].unlink()
+        result = self.executor('apply', sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f'applied {sha[:12]}', result.stdout)
+        self.assertEqual(self.targets()[1].read_text(), '#!/bin/sh\n# keygen one\n')
+        self.assertEqual(self.record(), {'fleet-apply': [sha, '1700000000']})
+
+    def test_pylon_install_killed_before_its_record_installs_and_records_on_rerun(self):
+        sha = self.commit(1_700_000_000)
+        self.killed_before_record('pylon-install', sha)
+        self.assertEqual(self.scheduler().count('systemctl --user restart fleet-agent.service'), 1)
+        result = self.executor('pylon-install', sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f'installed {sha[:12]}', result.stdout)
+        self.assertEqual(self.scheduler().count('systemctl --user restart fleet-agent.service'), 2)
+        self.assertEqual(self.record(), {'pylon-install': [sha, '1700000000']})
 
 
 class ExecutorPylonInstall(Executors):
