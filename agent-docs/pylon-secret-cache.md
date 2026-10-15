@@ -2,7 +2,7 @@
 
 Date: 2026-10-15
 
-Status: steps 1 and 2 done (fleet-config `0aaafe1`, dotfiles). Step 3 in progress.
+Status: done. Broker: fleet-config `0aaafe1`. Dotfiles: `14789b8`. pylon: agentic-control PR #184 (`pylon/secrets`, `83ed805`), released as `0.1.0-83ed805`.
 
 ## Goal
 
