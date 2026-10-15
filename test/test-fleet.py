@@ -17,6 +17,14 @@ USER_CA = 'ecdsa-sha2-nistp256 AAAAUSERCA'
 HOST_CA = 'ecdsa-sha2-nistp256 AAAAHOSTCA'
 TOKEN = 'eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.c2ln'
 
+def clean_env(**values):
+    # Never all of os.environ: an inherited FLEET_AGENT_SOCK, FLEET_SECRETS_SOCK, SSH_AUTH_SOCK, or
+    # XDG_RUNTIME_DIR points fleet at the host's live sockets, and some tests remove "their" socket.
+    env = {k: v for k, v in os.environ.items() if k in ('PATH', 'LANG', 'TMPDIR') or k.startswith('LC_')}
+    env.update(values)
+    return env
+
+
 STEP_STUB = r'''#!/usr/bin/env python3
 import json, os, sys
 from pathlib import Path
@@ -83,11 +91,13 @@ class FleetBase(unittest.TestCase):
             (bin_dir / name).chmod(0o700)
         self.log = self.home / 'step.log'
         # On Linux, fleet puts the agent and secrets sockets under XDG_RUNTIME_DIR, and falls back to
-        # /run/user/UID without it. A test that inherited either would remove the host's live sockets.
+        # FLEET_RUNTIME_BASE/UID (/run/user/UID) without it. Both are the test's, or a test that removes
+        # its socket would remove the host's live one.
         runtime = self.home / 'run'
         runtime.mkdir(mode=0o700)
-        self.env = dict(os.environ, HOME=str(self.home), PATH=f'{bin_dir}:{os.environ["PATH"]}',
-                        XDG_RUNTIME_DIR=str(runtime),
+        (self.home / 'run-user').mkdir(mode=0o755)
+        self.env = clean_env(HOME=str(self.home), PATH=f'{bin_dir}:{os.environ["PATH"]}',
+                        XDG_RUNTIME_DIR=str(runtime), FLEET_RUNTIME_BASE=str(self.home / 'run-user'),
                         STEP_LOG=str(self.log), EXPECT_TOKEN=TOKEN, USER_CA=USER_CA, HOST_CA=HOST_CA,
                         XDG_CONFIG_HOME=str(self.home / '.config'), XDG_STATE_HOME=str(self.home / '.local/state'),
                         FLEET_PYLON=str(self.home / 'no-pylon'), FLEET_TAILSCALE=str(self.home / 'no-tailscale'))
@@ -563,7 +573,7 @@ class Fleet(FleetBase):
             key = self.home / name
             subprocess.run(['ssh-keygen', '-q', '-t', 'ecdsa', '-b', '256', '-N', '', '-C', f'fleet {name}',
                             '-f', str(key)], check=True)
-            subprocess.run(['ssh-add', '-q', str(key)], env=dict(os.environ, SSH_AUTH_SOCK=str(sock)), check=True)
+            subprocess.run(['ssh-add', '-q', str(key)], env=clean_env(SSH_AUTH_SOCK=str(sock)), check=True)
         return sock, (self.home / 'agent-signing.pub').read_text().split()[:2]
 
     def test_agent_install_wires_git_signing_and_github(self):
@@ -603,7 +613,7 @@ class Fleet(FleetBase):
         wrapper.chmod(0o755)
         repo = self.home / 'repo'
         repo.mkdir()
-        genv = dict(os.environ, HOME=str(self.home), SSH_AUTH_SOCK='/nonexistent', FLEET_AGENT_SOCK=str(sock),
+        genv = clean_env(HOME=str(self.home), SSH_AUTH_SOCK='/nonexistent', FLEET_AGENT_SOCK=str(sock),
                     GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=str(self.home / '.gitconfig'))
         (self.home / '.gitconfig').write_text(f'[user]\n    name = T\n    email = t@example.com\n'
                                               f'[include]\n    path = {ssh}/fleet/gitconfig\n')
@@ -1486,13 +1496,16 @@ class WorkerInstall(ActlBase):
         self.assertIn(f'--cert {self.state}/node.crt', dl_actl)
 
     def test_install_without_a_runtime_folder_renders_the_user_runtime_folder(self):
-        # A Tailscale SSH session has no XDG_RUNTIME_DIR. Every command here is a stub.
+        # A Tailscale SSH session has no XDG_RUNTIME_DIR. fleet falls back to BASE/UID, and the base
+        # is the test's, so nothing under the host's /run/user can be reached.
         env = dict(self.env)
         del env['XDG_RUNTIME_DIR']
+        runtime = Path(env['FLEET_RUNTIME_BASE']) / str(os.getuid())
+        runtime.mkdir(mode=0o700)
         result = subprocess.run(['bash', str(self.script), 'worker', 'install'], capture_output=True, text=True, env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         args = self.executor_args((self.config_dir / 'worker.toml').read_text(), 'pylon-install')
-        self.assertIn(f'XDG_RUNTIME_DIR=/run/user/{os.getuid()}', args)
+        self.assertIn(f'XDG_RUNTIME_DIR={runtime}', args)
 
     def test_linux_install_refuses_paths_that_systemd_would_expand(self):
         # systemd expands % specifiers and $ variables in ExecStart, so the unit would run another path.
@@ -2534,6 +2547,22 @@ class FleetTask(ActlBase):
         self.assertIn('unsent', result.stdout)
 
 
+class TestEnvironment(unittest.TestCase):
+    def test_inherited_sockets_never_reach_fleet(self):
+        # A developer's shell holds the live agent, secrets, and SSH sockets. A test that removes "its"
+        # socket must not find one of these through an inherited variable. Short paths: socket limits.
+        with tempfile.TemporaryDirectory(dir='/tmp') as tmp:
+            live = {name: Path(tmp) / name for name in ('FLEET_AGENT_SOCK', 'FLEET_SECRETS_SOCK', 'SSH_AUTH_SOCK')}
+            for path in live.values():
+                path.write_text('')
+            env = dict(os.environ, **{name: str(path) for name, path in live.items()})
+            result = subprocess.run([sys.executable, __file__, 'Fleet.test_linux_sockets_stay_under_the_test_home',
+                                     'FleetEphemeral'], capture_output=True, text=True, env=env, timeout=240)
+            for path in live.values():
+                self.assertTrue(path.exists(), path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+
 class GitconfigInclude(unittest.TestCase):
     def test_gitconfig_includes_the_fleet_fragment_last(self):
         for data in ['data:\n  name: T\n  email: t@example.com\n',
@@ -2544,7 +2573,7 @@ class GitconfigInclude(unittest.TestCase):
                 config.write_text(data)
                 text = subprocess.run(['chezmoi', '--config', str(config), '--source', str(ROOT), 'execute-template'],
                                       input=(ROOT / 'dot_gitconfig.tmpl').read_text(), capture_output=True, text=True,
-                                      check=True, env=dict(os.environ, HOME=tmp)).stdout
+                                      check=True, env=clean_env(HOME=tmp)).stdout
                 includes = [l.strip() for l in text.splitlines() if l.strip().startswith('path =')]
                 self.assertEqual(includes[-1], 'path = ~/.ssh/fleet/gitconfig')
 
@@ -2555,7 +2584,7 @@ class SshConfigInclude(unittest.TestCase):
             home = Path(tmp)
             config = home / 'chezmoi.yaml'
             config.write_text('data:\n  name: Test\n  email: test@example.com\n')
-            env = dict(os.environ, HOME=str(home))
+            env = clean_env(HOME=str(home))
             modifier = subprocess.run(['chezmoi', '--config', str(config), '--source', str(ROOT), 'execute-template'],
                                       input=(ROOT / 'private_dot_ssh/modify_private_config.tmpl').read_text(),
                                       capture_output=True, text=True, check=True, env=env).stdout

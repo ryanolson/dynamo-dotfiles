@@ -182,7 +182,7 @@ class ActlContract(unittest.TestCase):
             (bindir / name).write_text(body)
             (bindir / name).chmod(0o700)
         cls.actl = Path(ACTL_DIR) / 'actl'
-        cls.env = dict(os.environ, HOME=str(home), PATH=f'{bindir}:{os.environ["PATH"]}', STEP_LOG=str(home / 'step.log'),
+        cls.env = tf.clean_env(HOME=str(home), PATH=f'{bindir}:{os.environ["PATH"]}', STEP_LOG=str(home / 'step.log'),
                        EXPECT_TOKEN=tf.TOKEN, USER_CA=tf.USER_CA, HOST_CA=tf.HOST_CA,
                        XDG_CONFIG_HOME=str(home / '.config'), XDG_STATE_HOME=str(home / '.local/state'),
                        FLEET_PYLON=str(home / 'no-pylon'), FLEET_TAILSCALE=str(home / 'no-tailscale'),
@@ -190,6 +190,8 @@ class ActlContract(unittest.TestCase):
         # Never the host's runtime folder: fleet keeps its agent and secrets sockets there on Linux.
         (cls.tmp / 'run').mkdir(mode=0o700)
         cls.env['XDG_RUNTIME_DIR'] = str(cls.tmp / 'run')
+        (cls.tmp / 'run-user').mkdir(mode=0o755)
+        cls.env['FLEET_RUNTIME_BASE'] = str(cls.tmp / 'run-user')
         cls.commit = os.environ.get('FLEET_CONTRACT_COMMIT') or subprocess.run(
             ['git', 'ls-remote', 'https://github.com/ryanolson/dynamo-dotfiles.git', 'refs/heads/main'],
             capture_output=True, text=True, check=True).stdout.split()[0]

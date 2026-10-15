@@ -880,14 +880,20 @@ cmd_secret() {
     esac
 }
 
+# The user's runtime folder when XDG_RUNTIME_DIR is unset. FLEET_RUNTIME_BASE lets tests use their
+# own folder: a test that falls back to /run/user/UID would reach the host's live sockets.
+user_runtime_dir() {
+    printf '%s' "${XDG_RUNTIME_DIR:-${FLEET_RUNTIME_BASE:-/run/user}/$(id -u)}"
+}
+
 # Unix socket paths are limited to 104 bytes on macOS and 108 on Linux.
 agent_sock() {
     if [[ -n "${FLEET_AGENT_SOCK:-}" ]]; then
         printf '%s' "$FLEET_AGENT_SOCK"
-    elif [[ "$(uname -s)" == Linux && -d "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" ]]; then
+    elif [[ "$(uname -s)" == Linux && -d "$(user_runtime_dir)" ]]; then
         # The systemd user service always has XDG_RUNTIME_DIR. Some SSH sessions (Tailscale SSH)
         # do not, so fall back to the same directory, or install looks for the wrong socket.
-        printf '%s' "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/fleet-agent.sock"
+        printf '%s' "$(user_runtime_dir)/fleet-agent.sock"
     else
         printf '%s' "$SSH_FLEET/agent.sock"
     fi
@@ -1687,7 +1693,7 @@ render_worker() {
         "XDG_STATE_HOME=${XDG_STATE_HOME:-$HOME/.local/state}")
     # The runtime folder of the user who runs install (user_bus fills it for an SSH session without
     # one): systemctl --user finds the user manager through it, and pylon keeps its sockets in it.
-    [[ "$os" == linux ]] && env_args+=("XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}")
+    [[ "$os" == linux ]] && env_args+=("XDG_RUNTIME_DIR=$(user_runtime_dir)")
     env_args+=("PATH=$(executor_path)")
     toml_check "$ACTL_SERVER" "$ACTL_CONFIG_DIR" "$ACTL_STATE" "$WORKER_ROOT" "$git" "$bin" "${env_args[@]}"
     {
@@ -1718,8 +1724,9 @@ WORKER_LOG="$HOME/Library/Logs/fleet-worker.log"
 # SSH sessions without a login session (Tailscale SSH) have no XDG_RUNTIME_DIR, and
 # systemctl --user needs it to find the user manager.
 user_bus() {
-    if [[ "$(uname -s)" == Linux && -z "${XDG_RUNTIME_DIR:-}" && -d "/run/user/$(id -u)" ]]; then
-        export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+    if [[ "$(uname -s)" == Linux && -z "${XDG_RUNTIME_DIR:-}" && -d "$(user_runtime_dir)" ]]; then
+        XDG_RUNTIME_DIR=$(user_runtime_dir)
+        export XDG_RUNTIME_DIR
     fi
 }
 
