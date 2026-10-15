@@ -1059,13 +1059,47 @@ class InstallPylon(FleetBase):
         (curl,) = self.curls()
         self.assertIn(f'https://ca.example:8443/v1/artifacts/pylon/{self.version}/linux-aarch64', curl)
         self.assertIn(f'--cert {self.state}/node.crt', curl)
-        self.assertIn('systemctl --user try-restart fleet-agent.service', (self.home / 'scheduler.log').read_text())
+        self.assertIn('systemctl --user restart fleet-agent.service', self.restarts())
+
+    def restarts(self):
+        log = self.home / 'scheduler.log'
+        return [l for l in log.read_text().splitlines() if 'fleet-agent' in l or 'dev.fleet.agent' in l] \
+            if log.exists() else []
 
     def test_a_current_binary_is_not_downloaded_again(self):
         self.install()
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self.curls()), 1)
+
+    def test_the_agent_restarts_also_when_the_binary_was_current(self):
+        # A pylon-install task proves the daemon that runs, so a current file is no reason to skip.
+        self.assertEqual(self.install().returncode, 0)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.restarts(), ['systemctl --user restart fleet-agent.service'] * 2)
+
+    def test_a_failed_restart_fails_install(self):
+        (self.home / 'bin/systemctl').write_text('#!/bin/sh\nprintf "systemctl %s\\n" "$*" >> "$HOME/scheduler.log"\n'
+                                                 'case "$*" in *restart*) exit 5 ;; esac\n')
+        for label in ['new binary', 'current binary']:
+            result = self.install()
+            self.assertNotEqual(result.returncode, 0, label)
+            self.assertIn('could not restart the fleet agent', result.stderr, label)
+        self.assertEqual((self.home / '.local/bin/pylon').read_bytes(), self.BODY)
+
+    def test_macos_restarts_the_launchd_agent_and_fails_when_it_cannot(self):
+        (self.home / 'bin/uname').write_text('#!/bin/sh\n[ "$1" = -m ] && echo arm64 || echo Darwin\n')
+        text = self.script.read_text()
+        good = hashlib.sha256(self.BODY).hexdigest()
+        self.script.write_text(re.sub(r'^(PYLON_SHA256_darwin_arm64=)\S+$', r'\g<1>' + good, text, flags=re.M))
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.restarts(), [f'launchctl kickstart -k gui/{os.getuid()}/dev.fleet.agent'])
+        (self.home / 'bin/launchctl').write_text('#!/bin/sh\nexit 113\n')
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('could not restart the fleet agent', result.stderr)
 
     def test_a_wrong_checksum_installs_nothing(self):
         pylon = self.home / '.local/bin/pylon'

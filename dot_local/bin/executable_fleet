@@ -94,7 +94,8 @@ Any machine:
                                         (renew, agent, tunnels), remove the authorized_keys CA line,
                                         and delete the fleet keys and settings. Alias: remove.
   install-step                          Linux: install the pinned step CLI into ~/.local/bin (~/.local/<arch>/bin on no-sudo hosts).
-  install-pylon                         Install the pinned pylon from the broker into the same folder, and restart the agent.
+  install-pylon                         Install the pinned pylon from the broker into the same folder, and restart
+                                        the agent, also when the binary was current. Fails when the restart fails.
 
 Fleet tasks through actl (the controller runs on the host that the broker's /v1/actl names):
   worker install [--timeout S]          Install or update the pinned actl pair, the worker seed, the
@@ -194,28 +195,37 @@ install_pylon() {
     sum="${!sum_var:-}"
     [[ -n "$sum" ]] || fail "no pylon build for $target"
     dir=$(local_bin)
-    if [[ -x "$dir/pylon" ]]; then
-        have=$(sha256_of "$dir/pylon")
-        [[ "$have" == "$sum" ]] && { printf 'pylon %s is installed in %s\n' "$PYLON_VERSION" "$dir"; return 0; }
+    if [[ -x "$dir/pylon" && "$(sha256_of "$dir/pylon")" == "$sum" ]]; then
+        printf 'pylon %s is installed in %s\n' "$PYLON_VERSION" "$dir"
+    else
+        need_enrollment
+        need_broker
+        mkdir -p "$dir"
+        scratch "$dir"
+        curl -fsS --cert "$STATE/node.crt" --key "$STATE/node.key" --cacert "$STATE/root_ca.crt" \
+            -o "$SCRATCH/pylon" "$broker_url/v1/artifacts/pylon/$PYLON_VERSION/$target" ||
+            fail "the broker did not return pylon $PYLON_VERSION for $target"
+        [[ "$(sha256_of "$SCRATCH/pylon")" == "$sum" ]] || fail "pylon download checksum mismatch; nothing installed"
+        chmod 0755 "$SCRATCH/pylon"
+        mv -f "$SCRATCH/pylon" "$dir/pylon"
+        printf 'installed pylon %s in %s\n' "$PYLON_VERSION" "$dir"
     fi
-    need_enrollment
-    need_broker
-    mkdir -p "$dir"
-    scratch "$dir"
-    curl -fsS --cert "$STATE/node.crt" --key "$STATE/node.key" --cacert "$STATE/root_ca.crt" \
-        -o "$SCRATCH/pylon" "$broker_url/v1/artifacts/pylon/$PYLON_VERSION/$target" ||
-        fail "the broker did not return pylon $PYLON_VERSION for $target"
-    [[ "$(sha256_of "$SCRATCH/pylon")" == "$sum" ]] || fail "pylon download checksum mismatch; nothing installed"
-    chmod 0755 "$SCRATCH/pylon"
-    mv -f "$SCRATCH/pylon" "$dir/pylon"
-    printf 'installed pylon %s in %s\n' "$PYLON_VERSION" "$dir"
-    # A running agent keeps the old binary until it restarts.
+    restart_agent
+}
+
+# A running agent keeps the old binary until it restarts. Restart it also when the file was current:
+# an earlier install can have replaced the file and then failed to restart, and the pylon-install
+# executor must prove the daemon that runs, not the file.
+restart_agent() {
     if [[ "$(uname -s)" == Darwin ]]; then
-        launchctl print "gui/$(id -u)/dev.fleet.agent" >/dev/null 2>&1 &&
-            launchctl kickstart -k "gui/$(id -u)/dev.fleet.agent" || true
-    elif command -v systemctl >/dev/null 2>&1; then
-        systemctl --user try-restart fleet-agent.service 2>/dev/null || true
+        launchctl kickstart -k "gui/$(id -u)/dev.fleet.agent" >/dev/null 2>&1 ||
+            fail 'could not restart the fleet agent (launchd agent dev.fleet.agent). Run: fleet agent install'
+    else
+        user_bus
+        command -v systemctl >/dev/null 2>&1 && systemctl --user restart fleet-agent.service ||
+            fail 'could not restart the fleet agent (systemd user service fleet-agent). Run: fleet agent install'
     fi
+    printf 'restarted the fleet agent\n'
 }
 
 install_step() {
