@@ -401,13 +401,13 @@ On the admin laptop:
 ```bash
 fleet actl client-init        # once, before the deployment: prints the client.cli public key
 fleet actl client-config      # after /v1/actl is published: writes client.toml and ca.pem
-fleet worker enroll HOST [--controller bb] [--provisioner ~/repos/agentic-control] [--fleet-config ~/repos/fleet-config] [--timeout 120]
+fleet worker enroll HOST [--controller bb] [--provisioner '~/repos/agentic-control-fleet'] [--fleet-config ~/repos/fleet-config] [--timeout 120]
 fleet task NAME --host ID... | --all [--commit SHA] [--timeout 600]
 fleet task --resume RUN [--timeout 600]
 fleet secret flush --all [--commit SHA] [--timeout 600]   # fleet task secrets-flush --all
 ```
 
-`fleet worker enroll HOST` runs `fleet worker install` on HOST over SSH and reads its `ID=OS:KEY` line. Next, it runs `sudo -n PROVISIONER/scripts/provision.py --config /etc/actl-fleet/deployment.json --environment prod --add-worker ID=OS:KEY` on the controller host. Then it adds `{"id": ID, "os": OS}` to `broker/actl.json` in the fleet-config checkout, once. Last, it waits until `actl workers` lists the worker. `FLEET_ACTL_CONTROLLER`, `FLEET_ACTL_PROVISIONER`, and `FLEET_CONFIG_REPO` change the defaults. It does not commit or deploy fleet-config. Commit the roster and deploy the broker yourself, as the fleet-config README describes. Each step is safe to repeat, so after a failure, run the same command again.
+`fleet worker enroll HOST` runs `fleet worker install` on HOST over SSH and reads its `ID=OS:KEY` line. Next, it runs `sudo -n PROVISIONER/scripts/provision.py --config /etc/actl-fleet/deployment.json --environment prod --add-worker ID=OS:KEY` on the controller host. Then it adds `{"id": ID, "os": OS}` to `broker/actl.json` in the fleet-config checkout, once. Last, it waits until `actl workers` lists the worker. The provisioner path is on the controller host. It is a clean checkout of agentic-control at the deployed commit, apart from the working copy there. Quote a path that starts with `~`, or your local shell expands it, and `sudo -n` fails. `FLEET_ACTL_CONTROLLER`, `FLEET_ACTL_PROVISIONER`, and `FLEET_CONFIG_REPO` change the defaults. It does not commit or deploy fleet-config. Commit the roster and deploy the broker yourself, as the fleet-config README describes. Each step is safe to repeat, so after a failure, run the same command again.
 
 `fleet task` sends one task for each machine, `actl submit --requires host-ID`, at an explicit commit of this repository. The default is `main` on GitHub. `--all` uses the workers from `/v1/actl`. An offline machine stays on the list, and its task waits in the queue. The run folder `~/.local/state/fleet/tasks/RUN` gets the run specification first, written atomically. Then each machine's task document is saved (`actl submit --save-task`) before it is sent. The command polls with backoff until each task ends or `--timeout` passes, and prints one line for each machine: `ID STATE DETAIL TASK_ID`. An unfinished machine is listed with the resume command. It exits 0 only when every task completed with exit status 0.
 

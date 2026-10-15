@@ -2401,7 +2401,7 @@ class WorkerEnroll(ActlBase):
         install, add = self.ssh_calls()
         self.assertEqual(install[-2:], ['bb', '~/.local/bin/fleet worker install'])
         self.assertEqual(add[-2], 'bb')
-        self.assertIn('sudo -n ~/repos/agentic-control/scripts/provision.py --config /etc/actl-fleet/deployment.json '
+        self.assertIn('sudo -n ~/repos/agentic-control-fleet/scripts/provision.py --config /etc/actl-fleet/deployment.json '
                       f'--environment prod --add-worker brev-x86-cpu=linux:{self.KEY}', add[-1])
         self.assertEqual(json.loads(self.roster.read_text())['workers'], [{'id': 'brev-x86-cpu', 'os': 'linux'}])
         self.assertIn('bb is the worker brev-x86-cpu', result.stdout)
