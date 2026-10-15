@@ -1453,13 +1453,18 @@ class WorkerInstall(ActlBase):
             self.assertEqual((env['USER'], env['LOGNAME']), (self.user, self.user))
             self.assertEqual(env['XDG_CONFIG_HOME'], f'{h}/.config')
             self.assertEqual(env['XDG_STATE_HOME'], f'{h}/.local/state')
-            self.assertEqual(env['XDG_RUNTIME_DIR'], f'/run/user/{uid}')
+            # The runtime folder of the shell that ran install: /run/user/UID on a real machine, the
+            # isolated folder here, so a test worker's executors never reach the host's sockets.
+            self.assertEqual(env['XDG_RUNTIME_DIR'], self.env['XDG_RUNTIME_DIR'])
             self.assertEqual(env['LANG'], 'C.UTF-8')
             path = env['PATH'].split(':')
             self.assertEqual(path[0], f'{h}/.local/bin')
             self.assertTrue(all(p.startswith('/') for p in path), path)
             self.assertIn('/usr/bin', path)
             self.assertEqual(args[-2 - len(command):], ['/bin/bash', 'dot_local/bin/executable_fleet', *command])
+            # systemctl --user finds the user manager through XDG_RUNTIME_DIR alone (systemd 255,
+            # proved on spark-d with a real worker), so no D-Bus address is rendered.
+            self.assertNotIn('DBUS_SESSION_BUS_ADDRESS', ' '.join(args))
         unit = (self.home / '.config/systemd/user/fleet-worker.service').read_text()
         self.assertIn(f'ExecStart={h}/.local/bin/actl --config {h}/.config/fleet/actl/worker.toml worker\n', unit)
         for line in ['Restart=always', 'RestartSec=30', 'TimeoutStopSec=90', 'WantedBy=default.target']:
@@ -1472,6 +1477,15 @@ class WorkerInstall(ActlBase):
         self.assertIn('https://ca.example:8443/v1/artifacts/actl/0.2.0/linux-aarch64', dl_actl)
         self.assertIn('https://ca.example:8443/v1/artifacts/actl-supervisor/0.2.0/linux-aarch64', dl_sup)
         self.assertIn(f'--cert {self.state}/node.crt', dl_actl)
+
+    def test_install_without_a_runtime_folder_renders_the_user_runtime_folder(self):
+        # A Tailscale SSH session has no XDG_RUNTIME_DIR. Every command here is a stub.
+        env = dict(self.env)
+        del env['XDG_RUNTIME_DIR']
+        result = subprocess.run(['bash', str(self.script), 'worker', 'install'], capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.executor_args((self.config_dir / 'worker.toml').read_text(), 'pylon-install')
+        self.assertIn(f'XDG_RUNTIME_DIR=/run/user/{os.getuid()}', args)
 
     def test_macos_install_renders_a_launchd_agent(self):
         result = self.install(FAKE_OS='Darwin', FAKE_ARCH='arm64')
@@ -1661,10 +1675,331 @@ class WorkerInstall(ActlBase):
         result = self.fleet('executor', 'probe', ACTL_TASK_ID='0190-test')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('fleet-probe: node-1 task 0190-test', result.stdout)
+        outside = self.home / 'not-a-checkout'
+        outside.mkdir()
         for command in ['apply', 'pylon-install']:
-            result = self.fleet('executor', command)
+            result = subprocess.run(['bash', str(SCRIPT), 'executor', command], capture_output=True, text=True,
+                                    env=self.env, cwd=outside)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn('part 5', result.stderr)
+            self.assertIn('checkout of the dotfiles', result.stderr)
+            self.assertFalse((self.state / 'applied').exists())
+
+
+# Stubs for the executors (task 029 part 5). curl plays the broker and, for --unix-socket requests,
+# a pylon that answers only after a restart ($HOME/pylon-running), and only from the STATUS_AFTER-th
+# poll on. systemctl and launchctl restart that pylon. ssh-add lists $HOME/agent-keys.
+EXECUTOR_CURL = r'''#!/usr/bin/env python3
+import json, os, shutil, sys
+from pathlib import Path
+home = Path(os.environ['HOME'])
+a = sys.argv[1:]
+with open(home / 'curl.log', 'a') as f:
+    f.write(json.dumps(a) + '\n')
+def opt(name):
+    return a[a.index(name) + 1] if name in a else None
+url = next(x for x in a if x.startswith('http'))
+if opt('--unix-socket'):
+    with open(home / 'sockets.log', 'a') as f:
+        f.write(opt('--unix-socket') + ' ' + url + '\n')
+    if not (home / 'pylon-running').exists():
+        sys.exit(7)
+    if url.endswith('/v1/status'):
+        polls = home / 'status-polls'
+        n = int(polls.read_text()) + 1 if polls.exists() else 1
+        polls.write_text(str(n))
+        if n < int(os.environ.get('STATUS_AFTER', '1')):
+            sys.exit(7)
+        print((home / 'pylon-status.json').read_text())
+        sys.exit(0)
+    if url.endswith('/v1/flush'):
+        print('{"flushed": 2}')
+        sys.exit(0)
+    sys.exit(22)
+if '/v1/artifacts/pylon/' in url:
+    shutil.copy(home / 'body', opt('-o'))
+    sys.exit(0)
+if url.endswith('/v1/secrets/fleet-selftest'):
+    value = (home / 'selftest').read_text() if (home / 'selftest').exists() else 'ok'
+    if value == 'refused':
+        sys.exit(22)
+    sys.stdout.write(value)
+    sys.exit(0)
+sys.exit(22)
+'''
+EXECUTOR_RESTART = r'''#!/bin/sh
+printf '%s %s\n' "$(basename "$0")" "$*" >> "$HOME/scheduler.log"
+case "$*" in
+  *"restart fleet-agent.service"*|*"kickstart -k gui/"*/dev.fleet.agent)
+    [ -e "$HOME/restart-fails" ] && exit 5
+    rm -f "$HOME/status-polls"; : > "$HOME/pylon-running" ;;
+esac
+exit 0
+'''
+SSH_ADD_STUB = r'''#!/bin/sh
+printf '%s %s\n' "$SSH_AUTH_SOCK" "$*" >> "$HOME/ssh-add.log"
+[ -f "$HOME/agent-keys" ] || { echo 'The agent has no identities.'; exit 1; }
+cat "$HOME/agent-keys"
+'''
+
+
+class Executors(FleetBase):
+    """fleet executor apply and pylon-install, run as the worker runs them: from a depth-1 checkout of
+    a dotfiles commit, with that commit's fleet script."""
+    BODY = b'\x7fELF fake pylon 0.2.0'
+
+    def setUp(self):
+        super().setUp()
+        for name, body in [('curl', EXECUTOR_CURL), ('systemctl', EXECUTOR_RESTART), ('launchctl', EXECUTOR_RESTART),
+                           ('ssh-add', SSH_ADD_STUB),
+                           ('uname', '#!/bin/sh\ncase "$1" in -m) echo "${FAKE_ARCH:-aarch64}" ;; '
+                                     '*) echo "${FAKE_OS:-Linux}" ;; esac\n')]:
+            (self.home / 'bin' / name).write_text(body)
+            (self.home / 'bin' / name).chmod(0o700)
+        (self.home / 'body').write_bytes(self.BODY)
+        self.enroll()
+        self.origin = self.home / 'dotfiles'
+        self.git(self.origin.parent, 'init', '-q', '-b', 'main', str(self.origin))
+        self.checkouts = 0
+        self.applied = self.state / 'applied'
+        self.set_status('0.2.0')
+        (self.home / 'agent-keys').write_text('ssh-ed25519 AAAAC3Nza fleet agent-signing\n'
+                                              'ssh-ed25519 AAAAC3Nzb fleet agent-auth\n')
+
+    def git(self, cwd, *args, **env):
+        return subprocess.run(['git', '-c', 'user.name=T', '-c', 'user.email=t@example.com', *args], cwd=cwd,
+                              check=True, capture_output=True, text=True, env=dict(self.env, **env)).stdout.strip()
+
+    def set_status(self, version):
+        status = {'entries': 0, 'ttl': 300}
+        if version is not None:
+            status['version'] = version
+        (self.home / 'pylon-status.json').write_text(json.dumps(status))
+
+    def commit(self, when, version='0.2.0', marker=''):
+        """A dotfiles commit whose fleet script pins pylon VERSION with the fake binary's checksum.
+        WHEN is the committer time in Unix seconds. Returns the commit."""
+        text = SCRIPT.read_text()
+        text = re.sub(r'^PYLON_VERSION=\S+$', f'PYLON_VERSION={version}', text, flags=re.M)
+        good = hashlib.sha256(self.BODY).hexdigest()
+        for target in ('linux_aarch64', 'darwin_arm64'):
+            text = re.sub(rf'^(PYLON_SHA256_{target}=)\S+$', r'\g<1>' + good, text, flags=re.M)
+        files = {'dot_local/bin/executable_fleet': text + f'# {marker}\n',
+                 'dot_local/bin/executable_fleet-ssh-keygen': f'#!/bin/sh\n# keygen {marker}\n'}
+        for rel, body in files.items():
+            (self.origin / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.origin / rel).write_text(body)
+        stamp = f'@{when} +0000'
+        self.git(self.origin, 'add', '-A')
+        self.git(self.origin, 'commit', '-q', '--allow-empty', '-m', f'commit {marker}',
+                 GIT_COMMITTER_DATE=stamp, GIT_AUTHOR_DATE=stamp)
+        sha = self.git(self.origin, 'rev-parse', 'HEAD')
+        self.git(self.origin, 'tag', f't{sha[:12]}')
+        return sha
+
+    def checkout(self, sha):
+        """A depth-1 checkout of SHA, as the worker fetches a task's commit."""
+        self.checkouts += 1
+        wt = self.home / f'attempt-{self.checkouts}'
+        self.git(self.home, 'init', '-q', str(wt))
+        self.git(wt, 'fetch', '-q', '--depth', '1', f'file://{self.origin}', f'refs/tags/t{sha[:12]}')
+        self.git(wt, 'checkout', '-q', 'FETCH_HEAD')
+        self.assertEqual(self.git(wt, 'rev-list', '--count', 'HEAD'), '1')
+        return wt
+
+    def executor(self, command, sha, **env):
+        return subprocess.run(['bash', 'dot_local/bin/executable_fleet', 'executor', command], cwd=self.checkout(sha),
+                              capture_output=True, text=True, env=dict(self.env, **dict({'FLEET_PYLON_WAIT': '3'}, **env)))
+
+    def record(self):
+        return dict((l.split()[0], l.split()[1:]) for l in self.applied.read_text().splitlines()) \
+            if self.applied.exists() else {}
+
+    def targets(self):
+        return [self.home / '.local/bin/fleet', self.home / '.local/bin/fleet-ssh-keygen']
+
+    def snapshot(self):
+        return {p: (p.stat().st_mtime_ns, p.read_bytes()) if p.exists() else None
+                for p in self.targets() + [self.applied, self.home / '.local/bin/pylon']}
+
+    def scheduler(self):
+        log = self.home / 'scheduler.log'
+        return log.read_text().splitlines() if log.exists() else []
+
+    def downloads(self):
+        log = self.home / 'curl.log'
+        return [l for l in log.read_text().splitlines() if '/v1/artifacts/' in l] if log.exists() else []
+
+
+class ExecutorApply(Executors):
+    def test_apply_installs_the_fleet_files_of_the_commit_and_records_it(self):
+        sha = self.commit(1_700_000_000, marker='one')
+        result = self.executor('apply', sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        fleet, keygen = self.targets()
+        self.assertTrue(fleet.read_text().endswith('# one\n'))
+        self.assertEqual(keygen.read_text(), '#!/bin/sh\n# keygen one\n')
+        self.assertEqual((self.mode(fleet), self.mode(keygen)), (0o755, 0o755))
+        self.assertEqual(self.record(), {'fleet-apply': [sha, '1700000000']})
+        self.assertEqual(self.mode(self.applied), 0o600)
+        self.assertEqual([p.name for p in self.state.iterdir() if p.name.startswith('.applied')], [])
+        self.assertEqual([p.name for p in (self.home / '.local/bin').iterdir() if p.name.startswith('.')], [])
+        self.assertIn(sha[:12], result.stdout)
+
+    def test_the_same_commit_again_is_a_no_op(self):
+        sha = self.commit(1_700_000_000, marker='one')
+        self.assertEqual(self.executor('apply', sha).returncode, 0)
+        before = self.snapshot()
+        result = self.executor('apply', sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('already', result.stdout)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_newer_commit_applies(self):
+        old = self.commit(1_700_000_000, marker='one')
+        new = self.commit(1_700_000_100, marker='two')
+        self.assertEqual(self.executor('apply', old).returncode, 0)
+        result = self.executor('apply', new)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.targets()[0].read_text().endswith('# two\n'))
+        self.assertEqual(self.record(), {'fleet-apply': [new, '1700000100']})
+
+    def test_an_older_commit_is_refused_without_changing_a_file(self):
+        old = self.commit(1_700_000_000, marker='one')
+        new = self.commit(1_700_000_100, marker='two')
+        self.assertEqual(self.executor('apply', new).returncode, 0)
+        before = self.snapshot()
+        result = self.executor('apply', old)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('older than', result.stderr)
+        self.assertIn(new[:12], result.stderr)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_unchanged_files_keep_their_time(self):
+        one = self.commit(1_700_000_000, marker='same')
+        self.assertEqual(self.executor('apply', one).returncode, 0)
+        before = {p: p.stat().st_mtime_ns for p in self.targets()}
+        two = self.commit(1_700_000_100, marker='same')
+        self.assertEqual(self.executor('apply', two).returncode, 0)
+        self.assertEqual({p: p.stat().st_mtime_ns for p in self.targets()}, before)
+        self.assertEqual(self.record()['fleet-apply'][0], two)
+
+    def test_a_malformed_record_stops_the_executor(self):
+        sha = self.commit(1_700_000_000)
+        self.state.mkdir(parents=True, exist_ok=True)
+        self.applied.write_text('fleet-apply not-a-commit\n')
+        result = self.executor('apply', sha)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(str(self.applied), result.stderr)
+        self.assertFalse(self.targets()[0].exists())
+
+    def test_each_executor_has_its_own_fence(self):
+        # pylon-install at a commit does not apply the fleet files, so it must not turn a later
+        # fleet-apply at the same commit into a repeat; and a fleet-apply of a newer commit must not
+        # make a release's pylon-install of an older pin commit stale.
+        old = self.commit(1_700_000_000, marker='one')
+        new = self.commit(1_700_000_100, marker='two')
+        self.assertEqual(self.executor('pylon-install', old).returncode, 0)
+        result = self.executor('apply', old)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.targets()[0].exists())
+        self.assertEqual(self.executor('apply', new).returncode, 0)
+        self.assertEqual(self.record(), {'fleet-apply': [new, '1700000100'], 'pylon-install': [old, '1700000000']})
+
+
+class ExecutorPylonInstall(Executors):
+    def test_install_restarts_and_proves_the_running_daemon(self):
+        sha = self.commit(1_700_000_000)
+        result = self.executor('pylon-install', sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.home / '.local/bin/pylon').read_bytes(), self.BODY)
+        (download,) = self.downloads()
+        self.assertIn('/v1/artifacts/pylon/0.2.0/linux-aarch64', download)
+        self.assertIn('systemctl --user restart fleet-agent.service', self.scheduler())
+        runtime = self.env['XDG_RUNTIME_DIR']
+        self.assertIn(f'{runtime}/fleet-secrets.sock http://pylon/v1/status',
+                      (self.home / 'sockets.log').read_text().splitlines())
+        self.assertIn('/v1/secrets/fleet-selftest', (self.home / 'curl.log').read_text())
+        self.assertEqual((self.home / 'ssh-add.log').read_text().splitlines()[-1], f'{runtime}/fleet-agent.sock -L')
+        self.assertIn('pylon 0.2.0', result.stdout)
+        self.assertIn('2 agent keys', result.stdout)
+        self.assertEqual(self.record(), {'pylon-install': [sha, '1700000000']})
+
+    def test_the_pins_come_from_the_task_commit(self):
+        sha = self.commit(1_700_000_000, version='0.3.0')
+        self.set_status('0.3.0')
+        result = self.executor('pylon-install', sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('/v1/artifacts/pylon/0.3.0/linux-aarch64', self.downloads()[0])
+
+    def test_a_current_binary_still_restarts_and_is_checked(self):
+        one = self.commit(1_700_000_000, marker='one')
+        self.assertEqual(self.executor('pylon-install', one).returncode, 0)
+        two = self.commit(1_700_000_100, marker='two')
+        result = self.executor('pylon-install', two)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.downloads()), 1)
+        self.assertEqual(self.scheduler().count('systemctl --user restart fleet-agent.service'), 2)
+
+    def test_the_status_check_waits_for_startup(self):
+        sha = self.commit(1_700_000_000)
+        result = self.executor('pylon-install', sha, STATUS_AFTER='3')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.home / 'status-polls').read_text(), '3')
+
+    def failed(self, result, message):
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(message, result.stderr)
+        self.assertNotIn('pylon-install', self.record())
+
+    def test_a_daemon_with_another_version_fails(self):
+        self.set_status('0.1.9')
+        self.failed(self.executor('pylon-install', self.commit(1_700_000_000)), "reports version '0.1.9'")
+
+    def test_a_status_without_a_version_fails(self):
+        self.set_status(None)
+        self.failed(self.executor('pylon-install', self.commit(1_700_000_000)), 'no version')
+
+    def test_a_daemon_that_does_not_answer_fails(self):
+        sha = self.commit(1_700_000_000)
+        self.failed(self.executor('pylon-install', sha, STATUS_AFTER='99', FLEET_PYLON_WAIT='2'), 'does not answer')
+
+    def test_a_failed_restart_fails(self):
+        (self.home / 'restart-fails').write_text('')
+        self.failed(self.executor('pylon-install', self.commit(1_700_000_000)), 'could not restart the fleet agent')
+
+    def test_a_failed_secret_check_fails_without_printing_the_value(self):
+        (self.home / 'selftest').write_text('refused')
+        self.failed(self.executor('pylon-install', self.commit(1_700_000_000)), 'fleet-selftest')
+        (self.home / 'selftest').write_text('SECRETVALUE')
+        result = self.executor('pylon-install', self.commit(1_700_000_100))
+        self.failed(result, 'fleet-selftest')
+        self.assertNotIn('SECRETVALUE', result.stdout + result.stderr)
+
+    def test_an_agent_without_keys_fails(self):
+        (self.home / 'agent-keys').unlink()
+        self.failed(self.executor('pylon-install', self.commit(1_700_000_000)), 'the fleet agent lists no keys')
+
+    def test_a_repeat_is_harmless_and_an_older_commit_changes_nothing(self):
+        old = self.commit(1_700_000_000, version='0.1.0', marker='old')
+        new = self.commit(1_700_000_100, marker='new')
+        self.assertEqual(self.executor('pylon-install', new).returncode, 0)
+        before, restarts, downloads = self.snapshot(), len(self.scheduler()), len(self.downloads())
+        result = self.executor('pylon-install', new)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('already', result.stdout)
+        result = self.executor('pylon-install', old)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('older than', result.stderr)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual((len(self.scheduler()), len(self.downloads())), (restarts, downloads))
+
+    def test_macos_restarts_the_launchd_agent(self):
+        sha = self.commit(1_700_000_000)
+        result = self.executor('pylon-install', sha, FAKE_OS='Darwin', FAKE_ARCH='arm64')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f'launchctl kickstart -k gui/{os.getuid()}/dev.fleet.agent', self.scheduler())
+        self.assertIn(f'{self.home}/.ssh/fleet/secrets.sock http://pylon/v1/status',
+                      (self.home / 'sockets.log').read_text().splitlines())
 
 
 class ActlClient(ActlBase):

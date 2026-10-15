@@ -113,7 +113,10 @@ Fleet tasks through actl (the controller runs on the host that the broker's /v1/
                                         Laptop: send the task NAME (fleet-apply, pylon-install,
                                         secrets-flush, fleet-probe) to each machine and report the results.
   task --resume RUN [--timeout S]       Finish a run that stopped or timed out.
-  executor apply|pylon-install|probe    Run by the worker for a task, from the task's checkout.
+  executor apply|pylon-install|probe    Run by the worker for a task, from the task's checkout. apply installs
+                                        fleet and fleet-ssh-keygen from it; pylon-install runs install-pylon with
+                                        its pins and checks the running pylon. Both refuse a commit older than the
+                                        one they applied last (~/.local/state/fleet/applied); the same commit is a no-op.
 EOF
 }
 
@@ -1431,6 +1434,39 @@ elif cmd == 'record':
     elif status == 'queued' and data.get('eligible_workers') == 0:
         detail = 'no-eligible-worker'
     print(record['task']['id'], status, detail)
+elif cmd in ('fence', 'fence-record'):
+    # ~/.local/state/fleet/applied: one line "EXECUTOR COMMIT COMMITTER_TIME" for each executor. A
+    # malformed file stops the executor rather than letting a stale commit through.
+    path, name, commit, ctime = a
+    records = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) != 3 or not re.fullmatch(r'[a-z-]{1,32}', parts[0]) \
+                        or not re.fullmatch(r'[0-9a-f]{40}', parts[1]) or not parts[2].isdigit():
+                    sys.exit(f'{path} is malformed; inspect it')
+                records[parts[0]] = (parts[1], int(parts[2]))
+    if cmd == 'fence':
+        old = records.get(name)
+        if old is None:
+            print('apply')
+        elif old[0] == commit:
+            print('repeat')
+        elif int(ctime) < old[1]:
+            print('stale', old[0], old[1])
+        else:
+            print('apply')
+    else:
+        records[name] = (commit, int(ctime))
+        atomic(path, ''.join(f'{k} {c} {t}\n' for k, (c, t) in sorted(records.items())), 0o600)
+elif cmd == 'status-version':
+    # pylon's GET /v1/status on stdin: print its version, or exit 2 when it reports none.
+    data = json.load(sys.stdin)
+    version = data.get('version') if isinstance(data, dict) else None
+    if not isinstance(version, str) or not re.fullmatch(r'[0-9A-Za-z.+-]{1,64}', version):
+        sys.exit(2)
+    print(version)
 else:
     sys.exit(f'unknown helper command {cmd}')
 PY
@@ -1641,7 +1677,9 @@ render_worker() {
     env_args=(-u GIT_CONFIG_GLOBAL -u GIT_CONFIG_NOSYSTEM -u GIT_TERMINAL_PROMPT -u GIT_LFS_SKIP_SMUDGE
         "HOME=$HOME" "USER=$user" "LOGNAME=$user" "LANG=$lang" "XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}"
         "XDG_STATE_HOME=${XDG_STATE_HOME:-$HOME/.local/state}")
-    [[ "$os" == linux ]] && env_args+=("XDG_RUNTIME_DIR=/run/user/$(id -u)")
+    # The runtime folder of the user who runs install (user_bus fills it for an SSH session without
+    # one): systemctl --user finds the user manager through it, and pylon keeps its sockets in it.
+    [[ "$os" == linux ]] && env_args+=("XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}")
     env_args+=("PATH=$(executor_path)")
     toml_check "$ACTL_SERVER" "$ACTL_CONFIG_DIR" "$ACTL_STATE" "$WORKER_ROOT" "$git" "$bin" "${env_args[@]}"
     {
@@ -2172,15 +2210,124 @@ cmd_task() {
     (( unfinished == 0 && failed == 0 ))
 }
 
-# Executors: the worker runs these from the task's checkout of the dotfiles (see render_worker).
+# ---- Executors: the worker runs these from the task's checkout of the dotfiles (see render_worker) ----
+# The code that runs, and so the pins it uses, is the code at the task's commit.
+
+# The freshness fence (task 029 part 5). actl delivers at least once, and a task abandoned by fleet
+# task can be admitted late, after a newer one ran. So each executor records the commit it applied
+# and that commit's committer time, refuses an older commit, and treats the same commit as a repeat.
+# The worker's checkout is one commit deep, so only the commit itself is read. Each executor has its
+# own line: they change different files, and a fleet-apply of a newer commit must not make a
+# release's pylon-install of its pin commit stale.
+# fence_open NAME: take the fence lock and set FENCE (apply or repeat), FENCE_COMMIT, FENCE_TIME.
+fence_open() {
+    local name="$1" verdict
+    need_python
+    [[ -f dot_local/bin/executable_fleet ]] && git rev-parse --git-dir >/dev/null 2>&1 ||
+        fail "fleet executor $name runs from a checkout of the dotfiles"
+    read -r FENCE_COMMIT FENCE_TIME <<<"$(git -c log.showSignature=false log -1 --format='%H %ct' HEAD 2>/dev/null || true)"
+    valid_commit "${FENCE_COMMIT:-}" && [[ "${FENCE_TIME:-}" =~ ^[0-9]+$ ]] || fail 'cannot read the commit of this checkout'
+    mkdir -p "$STATE"
+    # One executor at a time decides and records, so two tasks cannot both pass the check.
+    exec 8>>"$STATE/applied.lock"
+    python3 -c 'import fcntl; fcntl.flock(8, fcntl.LOCK_EX)'
+    verdict=$(fpy fence "$STATE/applied" "$name" "$FENCE_COMMIT" "$FENCE_TIME") || exit 1
+    case "$verdict" in
+        apply|repeat) FENCE="$verdict" ;;
+        stale\ *)
+            local newer newer_time
+            read -r _ newer newer_time <<<"$verdict"
+            fail "refusing $name of ${FENCE_COMMIT:0:12} (committed $FENCE_TIME): it is older than ${newer:0:12} (committed $newer_time), which this machine applied already. Nothing changed." ;;
+        *) fail "unexpected fence verdict: $verdict" ;;
+    esac
+}
+
+fence_record() { fpy fence-record "$STATE/applied" "$1" "$FENCE_COMMIT" "$FENCE_TIME"; }
+
+# The fleet files that fleet-apply installs, as SOURCE:TARGET under $HOME. Neither is a template, so
+# a copy renders them exactly as chezmoi would. A copy, not chezmoi apply: machines that joined with
+# join.sh have fleet but no chezmoi, and chezmoi apply would also read the user's chezmoi
+# configuration and state, which a task should not depend on.
+APPLY_FILES="dot_local/bin/executable_fleet:.local/bin/fleet dot_local/bin/executable_fleet-ssh-keygen:.local/bin/fleet-ssh-keygen"
+
+executor_apply() {
+    fence_open fleet-apply
+    if [[ "$FENCE" == repeat ]]; then
+        printf 'fleet-apply: %s is applied already\n' "${FENCE_COMMIT:0:12}"
+        return 0
+    fi
+    local pair src dst staged=() i
+    # Stage every file first, so a missing source changes nothing.
+    for pair in $APPLY_FILES; do
+        src="${pair%%:*}" dst="$HOME/${pair#*:}"
+        [[ -f "$src" ]] || fail "this checkout has no $src"
+        cmp -s "$src" "$dst" && [[ -x "$dst" ]] && continue
+        mkdir -p "$(dirname "$dst")"
+        local tmp
+        tmp=$(mktemp "$(dirname "$dst")/.fleet-apply.XXXXXX")
+        CLEANUP+=("$tmp")
+        cp "$src" "$tmp"
+        chmod 0755 "$tmp"
+        staged+=("$tmp" "$dst")
+    done
+    for ((i = 0; i < ${#staged[@]}; i += 2)); do
+        mv -f "${staged[i]}" "${staged[i + 1]}"
+        printf 'installed %s\n' "${staged[i + 1]}"
+    done
+    fence_record fleet-apply
+    printf 'fleet-apply: applied %s\n' "${FENCE_COMMIT:0:12}"
+}
+
+# prove_pylon: the restarted agent answers on the live secrets socket with the pinned version, a
+# secret arrives, and the agent lists keys. pylon needs a moment to start, so retry until
+# FLEET_PYLON_WAIT seconds pass. A status without a version is a pylon older than the pin.
+prove_pylon() {
+    local sock agent deadline status version seen='does not answer' keys
+    sock=$(secrets_sock) agent=$(agent_sock)
+    deadline=$((SECONDS + ${FLEET_PYLON_WAIT:-30}))
+    while true; do
+        if status=$(curl -fsS --max-time 5 --unix-socket "$sock" http://pylon/v1/status 2>/dev/null); then
+            if version=$(printf '%s' "$status" | fpy status-version 2>/dev/null); then
+                [[ "$version" == "$PYLON_VERSION" ]] && break
+                seen="reports version '$version'"
+            else
+                seen='reports no version'
+            fi
+        fi
+        (( SECONDS < deadline )) || fail "pylon on $sock $seen; the pin is $PYLON_VERSION"
+        sleep 1
+    done
+    [[ "$( (secret_value fleet-selftest) 2>/dev/null)" == ok ]] ||
+        fail 'the secret fleet-selftest did not arrive from the broker'
+    while true; do
+        keys=$(SSH_AUTH_SOCK="$agent" ssh-add -L 2>/dev/null | grep -c '^[a-z]' || true)
+        (( keys > 0 )) && break
+        (( SECONDS < deadline )) || fail "the fleet agent lists no keys on $agent"
+        sleep 1
+    done
+    printf 'pylon %s runs on %s; secrets ok; %s agent keys\n' "$PYLON_VERSION" "$sock" "$keys"
+}
+
+executor_pylon_install() {
+    fence_open pylon-install
+    if [[ "$FENCE" == repeat ]]; then
+        printf 'pylon-install: %s is installed already\n' "${FENCE_COMMIT:0:12}"
+        return 0
+    fi
+    install_pylon
+    prove_pylon
+    fence_record pylon-install
+    printf 'pylon-install: installed %s\n' "${FENCE_COMMIT:0:12}"
+}
+
 cmd_executor() {
     case "${1:-}" in
         probe)
             load_config
             printf 'fleet-probe: %s task %s user %s home %s\n' "${name:-unknown}" "${ACTL_TASK_ID:-none}" \
                 "${USER:-?}" "$HOME" ;;
-        apply|pylon-install)
-            fail "fleet executor $1 is not implemented yet; it arrives with agentic-control task 029, part 5" ;;
+        apply) executor_apply ;;
+        pylon-install) executor_pylon_install ;;
         *) fail 'usage: fleet executor apply|pylon-install|probe' ;;
     esac
 }

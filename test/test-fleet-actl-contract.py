@@ -5,11 +5,21 @@ on a real NATS broker (agentic-control task 029, part 4). Linux only. They skip 
   FLEET_CONTRACT_NATS_SERVER  a nats-server 2.12 binary
   FLEET_CONTRACT_SOURCE       an agentic-control checkout with the fleet deployment (task 029 part 3):
                               its scripts/provision.py renders the broker configuration
-  FLEET_CONTRACT_COMMIT       optional: a pushed dotfiles commit that has `fleet executor probe`;
+  FLEET_CONTRACT_COMMIT       optional: a pushed dotfiles commit with the part 5 executors;
                               default: main of the public dotfiles
+  FLEET_CONTRACT_OLD_COMMIT   optional: an older pushed commit with the part 5 executors, for the
+                              refusal of a stale commit
+  FLEET_CONTRACT_PYLON        optional: a pylon binary whose SHA-256 is the commit's
+                              PYLON_SHA256_linux_aarch64 (or _x86_64), for the pylon-install test
+  FLEET_CONTRACT_USER_UNITS   optional, 1: also prove that an executor restarts a user unit. This one
+                              test uses the host's systemd user manager: it creates two transient units
+                              named fleet-contract-*, a target and a worker, and removes them.
 
 The worker fetches the public dotfiles from GitHub. Only the CA host is simulated: stubs stand in for
-step, the broker (curl), and systemctl, as in test-fleet.py. Run it with a time limit:
+step, the broker (curl), and systemctl, as in test-fleet.py. The executors run the fleet script of the
+commit with the rendered environment, whose PATH starts with the test home's ~/.local/bin. Stubs
+there play the broker and restart a fake pylon, which serves the secrets and agent sockets in the
+test's own XDG_RUNTIME_DIR. Run it with a time limit:
 
   timeout 900 python3 test/test-fleet-actl-contract.py
 """
@@ -45,6 +55,84 @@ case "$url" in
   */v1/artifacts/actl/*) cp "$HOME/actl-body" "$out" ;;
   *) exit 22 ;;
 esac
+'''
+
+
+# On the executors' PATH. The broker: the selftest secret and the pylon download. Requests to a Unix
+# socket go to the real curl, so the executor talks to the fake pylon below.
+EXECUTOR_CURL = '''#!/bin/sh
+case " $* " in *" --unix-socket "*) exec /usr/bin/curl "$@" ;; esac
+url=""; out=""
+while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2 ;; https://*) url="$1"; shift ;; *) shift ;; esac; done
+case "$url" in
+  */v1/secrets/fleet-selftest) printf ok ;;
+  */v1/artifacts/pylon/*) cp "$HOME/pylon-body" "$out" ;;
+  *) exit 22 ;;
+esac
+'''
+# systemctl --user restart fleet-agent.service starts the fake pylon again with the version that the
+# task's fleet script pins (the executor runs in the checkout).
+EXECUTOR_SYSTEMCTL = '''#!/bin/sh
+printf '%s\\n' "$*" >> "$HOME/executor-systemctl.log"
+[ "$*" = "--user restart fleet-agent.service" ] || exit 1
+version=$(sed -n 's/^PYLON_VERSION=//p' dot_local/bin/executable_fleet 2>/dev/null | head -1)
+[ -f "$HOME/fake-pylon.pid" ] && kill "$(cat "$HOME/fake-pylon.pid")" 2>/dev/null
+setsid -f python3 "$HOME/.local/bin/fake-pylon" "$XDG_RUNTIME_DIR" "${version:-unknown}" "$HOME/fake-pylon.pid" \\
+    </dev/null >>"$HOME/fake-pylon.log" 2>&1
+'''
+# The secrets socket (status with a version, flush) and an ssh-agent that lists one key.
+FAKE_PYLON = r'''import base64, http.server, json, os, socketserver, struct, sys, threading
+runtime, version, pidfile = sys.argv[1:]
+state = {'entries': 3}
+class Http(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+    def answer(self, body):
+        data = json.dumps(body).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+    def do_GET(self):
+        if self.path == '/v1/status':
+            self.answer({'entries': state['entries'], 'ttl': 300, 'version': version})
+        else:
+            self.send_error(404)
+    def do_POST(self):
+        if self.path == '/v1/flush':
+            flushed, state['entries'] = state['entries'], 0
+            self.answer({'flushed': flushed})
+        else:
+            self.send_error(404)
+def s(b):
+    return struct.pack('>I', len(b)) + b
+blob = s(b'ssh-ed25519') + s(bytes(range(32)))
+class Agent(socketserver.BaseRequestHandler):
+    def handle(self):
+        while True:
+            head = self.request.recv(4)
+            if len(head) < 4:
+                return
+            body = self.request.recv(struct.unpack('>I', head)[0])
+            if body[:1] == bytes([11]):
+                reply = bytes([12]) + struct.pack('>I', 1) + s(blob) + s(b'fleet agent-signing')
+            else:
+                reply = bytes([5])
+            self.request.sendall(s(reply))
+class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+servers = []
+for name, handler in (('fleet-secrets.sock', Http), ('fleet-agent.sock', Agent)):
+    path = os.path.join(runtime, name)
+    if os.path.exists(path):
+        os.unlink(path)
+    servers.append(Server(path, handler))
+with open(pidfile, 'w') as f:
+    f.write(str(os.getpid()))
+for srv in servers[1:]:
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+servers[0].serve_forever()
 '''
 
 
@@ -111,6 +199,12 @@ class ActlContract(unittest.TestCase):
         line = cls.fleet('worker', 'install', script=cls.script).stdout.strip()
         assert line.startswith(f'{WORKER}=linux:U'), line
         cls.worker_key = line.split(':', 1)[1]
+        executor_bin = home / '.local/bin'
+        for name, body in [('curl', EXECUTOR_CURL), ('systemctl', EXECUTOR_SYSTEMCTL), ('fake-pylon', FAKE_PYLON)]:
+            (executor_bin / name).write_text(body)
+            (executor_bin / name).chmod(0o700)
+        if os.environ.get('FLEET_CONTRACT_PYLON'):
+            shutil.copy(os.environ['FLEET_CONTRACT_PYLON'], home / 'pylon-body')
         cls.start_nats(keys)
         cls.connection('admin', 'admin.main', keys / 'admin.seed')
         subprocess.run([str(cls.actl), '--config', str(cls.tmp / 'admin.toml'), 'bootstrap'], env=cls.env,
@@ -122,6 +216,12 @@ class ActlContract(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        pid = cls.home / 'fake-pylon.pid'
+        if pid.exists():
+            try:
+                os.kill(int(pid.read_text()), 15)
+            except (OSError, ValueError):
+                pass
         for proc in cls.procs.values():
             if proc.poll() is None:
                 proc.terminate()
@@ -187,7 +287,7 @@ class ActlContract(unittest.TestCase):
 
     @classmethod
     def write_controller(cls, keys):
-        types = '["fleet-apply", "pylon-install", "secrets-flush", "fleet-probe"]'
+        types = '["fleet-apply", "pylon-install", "secrets-flush", "fleet-probe", "unit-restart"]'
         text = cls.connection('controller', 'controller.main', keys / 'controller.seed')
         text += (f'\n[controller]\ndatabase = "{cls.tmp}/controller/state.sqlite"\nrepositories = ["dotfiles"]\n'
                  f'task_types = {types}\n\n[controller.workers.{WORKER}]\nrepositories = ["dotfiles"]\n'
@@ -320,6 +420,149 @@ class ActlContract(unittest.TestCase):
         status = self.fleet('worker', 'status', script=self.script).stdout
         self.assertIn(f'connection: tls://localhost:{self.port} (configuration and credential OK)', status)
         self.assertIn('installed: actl', status)
+
+    # ---- part 5: the executors through the real worker ----
+
+    def task(self, name, commit):
+        result = self.fleet('task', name, '--host', WORKER, '--commit', commit, '--timeout', '180', check=False)
+        return self.report(result)
+
+    def at(self, commit, path):
+        """The file PATH of the public dotfiles at COMMIT, fetched one commit deep as the worker does."""
+        repo = self.tmp / f'dotfiles-{commit[:12]}'
+        if not repo.exists():
+            subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+            subprocess.run(['git', '-C', str(repo), 'fetch', '-q', '--depth', '1',
+                            'https://github.com/ryanolson/dynamo-dotfiles.git', commit], check=True, timeout=120)
+        return subprocess.run(['git', '-C', str(repo), 'show', f'FETCH_HEAD:{path}'], capture_output=True,
+                              check=True).stdout
+
+    def applied(self):
+        path = self.home / '.local/state/fleet/applied'
+        return {l.split()[0]: l.split()[1] for l in path.read_text().splitlines()} if path.exists() else {}
+
+    def snapshot(self, *paths):
+        return {p: (p.stat().st_mtime_ns, p.read_bytes()) for p in paths}
+
+    def test_fleet_apply_applies_once_and_refuses_an_older_commit(self):
+        fleet = self.home / '.local/bin/fleet'
+        name, state, detail, _ = self.task('fleet-apply', self.commit)
+        self.assertEqual((state, detail), ('completed', 'exit=0'))
+        self.assertEqual(fleet.read_bytes(), self.at(self.commit, 'dot_local/bin/executable_fleet'))
+        self.assertTrue(os.access(fleet, os.X_OK))
+        self.assertEqual(self.applied()['fleet-apply'], self.commit)
+        record = self.home / '.local/state/fleet/applied'
+        before = self.snapshot(fleet, self.home / '.local/bin/fleet-ssh-keygen', record)
+        name, state, detail, _ = self.task('fleet-apply', self.commit)
+        self.assertEqual((state, detail), ('completed', 'exit=0'))
+        self.assertEqual(self.snapshot(*before), before)
+        old = os.environ.get('FLEET_CONTRACT_OLD_COMMIT')
+        if not old:
+            self.skipTest('set FLEET_CONTRACT_OLD_COMMIT for the stale commit')
+        name, state, detail, _ = self.task('fleet-apply', old)
+        self.assertEqual(state, 'failed')
+        self.assertTrue(detail.endswith(',exit=1'), detail)
+        self.assertEqual(self.snapshot(*before), before)
+
+    def pylon_status(self):
+        out = subprocess.run(['/usr/bin/curl', '-fsS', '--unix-socket', str(self.tmp / 'run/fleet-secrets.sock'),
+                              'http://pylon/v1/status'], capture_output=True, text=True, check=True).stdout
+        return json.loads(out)
+
+    @unittest.skipUnless(os.environ.get('FLEET_CONTRACT_PYLON'), 'set FLEET_CONTRACT_PYLON')
+    def test_pylon_install_proves_the_daemon_and_a_repeat_is_harmless(self):
+        name, state, detail, _ = self.task('pylon-install', self.commit)
+        self.assertEqual((state, detail), ('completed', 'exit=0'), (self.home / 'fake-pylon.log').read_text()
+                         if (self.home / 'fake-pylon.log').exists() else '')
+        self.assertEqual((self.home / '.local/bin/pylon').read_bytes(), (self.home / 'pylon-body').read_bytes())
+        pinned = [l for l in self.at(self.commit, 'dot_local/bin/executable_fleet').decode().splitlines()
+                  if l.startswith('PYLON_VERSION=')][0].split('=', 1)[1]
+        self.assertEqual(self.pylon_status()['version'], pinned)
+        self.assertEqual(self.applied()['pylon-install'], self.commit)
+        restarts = (self.home / 'executor-systemctl.log').read_text().count('restart fleet-agent.service')
+        pid = (self.home / 'fake-pylon.pid').read_text()
+        name, state, detail, _ = self.task('pylon-install', self.commit)
+        self.assertEqual((state, detail), ('completed', 'exit=0'))
+        self.assertEqual((self.home / 'executor-systemctl.log').read_text().count('restart fleet-agent.service'),
+                         restarts)
+        self.assertEqual((self.home / 'fake-pylon.pid').read_text(), pid)
+
+    def test_secrets_flush_all_empties_the_cache(self):
+        pid = self.home / 'fake-pylon.pid'
+        running = pid.exists() and Path(f'/proc/{pid.read_text().strip()}').exists()
+        if not running:
+            subprocess.run(['setsid', '-f', 'python3', str(self.home / '.local/bin/fake-pylon'), str(self.tmp / 'run'),
+                            'contract', str(pid)], check=True, env=self.env)
+            for _ in range(50):
+                if (self.tmp / 'run/fleet-secrets.sock').exists():
+                    break
+                time.sleep(0.1)
+        self.assertGreater(self.pylon_status()['entries'], 0)
+        result = self.fleet('secret', 'flush', '--all', '--commit', self.commit, '--timeout', '180', check=False)
+        name, state, detail, _ = self.report(result)
+        self.assertEqual((state, detail), ('completed', 'exit=0'), result.stdout + result.stderr)
+        self.assertEqual(self.pylon_status()['entries'], 0)
+
+    @unittest.skipUnless(os.environ.get('FLEET_CONTRACT_USER_UNITS') == '1', 'set FLEET_CONTRACT_USER_UNITS=1')
+    def test_an_executor_restarts_a_user_unit(self):
+        # The worker runs as a systemd user service and its executor gets the rendered environment:
+        # no DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR the user's. The rendered value here is the
+        # test's own folder, so this executor takes the rendered arguments with only that value
+        # replaced by the user's, as it is on a real machine. Everything else is the host's user
+        # manager, reached by two throwaway transient units.
+        runtime = f'/run/user/{os.getuid()}'
+        host = dict(os.environ, XDG_RUNTIME_DIR=runtime)
+        tag = uuid.uuid4().hex[:8]
+        target, worker = f'fleet-contract-target-{tag}.service', f'fleet-contract-worker-{tag}.service'
+        toml = (self.home / '.config/fleet/actl/worker.toml').read_text()
+        block = toml.split('[worker.executors.fleet-probe]\n')[1].split('\n\n')[0]
+        args = json.loads(next(l for l in block.splitlines() if l.startswith('args = '))[len('args = '):])
+        self.assertEqual(args[-4:], ['/bin/bash', 'dot_local/bin/executable_fleet', 'executor', 'probe'])
+        self.assertNotIn('DBUS_SESSION_BUS_ADDRESS', ' '.join(args))
+        env = [f'XDG_RUNTIME_DIR={runtime}' if a.startswith('XDG_RUNTIME_DIR=') else a for a in args[:-4]]
+        # /usr/bin/systemctl: the systemctl on the rendered PATH is the test's stub that restarts the fake pylon.
+        script = '/usr/bin/systemctl --user restart "$0" && /usr/bin/systemctl --user show -p MainPID --value "$0"'
+        unit_args = env + ['/bin/sh', '-c', script, target]
+        config = self.tmp / 'worker-unit.toml'
+        config.write_text(toml + '\n[worker.executors.unit-restart]\nkind = "command"\nprogram = "/usr/bin/env"\n'
+                          f'args = {json.dumps(unit_args)}\n')
+        show = lambda prop: subprocess.run(['systemctl', '--user', 'show', '-p', prop, '--value', target],
+                                           capture_output=True, text=True, env=host, check=True).stdout.strip()
+        proc = self.procs.pop('worker')
+        proc.terminate()
+        proc.wait(timeout=90)
+        try:
+            subprocess.run(['systemd-run', '--user', '--quiet', f'--unit={target}', '/bin/sleep', '600'],
+                           env=host, check=True)
+            before = (show('MainPID'), show('InvocationID'))
+            subprocess.run(['systemd-run', '--user', '--quiet', f'--unit={worker}', '-E', f'HOME={self.home}',
+                            '-E', 'RUST_LOG=warn', str(self.home / '.local/bin/actl'), '--config', str(config), 'worker'],
+                           env=host, check=True)
+            client = str(self.home / '.config/fleet/actl/client.toml')
+            out = subprocess.run([str(self.actl), '--config', client, '--json', 'submit', '--repo', 'dotfiles', '--commit',
+                                  self.commit, '--type', 'unit-restart', '--requires', f'host-{WORKER}'],
+                                 capture_output=True, text=True, env=self.env, check=True).stdout
+            task_id = json.loads(out)['record']['task']['id']
+            for _ in range(180):
+                record = self.status(task_id)
+                if record['state']['status'] in ('completed', 'failed', 'cancelled'):
+                    break
+                time.sleep(1)
+            logs = ''.join(p.read_text(errors='replace')[-2000:] for p in
+                           (self.home / '.local/state/fleet/actl-worker').rglob('*.log') if task_id in str(p) or
+                           record['state'].get('result', {}).get('stderr', {}).get('attempt_id', '-') in str(p))
+            self.assertEqual((record['state']['status'], record['state'].get('result', {}).get('exit_code')),
+                             ('completed', 0), logs or json.dumps(record['state'])[:2000])
+            after = (show('MainPID'), show('InvocationID'))
+            self.assertNotEqual(after[0], before[0])
+            self.assertNotEqual(after[1], before[1])
+            self.assertEqual(show('ActiveState'), 'active')
+        finally:
+            for unit in (worker, target):
+                subprocess.run(['systemctl', '--user', 'stop', unit], env=host, capture_output=True)
+                subprocess.run(['systemctl', '--user', 'reset-failed', unit], env=host, capture_output=True)
+            self.start_worker()
+            self.wait_for_worker()
 
 
 if __name__ == '__main__':
