@@ -70,20 +70,25 @@ case "$url" in
   *) exit 22 ;;
 esac
 '''
-# systemctl --user restart fleet-agent.service starts the fake pylon again with the version that the
-# task's fleet script pins (the executor runs in the checkout).
+# systemctl --user restart fleet-agent.service asks the fake pylon to restart with the version that
+# the task's fleet script pins (the executor runs in the checkout). The fake runs outside the worker,
+# as systemd runs pylon: actl owns every process that an attempt starts, and a daemon left behind by
+# an executor makes the worker stop with an unconfirmed teardown.
 EXECUTOR_SYSTEMCTL = '''#!/bin/sh
 printf '%s\\n' "$*" >> "$HOME/executor-systemctl.log"
 [ "$*" = "--user restart fleet-agent.service" ] || exit 1
 version=$(sed -n 's/^PYLON_VERSION=//p' dot_local/bin/executable_fleet 2>/dev/null | head -1)
-[ -f "$HOME/fake-pylon.pid" ] && kill "$(cat "$HOME/fake-pylon.pid")" 2>/dev/null
-setsid -f python3 "$HOME/.local/bin/fake-pylon" "$XDG_RUNTIME_DIR" "${version:-unknown}" "$HOME/fake-pylon.pid" \\
-    </dev/null >>"$HOME/fake-pylon.log" 2>&1
+exec python3 -c 'import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+s.sendall(sys.argv[2].encode() + b"\\n")
+sys.exit(0 if s.recv(64) == b"restarted\\n" else 1)' "$HOME/fake-pylon.ctl" "${version:-unknown}"
 '''
-# The secrets socket (status with a version, flush) and an ssh-agent that lists one key.
-FAKE_PYLON = r'''import base64, http.server, json, os, socketserver, struct, sys, threading
-runtime, version, pidfile = sys.argv[1:]
-state = {'entries': 3}
+# The secrets socket (status with a version, flush) and an ssh-agent that lists one key. A line on
+# the control socket is a restart: the new version, a full cache again, and one more restart counted.
+FAKE_PYLON = r'''import http.server, json, os, socketserver, struct, sys, threading
+runtime, control, pidfile = sys.argv[1:]
+state = {'entries': 3, 'version': 'not-restarted', 'restarts': 0}
 class Http(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -96,7 +101,8 @@ class Http(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
     def do_GET(self):
         if self.path == '/v1/status':
-            self.answer({'entries': state['entries'], 'ttl': 300, 'version': version})
+            self.answer({'entries': state['entries'], 'ttl': 300, 'version': state['version'],
+                         'restarts': state['restarts']})
         else:
             self.send_error(404)
     def do_POST(self):
@@ -120,11 +126,15 @@ class Agent(socketserver.BaseRequestHandler):
             else:
                 reply = bytes([5])
             self.request.sendall(s(reply))
+class Control(socketserver.StreamRequestHandler):
+    def handle(self):
+        state.update(version=self.rfile.readline().decode().strip(), entries=3, restarts=state['restarts'] + 1)
+        self.wfile.write(b'restarted\n')
 class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
 servers = []
-for name, handler in (('fleet-secrets.sock', Http), ('fleet-agent.sock', Agent)):
-    path = os.path.join(runtime, name)
+for path, handler in ((os.path.join(runtime, 'fleet-secrets.sock'), Http),
+                      (os.path.join(runtime, 'fleet-agent.sock'), Agent), (control, Control)):
     if os.path.exists(path):
         os.unlink(path)
     servers.append(Server(path, handler))
@@ -205,6 +215,8 @@ class ActlContract(unittest.TestCase):
             (executor_bin / name).chmod(0o700)
         if os.environ.get('FLEET_CONTRACT_PYLON'):
             shutil.copy(os.environ['FLEET_CONTRACT_PYLON'], home / 'pylon-body')
+        cls.spawn('fake-pylon', ['python3', str(executor_bin / 'fake-pylon'), str(cls.tmp / 'run'),
+                                 str(home / 'fake-pylon.ctl'), str(home / 'fake-pylon.pid')])
         cls.start_nats(keys)
         cls.connection('admin', 'admin.main', keys / 'admin.seed')
         subprocess.run([str(cls.actl), '--config', str(cls.tmp / 'admin.toml'), 'bootstrap'], env=cls.env,
@@ -216,12 +228,6 @@ class ActlContract(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        pid = cls.home / 'fake-pylon.pid'
-        if pid.exists():
-            try:
-                os.kill(int(pid.read_text()), 15)
-            except (OSError, ValueError):
-                pass
         for proc in cls.procs.values():
             if proc.poll() is None:
                 proc.terminate()
@@ -472,31 +478,19 @@ class ActlContract(unittest.TestCase):
     @unittest.skipUnless(os.environ.get('FLEET_CONTRACT_PYLON'), 'set FLEET_CONTRACT_PYLON')
     def test_pylon_install_proves_the_daemon_and_a_repeat_is_harmless(self):
         name, state, detail, _ = self.task('pylon-install', self.commit)
-        self.assertEqual((state, detail), ('completed', 'exit=0'), (self.home / 'fake-pylon.log').read_text()
-                         if (self.home / 'fake-pylon.log').exists() else '')
+        self.assertEqual((state, detail), ('completed', 'exit=0'), (self.home / 'fake-pylon.log').read_text())
         self.assertEqual((self.home / '.local/bin/pylon').read_bytes(), (self.home / 'pylon-body').read_bytes())
         pinned = [l for l in self.at(self.commit, 'dot_local/bin/executable_fleet').decode().splitlines()
                   if l.startswith('PYLON_VERSION=')][0].split('=', 1)[1]
         self.assertEqual(self.pylon_status()['version'], pinned)
         self.assertEqual(self.applied()['pylon-install'], self.commit)
-        restarts = (self.home / 'executor-systemctl.log').read_text().count('restart fleet-agent.service')
-        pid = (self.home / 'fake-pylon.pid').read_text()
+        restarts = self.pylon_status()['restarts']
+        self.assertGreater(restarts, 0)
         name, state, detail, _ = self.task('pylon-install', self.commit)
         self.assertEqual((state, detail), ('completed', 'exit=0'))
-        self.assertEqual((self.home / 'executor-systemctl.log').read_text().count('restart fleet-agent.service'),
-                         restarts)
-        self.assertEqual((self.home / 'fake-pylon.pid').read_text(), pid)
+        self.assertEqual(self.pylon_status()['restarts'], restarts)
 
     def test_secrets_flush_all_empties_the_cache(self):
-        pid = self.home / 'fake-pylon.pid'
-        running = pid.exists() and Path(f'/proc/{pid.read_text().strip()}').exists()
-        if not running:
-            subprocess.run(['setsid', '-f', 'python3', str(self.home / '.local/bin/fake-pylon'), str(self.tmp / 'run'),
-                            'contract', str(pid)], check=True, env=self.env)
-            for _ in range(50):
-                if (self.tmp / 'run/fleet-secrets.sock').exists():
-                    break
-                time.sleep(0.1)
         self.assertGreater(self.pylon_status()['entries'], 0)
         result = self.fleet('secret', 'flush', '--all', '--commit', self.commit, '--timeout', '180', check=False)
         name, state, detail, _ = self.report(result)
