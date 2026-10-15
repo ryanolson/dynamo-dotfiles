@@ -1367,9 +1367,6 @@ if cmd == 'actl-endpoint':
         f.write(ca)
     with open(os.path.join(a[1], 'workers'), 'w') as f:
         f.write(''.join(f"{w['id']} {w['os']}\n" for w in workers))
-elif cmd == 'atomic-copy':
-    with open(a[1]) as f:
-        atomic(a[0], f.read(), int(a[2], 8))
 elif cmd == 'sync-dir':
     sync_dir(a[0])
 elif cmd == 'drained-pid':
