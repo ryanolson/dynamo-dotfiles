@@ -75,11 +75,16 @@ class FleetBase(unittest.TestCase):
         bin_dir.mkdir()
         recorder = '#!/bin/sh\nprintf "%s %s\\n" "$(basename "$0")" "$*" >> "$HOME/scheduler.log"\n'
         for name, body in [('step', STEP_STUB), ('op', OP_STUB), ('launchctl', recorder), ('systemctl', recorder),
-                           ('loginctl', recorder), ('crontab', recorder)]:
+                           ('loginctl', recorder), ('crontab', recorder), ('journalctl', recorder)]:
             (bin_dir / name).write_text(body)
             (bin_dir / name).chmod(0o700)
         self.log = self.home / 'step.log'
+        # On Linux, fleet puts the agent and secrets sockets under XDG_RUNTIME_DIR, and falls back to
+        # /run/user/UID without it. A test that inherited either would remove the host's live sockets.
+        runtime = self.home / 'run'
+        runtime.mkdir(mode=0o700)
         self.env = dict(os.environ, HOME=str(self.home), PATH=f'{bin_dir}:{os.environ["PATH"]}',
+                        XDG_RUNTIME_DIR=str(runtime),
                         STEP_LOG=str(self.log), EXPECT_TOKEN=TOKEN, USER_CA=USER_CA, HOST_CA=HOST_CA,
                         XDG_CONFIG_HOME=str(self.home / '.config'), XDG_STATE_HOME=str(self.home / '.local/state'),
                         FLEET_PYLON=str(self.home / 'no-pylon'), FLEET_TAILSCALE=str(self.home / 'no-tailscale'))
@@ -507,6 +512,21 @@ class Fleet(FleetBase):
                      ('run', 'missing')]:
             self.assertNotEqual(self.tunnel(*args).returncode, 0, args)
 
+    def test_linux_sockets_stay_under_the_test_home(self):
+        # The host's XDG_RUNTIME_DIR must not reach fleet, whatever the parent environment holds.
+        runtime = Path(self.env['XDG_RUNTIME_DIR'])
+        self.assertTrue(runtime.is_relative_to(self.home), runtime)
+        self.enroll()
+        (self.home / 'bin/uname').write_text('#!/bin/sh\n[ "$1" = -m ] && echo x86_64 || echo Linux\n')
+        (self.home / 'bin/uname').chmod(0o700)
+        sentinel = runtime / 'fleet-agent.sock'
+        sentinel.write_text('')
+        result = self.fleet('agent', 'remove')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(sentinel.exists())
+        for line in (self.home / 'scheduler.log').read_text().splitlines():
+            self.assertTrue(line.split()[0] in ('systemctl', 'launchctl', 'loginctl', 'crontab', 'journalctl'), line)
+
     def test_agent_refuses_a_socket_path_that_is_too_long(self):
         self.enroll()
         self.socat_stub()
@@ -638,7 +658,10 @@ class Fleet(FleetBase):
             self.assertFalse(gone.exists(), gone)
         self.assertEqual((ssh / 'authorized_keys').read_text(), 'ssh-ed25519 AAAAOTHERKEY me@laptop\n')
         scheduler = (self.home / 'scheduler.log').read_text()
-        for label in ['dev.fleet.renew', 'dev.fleet.agent', 'dev.fleet.tunnel.bb']:
+        labels = (['dev.fleet.renew', 'dev.fleet.agent', 'dev.fleet.tunnel.bb'] if os.uname().sysname == 'Darwin' else
+                  ['disable --now fleet-renew.timer', 'disable --now fleet-agent.service',
+                   'disable --now fleet-tunnel-bb.service'])
+        for label in labels:
             self.assertIn(label, scheduler)
         for plist in ['dev.fleet.renew', 'dev.fleet.agent', 'dev.fleet.tunnel.bb']:
             self.assertFalse((self.home / f'Library/LaunchAgents/{plist}.plist').exists(), plist)
@@ -916,7 +939,6 @@ class FleetLaptop(FleetBase):
 class FleetEphemeral(FleetBase):
     def start(self, *extra):
         runtime = self.home / 'run'
-        runtime.mkdir(mode=0o700)
         self.stderr_path = self.home / 'ephemeral.err'
         stderr = self.stderr_path.open('w')
         self.addCleanup(stderr.close)
