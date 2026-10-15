@@ -123,6 +123,8 @@ EOF
 }
 
 valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]]; }
+# An SSH destination. A leading - would make ssh read it as an option, so callers also pass --.
+valid_ssh_host() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9@._-]*$ ]]; }
 valid_url() { [[ "$1" =~ ^https://[A-Za-z0-9.:-]+(/[A-Za-z0-9._/-]*)?$ ]]; }
 valid_fingerprint() { [[ "$1" =~ ^[0-9a-f]{64}$ ]]; }
 valid_principal() { [[ "$1" =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]]; }
@@ -615,7 +617,7 @@ cmd_ephemeral() {
 cmd_enroll_remote() {
     [[ $# -ge 2 ]] || fail 'usage: fleet enroll-remote HOST NAME [--san NAME]... [--no-trust] [--principal NAME]'
     local host="$1" node="$2"; shift 2
-    [[ "$host" =~ ^[A-Za-z0-9@._-]+$ ]] || fail 'invalid HOST'
+    valid_ssh_host "$host" || fail 'invalid HOST'
     valid_name "$node" || fail 'invalid NAME'
     load_config
     local token_args=() remote_args=()
@@ -630,7 +632,7 @@ cmd_enroll_remote() {
     local out
     scratch; out="$SCRATCH"
     mint_token "$node" "${token_args[@]+"${token_args[@]}"}" > "$out/token"
-    ssh "$host" < "$out/token" "~/.local/bin/fleet enroll $node --ca-url $ca_url --fingerprint $fingerprint ${remote_args[*]-}"
+    ssh -- "$host" < "$out/token" "~/.local/bin/fleet enroll $node --ca-url $ca_url --fingerprint $fingerprint ${remote_args[*]-}"
 }
 
 cmd_renew() {
@@ -1992,7 +1994,7 @@ cmd_actl() {
 cmd_worker_enroll() {
     [[ $# -ge 1 ]] || fail 'usage: fleet worker enroll HOST [--controller HOST] [--provisioner PATH] [--fleet-config PATH] [--timeout S]'
     local host="$1"; shift
-    [[ "$host" =~ ^[A-Za-z0-9@._-]+$ ]] || fail 'invalid HOST'
+    valid_ssh_host "$host" || fail 'invalid HOST'
     local controller="${FLEET_ACTL_CONTROLLER:-bb}" provisioner="${FLEET_ACTL_PROVISIONER:-~/repos/agentic-control}"
     local fleet_config="${FLEET_CONFIG_REPO:-$HOME/repos/fleet-config}" timeout=120
     while [[ $# -gt 0 ]]; do
@@ -2004,18 +2006,18 @@ cmd_worker_enroll() {
             *) fail "unknown option $1" ;;
         esac
     done
-    [[ "$controller" =~ ^[A-Za-z0-9@._-]+$ ]] || fail 'invalid --controller'
+    valid_ssh_host "$controller" || fail 'invalid --controller'
     [[ "$provisioner" =~ ^(/|~/)[A-Za-z0-9_./-]*$ ]] || fail 'invalid --provisioner (an absolute or ~/ path)'
     need_python
     need_client_config
     need_actl
     local out line id os
-    out=$(ssh "$host" '~/.local/bin/fleet worker install') || fail "fleet worker install failed on $host"
+    out=$(ssh -- "$host" '~/.local/bin/fleet worker install') || fail "fleet worker install failed on $host"
     line=$(printf '%s\n' "$out" | grep -E '^[A-Za-z0-9_-]{1,59}=(linux|macos):U[A-Z2-7]{55}$' || true)
     [[ -n "$line" && "$line" != *$'\n'* ]] || fail "fleet worker install on $host did not print one ID=OS:PUBLIC_KEY line"
     id="${line%%=*}" os="${line#*=}" os="${os%%:*}"
     printf '%s is the worker %s (%s)\n' "$host" "$id" "$os"
-    ssh "$controller" "sudo -n $provisioner/scripts/provision.py --config /etc/actl-fleet/deployment.json --environment prod --add-worker $line" ||
+    ssh -- "$controller" "sudo -n $provisioner/scripts/provision.py --config /etc/actl-fleet/deployment.json --environment prod --add-worker $line" ||
         fail "provision.py --add-worker failed on $controller. Run the same fleet worker enroll again; each step is safe to repeat."
     printf 'the controller on %s enrolls %s\n' "$controller" "$id"
     local roster="$fleet_config/broker/actl.json" added

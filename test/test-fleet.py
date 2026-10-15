@@ -348,13 +348,17 @@ class Fleet(FleetBase):
         result = self.fleet('enroll-remote', 'user@box', 'box.fleet', '--no-trust')
         self.assertEqual(result.returncode, 0, result.stderr)
         args = (self.home / 'ssh-args').read_text().splitlines()
-        self.assertEqual(args[0], 'user@box')
-        self.assertIn('fleet enroll box.fleet --ca-url https://ca.example', args[1])
-        self.assertIn('--no-trust', args[1])
-        self.assertNotIn(TOKEN, args[1])
+        self.assertEqual(args[:2], ['--', 'user@box'])
+        self.assertIn('fleet enroll box.fleet --ca-url https://ca.example', args[2])
+        self.assertIn('--no-trust', args[2])
+        self.assertNotIn(TOKEN, args[2])
         self.assertEqual((self.home / 'ssh-stdin').read_text().strip(), TOKEN)
         seen = json.loads((self.home / 'token-seen.json').read_text())
         self.assertFalse(Path(seen['key_path']).exists())
+        (self.home / 'ssh-args').unlink()
+        result = self.fleet('enroll-remote', '-oProxyCommand', 'box.fleet', '--no-trust')
+        self.assertIn('invalid HOST', result.stderr)
+        self.assertFalse((self.home / 'ssh-args').exists())
 
     def test_revoke_uses_a_revoke_token(self):
         self.fleet('init', '--ca-url', 'https://ca.example', '--fingerprint', 'ab' * 32,
@@ -2187,6 +2191,19 @@ class WorkerEnroll(ActlBase):
         self.assertIn('bb is the worker brev-x86-cpu', result.stdout)
         self.assertIn('commit broker/actl.json', result.stdout)
         self.assertIn('brev-x86-cpu is connected', result.stdout)
+
+    def test_a_host_or_controller_that_looks_like_an_option_is_refused(self):
+        for args in (['-oProxyCommand'], ['bb', '--controller', '-oProxyCommand'], ['.bb'], ['bb', '--controller', '_x']):
+            with self.subTest(args):
+                result = self.fleet('worker', 'enroll', *args, '--fleet-config', str(self.repo), '--timeout', '3')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('invalid', result.stderr)
+        self.assertFalse((self.home / 'ssh.log').exists())
+
+    def test_ssh_gets_the_host_after_the_end_of_options(self):
+        self.assertEqual(self.enroll_worker().returncode, 0)
+        for call in self.ssh_calls():
+            self.assertEqual(call[-3], '--', call)
 
     def test_controller_and_provisioner_are_configurable(self):
         result = self.enroll_worker('--controller', 'ctl-host', '--provisioner', '/srv/actl')
