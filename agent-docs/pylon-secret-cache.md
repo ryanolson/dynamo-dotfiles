@@ -70,7 +70,7 @@ Rules:
 
 ## Flush on every machine
 
-Today: an SSH loop that runs `fleet secret flush`. Later: an executor in agentic-control that runs the same command on every worker over NATS. The automatic `pylon` updates come from the same executors. Until then, `fleet install-pylon` runs by hand.
+`fleet secret flush --all` on the admin laptop runs `fleet task secrets-flush --all`: each enrolled actl worker runs `fleet secret flush` (agentic-control task 029, part 5). `pylon` updates use the same path: the `pylon-install` executor runs `fleet install-pylon` with the pins of the task's commit and checks that the running pylon reports the pinned version in `/v1/status`. `fleet-config/artifacts/release pylon` sends that task when `FLEET_TRANSPORT=actl`.
 
 ## Order of work
 
