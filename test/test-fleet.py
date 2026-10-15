@@ -2296,6 +2296,21 @@ class FleetTask(ActlBase):
         self.assertNotEqual(resumed.returncode, 0)
         self.assertIn('another fleet task', resumed.stderr)
 
+    def test_secret_flush_all_sends_secrets_flush_to_every_machine(self):
+        result = self.fleet('secret', 'flush', '--all', '--commit', self.COMMIT, '--timeout', '2')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.report(result), {'brev-x86-cpu': 'completed', 'spark-d': 'completed', 'mba-15': 'completed'})
+        types = [c[c.index('--type') + 1] for c in self.submits()]
+        self.assertEqual(types, ['secrets-flush'] * 3)
+        self.assertEqual(sorted(c[c.index('--requires') + 1] for c in self.submits()),
+                         ['host-brev-x86-cpu', 'host-mba-15', 'host-spark-d'])
+        self.assertFalse((self.home / 'curl.log').exists() and '--unix-socket' in (self.home / 'curl.log').read_text())
+        self.controller(fail=['spark-d'])
+        failed = self.fleet('secret', 'flush', '--all', '--commit', self.COMMIT, '--timeout', '2')
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn('1 machine failed', failed.stdout)
+        self.assertNotEqual(self.fleet('secret', 'flush', 'extra').returncode, 0)
+
     def test_run_specification_is_written_before_any_submission(self):
         self.controller(down=True)
         result = self.fleet('task', 'fleet-apply', '--all', '--commit', self.COMMIT, '--timeout', '1')

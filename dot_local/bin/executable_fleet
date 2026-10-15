@@ -86,6 +86,8 @@ Any machine:
                                         NAME can be an op://VAULT/ITEM/[SECTION/]FIELD reference: pylon
                                         answers it from its cache, else the broker looks it up.
   secret flush                          Empty the secrets cache of the local pylon.
+  secret flush --all [--commit SHA] [--timeout S]
+                                        Laptop: empty it on every enrolled machine (fleet task secrets-flush --all).
   claude [ARGS...]                      Run claude with CLAUDE_CODE_OAUTH_TOKEN from the secret claude-oauth-token.
   trust [--principal NAME] | untrust    Add or remove the CA line in ~/.ssh/authorized_keys.
   timer install | timer remove          Schedule renew every hour.
@@ -861,11 +863,18 @@ cmd_secret() {
             done
             exec "$@" ;;
         flush)
+            # --all flushes every enrolled machine through actl; the rest of the arguments go to fleet task.
+            if [[ "${2:-}" == --all ]]; then
+                shift 2
+                cmd_task secrets-flush --all "$@"
+                return
+            fi
+            [[ $# -eq 1 ]] || fail 'usage: fleet secret flush [--all [--commit SHA] [--timeout S]]'
             local sock; sock=$(secrets_sock)
             [[ -S "$sock" ]] || fail "pylon does not serve secrets on $sock"
             curl -fsS --unix-socket "$sock" -X POST http://pylon/v1/flush >/dev/null || fail 'pylon did not flush its cache'
             echo 'flushed the pylon secrets cache' ;;
-        *) fail 'usage: fleet secret get NAME | fleet secret env VAR=NAME... -- CMD... | fleet secret flush' ;;
+        *) fail 'usage: fleet secret get NAME | fleet secret env VAR=NAME... -- CMD... | fleet secret flush [--all]' ;;
     esac
 }
 
