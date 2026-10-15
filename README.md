@@ -386,7 +386,7 @@ With nothing changed, install changes nothing, but it starts a stopped service. 
 Each executor runs the `fleet` script of the task's commit, so it uses that commit's pins:
 
 - `fleet-apply` (`fleet executor apply`) installs `fleet` and `fleet-ssh-keygen` from the checkout into `~/.local/bin`, mode 755. A file that is already the same is not written. Neither file is a template, so the copy is what `chezmoi apply` would write, and a machine that joined with `join.sh` needs no chezmoi.
-- `pylon-install` (`fleet executor pylon-install`) runs `install-pylon` and then checks the running agent. Within 30 seconds (`FLEET_PYLON_WAIT`), `GET /v1/status` on the secrets socket must report the pinned `PYLON_VERSION`. A status without a version fails. Then the secret `fleet-selftest` must arrive, and the agent must list keys.
+- `pylon-install` (`fleet executor pylon-install`) runs `install-pylon` and then checks the running agent. Within 30 seconds (`FLEET_PYLON_WAIT`), `GET /v1/status` on the secrets socket must report the pinned `PYLON_VERSION`. A status without a version fails. Then a secret reference must arrive, not empty, through the same secrets socket that `openv` uses, with no fallback to the broker. The reference is `op://Fleet/HuggingFace/credential`, or `FLEET_SELFTEST_REF` when it is set. Only the length of the value is checked; the value is not printed or saved. Last, the agent must list keys.
 - `secrets-flush` runs `fleet secret flush`.
 - `fleet-probe` prints the machine name and the task ID.
 

@@ -2288,10 +2288,14 @@ executor_apply() {
 }
 
 # prove_pylon: the restarted agent answers on the live secrets socket with the pinned version, a
-# secret arrives, and the agent lists keys. pylon needs a moment to start, so retry until
-# FLEET_PYLON_WAIT seconds pass. A status without a version is a pylon older than the pin.
+# secret arrives through that socket, and the agent lists keys. pylon needs a moment to start, so
+# retry until FLEET_PYLON_WAIT seconds pass. A status without a version is a pylon older than the pin.
+# The secret is fetched from the socket only, not with ref_value: its broker fallback would pass
+# while the pylon path that openv uses is broken. Only its length is checked; the value is not kept.
 prove_pylon() {
-    local sock agent deadline status version seen='does not answer' keys
+    local sock agent deadline status version seen='does not answer' keys length
+    local ref="${FLEET_SELFTEST_REF:-op://Fleet/HuggingFace/credential}"
+    valid_ref "$ref" || fail "invalid FLEET_SELFTEST_REF: $ref"
     sock=$(secrets_sock) agent=$(agent_sock)
     deadline=$((SECONDS + ${FLEET_PYLON_WAIT:-30}))
     while true; do
@@ -2306,8 +2310,10 @@ prove_pylon() {
         (( SECONDS < deadline )) || fail "pylon on $sock $seen; the pin is $PYLON_VERSION"
         sleep 1
     done
-    [[ "$( (secret_value fleet-selftest) 2>/dev/null)" == ok ]] ||
-        fail 'the secret fleet-selftest did not arrive from the broker'
+    length=$(curl -fsS --connect-timeout 5 --max-time 30 --unix-socket "$sock" \
+        "http://pylon/v1/secrets?ref=$(encode_ref "$ref")" 2>/dev/null | wc -c) ||
+        fail "$ref did not arrive through the pylon secrets socket $sock"
+    (( length > 0 )) || fail "$ref arrived empty through the pylon secrets socket $sock"
     while true; do
         keys=$(SSH_AUTH_SOCK="$agent" ssh-add -L 2>/dev/null | grep -c '^[a-z]' || true)
         (( keys > 0 )) && break

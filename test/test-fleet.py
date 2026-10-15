@@ -1714,15 +1714,15 @@ if opt('--unix-socket'):
     if url.endswith('/v1/flush'):
         print('{"flushed": 2}')
         sys.exit(0)
+    if '/v1/secrets?ref=' in url:
+        value = (home / 'selftest').read_text() if (home / 'selftest').exists() else 'hf_value'
+        if value == 'refused':
+            sys.exit(22)
+        sys.stdout.write(value)
+        sys.exit(0)
     sys.exit(22)
 if '/v1/artifacts/pylon/' in url:
     shutil.copy(home / 'body', opt('-o'))
-    sys.exit(0)
-if url.endswith('/v1/secrets/fleet-selftest'):
-    value = (home / 'selftest').read_text() if (home / 'selftest').exists() else 'ok'
-    if value == 'refused':
-        sys.exit(22)
-    sys.stdout.write(value)
     sys.exit(0)
 sys.exit(22)
 '''
@@ -1918,7 +1918,14 @@ class ExecutorPylonInstall(Executors):
         runtime = self.env['XDG_RUNTIME_DIR']
         self.assertIn(f'{runtime}/fleet-secrets.sock http://pylon/v1/status',
                       (self.home / 'sockets.log').read_text().splitlines())
-        self.assertIn('/v1/secrets/fleet-selftest', (self.home / 'curl.log').read_text())
+        sockets = (self.home / 'sockets.log').read_text().splitlines()
+        self.assertIn(f'{runtime}/fleet-secrets.sock http://pylon/v1/secrets?ref=op%3A%2F%2FFleet%2FHuggingFace%2Fcredential',
+                      sockets)
+        secret_calls = [json.loads(l) for l in (self.home / 'curl.log').read_text().splitlines() if '/v1/secrets' in l]
+        self.assertEqual(len(secret_calls), 1)
+        self.assertIn('--max-time', secret_calls[0])
+        self.assertIn('--unix-socket', secret_calls[0])
+        self.assertNotIn('hf_value', result.stdout + result.stderr)
         self.assertEqual((self.home / 'ssh-add.log').read_text().splitlines()[-1], f'{runtime}/fleet-agent.sock -L')
         self.assertIn('pylon 0.2.0', result.stdout)
         self.assertIn('2 agent keys', result.stdout)
@@ -1967,13 +1974,25 @@ class ExecutorPylonInstall(Executors):
         (self.home / 'restart-fails').write_text('')
         self.failed(self.executor('pylon-install', self.commit(1_700_000_000)), 'could not restart the fleet agent')
 
-    def test_a_failed_secret_check_fails_without_printing_the_value(self):
+    def test_a_failed_secret_check_fails(self):
         (self.home / 'selftest').write_text('refused')
-        self.failed(self.executor('pylon-install', self.commit(1_700_000_000)), 'fleet-selftest')
-        (self.home / 'selftest').write_text('SECRETVALUE')
-        result = self.executor('pylon-install', self.commit(1_700_000_100))
-        self.failed(result, 'fleet-selftest')
-        self.assertNotIn('SECRETVALUE', result.stdout + result.stderr)
+        self.failed(self.executor('pylon-install', self.commit(1_700_000_000)), 'op://Fleet/HuggingFace/credential')
+
+    def test_an_empty_secret_fails(self):
+        (self.home / 'selftest').write_text('')
+        self.failed(self.executor('pylon-install', self.commit(1_700_000_000)), 'empty')
+
+    def test_the_secret_check_does_not_fall_back_to_the_broker(self):
+        (self.home / 'selftest').write_text('refused')
+        self.failed(self.executor('pylon-install', self.commit(1_700_000_000)), 'secrets socket')
+        broker = [l for l in (self.home / 'curl.log').read_text().splitlines() if '/v1/secrets' in l and 'unix-socket' not in l]
+        self.assertEqual(broker, [])
+
+    def test_the_secret_reference_can_be_overridden(self):
+        sha = self.commit(1_700_000_000)
+        result = self.executor('pylon-install', sha, FLEET_SELFTEST_REF='op://Fleet/Other item/password')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('ref=op%3A%2F%2FFleet%2FOther%20item%2Fpassword', (self.home / 'sockets.log').read_text())
 
     def test_an_agent_without_keys_fails(self):
         (self.home / 'agent-keys').unlink()

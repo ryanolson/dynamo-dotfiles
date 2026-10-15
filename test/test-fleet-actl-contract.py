@@ -58,14 +58,13 @@ esac
 '''
 
 
-# On the executors' PATH. The broker: the selftest secret and the pylon download. Requests to a Unix
-# socket go to the real curl, so the executor talks to the fake pylon below.
+# On the executors' PATH. The broker: the pylon download only. Requests to a Unix socket go to the
+# real curl, so the executor talks to the fake pylon below.
 EXECUTOR_CURL = '''#!/bin/sh
 case " $* " in *" --unix-socket "*) exec /usr/bin/curl "$@" ;; esac
 url=""; out=""
 while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2 ;; https://*) url="$1"; shift ;; *) shift ;; esac; done
 case "$url" in
-  */v1/secrets/fleet-selftest) printf ok ;;
   */v1/artifacts/pylon/*) cp "$HOME/pylon-body" "$out" ;;
   *) exit 22 ;;
 esac
@@ -84,8 +83,9 @@ s.connect(sys.argv[1])
 s.sendall(sys.argv[2].encode() + b"\\n")
 sys.exit(0 if s.recv(64) == b"restarted\\n" else 1)' "$HOME/fake-pylon.ctl" "${version:-unknown}"
 '''
-# The secrets socket (status with a version, flush) and an ssh-agent that lists one key. A line on
-# the control socket is a restart: the new version, a full cache again, and one more restart counted.
+# The secrets socket (status with a version, flush, secrets by reference, each reference logged) and
+# an ssh-agent that lists one key. A line on the control socket is a restart: the new version, a full
+# cache again, and one more restart counted.
 FAKE_PYLON = r'''import http.server, json, os, socketserver, struct, sys, threading
 runtime, control, pidfile = sys.argv[1:]
 state = {'entries': 3, 'version': 'not-restarted', 'restarts': 0}
@@ -103,6 +103,13 @@ class Http(http.server.BaseHTTPRequestHandler):
         if self.path == '/v1/status':
             self.answer({'entries': state['entries'], 'ttl': 300, 'version': state['version'],
                          'restarts': state['restarts']})
+        elif self.path.startswith('/v1/secrets?ref='):
+            with open(control + '.secrets.log', 'a') as f:
+                f.write(self.path + '\n')
+            self.send_response(200)
+            self.send_header('Content-Length', '8')
+            self.end_headers()
+            self.wfile.write(b'hf_value')
         else:
             self.send_error(404)
     def do_POST(self):
@@ -484,6 +491,8 @@ class ActlContract(unittest.TestCase):
                   if l.startswith('PYLON_VERSION=')][0].split('=', 1)[1]
         self.assertEqual(self.pylon_status()['version'], pinned)
         self.assertEqual(self.applied()['pylon-install'], self.commit)
+        self.assertIn('/v1/secrets?ref=op%3A%2F%2FFleet%2FHuggingFace%2Fcredential',
+                      (self.home / 'fake-pylon.ctl.secrets.log').read_text().splitlines())
         restarts = self.pylon_status()['restarts']
         self.assertGreater(restarts, 0)
         name, state, detail, _ = self.task('pylon-install', self.commit)
