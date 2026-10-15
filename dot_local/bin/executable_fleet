@@ -2288,6 +2288,11 @@ executor_apply() {
     # The fence only refuses an older commit. A repeat of the same commit still compares and copies,
     # so a file changed or removed by hand since the last apply is put back.
     local pair src dst tmp staged=() i
+    # A killed apply leaves its temporary files. The fence lock is held, so none belongs to a live apply.
+    for pair in $APPLY_FILES; do
+        dst="$HOME/${pair#*:}"
+        rm -f "$(dirname "$dst")"/.fleet-apply.??????
+    done
     # Stage and check every file first, so a missing source or a script that does not parse changes
     # nothing. All the APPLY_FILES are bash scripts.
     for pair in $APPLY_FILES; do

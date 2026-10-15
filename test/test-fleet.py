@@ -1959,6 +1959,19 @@ class ExecutorApply(Executors):
         self.assertFalse(self.targets()[0].exists())
         self.assertEqual(self.record(), {})
 
+    def test_apply_removes_temporary_files_left_by_a_killed_apply(self):
+        sha = self.commit(1_700_000_000, marker='one')
+        bin_dir = self.home / '.local/bin'
+        bin_dir.mkdir(parents=True)
+        stale = bin_dir / '.fleet-apply.Ab12Cd'
+        stale.write_text('#!/bin/sh\n')
+        other = bin_dir / '.fleet-apply-notes'
+        other.write_text('not ours')
+        result = self.executor('apply', sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(stale.exists())
+        self.assertTrue(other.exists())
+
     def test_a_malformed_record_stops_the_executor(self):
         sha = self.commit(1_700_000_000)
         self.state.mkdir(parents=True, exist_ok=True)
