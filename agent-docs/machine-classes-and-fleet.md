@@ -161,3 +161,11 @@ The items that machines use go in a separate vault, `Fleet`. 1Password stays the
 Open question: does `op` need a writable configuration folder when the unit has `ProtectHome=yes`? Test this on ca-1.
 
 Open question: what are the request limits of a service account on the plan that holds the vault? The 60-second cache is a guess until that is known.
+
+## Addendum 2026-10-15: step 4 done
+
+- The `Fleet` vault holds copies of `HuggingFace` and `NGC NIM Operations PAT` from `Development`. A read-only service account can read only `Fleet`. Its token is `op://Development/Fleet SA/credential`.
+- The broker on ca-1 serves `hf-token` and `ngc-api-key` from `Fleet` (fleet-config `8dfc840`). `op` keeps its configuration in `/var/lib/fleet-broker/.config`, so `ProtectHome=yes` does not stop it.
+- `openv` uses `op` when `dev.env.op` has a reference, and otherwise runs `fleet secret env` with the pairs in `dev.env.fleet`. The map is `fleet_secrets` in `.chezmoidata/team.yaml`. `test/test-openv.py` covers both paths, a missing map, and lines that are not `VAR=name`.
+- The copies in `Fleet` do not follow a rotation in `Development`. A rotation must update the item in `Fleet`.
+- `onepassword.secrets` still points `ngc_api_key` at `op://Development/NGC/credential`, but the broker serves the NIM Operations key. Open question: change the team map to the NIM Operations key, so that both paths give the same key?

@@ -254,6 +254,7 @@ API keys and tokens are managed via 1Password CLI (`op`) with on-demand injectio
 **How it works:**
 - Chezmoi writes `~/.config/dynamo/dev.env.op` with 1Password secret references only
 - `openv <cmd...>` runs a command under `op run --env-file ~/.config/dynamo/dev.env.op`
+- On a machine where `onepassword.enabled` is false, chezmoi writes `~/.config/dynamo/dev.env.fleet` instead, with one `VAR=name` line for each entry in `fleet_secrets` (`.chezmoidata/team.yaml`). `openv` then runs `fleet secret env VAR=name... -- <cmd...>`, and the fleet broker serves each name from the `Fleet` vault in 1Password. The machine must be enrolled in the fleet.
 - `openv-file <env-file> <cmd...>` does the same for an alternate env-reference file
 - No service-account token is stored in `chezmoi` config or auto-exported into every shell
 

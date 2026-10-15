@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# A machine with 1Password has op:// references in dev.env.op. A machine without it has
+# VAR=name lines in dev.env.fleet, and the fleet broker serves each name. chezmoi writes
+# only one of the two with content, from onepassword.enabled.
 ENV_FILE="${DYNAMO_OP_ENV_FILE:-$HOME/.config/dynamo/dev.env.op}"
+FLEET_FILE="$HOME/.config/dynamo/dev.env.fleet"
 
 usage() {
     echo "Usage: openv <command...>" >&2
@@ -10,14 +14,29 @@ usage() {
 
 [[ $# -gt 0 ]] || usage
 
-if ! command -v op >/dev/null 2>&1; then
-    echo "openv: 1Password CLI (op) is not installed" >&2
-    exit 1
+if [[ -f "$ENV_FILE" ]] && grep -Eq '^[A-Z_][A-Z0-9_]*=' "$ENV_FILE"; then
+    if ! command -v op >/dev/null 2>&1; then
+        echo "openv: 1Password CLI (op) is not installed" >&2
+        exit 1
+    fi
+    exec op run --env-file "$ENV_FILE" -- "$@"
 fi
 
-if [[ ! -f "$ENV_FILE" ]]; then
-    echo "openv: env file not found at $ENV_FILE" >&2
+pairs=()
+if [[ -f "$FLEET_FILE" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        # A broker name cannot start with '-', so a line cannot add an option to fleet.
+        if [[ ! "$line" =~ ^[A-Z_][A-Z0-9_]*=[a-z0-9][a-z0-9-]*$ ]]; then
+            echo "openv: invalid line in $FLEET_FILE: $line" >&2
+            exit 1
+        fi
+        pairs+=("$line")
+    done < "$FLEET_FILE"
+fi
+if [[ ${#pairs[@]} -eq 0 ]]; then
+    echo "openv: no secrets: $ENV_FILE has no references and $FLEET_FILE has no broker names" >&2
     exit 1
 fi
-
-exec op run --env-file "$ENV_FILE" -- "$@"
+fleet=$(command -v fleet || echo "$HOME/.local/bin/fleet")
+exec "$fleet" secret env "${pairs[@]}" -- "$@"

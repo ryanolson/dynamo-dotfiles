@@ -13,7 +13,7 @@ Shell aliases and Fish functions are not portable commands. Prefer the executabl
 | Task | Tool and entry point | Prerequisites and scope |
 |---|---|---|
 | Inspect or manage BB projects, machines, and conversations | Read the `bb-cli` skill. Use `bb --help`, `bb guide`, and `bb <group> --help`. | Requires an installed CLI. State queries also require the intended server and authentication. |
-| Inject credentials into one process | `openv <command...>` or `openv-file <env-reference-file> <command...>` | Requires `op`, access to 1Password, and an env-reference file. Never invoke an environment dump to check secrets. |
+| Inject credentials into one process | `openv <command...>` or `openv-file <env-reference-file> <command...>` | `openv` uses `op` and `~/.config/dynamo/dev.env.op` where 1Password is enabled, and the fleet broker and `~/.config/dynamo/dev.env.fleet` on other enrolled machines. `openv-file` requires `op`. Never invoke an environment dump to check secrets. |
 | Inspect and manage repository worktrees | `git worktree list`; `wt ls`; `wt path <name>` | `wt` manages `.claude/worktrees/`. `wt new <name> [base-ref]` creates a `wt/<name>` branch. Use explicit Git commands when a different branch or path is required. |
 | Launch a terminal agent session | `agent-spawn claude` or `agent-spawn codex`; inspect the script usage for worktree and prompt arguments | Requires Zellij and the selected CLI. Launch only as part of authorized agent work. Autonomous modes change permission behavior; inspect them before use. |
 | Inspect terminal agent/worktree status | `agent-status` | Scans the current repository and repositories under `~/src`. Process-name matches are hints, not proof of session health. Requires Bash with associative arrays. |

@@ -191,7 +191,8 @@ validation, or fallback behavior merely to satisfy a reviewer.
 ## Secrets
 
 Secrets live in 1Password and are injected on demand: `openv <cmd>` runs a command under
-`op run --env-file ~/.config/dynamo/dev.env.op`. Never inline a secret, never echo one into a
+`op run --env-file ~/.config/dynamo/dev.env.op`. On a fleet machine without 1Password, `openv`
+gets the same variables from the fleet broker. Never inline a secret, never echo one into a
 transcript or a log, and never write one to disk except as below. If a command needs a credential,
 wrap it in `openv` rather than exporting the value into the shell.
 
