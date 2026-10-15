@@ -107,9 +107,13 @@ Any machine:
                                         the agent, also when the binary was current. Fails when the restart fails.
 
 Fleet tasks through actl (the controller runs on the host that the broker's /v1/actl names):
-  worker install [--timeout S]          Install or update the pinned actl pair, the worker seed, the
+  worker install [--timeout S] [--server URL|default]
+                                        Install or update the pinned actl pair, the worker seed, the
                                         worker configuration from the broker, and the worker service.
                                         Prints ID=OS:PUBLIC_KEY. An update drains the running worker first.
+                                        --server tls://HOST:PORT replaces the broker's NATS URL on this
+                                        machine, for example a loopback fleet tunnel, and is kept for later
+                                        installs; --server default returns to the broker's URL.
   worker status                         The service, the pinned and installed actl, the connection,
                                         running attempts, and drain markers.
   worker enroll HOST [--controller HOST] [--provisioner PATH] [--fleet-config PATH] [--timeout S]
@@ -136,9 +140,10 @@ valid_url() { [[ "$1" =~ ^https://[A-Za-z0-9.:-]+(/[A-Za-z0-9._/-]*)?$ ]]; }
 valid_fingerprint() { [[ "$1" =~ ^[0-9a-f]{64}$ ]]; }
 valid_principal() { [[ "$1" =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]]; }
 valid_item() { [[ "$1" =~ ^op://[A-Za-z0-9\ ._-]+/[A-Za-z0-9\ ._-]+$ ]]; }
+valid_actl_server() { [[ "$1" =~ ^tls://[A-Za-z0-9.-]+:[0-9]{1,5}$ ]]; }
 valid_token() { [[ "$1" =~ ^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; }
 
-declare ca_url="" fingerprint="" name="" enroll_item="" admin_item="" broker_url="" principal=""
+declare ca_url="" fingerprint="" name="" enroll_item="" admin_item="" broker_url="" principal="" actl_server=""
 
 load_config() {
     [[ -f "$CONFIG" ]] || return 0
@@ -152,6 +157,7 @@ load_config() {
             admin_item) valid_item "$value" && admin_item="$value" ;;
             broker_url) valid_url "$value" && broker_url="$value" ;;
             principal) valid_principal "$value" && principal="$value" ;;
+            actl_server) valid_actl_server "$value" && actl_server="$value" ;;
         esac
     done < "$CONFIG"
     return 0
@@ -169,6 +175,7 @@ save_config() {
         [[ -n "$admin_item" ]] && printf 'admin_item=%s\n' "$admin_item"
         [[ -n "$broker_url" ]] && printf 'broker_url=%s\n' "$broker_url"
         [[ -n "$principal" ]] && printf 'principal=%s\n' "$principal"
+        [[ -n "$actl_server" ]] && printf 'actl_server=%s\n' "$actl_server"
         true
     } > "$tmp"
     mv "$tmp" "$CONFIG"
@@ -1867,15 +1874,23 @@ drain_worker() {
 }
 
 cmd_worker_install() {
-    local timeout=600
+    local timeout=600 server=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --timeout) [[ "${2:-}" =~ ^[0-9]+$ ]] || fail 'invalid --timeout (seconds)'; timeout="$2"; shift 2 ;;
+            --server)
+                [[ "${2:-}" == default ]] || valid_actl_server "${2:-}" || fail 'invalid --server (tls://HOST:PORT, or default)'
+                server="$2"; shift 2 ;;
             *) fail "unknown option $1" ;;
         esac
     done
     need_python
     need_enrollment
+    # The saved URL outlives this install, so an actl update does not drop a machine's tunnel.
+    if [[ -n "$server" ]]; then
+        [[ "$server" == default ]] && actl_server="" || actl_server="$server"
+        save_config
+    fi
     user_bus
     local id os kind work changed=0 f p0
     id=$(worker_id)
@@ -1886,6 +1901,7 @@ cmd_worker_install() {
     stage_actl_pair
     scratch; work="$SCRATCH"
     fetch_actl "$work"
+    [[ -z "$actl_server" ]] || ACTL_SERVER="$actl_server"
     ensure_seed "$ACTL_STATE/worker.seed" "$ACTL_STAGE/actl"
     render_worker "$work/worker.toml" "$id" "$os"
     render_worker_service "$work/service" "$kind"
@@ -2070,7 +2086,7 @@ cmd_worker() {
         install) cmd_worker_install "$@" ;;
         enroll) cmd_worker_enroll "$@" ;;
         status) [[ $# -eq 0 ]] || fail 'usage: fleet worker status'; cmd_worker_status ;;
-        *) fail 'usage: fleet worker install [--timeout S] | status | enroll HOST [options]' ;;
+        *) fail 'usage: fleet worker install [--timeout S] [--server URL|default] | status | enroll HOST [options]' ;;
     esac
 }
 

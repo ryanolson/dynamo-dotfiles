@@ -369,7 +369,7 @@ Fleet maintenance runs as [actl](https://github.com/ryanolson/agentic-control) t
 On a worker machine:
 
 ```bash
-fleet worker install [--timeout S]   # prints ID=OS:PUBLIC_KEY
+fleet worker install [--timeout S] [--server URL|default]   # prints ID=OS:PUBLIC_KEY
 fleet worker status
 ```
 
@@ -382,6 +382,8 @@ fleet worker status
 | `~/.local/state/fleet/actl-worker` | The worker root, with the drain files. |
 | `fleet-worker.service` (Linux) | systemd user service with linger, `Restart=always`, `RestartSec=30`, `TimeoutStopSec=90`. |
 | `dev.fleet.worker` (macOS) | launchd agent in the GUI domain, `ExitTimeOut` 60, log `~/Library/Logs/fleet-worker.log`. `KeepAlive` restarts it only after a failure, because launchd would start it again at once after a drain and replace its acknowledgement. |
+
+`--server tls://HOST:PORT` writes that NATS URL instead of the one from `/v1/actl`, for a machine that reaches NATS through a fleet tunnel. gb300 uses `--server tls://127.0.0.1:38910`, the client end of its `bb-nats` tunnel through spark-p. The fleet NATS certificate names `127.0.0.1`, so TLS checks pass. Install saves the URL as `actl_server` in `~/.config/fleet/config` and uses it for later installs, so an actl update keeps the tunnel. `--server default` removes it and returns to the broker's URL.
 
 With nothing changed, install changes nothing, but it starts a stopped service. To change a running worker, install drains it first. It creates `<root>/drain` and waits up to `--timeout` seconds (default 600) for `<root>/drained` from the service's main process, which the worker writes when no attempt runs. Then it stops the service, replaces the files, removes both drain files, and starts the service. If the worker exits without the acknowledgement, or the service fails, install stops, keeps the drain file, and prints the worker log: inspect the worker as the actl operations guide requires. If the time runs out, install removes the drain file, so the worker keeps working. While `<root>/unsafe-exit` exists, install refuses to run.
 

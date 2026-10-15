@@ -1675,6 +1675,40 @@ class WorkerInstall(ActlBase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('unsafe-exit', result.stderr)
 
+    def server_line(self):
+        return next(l for l in (self.config_dir / 'worker.toml').read_text().splitlines() if l.startswith('servers = '))
+
+    def test_server_override_is_kept_until_reset_to_the_broker_value(self):
+        tunnel = 'tls://127.0.0.1:38910'
+        result = self.install('--server', tunnel)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.server_line(), f'servers = ["{tunnel}"]')
+        config = (self.home / '.config/fleet/config').read_text()
+        self.assertIn(f'actl_server={tunnel}\n', config)
+        self.assertIn('name=node-1\n', config)
+        # A later install without the option, for example for a new actl, keeps the tunnel.
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('is current', result.stderr)
+        self.assertEqual(self.server_line(), f'servers = ["{tunnel}"]')
+        result = self.run_script('worker', 'status')
+        self.assertIn(f'connection: {tunnel} ', result.stdout)
+        result = self.install('--server', 'default')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.server_line(), f'servers = ["{self.SERVER}"]')
+        config = (self.home / '.config/fleet/config').read_text()
+        self.assertNotIn('actl_server', config)
+        self.assertIn('name=node-1\n', config)
+
+    def test_server_override_must_be_a_plain_tls_url(self):
+        for bad in ('nats://127.0.0.1:4222', 'tls://user@127.0.0.1:4222', 'tls://127.0.0.1', 'tls://127.0.0.1:4222/x', ''):
+            with self.subTest(server=bad):
+                result = self.install('--server', bad)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('--server', result.stderr)
+                self.assertFalse((self.config_dir / 'worker.toml').exists())
+                self.assertNotIn('actl_server', (self.home / '.config/fleet/config').read_text())
+
     def test_install_needs_published_connection_data_and_a_valid_worker_id(self):
         (self.home / 'actl.json').unlink()
         result = self.install()
