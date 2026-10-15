@@ -223,14 +223,17 @@ install_pylon() {
 # A running agent keeps the old binary until it restarts. Restart it also when the file was current:
 # an earlier install can have replaced the file and then failed to restart, and the pylon-install
 # executor must prove the daemon that runs, not the file.
+# The restart has a limit (FLEET_RESTART_WAIT, 120 seconds): systemctl waits for the start job, and an
+# executor that waits forever holds its actl attempt.
 restart_agent() {
+    local wait="${FLEET_RESTART_WAIT:-120}"
     if [[ "$(uname -s)" == Darwin ]]; then
-        launchctl kickstart -k "gui/$(id -u)/dev.fleet.agent" >/dev/null 2>&1 ||
-            fail 'could not restart the fleet agent (launchd agent dev.fleet.agent). Run: fleet agent install'
+        bounded "$wait" launchctl kickstart -k "gui/$(id -u)/dev.fleet.agent" >/dev/null 2>&1 ||
+            fail "could not restart the fleet agent (launchd agent dev.fleet.agent) within $wait seconds. Run: fleet agent install"
     else
         user_bus
-        command -v systemctl >/dev/null 2>&1 && systemctl --user restart fleet-agent.service ||
-            fail 'could not restart the fleet agent (systemd user service fleet-agent). Run: fleet agent install'
+        command -v systemctl >/dev/null 2>&1 && bounded "$wait" systemctl --user restart fleet-agent.service ||
+            fail "could not restart the fleet agent (systemd user service fleet-agent) within $wait seconds. Run: fleet agent install"
     fi
     printf 'restarted the fleet agent\n'
 }
@@ -2245,9 +2248,22 @@ fence_open() {
     read -r FENCE_COMMIT FENCE_TIME <<<"$(git -c log.showSignature=false log -1 --format='%H %ct' HEAD 2>/dev/null || true)"
     valid_commit "${FENCE_COMMIT:-}" && [[ "${FENCE_TIME:-}" =~ ^[0-9]+$ ]] || fail 'cannot read the commit of this checkout'
     mkdir -p "$STATE"
-    # One executor at a time decides and records, so two tasks cannot both pass the check.
+    # One executor at a time decides and records, so two tasks cannot both pass the check. The wait
+    # has a limit (FLEET_FENCE_WAIT, 600 seconds): a stuck holder must not hold this attempt forever.
     exec 8>>"$STATE/applied.lock"
-    python3 -c 'import fcntl; fcntl.flock(8, fcntl.LOCK_EX)'
+    python3 -c '
+import fcntl, sys, time
+deadline = time.monotonic() + float(sys.argv[1])
+while True:
+    try:
+        fcntl.flock(8, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except BlockingIOError:
+        if time.monotonic() >= deadline:
+            sys.exit(1)
+        time.sleep(0.2)
+' "${FLEET_FENCE_WAIT:-600}" ||
+        fail "another executor held the fence lock $STATE/applied.lock for ${FLEET_FENCE_WAIT:-600} seconds (FLEET_FENCE_WAIT); nothing changed"
     verdict=$(fpy fence "$STATE/applied" "$name" "$FENCE_COMMIT" "$FENCE_TIME") || exit 1
     case "$verdict" in
         apply|repeat) FENCE="$verdict" ;;

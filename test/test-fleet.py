@@ -1762,6 +1762,7 @@ printf '%s %s\n' "$(basename "$0")" "$*" >> "$HOME/scheduler.log"
 case "$*" in
   *"restart fleet-agent.service"*|*"kickstart -k gui/"*/dev.fleet.agent)
     [ -e "$HOME/restart-fails" ] && exit 5
+    if [ -e "$HOME/restart-hangs" ]; then echo $$ > "$HOME/restart.pid"; exec sleep 60; fi
     rm -f "$HOME/status-polls"; : > "$HOME/pylon-running" ;;
 esac
 exit 0
@@ -1940,6 +1941,21 @@ class ExecutorApply(Executors):
         self.assertEqual(self.executor('apply', two).returncode, 0)
         self.assertEqual({p: p.stat().st_mtime_ns for p in self.targets()}, before)
         self.assertEqual(self.record()['fleet-apply'][0], two)
+
+    def test_a_held_fence_lock_fails_in_time(self):
+        sha = self.commit(1_700_000_000)
+        self.state.mkdir(parents=True, exist_ok=True)
+        with open(self.state / 'applied.lock', 'a') as lock:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            started = time.monotonic()
+            result = self.executor('apply', sha, FLEET_FENCE_WAIT='2')
+            self.assertLess(time.monotonic() - started, 20)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('fence lock', result.stderr)
+        self.assertIn('FLEET_FENCE_WAIT', result.stderr)
+        self.assertFalse(self.targets()[0].exists())
+        self.assertEqual(self.record(), {})
 
     def test_a_malformed_record_stops_the_executor(self):
         sha = self.commit(1_700_000_000)
@@ -2195,6 +2211,15 @@ class ExecutorPylonInstall(Executors):
         self.assertIn("reports version '0.1.9'", result.stderr)
         self.assertEqual(len(self.scheduler()), restarts)
         self.assertEqual(self.record(), {'pylon-install': [sha, '1700000000']})
+
+    def test_a_hung_restart_fails_in_time_and_leaves_no_process(self):
+        (self.home / 'restart-hangs').write_text('')
+        started = time.monotonic()
+        result = self.executor('pylon-install', self.commit(1_700_000_000), FLEET_RESTART_WAIT='2')
+        self.assertLess(time.monotonic() - started, 20)
+        self.failed(result, 'could not restart the fleet agent')
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int((self.home / 'restart.pid').read_text()), 0)
 
     def test_the_download_has_a_time_limit(self):
         self.assertEqual(self.executor('pylon-install', self.commit(1_700_000_000)).returncode, 0)
