@@ -2243,6 +2243,14 @@ class ExecutorPylonInstall(Executors):
         with self.assertRaises(ProcessLookupError):
             os.kill(int((self.home / 'restart.pid').read_text()), 0)
 
+    def test_a_wait_that_is_not_a_positive_number_is_refused(self):
+        for name in ('FLEET_RESTART_WAIT', 'FLEET_FENCE_WAIT', 'FLEET_PYLON_WAIT'):
+            for value in ('0', 'abc', '-1'):
+                with self.subTest(name=name, value=value):
+                    result = self.executor('pylon-install', self.commit(1_700_000_000), **{name: value})
+                    self.failed(result, f'{name} must be a whole number of seconds more than 0')
+                    self.assertEqual(self.scheduler(), [])
+
     def test_the_download_has_a_time_limit(self):
         self.assertEqual(self.executor('pylon-install', self.commit(1_700_000_000)).returncode, 0)
         (download,) = self.downloads()
