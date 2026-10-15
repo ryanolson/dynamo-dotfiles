@@ -149,3 +149,7 @@ The broker serves named secrets over the same mTLS port as the machine list. A p
 ## Addendum 2026-10-14: machine classes
 
 Fleet now does Git signing, GitHub SSH, and SSH between machines without 1Password. [machine-classes-and-fleet.md](machine-classes-and-fleet.md) is the plan to split `machine_class` into an install setting and a separate 1Password setting, and to give `openv` the broker backend that the "Secrets" section describes.
+
+## Addendum 2026-10-15: 1Password as a broker source
+
+A secret source in the broker policy can now be an `op://` reference as well as a Secret Manager version. The broker reads it with a read-only 1Password service account, which can read only a dedicated `Fleet` vault. The broker also refuses a source outside the vaults in its `--op-vaults` flag. This returns to the design in "Secrets" above: the broker resolves `op://` references, and the service account reads only a dedicated fleet vault. The 2026-10-14 addendum used Secret Manager so that no 1Password token is on ca-1. With this change, a token for one read-only vault is on ca-1, and 1Password stays the only store. Secret Manager sources still work. The plan for the rollout is in [machine-classes-and-fleet.md](machine-classes-and-fleet.md).

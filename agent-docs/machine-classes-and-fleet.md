@@ -128,3 +128,36 @@ Steps 1 and 2 are in one commit, because both change the same lines of `.chezmoi
 
 - Open question: which NGC key does the broker serve? The team data points to `op://Development/NGC/credential`. The user instructions say that this legacy key gets 401 from the API gateway, and that `Development/NGC NIM Operations PAT` works. The local override in `credentials_*.yaml` was not read.
 - Open question: must every machine read both secrets, or only some machine-name patterns?
+
+## Addendum 2026-10-15: the broker reads 1Password
+
+This addendum replaces the "Work in fleet-config" list and the NGC question in the plan for step 4 above.
+
+The broker can now read `op://` references with a 1Password service account (fleet-config commit `853fc47`). A secret in `secrets.json` names the 1Password item directly, so there is no copy into Secret Manager.
+
+```mermaid
+flowchart LR
+  M[machine, mTLS certificate] -->|GET /v1/secrets/ngc-api-key| B[broker on ca-1]
+  B -->|1. policy: name and machine pattern| B
+  B -->|2. the source vault is in --op-vaults| B
+  B -->|op read, service account token| OP[(1Password: Fleet vault only)]
+```
+
+Two limits apply:
+
+- The service account is read-only and can read only the vaults that it was created with. It can never read a Personal, Private, or Employee vault.
+- The broker accepts only sources in the vaults that `--op-vaults` lists. The flag is in the service unit, not in `secrets.json`.
+
+The items that machines use go in a separate vault, `Fleet`. 1Password stays the only store, and a rotation in 1Password applies after the cache time (60 seconds by default).
+
+### New order for step 4
+
+1. The user creates the `Fleet` vault and puts the shared items in it: the Hugging Face token and the NGC key. The user decides which NGC item is the correct one.
+2. The user creates a read-only service account for `Fleet` only, and saves its token where it can go to ca-1.
+3. On ca-1: install the 1Password CLI, give the token to the service with `LoadCredential`, and add `--op-token-file` and `--op-vaults Fleet`. Add `hf-token` and `ngc-api-key` to `secrets.json` with `op://Fleet/...` sources.
+4. On one enrolled machine, run `fleet secret get hf-token >/dev/null`. It must exit 0.
+5. The dotfiles work for `openv` stays as written above.
+
+Open question: does `op` need a writable configuration folder when the unit has `ProtectHome=yes`? Test this on ca-1.
+
+Open question: what are the request limits of a service account on the plan that holds the vault? The 60-second cache is a guess until that is known.
