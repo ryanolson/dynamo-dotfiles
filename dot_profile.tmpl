@@ -63,3 +63,10 @@ fi
 if [ -z "${ZELLIJ_SOCKET_DIR:-}" ] && [ -x "$HOME/.local/bin/zellij-socket-dir" ]; then
     export ZELLIJ_SOCKET_DIR="$("$HOME/.local/bin/zellij-socket-dir")"
 fi
+
+# Point the standalone bb CLI at the shared bb server. Keep a value already set,
+# because bb sets BB_SERVER_URL in its own thread shells. fish does the same in
+# conf.d/bb-server-url.fish.
+if [ -z "${BB_SERVER_URL:-}" ] && [ -s "$HOME/.config/bb/server-url" ]; then
+    IFS= read -r BB_SERVER_URL < "$HOME/.config/bb/server-url" && export BB_SERVER_URL
+fi

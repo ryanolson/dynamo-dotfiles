@@ -371,6 +371,14 @@ bb-server-service remove             # keeps ~/.bb and the install
 
 The script installs `bb-app` under `~/.local/share/bb-server` and writes `bb-server.service`. The server listens on `127.0.0.1:38886`. `--serve` publishes it at `https://<machine>.<tailnet>.ts.net` and sets `BB_APP_URL` to that address. npm 11 refuses `--allow-scripts` for a `--prefix` install, so the script writes the setting to `.npmrc` in the install directory.
 
+The shared bb server is also the Tailscale Service `svc:bb`, at `https://bb.<tailnet>.ts.net`. `bb-server-service` does not set this up: the service is configured with `tailscale serve --service=svc:bb`, and the server's `BB_APP_URL` is that address. On every machine, `chezmoi apply` writes this URL to `~/.config/bb/server-url`. It reads the tailnet suffix from `tailscale status`, so no tailnet name is in this repository. fish (`conf.d/bb-server-url.fish`) and `~/.profile` export the URL as `BB_SERVER_URL`, so the standalone `bb` CLI reaches the shared server from any machine on the tailnet. They keep a value that is already set, because bb sets `BB_SERVER_URL` in the shells of its own threads. Without tailscale, the file is not written and the CLI uses its default, `http://127.0.0.1:38886`. Run `chezmoi apply` again if the tailnet changes.
+
+Verification:
+
+```bash
+timeout 300 python3 test/bb-server-url.py
+```
+
 ### GitHub auth policy
 
 **`gh auth login` only. Never a personal access token.** No `GITHUB_TOKEN`, `GH_TOKEN`, or

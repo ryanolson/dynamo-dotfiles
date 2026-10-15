@@ -47,7 +47,7 @@ The guide describes capabilities, not authorization or current service access. q
 
 The `bb-cli` skill describes BB workflows; the installed CLI's help describes its current interface. Start a state task with `bb status --json` when context is not established. Use the relevant list command to check actual access. Help output alone does not prove connectivity.
 
-Common read commands are `bb project list --json`, `bb machine list --json`, and `bb thread list --json`. Read live help for filters and selectors. Resolve IDs before mutations. Preserve the established server and machine selection; do not switch targets to bypass a connection error.
+Managed shells set `BB_SERVER_URL` to the shared server, `https://bb.<tailnet>.ts.net`, when it is not already set. See the bb server section of the source README. Common read commands are `bb project list --json`, `bb machine list --json`, and `bb thread list --json`. Read live help for filters and selectors. Resolve IDs before mutations. Preserve the established server and machine selection; do not switch targets to bypass a connection error.
 
 BB owns its CLI launcher and the installed `bb-cli` skill. They are not part of the chezmoi skill roster. In a BB source checkout, the skill lives at `plugins/bb-guide/skills/bb-cli/`. Find that checkout instead of assuming it is under `~/repos`.
 

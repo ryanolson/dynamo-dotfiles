@@ -1,0 +1,6 @@
+{{- /* The shared bb server is the Tailscale Service svc:bb. Read the tailnet suffix at apply time so no tailnet name is committed. Without tailscale or a suffix the file is empty, and chezmoi does not create it. */ -}}
+{{- $status := output "sh" "-c" "tailscale status --json 2>/dev/null || echo '{}'" | fromJson -}}
+{{- $suffix := get $status "MagicDNSSuffix" | default "" -}}
+{{- if $suffix -}}
+https://bb.{{ $suffix }}
+{{ end -}}
