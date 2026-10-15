@@ -875,6 +875,38 @@ class FleetEphemeral(FleetBase):
         self.assertIn('persistent', result.stderr)
 
 
+class InstallStep(FleetBase):
+    # A Linux host with fake download tools. The step binary is a script that prints a version.
+    def setUp(self):
+        super().setUp()
+        bin_dir = self.home / 'bin'
+        stubs = {
+            'uname': '#!/bin/sh\n[ "$1" = -m ] && echo aarch64 || echo Linux\n',
+            'curl': '#!/bin/sh\nwhile [ "$1" != -o ]; do shift; done; : > "$2"\n',
+            'sha256sum': '#!/bin/sh\ncat >/dev/null\n',
+            'tar': '#!/bin/sh\nd="$4/step_linux_arm64/bin"; mkdir -p "$d"\n'
+                   'printf "#!/bin/sh\\necho Smallstep CLI\\n" > "$d/step"\n',
+        }
+        for name, body in stubs.items():
+            (bin_dir / name).write_text(body)
+            (bin_dir / name).chmod(0o700)
+        (bin_dir / 'step').unlink()
+
+    def test_sudo_host_gets_step_in_local_bin(self):
+        # The shell turns on the no-sudo layout when ~/.local/<arch> exists, so fleet must not make it.
+        result = self.fleet('install-step')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.home / '.local/bin/step').exists())
+        self.assertFalse((self.home / '.local/aarch64').exists())
+
+    def test_nosudo_host_keeps_step_in_the_arch_folder(self):
+        (self.home / '.local/aarch64').mkdir(parents=True)
+        result = self.fleet('install-step')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.home / '.local/aarch64/bin/step').exists())
+        self.assertFalse((self.home / '.local/bin/step').exists())
+
+
 class GitconfigInclude(unittest.TestCase):
     def test_gitconfig_includes_the_fleet_fragment_last(self):
         for data in ['data:\n  name: T\n  email: t@example.com\n',

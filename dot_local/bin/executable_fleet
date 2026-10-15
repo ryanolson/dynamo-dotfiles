@@ -72,7 +72,7 @@ Any machine:
   uninstall [--yes] [--keep-cert]       Revoke this machine's certificate, stop the fleet services
                                         (renew, agent, tunnels), remove the authorized_keys CA line,
                                         and delete the fleet keys and settings. Alias: remove.
-  install-step                          Linux: install the pinned step CLI into ~/.local/<arch>/bin.
+  install-step                          Linux: install the pinned step CLI into ~/.local/bin (~/.local/<arch>/bin on no-sudo hosts).
 EOF
 }
 
@@ -130,7 +130,7 @@ step_arch() {
 # Timers run with a minimal PATH, and no-sudo hosts keep step in an arch directory.
 find_step() {
     local candidate
-    for candidate in "$(command -v step 2>/dev/null || true)" "$HOME/.local/$(uname -m)/bin/step" \
+    for candidate in "$(command -v step 2>/dev/null || true)" "$HOME/.local/$(uname -m)/bin/step" "$HOME/.local/bin/step" \
                      /opt/homebrew/bin/step /usr/local/bin/step /usr/bin/step; do
         [[ -n "$candidate" && -x "$candidate" ]] && { STEP="$candidate"; return 0; }
     done
@@ -142,7 +142,9 @@ install_step() {
     local arch sum_var sum dir work
     arch=$(step_arch)
     sum_var="STEP_SHA256_$arch"; sum="${!sum_var}"
-    dir="$HOME/.local/$(uname -m)/bin"
+    # The shell profiles turn on the no-sudo layout when ~/.local/<arch> exists. Use it only if it is already there.
+    dir="$HOME/.local/bin"
+    [[ -d "$HOME/.local/$(uname -m)" ]] && dir="$HOME/.local/$(uname -m)/bin"
     scratch; work="$SCRATCH"
     curl -fsSL -o "$work/step.tgz" "https://github.com/smallstep/cli/releases/download/v$STEP_VERSION/step_linux_$arch.tar.gz"
     printf '%s  %s\n' "$sum" "$work/step.tgz" | sha256sum -c - >/dev/null || fail 'step download checksum mismatch'
