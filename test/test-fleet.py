@@ -6,6 +6,7 @@ import re
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1737,6 +1738,7 @@ exit 0
 '''
 SSH_ADD_STUB = r'''#!/bin/sh
 printf '%s %s\n' "$SSH_AUTH_SOCK" "$*" >> "$HOME/ssh-add.log"
+if [ -f "$HOME/agent-hangs" ]; then echo $$ > "$HOME/ssh-add.pid"; exec sleep 60; fi
 [ -f "$HOME/agent-keys" ] || { echo 'The agent has no identities.'; exit 1; }
 cat "$HOME/agent-keys"
 '''
@@ -1808,7 +1810,7 @@ class Executors(FleetBase):
 
     def executor(self, command, sha, **env):
         return subprocess.run(['bash', 'dot_local/bin/executable_fleet', 'executor', command], cwd=self.checkout(sha),
-                              capture_output=True, text=True, env=dict(self.env, **dict({'FLEET_PYLON_WAIT': '3'}, **env)))
+                              capture_output=True, text=True, timeout=120, env=dict(self.env, **dict({'FLEET_PYLON_WAIT': '3'}, **env)))
 
     def record(self):
         return dict((l.split()[0], l.split()[1:]) for l in self.applied.read_text().splitlines()) \
@@ -2011,6 +2013,40 @@ class ExecutorPylonInstall(Executors):
         self.assertIn('older than', result.stderr)
         self.assertEqual(self.snapshot(), before)
         self.assertEqual((len(self.scheduler()), len(self.downloads())), (restarts, downloads))
+
+    def test_the_download_has_a_time_limit(self):
+        self.assertEqual(self.executor('pylon-install', self.commit(1_700_000_000)).returncode, 0)
+        (download,) = self.downloads()
+        self.assertIn('--connect-timeout', json.loads(download))
+        self.assertIn('--max-time', json.loads(download))
+
+    def without_timeout(self):
+        """A PATH with every command of this one except timeout, as on a Mac without coreutils."""
+        tools = self.home / 'no-timeout-bin'
+        tools.mkdir()
+        for d in self.env['PATH'].split(':'):
+            if not os.path.isdir(d) or Path(d) == self.home / 'bin':
+                continue
+            for entry in os.scandir(d):
+                if entry.name not in ('timeout', 'gtimeout') and not (tools / entry.name).exists():
+                    (tools / entry.name).symlink_to(entry.path)
+        return f"{self.home / 'bin'}:{tools}"
+
+    def check_a_hung_agent(self, **env):
+        (self.home / 'agent-hangs').write_text('')
+        started = time.monotonic()
+        result = self.executor('pylon-install', self.commit(1_700_000_000), FLEET_PYLON_WAIT='2', **env)
+        self.assertLess(time.monotonic() - started, 20)
+        self.failed(result, 'the fleet agent lists no keys')
+        pid = int((self.home / 'ssh-add.pid').read_text())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    def test_a_hung_agent_fails_in_time_and_leaves_no_process(self):
+        self.check_a_hung_agent()
+
+    def test_a_hung_agent_fails_in_time_without_timeout(self):
+        self.check_a_hung_agent(PATH=self.without_timeout())
 
     def test_macos_restarts_the_launchd_agent(self):
         sha = self.commit(1_700_000_000)
