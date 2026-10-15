@@ -1,8 +1,9 @@
 #!/bin/bash
 # OpenSSH uses the first value. The fleet file sets an agent only for github.com, so it goes
-# first; local provisioning then sets the agent for other hosts, before the agent settings below.
+# first, before the agent settings below. The sed also removes the include of ~/.ssh/provisioned,
+# which configurations from before 2026-10-15 have.
 CONFIG="$(cat)"
-printf '%s\n' 'Include ~/.ssh/fleet/config' 'Include ~/.ssh/provisioned/config'
+printf '%s\n' 'Include ~/.ssh/fleet/config'
 CONFIG="$(printf '%s\n' "$CONFIG" | sed -e '\|^Include ~/.ssh/provisioned/config$|d' -e '\|^Include ~/.ssh/fleet/config$|d')"
 {{- if and (hasKey . "onepassword") .onepassword.ssh_agent }}
 {{- if eq .chezmoi.os "darwin" }}

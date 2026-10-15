@@ -1087,35 +1087,16 @@ class SshConfigInclude(unittest.TestCase):
             modifier = subprocess.run(['chezmoi', '--config', str(config), '--source', str(ROOT), 'execute-template'],
                                       input=(ROOT / 'private_dot_ssh/modify_private_config.tmpl').read_text(),
                                       capture_output=True, text=True, check=True, env=env).stdout
-            text = 'Host example\n    User me\n'
+            # A config from before 2026-10-15 also includes ~/.ssh/provisioned/config. The modifier removes it.
+            text = 'Include ~/.ssh/provisioned/config\nHost example\n    User me\n'
             for _ in range(2):
                 text = subprocess.run(['bash', '-c', modifier], input=text, capture_output=True, text=True,
                                       check=True, env=env).stdout
             lines = text.splitlines()
-            self.assertEqual(lines[:2], ['Include ~/.ssh/fleet/config', 'Include ~/.ssh/provisioned/config'])
+            self.assertEqual(lines[0], 'Include ~/.ssh/fleet/config')
             self.assertEqual(text.count('Include ~/.ssh/fleet/config'), 1)
-            self.assertEqual(text.count('Include ~/.ssh/provisioned/config'), 1)
+            self.assertNotIn('provisioned', text)
             self.assertIn('Host example\n    User me\n', text)
-
-    def test_fleet_github_agent_wins_over_local_provisioning(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp)
-            (home / '.ssh/fleet').mkdir(parents=True)
-            (home / '.ssh/provisioned').mkdir()
-            (home / '.ssh/provisioned/config').write_text('Host *\n    IdentityAgent none\n    IdentitiesOnly yes\n'
-                                                         '    IdentityFile ~/.ssh/provisioned/key\n')
-            (home / '.ssh/fleet/config').write_text(f'Host github.com\n    IdentityAgent {home}/agent.sock\n'
-                                                   f'    IdentityFile {home}/.ssh/fleet/agent-auth.pub\n'
-                                                   '    IdentitiesOnly yes\nHost *\n    IdentityFile /x/id_fleet\n')
-            main = home / 'config'
-            main.write_text(f'Include {home}/.ssh/fleet/config\nInclude {home}/.ssh/provisioned/config\n')
-            github = subprocess.run(['ssh', '-G', '-F', str(main), 'github.com'], capture_output=True, text=True,
-                                    check=True).stdout
-            self.assertIn(f'identityagent {home}/agent.sock\n', github)
-            other = subprocess.run(['ssh', '-G', '-F', str(main), 'example.com'], capture_output=True, text=True,
-                                   check=True).stdout
-            self.assertIn('identityagent none\n', other)
-
 
 if __name__ == '__main__':
     unittest.main()

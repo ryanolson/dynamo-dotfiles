@@ -46,3 +46,5 @@
 
 # Broken symlinks
 # .local/bin/broken-*
+# provision-keys copied 1Password keys to ~/.ssh/provisioned. Fleet certificates replaced it on 2026-10-15.
+.local/bin/provision-keys

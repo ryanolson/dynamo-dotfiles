@@ -4,19 +4,14 @@
      bootstrap.sh exports DOTFILES_MACHINE_CLASS when it detects no usable sudo.
      When set it is AUTHORITATIVE (not just a prompt default), so re-running
      bootstrap on a node with a stale machine_class self-corrects.
-     Configs written before 2026-10-14 hold primary, headless-sudo, or headless-nosudo;
-     init converts them once. See agent-docs/machine-classes-and-fleet.md. */}}
-{{- $envClass := env "DOTFILES_MACHINE_CLASS" -}}
-{{- $oldClass := dig "machine_class" "" . -}}
-{{- $machineClass := "" -}}
-{{- if ne $envClass "" -}}
-{{-   $machineClass = $envClass -}}
-{{- else if has $oldClass (list "primary" "headless-sudo") -}}
-{{-   $machineClass = "sudo" -}}
-{{- else if eq $oldClass "headless-nosudo" -}}
-{{-   $machineClass = "nosudo" -}}
-{{- else -}}
-{{-   $machineClass = promptChoiceOnce . "machine_class" "Machine class" (list "sudo" "nosudo") "sudo" -}}
+     A saved value that is not a class is asked again. */}}
+{{- $classes := list "sudo" "nosudo" -}}
+{{- $machineClass := env "DOTFILES_MACHINE_CLASS" -}}
+{{- if eq $machineClass "" -}}
+{{-   $machineClass = dig "machine_class" "" . -}}
+{{-   if not (has $machineClass $classes) -}}
+{{-     $machineClass = promptChoice "Machine class" $classes "sudo" -}}
+{{-   end -}}
 {{- end -}}
 {{- $machineSeed := promptChoiceOnce . "machine_seed" "Per-machine fish seed (creates conf.d/local.fish once, then unsynced)" (list "blank" "cuda") "blank" -}}
 {{- $defaultHost := .chezmoi.hostname -}}

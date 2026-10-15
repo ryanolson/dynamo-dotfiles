@@ -28,7 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/ryanolson/dynamo-dotfiles/main/boot
 | `sudo`   | apt + pixi                  | yes  | yes         |
 | `nosudo` | `~/.local/<arch>/` via pixi | no   | no          |
 
-`chezmoi init` also asks once whether the machine has the 1Password CLI and administers the fleet. The answer sets `onepassword.enabled`, and later runs of `chezmoi init` keep it. It turns on the 1Password CLI, `openv`, and commit signing with a 1Password key. On a fleet machine, the fleet agent signs commits instead (see Fleet certificates). Configurations from before 2026-10-14 used the classes `primary`, `headless-sudo`, and `headless-nosudo`. `chezmoi init` converts them to `sudo` or `nosudo` and keeps their 1Password settings.
+`chezmoi init` also asks once whether the machine has the 1Password CLI and administers the fleet. The answer sets `onepassword.enabled`, and later runs of `chezmoi init` keep it. It turns on the 1Password CLI, `openv`, and commit signing with a 1Password key. On a fleet machine, the fleet agent signs commits instead (see Fleet certificates). If the saved class is not `sudo` or `nosudo`, `chezmoi init` asks for it again.
 
 On `nosudo` the install is **pixi-centric**: nearly the whole toolset
 (`fish`, `node`, `git`, `gh`, `bat`, `ripgrep`, `fd`, `helix`, `zellij`, `lazygit`,
@@ -265,36 +265,6 @@ API keys and tokens are managed via 1Password CLI (`op`) with on-demand injectio
 - GitHub HTTPS URLs are rewritten to SSH automatically, so no HTTPS credential is ever requested
 - Use `gh auth login -p ssh` to authenticate the GitHub CLI
 
-### Local SSH keys on trusted nodes
-
-Run this command on a node after `chezmoi apply`. It copies an existing key from 1Password for SSH authentication and Git signing:
-
-```bash
-provision-keys --ssh-key-ref 'op://Private/My SSH Key/private key'
-```
-
-The node needs `op`, an authenticated 1Password CLI session, Git 2.34 or later, and OpenSSH with SSH signing support. Bootstrap installs `op` on macOS, and on Linux where `onepassword.enabled` is set. On other Linux machines, install `op` before provisioning. Configure your Git name and email through chezmoi first.
-
-To use a separate signing key, pass its reference with `--signing-key-ref`:
-
-```bash
-provision-keys --ssh-key-ref 'op://Private/My SSH Key/private key' --signing-key-ref 'op://Private/Git Signing Key/private key'
-```
-
-For bootstrap with an authenticated `op` session, pass the same references as flags:
-
-```bash
-bash bootstrap.sh --ssh-key-ref 'op://Private/My SSH Key/private key' --signing-key-ref 'op://Private/Git Signing Key/private key'
-```
-
-Repeat `--ssh-key-ref` to install multiple authentication keys. Omit `--signing-key-ref` to use the first authentication key for signing. A signing reference that is the same as an authentication reference uses that key file, and the command makes no second copy. The references contain vault and item names, not private key contents.
-
-The command stores unencrypted private keys and derived public keys in `~/.ssh/provisioned`. Each key file has the name of its 1Password item in lowercase, with a hyphen in place of each run of other characters. For example, the item `Git Signing Key` gives the files `git-signing-key` and `git-signing-key.pub`. The comment of the public key is the item name as written. The command stops when two references give the same file name, or when an item gives the name `config` or `gitconfig`. The directory has mode `700`. Its files have mode `600`. It checks a signature before installation and refuses to replace different existing files. Identical repeat runs succeed. Private key contents never enter chezmoi templates or diffs.
-
-Chezmoi includes the local SSH configuration before agent settings and the local Git configuration after agent settings. These includes survive `chezmoi apply`. Local provisioning disables agent use for SSH and supplies the authentication keys for all hosts. Explicit host-specific identity files remain additive. Git signing uses the local private key without a forwarded agent. GitHub HTTPS URLs use SSH with this key.
-
-To return to agent configuration, move `~/.ssh/provisioned` out of that path. To replace keys, move the directory aside and run `provision-keys` again. Existing public-key registrations remain valid when you copy the same keys.
-
 ### Fleet certificates
 
 `fleet` gives each machine its own short-lived identity from a [step-ca](https://smallstep.com/docs/step-ca) certificate authority. A machine with an identity can SSH to other enrolled machines without a password and without a 1Password approval. The design is in `agent-docs/fleet-identity.md`. The CA address, the root fingerprint, and the 1Password item are deployment values. They are not in this repository.
@@ -336,7 +306,7 @@ The timer is a launchd agent on macOS, a systemd user timer on Linux, or a cront
 | SSH client settings and host CA | Rewritten at enrollment | `~/.ssh/fleet/config`, `~/.ssh/fleet/known_hosts` |
 | Login trust | Until `fleet untrust` | A `# BEGIN fleet` block in `~/.ssh/authorized_keys` |
 
-Chezmoi includes `~/.ssh/fleet/config` before the local provisioning file. The fleet file sets an agent only for `github.com`, so local provisioning still applies to other hosts. By default, enrollment adds a `cert-authority` line to `~/.ssh/authorized_keys` for the principal `ryan`. Use `--principal NAME` to accept a different principal. Use `--no-trust` on a machine that must not accept fleet logins, for example the CA host. Other lines in `authorized_keys` do not change.
+Chezmoi includes `~/.ssh/fleet/config` first in `~/.ssh/config`. The fleet file sets an agent only for `github.com`, so the agent settings after it still apply to other hosts. By default, enrollment adds a `cert-authority` line to `~/.ssh/authorized_keys` for the principal `ryan`. Use `--principal NAME` to accept a different principal. Use `--no-trust` on a machine that must not accept fleet logins, for example the CA host. Other lines in `authorized_keys` do not change.
 
 No `sshd` presents a fleet host certificate yet, so the fleet file trusts fleet hosts on first use. For the broker's aliases, tailnet addresses (`100.64.0.0/10`), and `*.ts.net` names, it sets `StrictHostKeyChecking accept-new`: ssh records a new host key without asking and still refuses a changed one. Other hosts, such as GitHub, keep the normal prompt. When `tailscale status` reports a MagicDNS suffix, the file also makes ssh expand a bare name such as `mac-mini-m6` to its `ts.net` name, so bare tailnet names get the same rule. Names that do not resolve in the tailnet fall back to normal lookup.
 
@@ -431,7 +401,7 @@ print nothing. `chezmoi apply` restores the correct rewrite.
 - Use ordinary OpenSSH over the tailnet for sessions that need commit signing or secrets
 - `dev-remote <host> [session]` primes a remote zellij session with per-session env vars and then attaches
 - `dev-remote refresh <host> [session]` recreates the session after a secret rotation
-- Without local key provisioning, commit signing on Linux remotes uses the forwarded SSH agent. Reconnect with `ssh -A` or `dev-remote` if the agent went stale.
+- On a Linux remote without the fleet agent, commit signing uses the forwarded SSH agent. Reconnect with `ssh -A` or `dev-remote` if the agent went stale.
 - Every login path pins the same zellij socket directory, so `zellij a <name>` reaches one server no matter how you reached the host
 
 **Manual auth steps (once per machine):**

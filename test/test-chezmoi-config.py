@@ -29,10 +29,16 @@ class ChezmoiConfig(unittest.TestCase):
     def test_init_defaults_the_vault(self):
         self.assertIn('    vault: "Development"\n', self.init(BASE).stdout)
 
-    def test_init_converts_the_old_classes(self):
-        for old, new in [('primary', 'sudo'), ('headless-sudo', 'sudo'), ('headless-nosudo', 'nosudo')]:
-            out = self.init(PEOPLE + f'  machine_class: "{old}"\n  onepassword:\n    enabled: false\n').stdout
-            self.assertIn(f'  machine_class: "{new}"\n', out, old)
+    def test_a_value_that_is_not_a_class_is_asked_again(self):
+        out = self.init(PEOPLE + '  machine_class: "primary"\n  onepassword:\n    enabled: false\n',
+                        '--promptChoice', f'{CLASS_PROMPT}=nosudo').stdout
+        self.assertIn('  machine_class: "nosudo"\n', out)
+
+    def test_an_existing_class_is_kept(self):
+        for value in ('sudo', 'nosudo'):
+            out = self.init(PEOPLE + f'  machine_class: "{value}"\n  onepassword:\n    enabled: false\n',
+                            '--promptChoice', f'{CLASS_PROMPT}=sudo' if value == 'nosudo' else f'{CLASS_PROMPT}=nosudo')
+            self.assertIn(f'  machine_class: "{value}"\n', out.stdout)
 
     def test_bootstrap_forces_nosudo(self):
         out = self.init(BASE, env={'DOTFILES_MACHINE_CLASS': 'nosudo'}).stdout
@@ -47,12 +53,12 @@ class ChezmoiConfig(unittest.TestCase):
 
     def test_init_keeps_the_1password_setting_on_any_class(self):
         # The class no longer decides 1Password: a sudo machine keeps its own setting.
-        out = self.init(PEOPLE + '  machine_class: "headless-sudo"\n  onepassword:\n    enabled: true\n'
+        out = self.init(PEOPLE + '  machine_class: "sudo"\n  onepassword:\n    enabled: true\n'
                         '    ssh_agent: true\n    signing_public_key: "ssh-ed25519 AAAAKEY"\n').stdout
         self.assertIn('    enabled: true\n', out)
         self.assertIn('    ssh_agent: true\n', out)
         self.assertIn('    signing_public_key: "ssh-ed25519 AAAAKEY"\n', out)
-        out = self.init(PEOPLE + '  machine_class: "primary"\n  onepassword:\n    enabled: false\n').stdout
+        out = self.init(PEOPLE + '  machine_class: "nosudo"\n  onepassword:\n    enabled: false\n').stdout
         self.assertIn('    enabled: false\n', out)
 
     def test_a_new_machine_answers_the_1password_question(self):

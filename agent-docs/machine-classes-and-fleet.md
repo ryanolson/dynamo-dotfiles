@@ -169,3 +169,9 @@ Open question: what are the request limits of a service account on the plan that
 - `openv` uses `op` when `dev.env.op` has a reference, and otherwise runs `fleet secret env` with the pairs in `dev.env.fleet`. The map is `fleet_secrets` in `.chezmoidata/team.yaml`. `test/test-openv.py` covers both paths, a missing map, and lines that are not `VAR=name`.
 - The copies in `Fleet` do not follow a rotation in `Development`. A rotation must update the item in `Fleet`.
 - `onepassword.secrets` still points `ngc_api_key` at `op://Development/NGC/credential`, but the broker serves the NIM Operations key. Open question: change the team map to the NIM Operations key, so that both paths give the same key?
+
+## Addendum 2026-10-15: step 5 done
+
+- `chezmoi init` no longer converts `primary`, `headless-sudo`, and `headless-nosudo`. A saved class that is not `sudo` or `nosudo` is asked again. Every reachable machine had converted. nv-mbp-16 was not reachable and still has its old class, so its next `chezmoi init` asks for the class.
+- `provision-keys`, the bootstrap flags `--ssh-key-ref` and `--signing-key-ref`, the includes of `~/.ssh/provisioned`, and the provisioned branches in `setup-secrets` and `git-signing-status` are removed. No reachable machine had `~/.ssh/provisioned`. The SSH config modifier still deletes an old `Include ~/.ssh/provisioned/config` line from a deployed `~/.ssh/config`.
+- Step 3 still waits for nv-mbp-16.

@@ -22,16 +22,6 @@ if [[ "$(git config --global --includes gpg.ssh.program 2>/dev/null || true)" ==
     exit 1
 fi
 
-signing_key="${signing_key/#\~\//$HOME/}"
-if [[ "$signing_key" == "$HOME/.ssh/provisioned/"* ]]; then
-    if [[ -r "$signing_key" && -r "$HOME/.ssh/provisioned/allowed_signers" ]]; then
-        echo "ready: local SSH signing key is configured"
-        exit 0
-    fi
-    echo "degraded: local signing key or allowed signers file is missing"
-    exit 1
-fi
-
 if [[ ! -f "$HOME/.ssh/allowed_signers" ]]; then
     echo "degraded: ~/.ssh/allowed_signers is missing"
     exit 1
