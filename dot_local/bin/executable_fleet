@@ -2354,6 +2354,8 @@ prove_pylon() {
         "http://pylon/v1/secrets?ref=$(encode_ref "$ref")" 2>/dev/null | wc -c) ||
         fail "$ref did not arrive through the pylon secrets socket $sock"
     (( length > 0 )) || fail "$ref arrived empty through the pylon secrets socket $sock"
+    # The key check has its own FLEET_PYLON_WAIT: the secret fetch can use up the first one.
+    deadline=$((SECONDS + ${FLEET_PYLON_WAIT:-30}))
     while true; do
         keys=$(SSH_AUTH_SOCK="$agent" bounded $((deadline > SECONDS ? deadline - SECONDS : 1)) ssh-add -L 2>/dev/null |
             grep -c '^[a-z]' || true)

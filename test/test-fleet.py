@@ -1720,7 +1720,7 @@ class WorkerInstall(ActlBase):
 # a pylon that answers only after a restart ($HOME/pylon-running), and only from the STATUS_AFTER-th
 # poll on. systemctl and launchctl restart that pylon. ssh-add lists $HOME/agent-keys.
 EXECUTOR_CURL = r'''#!/usr/bin/env python3
-import json, os, shutil, sys
+import json, os, shutil, sys, time
 from pathlib import Path
 home = Path(os.environ['HOME'])
 a = sys.argv[1:]
@@ -1746,6 +1746,7 @@ if opt('--unix-socket'):
         print('{"flushed": 2}')
         sys.exit(0)
     if '/v1/secrets?ref=' in url:
+        time.sleep(float(os.environ.get('SECRET_DELAY', '0')))
         value = (home / 'selftest').read_text() if (home / 'selftest').exists() else 'hf_value'
         if value == 'refused':
             sys.exit(22)
@@ -1770,7 +1771,8 @@ exit 0
 SSH_ADD_STUB = r'''#!/bin/sh
 printf '%s %s\n' "$SSH_AUTH_SOCK" "$*" >> "$HOME/ssh-add.log"
 if [ -f "$HOME/agent-hangs" ]; then echo $$ > "$HOME/ssh-add.pid"; exec sleep 60; fi
-[ -f "$HOME/agent-keys" ] || { echo 'The agent has no identities.'; exit 1; }
+n=$(($(cat "$HOME/key-lists" 2>/dev/null || echo 0) + 1)); echo $n > "$HOME/key-lists"
+[ -f "$HOME/agent-keys" ] && [ $n -ge "${KEYS_AFTER:-1}" ] || { echo 'The agent has no identities.'; exit 1; }
 cat "$HOME/agent-keys"
 '''
 
@@ -2211,6 +2213,13 @@ class ExecutorPylonInstall(Executors):
         self.assertIn("reports version '0.1.9'", result.stderr)
         self.assertEqual(len(self.scheduler()), restarts)
         self.assertEqual(self.record(), {'pylon-install': [sha, '1700000000']})
+
+    def test_a_slow_secret_does_not_take_the_time_for_the_keys(self):
+        # The secret has its own 30 seconds. The key check has its own FLEET_PYLON_WAIT after it.
+        result = self.executor('pylon-install', self.commit(1_700_000_000), FLEET_PYLON_WAIT='3',
+                               SECRET_DELAY='4', KEYS_AFTER='2')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.home / 'key-lists').read_text().strip(), '2')
 
     def test_a_hung_restart_fails_in_time_and_leaves_no_process(self):
         (self.home / 'restart-hangs').write_text('')
