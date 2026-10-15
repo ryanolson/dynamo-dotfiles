@@ -658,9 +658,10 @@ class Fleet(FleetBase):
             self.assertFalse(gone.exists(), gone)
         self.assertEqual((ssh / 'authorized_keys').read_text(), 'ssh-ed25519 AAAAOTHERKEY me@laptop\n')
         scheduler = (self.home / 'scheduler.log').read_text()
-        labels = (['dev.fleet.renew', 'dev.fleet.agent', 'dev.fleet.tunnel.bb'] if os.uname().sysname == 'Darwin' else
+        labels = (['dev.fleet.renew', 'dev.fleet.agent', 'dev.fleet.tunnel.bb', 'dev.fleet.worker']
+                  if os.uname().sysname == 'Darwin' else
                   ['disable --now fleet-renew.timer', 'disable --now fleet-agent.service',
-                   'disable --now fleet-tunnel-bb.service'])
+                   'disable --now fleet-tunnel-bb.service', 'disable --now fleet-worker.service'])
         for label in labels:
             self.assertIn(label, scheduler)
         for plist in ['dev.fleet.renew', 'dev.fleet.agent', 'dev.fleet.tunnel.bb']:
@@ -1082,6 +1083,858 @@ class InstallPylon(FleetBase):
         self.assertEqual(self.install().returncode, 0)
         self.assertEqual((self.home / '.local/aarch64/bin/pylon').read_bytes(), self.BODY)
         self.assertFalse((self.home / '.local/bin/pylon').exists())
+
+
+# A stub of the actl CLI. keygen writes a private seed file the way actl does and prints a public
+# key. submit, status, and workers play a controller whose state is $HOME/controller.json:
+#   tasks          task ID -> {"task": document, "polls": n}
+#   offline        worker IDs whose tasks stay queued
+#   fail           worker IDs whose tasks fail
+#   lose_admitted  worker IDs whose next submit is admitted but its reply is lost
+#   lose_dropped   worker IDs whose next submit is neither admitted nor answered
+#   expired        true: a resend of an unknown task is refused, as for an expired request
+#   down           true: every call fails as if NATS were unreachable
+#   workers        the worker IDs that `actl workers` lists
+ACTL_STUB = r'''#!/usr/bin/env python3
+import json, os, sys, time, uuid
+from pathlib import Path
+home = Path(os.environ['HOME'])
+a = sys.argv[1:]
+with open(home / 'actl.log', 'a') as f:
+    f.write(json.dumps(a) + '\n')
+def opt(name):
+    return a[a.index(name) + 1] if name in a else None
+if a == ['--version']:
+    print('actl ' + os.environ.get('ACTL_STUB_VERSION', '0.2.0'))
+    sys.exit(0)
+words = [w for i, w in enumerate(a) if not w.startswith('--') and (i == 0 or a[i - 1] not in
+         ('--config', '--seed-file', '--repo', '--commit', '--type', '--requires', '--save-task', '--task-file',
+          '--runtime', '--attempts'))]
+cmd = words[0] if words else ''
+if cmd == 'keygen':
+    path = Path(opt('--seed-file'))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.write(fd, b'SUAPRIVATESEEDSENTINEL\n')
+    os.close(fd)
+    n = len(list(home.glob('.keygen-*')))
+    (home / f'.keygen-{n}').write_text('')
+    print(os.environ.get('ACTL_PUBKEY', 'U' + 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'[n] * 55))
+    sys.exit(0)
+if cmd == 'doctor':
+    print('configuration and credential OK')
+    sys.exit(0)
+state_path = home / 'controller.json'
+state = json.loads(state_path.read_text()) if state_path.exists() else {}
+state.setdefault('tasks', {})
+def save():
+    state_path.write_text(json.dumps(state))
+def host(doc):
+    return doc['required_capabilities'][0][len('host-'):]
+def rejected(code):
+    sys.stderr.write(f'Error: controller rejected request\n\nCaused by:\n    {code}\n')
+    sys.exit(1)
+if state.get('down'):
+    sys.stderr.write('Error: NATS connection failed\n')
+    sys.exit(1)
+if cmd == 'submit':
+    if opt('--task-file'):
+        doc = json.loads(Path(opt('--task-file')).read_text())
+    else:
+        doc = {'protocol_version': 1, 'id': str(uuid.uuid4()), 'correlation_id': str(uuid.uuid4()),
+               'parent_task_id': None, 'repository': opt('--repo'), 'commit': opt('--commit'),
+               'task_type': opt('--type'), 'context_refs': [], 'required_capabilities': [opt('--requires')],
+               'policy': {'runtime_seconds': 300, 'max_attempts': 2}, 'created_at': int(time.time())}
+    if opt('--save-task'):
+        fd = os.open(opt('--save-task'), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        os.write(fd, json.dumps(doc, indent=2).encode())
+        os.close(fd)
+    h = host(doc)
+    known = doc['id'] in state['tasks']
+    if not known and h in state.get('lose_dropped', []):
+        state['lose_dropped'].remove(h)
+        save()
+        sys.stderr.write('Error: request timed out\n')
+        sys.exit(1)
+    if not known and opt('--task-file') and state.get('expired'):
+        rejected('expired')
+    if not known:
+        state['tasks'][doc['id']] = {'task': doc, 'polls': 0}
+    if h in state.get('lose_admitted', []):
+        state['lose_admitted'].remove(h)
+        save()
+        sys.stderr.write('Error: request timed out\n')
+        sys.exit(1)
+    save()
+    print(json.dumps({'response': 'task', 'record': {'task': doc, 'state': {'status': 'queued'}, 'attempts': 0,
+                                                     'updated_at': 0}}))
+    sys.exit(0)
+if cmd == 'status':
+    entry = state['tasks'].get(words[1])
+    if entry is None:
+        rejected('not_found')
+    entry['polls'] += 1
+    h = host(entry['task'])
+    if h in state.get('offline', []):
+        st = {'status': 'queued'}
+    elif entry['polls'] < 2:
+        st = {'status': 'running', 'lease': {}}
+    elif h in state.get('fail', []):
+        st = {'status': 'failed', 'reason': 'execution', 'result': {'exit_code': 1, 'stdout': {}, 'stderr': {},
+                                                                    'truncated': False, 'commit': None}}
+    else:
+        st = {'status': 'completed', 'result': {'exit_code': 0, 'stdout': {}, 'stderr': {}, 'truncated': False,
+                                                'commit': entry['task']['commit']}}
+    save()
+    print(json.dumps({'response': 'inspection', 'record': {'task': entry['task'], 'state': st, 'attempts': 1,
+                                                           'updated_at': 0},
+                      'events': [], 'next': None, 'eligible_workers': 0 if h in state.get('offline', []) else 1}))
+    sys.exit(0)
+if cmd == 'workers':
+    print(json.dumps({'response': 'workers', 'next': None, 'workers': [
+        {'worker': {'worker_id': w, 'platform': 'linux', 'architecture': 'aarch64', 'version': '0.2.0',
+                    'capabilities': [], 'repositories': [], 'task_types': []},
+         'enrollment': {}, 'last_seen': 0, 'roots': []} for w in state.get('workers', [])]}))
+    sys.exit(0)
+sys.exit('unexpected actl ' + ' '.join(a))
+'''
+
+# A stub of systemctl --user for the worker service. $HOME/svc.json holds whether the service is
+# active and its main PID. When the drain file exists, a read of MainPID plays the worker:
+# DRAIN_MODE=ack writes the acknowledgement and exits, exit exits without one, fail exits and
+# marks the unit failed, other acknowledges with another PID, hang keeps running.
+SYSTEMCTL_STUB = r'''#!/usr/bin/env python3
+import json, os, sys, time, hashlib
+from pathlib import Path
+home = Path(os.environ['HOME'])
+a = sys.argv[1:]
+root = home / '.local/state/fleet/actl-worker'
+state_path = home / 'svc.json'
+state = json.loads(state_path.read_text()) if state_path.exists() else {'active': False, 'pid': 0, 'next': 4000,
+                                                                          'failed': False}
+def save():
+    state_path.write_text(json.dumps(state))
+def binary_sum():
+    for d in (home / '.local/bin', home / '.local/aarch64/bin'):
+        if (d / 'actl').exists():
+            return hashlib.sha256((d / 'actl').read_bytes()).hexdigest()[:12]
+    return 'none'
+with open(home / 'scheduler.log', 'a') as f:
+    f.write('systemctl ' + ' '.join(a) + (f' actl={binary_sum()}' if 'stop' in a else '') + '\n')
+args = [x for x in a if x not in ('--user', '--quiet', '--value', '--no-pager')]
+def start():
+    state.update(active=True, pid=state['next'], failed=False)
+    state['next'] += 1
+if args[:1] == ['show-environment']:
+    sys.exit(0)
+if args[:2] == ['show', '-p'] and args[2] == 'MainPID':
+    mode = os.environ.get('DRAIN_MODE', 'ack')
+    if state['active'] and (root / 'drain').exists() and mode != 'hang':
+        if mode in ('ack', 'other'):
+            pid = state['pid'] + (1 if mode == 'other' else 0)
+            (root / 'drained').write_text(json.dumps({'pid': pid, 'drained_at': int(time.time())}))
+        state.update(active=False, pid=0, failed=(mode == 'fail'))
+    save()
+    print(state['pid'] if state['active'] else 0)
+    sys.exit(0)
+if args[:1] == ['is-active']:
+    sys.exit(0 if state['active'] else 3)
+if args[:1] == ['is-failed']:
+    sys.exit(0 if state['failed'] else 1)
+if args[:1] == ['start'] or args[:2] == ['enable', '--now'] or args[:1] == ['restart']:
+    if not state['active'] or args[:1] == ['restart']:
+        start()
+elif args[:1] == ['stop']:
+    state.update(active=False, pid=0)
+save()
+sys.exit(0)
+'''
+
+# A stub of launchctl for the macOS worker agent, with the same state file and drain behavior.
+LAUNCHCTL_STUB = r'''#!/usr/bin/env python3
+import json, os, sys, time
+from pathlib import Path
+home = Path(os.environ['HOME'])
+a = sys.argv[1:]
+root = home / '.local/state/fleet/actl-worker'
+state_path = home / 'svc.json'
+state = json.loads(state_path.read_text()) if state_path.exists() else {'active': False, 'pid': 0, 'next': 4000,
+                                                                          'loaded': False}
+def save():
+    state_path.write_text(json.dumps(state))
+with open(home / 'scheduler.log', 'a') as f:
+    f.write('launchctl ' + ' '.join(a) + '\n')
+worker = a[1:2] == [f'gui/{os.getuid()}/dev.fleet.worker'] or (len(a) > 2 and a[2].endswith('dev.fleet.worker.plist'))
+if not worker:
+    sys.exit(0)
+if a[0] == 'print':
+    if not state.get('loaded'):
+        sys.exit(113)
+    if state['active'] and (root / 'drain').exists() and os.environ.get('DRAIN_MODE', 'ack') == 'ack':
+        (root / 'drained').write_text(json.dumps({'pid': state['pid'], 'drained_at': int(time.time())}))
+        state.update(active=False, pid=0)
+    save()
+    print('gui/501/dev.fleet.worker = {\n\tstate = ' + ('running' if state['active'] else 'not running'))
+    if state['active']:
+        print(f"\tpid = {state['pid']}")
+    print('}')
+    sys.exit(0)
+if a[0] == 'bootstrap':
+    state.update(loaded=True, active=True, pid=state['next'])
+    state['next'] += 1
+elif a[0] == 'bootout':
+    state.update(loaded=False, active=False, pid=0)
+elif a[0] == 'kickstart':
+    state.update(active=True, pid=state['next'])
+    state['next'] += 1
+save()
+'''
+
+# The pinned actl is the stub itself, so install can run keygen and status can run doctor with it.
+ACTL_BODY = ACTL_STUB.encode()
+NEW_ACTL_BODY = ACTL_STUB.encode() + b'# 0.3.0\n'
+SUPERVISOR_BODY = b'\x7fELF fake actl-supervisor 0.2.0'
+
+
+def pinned_script(home, actl=ACTL_BODY, supervisor=SUPERVISOR_BODY, version='0.2.0'):
+    """A copy of fleet with the actl pins that artifacts/release would add after the last checksum line."""
+    text = SCRIPT.read_text()
+    lines = [f'ACTL_VERSION={version}']
+    for target in ('darwin_arm64', 'linux_aarch64', 'linux_x86_64'):
+        lines.append(f'ACTL_SHA256_{target}={hashlib.sha256(actl).hexdigest()}')
+        lines.append(f'ACTL_SUPERVISOR_SHA256_{target}={hashlib.sha256(supervisor).hexdigest()}')
+    last = [m for m in re.finditer(r'^[A-Z_]+_SHA256_[a-z0-9_]+=\S+\n', text, re.M)][-1]
+    text = text[:last.end()] + '\n'.join(lines) + '\n' + text[last.end():]
+    script = home / 'fleet-pinned'
+    script.write_text(text)
+    return script
+
+
+class ActlBase(FleetBase):
+    SERVER = 'tls://ctl.example.ts.net:4222'
+    CA = '-----BEGIN CERTIFICATE-----\nMIIBfakeCA==\n-----END CERTIFICATE-----\n'
+
+    def setUp(self):
+        super().setUp()
+        self.bin = self.home / 'bin'
+        for name, body in [('actl', ACTL_STUB), ('systemctl', SYSTEMCTL_STUB), ('launchctl', LAUNCHCTL_STUB),
+                           ('journalctl', '#!/bin/sh\necho "worker log: teardown was not confirmed"\n'),
+                           ('uname', '#!/bin/sh\ncase "$1" in -m) echo "${FAKE_ARCH:-aarch64}" ;; '
+                                     '*) echo "${FAKE_OS:-Linux}" ;; esac\n'),
+                           ('curl', '#!/bin/sh\nprintf "%s\\n" "$*" >> "$HOME/curl.log"\nout=""; url=""\n'
+                                    'while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2 ;; '
+                                    'https://*) url="$1"; shift ;; *) shift ;; esac; done\n'
+                                    'case "$url" in\n'
+                                    '  */v1/actl) [ -f "$HOME/actl.json" ] || exit 22; cat "$HOME/actl.json" ;;\n'
+                                    '  */v1/artifacts/actl-supervisor/*) cp "$HOME/supervisor-body" "$out" ;;\n'
+                                    '  */v1/artifacts/actl/*) cp "$HOME/actl-body" "$out" ;;\n'
+                                    '  *) exit 22 ;;\nesac\n')]:
+            (self.bin / name).write_text(body)
+            (self.bin / name).chmod(0o700)
+        (self.home / 'actl-body').write_bytes(ACTL_BODY)
+        (self.home / 'supervisor-body').write_bytes(SUPERVISOR_BODY)
+        self.publish()
+        self.script = pinned_script(self.home)
+        self.user = __import__('pwd').getpwuid(os.getuid()).pw_name
+        self.config_dir = self.home / '.config/fleet/actl'
+        self.root = self.state / 'actl-worker'
+        self.seed = self.state / 'actl/worker.seed'
+
+    def publish(self, workers=()):
+        (self.home / 'actl.json').write_text(json.dumps({
+            'server': self.SERVER, 'ca_pem': self.CA, 'workers': [{'id': i, 'os': o} for i, o in workers]}))
+
+    def enroll_as(self, name):
+        result = self.fleet('enroll', name, '--ca-url', 'https://ca.example', '--fingerprint', 'ab' * 32,
+                            '--no-trust', stdin=TOKEN + '\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def run_script(self, *args, script=None, **env):
+        return subprocess.run(['bash', str(script or self.script), *args], capture_output=True, text=True,
+                              env=dict(self.env, **env))
+
+    def svc(self):
+        path = self.home / 'svc.json'
+        return json.loads(path.read_text()) if path.exists() else {'active': False, 'pid': 0}
+
+    def set_svc(self, **values):
+        state = dict({'active': False, 'pid': 0, 'next': 4000, 'failed': False, 'loaded': False}, **self.svc())
+        state.update(values)
+        (self.home / 'svc.json').write_text(json.dumps(state))
+
+    def scheduler(self):
+        path = self.home / 'scheduler.log'
+        return path.read_text().splitlines() if path.exists() else []
+
+    def downloads(self):
+        log = self.home / 'curl.log'
+        return [l for l in log.read_text().splitlines() if '/v1/artifacts/' in l] if log.exists() else []
+
+
+class WorkerInstall(ActlBase):
+    def setUp(self):
+        super().setUp()
+        self.enroll_as('node-1')
+
+    def install(self, *args, **env):
+        return self.run_script('worker', 'install', *args, **env)
+
+    def executor_args(self, toml, name):
+        block = toml.split(f'[worker.executors.{name}]\n')[1].split('\n\n')[0]
+        line = next(l for l in block.splitlines() if l.startswith('args = '))
+        return json.loads(line[len('args = '):])
+
+    def test_linux_install_renders_the_worker_and_prints_only_the_public_key(self):
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        key = 'U' + 'A' * 55
+        self.assertEqual(result.stdout, f'node-1=linux:{key}\n')
+        self.assertNotIn('SUAPRIVATESEEDSENTINEL', result.stdout + result.stderr)
+        bindir = self.home / '.local/bin'
+        self.assertEqual((bindir / 'actl').read_bytes(), ACTL_BODY)
+        self.assertEqual((bindir / 'actl-supervisor').read_bytes(), SUPERVISOR_BODY)
+        self.assertEqual(self.mode(bindir / 'actl'), 0o755)
+        self.assertEqual(self.mode(self.seed), 0o600)
+        self.assertEqual(self.mode(self.seed.parent), 0o700)
+        self.assertEqual((self.config_dir / 'ca.pem').read_text(), self.CA)
+        toml = (self.config_dir / 'worker.toml').read_text()
+        h = str(self.home)
+        for line in ['[connection]', f'servers = ["{self.SERVER}"]', f'ca_certificate = "{h}/.config/fleet/actl/ca.pem"',
+                     f'seed_file = "{h}/.local/state/fleet/actl/worker.seed"', 'principal = "worker.node-1"',
+                     '[worker]', f'root = "{h}/.local/state/fleet/actl-worker"', 'git_binary = "/usr/bin/git"',
+                     f'supervisor_binary = "{h}/.local/bin/actl-supervisor"', 'max_disk_bytes = 10737418240',
+                     'retain_attempts = 100', 'capabilities = ["host-node-1", "os-linux"]',
+                     '[worker.repositories]', 'dotfiles = "https://github.com/ryanolson/dynamo-dotfiles.git"']:
+            self.assertIn(line + '\n', toml)
+        commands = {'fleet-apply': ['executor', 'apply'], 'pylon-install': ['executor', 'pylon-install'],
+                    'secrets-flush': ['secret', 'flush'], 'fleet-probe': ['executor', 'probe']}
+        uid = os.getuid()
+        for name, command in commands.items():
+            block = toml.split(f'[worker.executors.{name}]\n')[1]
+            self.assertTrue(block.startswith('kind = "command"\nprogram = "/usr/bin/env"\n'), block)
+            args = self.executor_args(toml, name)
+            self.assertEqual(args[:8], ['-u', 'GIT_CONFIG_GLOBAL', '-u', 'GIT_CONFIG_NOSYSTEM', '-u',
+                                        'GIT_TERMINAL_PROMPT', '-u', 'GIT_LFS_SKIP_SMUDGE'])
+            env = dict(x.split('=', 1) for x in args[8:-2 - len(command)])
+            self.assertEqual(env['HOME'], h)
+            self.assertEqual((env['USER'], env['LOGNAME']), (self.user, self.user))
+            self.assertEqual(env['XDG_CONFIG_HOME'], f'{h}/.config')
+            self.assertEqual(env['XDG_STATE_HOME'], f'{h}/.local/state')
+            self.assertEqual(env['XDG_RUNTIME_DIR'], f'/run/user/{uid}')
+            self.assertEqual(env['LANG'], 'C.UTF-8')
+            path = env['PATH'].split(':')
+            self.assertEqual(path[0], f'{h}/.local/bin')
+            self.assertTrue(all(p.startswith('/') for p in path), path)
+            self.assertIn('/usr/bin', path)
+            self.assertEqual(args[-2 - len(command):], ['/bin/bash', 'dot_local/bin/executable_fleet', *command])
+        unit = (self.home / '.config/systemd/user/fleet-worker.service').read_text()
+        self.assertIn(f'ExecStart={h}/.local/bin/actl --config {h}/.config/fleet/actl/worker.toml worker\n', unit)
+        for line in ['Restart=always', 'RestartSec=30', 'TimeoutStopSec=90', 'WantedBy=default.target']:
+            self.assertIn(line + '\n', unit)
+        log = self.scheduler()
+        self.assertIn('systemctl --user enable fleet-worker.service', log)
+        self.assertTrue(self.svc()['active'])
+        self.assertTrue(any(l.startswith('loginctl ') for l in log), log)
+        (dl_actl, dl_sup) = sorted(self.downloads(), key=lambda l: 'supervisor' in l)
+        self.assertIn('https://ca.example:8443/v1/artifacts/actl/0.2.0/linux-aarch64', dl_actl)
+        self.assertIn('https://ca.example:8443/v1/artifacts/actl-supervisor/0.2.0/linux-aarch64', dl_sup)
+        self.assertIn(f'--cert {self.state}/node.crt', dl_actl)
+
+    def test_macos_install_renders_a_launchd_agent(self):
+        result = self.install(FAKE_OS='Darwin', FAKE_ARCH='arm64')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.startswith('node-1=macos:U'), result.stdout)
+        toml = (self.config_dir / 'worker.toml').read_text()
+        self.assertIn('capabilities = ["host-node-1", "os-macos"]\n', toml)
+        args = self.executor_args(toml, 'secrets-flush')
+        self.assertFalse([x for x in args if x.startswith('XDG_RUNTIME_DIR=')])
+        self.assertIn('/opt/homebrew/bin', dict(x.split('=', 1) for x in args if '=' in x)['PATH'].split(':'))
+        plist = (self.home / 'Library/LaunchAgents/dev.fleet.worker.plist').read_text()
+        h = str(self.home)
+        for part in ['<string>dev.fleet.worker</string>', f'<string>{h}/.local/bin/actl</string><string>--config</string>'
+                     f'<string>{h}/.config/fleet/actl/worker.toml</string><string>worker</string>',
+                     '<key>ExitTimeOut</key><integer>60</integer>', '<key>RunAtLoad</key><true/>',
+                     '<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>',
+                     f'{h}/Library/Logs/fleet-worker.log']:
+            self.assertIn(part, plist)
+        self.assertIn(f'launchctl bootstrap gui/{os.getuid()} {h}/Library/LaunchAgents/dev.fleet.worker.plist',
+                      self.scheduler())
+        self.assertTrue(self.svc()['active'])
+
+    def test_unchanged_install_changes_nothing_and_starts_a_stopped_service(self):
+        self.assertEqual(self.install().returncode, 0)
+        files = [self.home / '.local/bin/actl', self.config_dir / 'worker.toml', self.config_dir / 'ca.pem',
+                 self.home / '.config/systemd/user/fleet-worker.service', self.seed]
+        before = {f: (f.stat().st_mtime_ns, f.read_bytes()) for f in files}
+        log_len, pid = len(self.scheduler()), self.svc()['pid']
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f'node-1=linux:U{"A" * 55}\n')
+        self.assertEqual({f: (f.stat().st_mtime_ns, f.read_bytes()) for f in files}, before)
+        self.assertEqual(len(self.downloads()), 2)
+        self.assertEqual(self.svc()['pid'], pid)
+        self.assertFalse([l for l in self.scheduler()[log_len:] if ' stop' in l or ' start' in l or 'restart' in l])
+        self.assertFalse((self.root / 'drain').exists())
+        self.set_svc(active=False, pid=0)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.svc()['active'])
+        self.assertEqual({f: (f.stat().st_mtime_ns, f.read_bytes()) for f in files}, before)
+
+    def test_an_unsafe_existing_seed_stops_install(self):
+        def reset():
+            if self.seed.parent.exists():
+                __import__('shutil').rmtree(self.seed.parent)
+            self.seed.parent.mkdir(mode=0o700, parents=True)
+        cases = {}
+        reset()
+        self.seed.write_text('SUAOTHER\n'); self.seed.chmod(0o644)
+        cases['group-readable seed'] = self.install()
+        reset()
+        target = self.home / 'elsewhere.seed'; target.write_text('SUAOTHER\n'); target.chmod(0o600)
+        self.seed.symlink_to(target)
+        cases['symlinked seed'] = self.install()
+        reset()
+        self.seed.write_text('SUAOTHER\n'); self.seed.chmod(0o600); self.seed.parent.chmod(0o755)
+        cases['shared directory'] = self.install()
+        reset()
+        self.seed.write_text('SUAOTHER\n'); self.seed.chmod(0o600)
+        os.link(self.seed, self.home / 'second-link')
+        cases['second hard link'] = self.install()
+        for label, result in cases.items():
+            self.assertNotEqual(result.returncode, 0, label)
+            self.assertIn('seed', result.stderr, label)
+            self.assertNotIn('SUAOTHER', result.stdout + result.stderr, label)
+        self.assertFalse(list(self.home.glob('.keygen-*')))
+        self.assertFalse((self.config_dir / 'worker.toml').exists())
+
+    def test_update_drains_the_worker_before_it_replaces_anything(self):
+        self.assertEqual(self.install().returncode, 0)
+        old = hashlib.sha256(ACTL_BODY).hexdigest()[:12]
+        new_body = NEW_ACTL_BODY
+        (self.home / 'actl-body').write_bytes(new_body)
+        script = pinned_script(self.home, actl=new_body, version='0.3.0')
+        log_len, pid = len(self.scheduler()), self.svc()['pid']
+        result = self.run_script('worker', 'install', script=script)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.home / '.local/bin/actl').read_bytes(), new_body)
+        log = self.scheduler()[log_len:]
+        stop = next(i for i, l in enumerate(log) if l.startswith('systemctl --user stop fleet-worker.service'))
+        self.assertIn(f'actl={old}', log[stop])
+        self.assertTrue(any('MainPID' in l for l in log[:stop]))
+        self.assertTrue(any('start fleet-worker.service' in l for l in log[stop:]))
+        self.assertFalse((self.root / 'drain').exists())
+        self.assertFalse((self.root / 'drained').exists())
+        self.assertNotEqual(self.svc()['pid'], pid)
+        self.assertTrue(self.svc()['active'])
+
+    def test_update_stops_when_the_worker_exits_without_an_acknowledgement(self):
+        self.assertEqual(self.install().returncode, 0)
+        new_body = NEW_ACTL_BODY
+        (self.home / 'actl-body').write_bytes(new_body)
+        script = pinned_script(self.home, actl=new_body, version='0.3.0')
+        for mode in ['exit', 'fail', 'other']:
+            with self.subTest(mode):
+                self.set_svc(active=True, pid=4100, failed=False)
+                (self.root / 'drain').unlink(missing_ok=True)
+                log_len = len(self.scheduler())
+                result = self.run_script('worker', 'install', script=script, DRAIN_MODE=mode)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('without a drain acknowledgement', result.stderr)
+                self.assertIn('worker log: teardown was not confirmed', result.stderr)
+                self.assertEqual((self.home / '.local/bin/actl').read_bytes(), ACTL_BODY)
+                self.assertTrue((self.root / 'drain').exists())
+                self.assertFalse([l for l in self.scheduler()[log_len:] if ' start' in l])
+
+    def test_update_that_times_out_removes_the_drain_file(self):
+        self.assertEqual(self.install().returncode, 0)
+        new_body = NEW_ACTL_BODY
+        (self.home / 'actl-body').write_bytes(new_body)
+        script = pinned_script(self.home, actl=new_body, version='0.3.0')
+        result = self.run_script('worker', 'install', '--timeout', '2', script=script, DRAIN_MODE='hang')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('did not drain within 2 seconds', result.stderr)
+        self.assertFalse((self.root / 'drain').exists())
+        self.assertEqual((self.home / '.local/bin/actl').read_bytes(), ACTL_BODY)
+        self.assertTrue(self.svc()['active'])
+
+    def test_both_checksums_are_checked_before_anything_is_replaced(self):
+        self.assertEqual(self.install().returncode, 0)
+        new_actl, new_sup = NEW_ACTL_BODY, b'\x7fELF fake actl-supervisor 0.3.0'
+        (self.home / 'actl-body').write_bytes(new_actl)
+        (self.home / 'supervisor-body').write_bytes(b'tampered')
+        script = pinned_script(self.home, actl=new_actl, supervisor=new_sup, version='0.3.0')
+        log_len = len(self.scheduler())
+        result = self.run_script('worker', 'install', script=script)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('checksum', result.stderr)
+        self.assertEqual((self.home / '.local/bin/actl').read_bytes(), ACTL_BODY)
+        self.assertEqual((self.home / '.local/bin/actl-supervisor').read_bytes(), SUPERVISOR_BODY)
+        self.assertFalse((self.root / 'drain').exists())
+        self.assertFalse([l for l in self.scheduler()[log_len:] if 'stop' in l or 'MainPID' in l])
+        self.assertEqual(list((self.home / '.local/bin').glob('.fleet.*')), [])
+
+    def test_install_fails_clearly_without_the_actl_pins(self):
+        result = self.fleet('worker', 'install')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('actl is not pinned', result.stderr)
+        self.assertFalse(self.downloads())
+        self.assertFalse((self.home / '.local/bin/actl').exists())
+
+    def test_install_refuses_an_unsafe_exit_marker(self):
+        self.assertEqual(self.install().returncode, 0)
+        (self.root).mkdir(parents=True, exist_ok=True)
+        (self.root / 'unsafe-exit').write_text('{}')
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('unsafe-exit', result.stderr)
+
+    def test_install_needs_published_connection_data_and_a_valid_worker_id(self):
+        (self.home / 'actl.json').unlink()
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('/v1/actl', result.stderr)
+        self.publish()
+        self.enroll_as('node-1.fleet')
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('worker ID', result.stderr)
+        self.assertFalse(list(self.home.glob('.keygen-*')))
+
+    def test_nosudo_host_installs_the_pair_into_the_arch_folder(self):
+        (self.home / '.local/aarch64').mkdir(parents=True)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arch_bin = self.home / '.local/aarch64/bin'
+        self.assertEqual((arch_bin / 'actl').read_bytes(), ACTL_BODY)
+        self.assertIn(f'supervisor_binary = "{arch_bin}/actl-supervisor"\n',
+                      (self.config_dir / 'worker.toml').read_text())
+        self.assertFalse((self.home / '.local/bin/actl').exists())
+
+    def test_worker_status_reports_the_service_versions_and_connection(self):
+        self.assertEqual(self.install().returncode, 0)
+        result = self.run_script('worker', 'status')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = result.stdout
+        self.assertIn('worker: node-1 (linux)\n', out)
+        self.assertIn(f'service: active, pid {self.svc()["pid"]}\n', out)
+        self.assertIn('pinned: actl 0.2.0\n', out)
+        self.assertIn('installed: actl 0.2.0, matches the pin\n', out)
+        self.assertIn(f'connection: {self.SERVER}', out)
+        self.assertIn('active attempts: 0\n', out)
+        self.assertIn('drain: none\n', out)
+
+    def test_executor_commands(self):
+        result = self.fleet('executor', 'probe', ACTL_TASK_ID='0190-test')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('fleet-probe: node-1 task 0190-test', result.stdout)
+        for command in ['apply', 'pylon-install']:
+            result = self.fleet('executor', command)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('part 5', result.stderr)
+
+
+class ActlClient(ActlBase):
+    def setUp(self):
+        super().setUp()
+        self.enroll_as('laptop-1')
+        self.env['FLEET_ACTL'] = str(self.bin / 'actl')
+
+    def test_client_init_creates_the_seed_once_and_prints_only_the_public_key(self):
+        result = self.fleet('actl', 'client-init')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f'U{"A" * 55}\n')
+        seed = self.state / 'actl/client.seed'
+        self.assertEqual(self.mode(seed), 0o600)
+        self.assertEqual(self.mode(seed.parent), 0o700)
+        again = self.fleet('actl', 'client-init')
+        self.assertEqual((again.returncode, again.stdout), (0, result.stdout), again.stderr)
+        self.assertEqual(len(list(self.home.glob('.keygen-*'))), 1)
+        self.assertNotIn('SUAPRIVATESEEDSENTINEL', result.stdout + result.stderr + again.stdout + again.stderr)
+        seed.chmod(0o640)
+        self.assertNotEqual(self.fleet('actl', 'client-init').returncode, 0)
+
+    def test_client_config_renders_from_the_broker(self):
+        self.assertNotEqual(self.fleet('actl', 'client-config').returncode, 0)
+        self.assertEqual(self.fleet('actl', 'client-init').returncode, 0)
+        result = self.fleet('actl', 'client-config')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        h = str(self.home)
+        self.assertEqual((self.config_dir / 'client.toml').read_text(),
+                         f'[connection]\nservers = ["{self.SERVER}"]\nca_certificate = "{h}/.config/fleet/actl/ca.pem"\n'
+                         f'seed_file = "{h}/.local/state/fleet/actl/client.seed"\nprincipal = "client.cli"\n')
+        self.assertEqual((self.config_dir / 'ca.pem').read_text(), self.CA)
+
+    def test_client_commands_fail_clearly_without_the_actl_pins(self):
+        del self.env['FLEET_ACTL']
+        result = self.fleet('actl', 'client-init')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('actl is not pinned', result.stderr)
+
+
+# An ssh stub. The worker host answers `fleet worker install` with $INSTALL_LINE. The controller
+# records --add-worker and adds the worker to the controller state that the actl stub lists.
+# $HOME/fail-install and $HOME/fail-add-worker make that step fail.
+SSH_STUB = r'''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+home = Path(os.environ['HOME'])
+a = sys.argv[1:]
+with open(home / 'ssh.log', 'a') as f:
+    f.write(json.dumps(a) + '\n')
+host, command = a[-2], a[-1]
+if 'fleet worker install' in command:
+    if (home / 'fail-install').exists():
+        sys.exit('install failed on ' + host)
+    print('installed actl 0.2.0', file=sys.stderr)
+    print(os.environ['INSTALL_LINE'])
+    sys.exit(0)
+if '--add-worker' in command:
+    if (home / 'fail-add-worker').exists():
+        sys.exit('provision.py: reload failed')
+    spec = command.split('--add-worker ')[1].split()[0]
+    state_path = home / 'controller.json'
+    state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    workers = state.setdefault('workers', [])
+    if spec.split('=')[0] not in workers and not (home / 'worker-offline').exists():
+        workers.append(spec.split('=')[0])
+    state_path.write_text(json.dumps(state))
+    sys.exit(0)
+sys.exit('unexpected ssh ' + ' '.join(a))
+'''
+
+
+class WorkerEnroll(ActlBase):
+    KEY = 'U' + 'K' * 55
+
+    def setUp(self):
+        super().setUp()
+        self.enroll_as('laptop-1')
+        self.env['FLEET_ACTL'] = str(self.bin / 'actl')
+        (self.bin / 'ssh').write_text(SSH_STUB)
+        (self.bin / 'ssh').chmod(0o700)
+        self.repo = self.home / 'fleet-config'
+        (self.repo / 'broker').mkdir(parents=True)
+        self.roster = self.repo / 'broker/actl.json'
+        self.roster.write_text(json.dumps({'server': self.SERVER, 'ca_pem': self.CA, 'workers': []}, indent=2) + '\n')
+        self.assertEqual(self.fleet('actl', 'client-init').returncode, 0)
+        self.env['INSTALL_LINE'] = f'brev-x86-cpu=linux:{self.KEY}'
+
+    def enroll_worker(self, *extra, **env):
+        return self.fleet('worker', 'enroll', 'bb', '--fleet-config', str(self.repo), '--timeout', '3', *extra, **env)
+
+    def ssh_calls(self):
+        return [json.loads(l) for l in (self.home / 'ssh.log').read_text().splitlines()]
+
+    def test_enroll_uses_the_worker_id_from_the_install_line_not_the_alias(self):
+        result = self.enroll_worker()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        install, add = self.ssh_calls()
+        self.assertEqual(install[-2:], ['bb', '~/.local/bin/fleet worker install'])
+        self.assertEqual(add[-2], 'bb')
+        self.assertIn('sudo -n ~/repos/agentic-control/scripts/provision.py --config /etc/actl-fleet/deployment.json '
+                      f'--environment prod --add-worker brev-x86-cpu=linux:{self.KEY}', add[-1])
+        self.assertEqual(json.loads(self.roster.read_text())['workers'], [{'id': 'brev-x86-cpu', 'os': 'linux'}])
+        self.assertIn('bb is the worker brev-x86-cpu', result.stdout)
+        self.assertIn('commit broker/actl.json', result.stdout)
+        self.assertIn('brev-x86-cpu is connected', result.stdout)
+
+    def test_controller_and_provisioner_are_configurable(self):
+        result = self.enroll_worker('--controller', 'ctl-host', '--provisioner', '/srv/actl')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        add = self.ssh_calls()[1]
+        self.assertEqual(add[-2], 'ctl-host')
+        self.assertIn('sudo -n /srv/actl/scripts/provision.py ', add[-1])
+        self.assertNotEqual(self.enroll_worker('--provisioner', '/srv/$(x)').returncode, 0)
+
+    def test_each_step_can_be_interrupted_and_run_again(self):
+        steps = [('install', self.home / 'fail-install', 'install failed'),
+                 ('add-worker', self.home / 'fail-add-worker', '--add-worker'),
+                 ('roster', self.roster, 'actl.json'),
+                 ('wait', self.home / 'worker-offline', 'not connected')]
+        for step, marker, message in steps:
+            with self.subTest(step):
+                (self.home / 'controller.json').unlink(missing_ok=True)
+                if step == 'roster':
+                    saved = self.roster.read_text()
+                    self.roster.unlink()
+                else:
+                    marker.write_text('')
+                result = self.enroll_worker()
+                self.assertNotEqual(result.returncode, 0, step)
+                self.assertIn(message, result.stderr, step)
+                if step == 'roster':
+                    self.roster.write_text(saved)
+                else:
+                    marker.unlink()
+                result = self.enroll_worker()
+                self.assertEqual(result.returncode, 0, f'{step}: {result.stderr}')
+                self.assertEqual(json.loads(self.roster.read_text())['workers'],
+                                 [{'id': 'brev-x86-cpu', 'os': 'linux'}], step)
+
+    def test_roster_refuses_an_id_enrolled_with_another_os(self):
+        self.roster.write_text(json.dumps({'server': self.SERVER, 'ca_pem': self.CA,
+                                           'workers': [{'id': 'Brev-X86-CPU', 'os': 'macos'}]}))
+        result = self.enroll_worker()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('already in the roster', result.stderr)
+        self.assertEqual(json.loads(self.roster.read_text())['workers'], [{'id': 'Brev-X86-CPU', 'os': 'macos'}])
+
+    def test_a_malformed_install_line_stops_before_the_controller(self):
+        for line in ['nonsense', 'brev-x86-cpu=linux:SUASEED', f'bad.id=linux:{self.KEY}']:
+            (self.home / 'ssh.log').unlink(missing_ok=True)
+            result = self.enroll_worker(INSTALL_LINE=line)
+            self.assertNotEqual(result.returncode, 0, line)
+            self.assertIn('ID=OS:PUBLIC_KEY', result.stderr)
+            self.assertEqual(len(self.ssh_calls()), 1, line)
+
+
+class FleetTask(ActlBase):
+    COMMIT = 'c' * 40
+
+    def setUp(self):
+        super().setUp()
+        self.enroll_as('laptop-1')
+        self.env['FLEET_ACTL'] = str(self.bin / 'actl')
+        self.env['FLEET_TASK_POLL'] = '0.05'
+        self.publish([('brev-x86-cpu', 'linux'), ('spark-d', 'linux'), ('mba-15', 'macos')])
+        self.assertEqual(self.fleet('actl', 'client-init').returncode, 0)
+        self.tasks = self.state / 'tasks'
+
+    def controller(self, **values):
+        path = self.home / 'controller.json'
+        state = json.loads(path.read_text()) if path.exists() else {}
+        state.update(values)
+        path.write_text(json.dumps(state))
+
+    def run_dir(self, result):
+        m = re.search(r'fleet task --resume (\S+)', result.stdout + result.stderr)
+        self.assertTrue(m, result.stdout + result.stderr)
+        return self.tasks / m.group(1)
+
+    def docs(self, run, worker):
+        return sorted((run / worker).glob('task-*.json'), key=lambda p: int(p.stem.split('-')[1]))
+
+    def report(self, result):
+        return {l.split()[0]: l.split()[1] for l in result.stdout.splitlines() if l and l.split()[0] in
+                ('brev-x86-cpu', 'spark-d', 'mba-15')}
+
+    def submits(self):
+        return [json.loads(l) for l in (self.home / 'actl.log').read_text().splitlines() if 'submit' in l]
+
+    def test_all_sends_one_task_per_machine_and_reports_an_offline_machine(self):
+        self.controller(offline=['mba-15'])
+        result = self.fleet('task', 'secrets-flush', '--all', '--commit', self.COMMIT, '--timeout', '2')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(self.report(result), {'brev-x86-cpu': 'completed', 'spark-d': 'completed', 'mba-15': 'queued'})
+        self.assertIn('1 machine unfinished', result.stdout)
+        run = self.run_dir(result)
+        spec = json.loads((run / 'spec.json').read_text())
+        self.assertEqual((spec['task'], spec['commit'], spec['hosts']),
+                         ('secrets-flush', self.COMMIT, ['brev-x86-cpu', 'spark-d', 'mba-15']))
+        self.assertEqual(spec['roster'], [{'id': 'brev-x86-cpu', 'os': 'linux'}, {'id': 'spark-d', 'os': 'linux'},
+                                          {'id': 'mba-15', 'os': 'macos'}])
+        for worker in spec['hosts']:
+            (doc,) = self.docs(run, worker)
+            task = json.loads(doc.read_text())
+            self.assertEqual((task['task_type'], task['commit'], task['required_capabilities']),
+                             ('secrets-flush', self.COMMIT, [f'host-{worker}']))
+        for call in self.submits():
+            self.assertIn('--save-task', call)
+        self.assertTrue((self.config_dir / 'client.toml').exists())
+        self.controller(offline=[])
+        resumed = self.fleet('task', '--resume', run.name, '--timeout', '2')
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertEqual(set(self.report(resumed).values()), {'completed'})
+        self.assertEqual(len(self.submits()), 3)
+
+    def test_host_selects_one_machine_from_the_roster(self):
+        result = self.fleet('task', 'fleet-probe', '--host', 'spark-d', '--commit', self.COMMIT, '--timeout', '2')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.report(result), {'spark-d': 'completed'})
+        result = self.fleet('task', 'fleet-probe', '--host', 'bb', '--commit', self.COMMIT)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('not in the roster', result.stderr)
+        for bad in [('task', 'rm-rf', '--all', '--commit', self.COMMIT), ('task', 'fleet-probe', '--commit', self.COMMIT),
+                    ('task', 'fleet-probe', '--all', '--commit', 'main')]:
+            self.assertNotEqual(self.fleet(*bad).returncode, 0, bad)
+
+    def test_default_commit_is_main_of_the_public_dotfiles(self):
+        (self.bin / 'git').write_text('#!/bin/sh\nprintf "%s\\n" "$*" > "$HOME/git-args"\n'
+                                      f'printf "{self.COMMIT}\\trefs/heads/main\\n"\n')
+        (self.bin / 'git').chmod(0o700)
+        result = self.fleet('task', 'fleet-probe', '--host', 'spark-d', '--timeout', '2')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.home / 'git-args').read_text().strip(),
+                         'ls-remote https://github.com/ryanolson/dynamo-dotfiles.git refs/heads/main')
+        self.assertEqual(json.loads((self.run_dir(result) / 'spec.json').read_text())['commit'], self.COMMIT)
+
+    def test_resume_keeps_a_task_whose_reply_was_lost(self):
+        self.controller(lose_admitted=['spark-d'], lose_dropped=['mba-15'])
+        result = self.fleet('task', 'secrets-flush', '--all', '--commit', self.COMMIT, '--timeout', '1')
+        self.assertNotEqual(result.returncode, 0)
+        run = self.run_dir(result)
+        admitted = json.loads(self.docs(run, 'spark-d')[0].read_text())['id']
+        dropped = json.loads(self.docs(run, 'mba-15')[0].read_text())['id']
+        resumed = self.fleet('task', '--resume', run.name, '--timeout', '2')
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertEqual(set(self.report(resumed).values()), {'completed'})
+        self.assertEqual(len(self.docs(run, 'spark-d')), 1)
+        self.assertEqual(len(self.docs(run, 'mba-15')), 1)
+        tasks = json.loads((self.home / 'controller.json').read_text())['tasks']
+        self.assertIn(admitted, tasks)
+        self.assertIn(dropped, tasks)
+        resends = [c for c in self.submits() if '--task-file' in c]
+        self.assertEqual([c[c.index('--task-file') + 1] for c in resends], [str(self.docs(run, 'mba-15')[0])])
+
+    def test_a_refused_resend_or_a_missing_document_gets_a_new_task(self):
+        self.controller(lose_dropped=['spark-d', 'mba-15'], down=False)
+        result = self.fleet('task', 'secrets-flush', '--all', '--commit', self.COMMIT, '--timeout', '1')
+        run = self.run_dir(result)
+        self.docs(run, 'mba-15')[0].write_text('{"id": "trunc')
+        self.controller(expired=True)
+        resumed = self.fleet('task', '--resume', run.name, '--timeout', '2')
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertEqual(self.report(resumed), {'brev-x86-cpu': 'completed', 'spark-d': 'completed',
+                                                'mba-15': 'completed'})
+        for worker in ['spark-d', 'mba-15']:
+            docs = self.docs(run, worker)
+            self.assertEqual([d.name for d in docs], ['task-1.json', 'task-2.json'], worker)
+            new = json.loads(docs[1].read_text())
+            self.assertIn(new['id'], json.loads((self.home / 'controller.json').read_text())['tasks'])
+            self.assertIn(new['id'], resumed.stdout)
+
+    def test_an_unreachable_controller_creates_no_new_documents(self):
+        result = self.fleet('task', 'secrets-flush', '--all', '--commit', self.COMMIT, '--timeout', '1',
+                            )
+        run = self.run_dir(result)
+        self.controller(down=True)
+        resumed = self.fleet('task', '--resume', run.name, '--timeout', '1')
+        self.assertNotEqual(resumed.returncode, 0)
+        for worker in ['brev-x86-cpu', 'spark-d', 'mba-15']:
+            self.assertEqual(len(self.docs(run, worker)), 1)
+        self.assertIn('fleet task --resume', resumed.stdout)
+
+    def test_one_resume_runs_at_a_time(self):
+        self.controller(offline=['mba-15'])
+        result = self.fleet('task', 'secrets-flush', '--host', 'mba-15', '--commit', self.COMMIT, '--timeout', '1')
+        run = self.run_dir(result)
+        holder = subprocess.Popen(['python3', '-c', 'import fcntl, sys, time\n'
+                                   'f = open(sys.argv[1], "a"); fcntl.flock(f, fcntl.LOCK_EX); print("held", flush=True)\n'
+                                   'time.sleep(30)', str(run / 'lock')], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), 'held')
+        resumed = self.fleet('task', '--resume', run.name, '--timeout', '1')
+        self.assertNotEqual(resumed.returncode, 0)
+        self.assertIn('another fleet task', resumed.stderr)
+
+    def test_run_specification_is_written_before_any_submission(self):
+        self.controller(down=True)
+        result = self.fleet('task', 'fleet-apply', '--all', '--commit', self.COMMIT, '--timeout', '1')
+        self.assertNotEqual(result.returncode, 0)
+        run = self.run_dir(result)
+        self.assertEqual(json.loads((run / 'spec.json').read_text())['task'], 'fleet-apply')
+        self.assertEqual(list(run.glob('.spec*')), [])
+        self.assertIn('unsent', result.stdout)
 
 
 class GitconfigInclude(unittest.TestCase):

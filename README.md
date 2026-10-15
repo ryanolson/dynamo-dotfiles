@@ -340,7 +340,7 @@ timeout 300 python3 test/test-join.py
 
 ### Remove a machine from the fleet
 
-`fleet uninstall` (or `fleet remove`) revokes the machine's certificate, stops the renew timer, the agent, and every tunnel, removes the CA line from `~/.ssh/authorized_keys`, and deletes `~/.ssh/fleet`, the fleet state, and the fleet settings. It asks first; pass `--yes` when there is no terminal. `--keep-cert` skips the revocation. It does not remove `pylon` or a bb host daemon.
+`fleet uninstall` (or `fleet remove`) revokes the machine's certificate, stops the renew timer, the agent, the actl worker, and every tunnel, removes the CA line from `~/.ssh/authorized_keys`, and deletes `~/.ssh/fleet`, the fleet state, and the fleet settings. It asks first; pass `--yes` when there is no terminal. `--keep-cert` skips the revocation. It does not remove `pylon`, `actl`, or a bb host daemon.
 
 ### Fleet SSH names
 
@@ -357,6 +357,49 @@ fleet claude [ARGS...]                         # run claude with CLAUDE_CODE_OAU
 ```
 
 The broker URL defaults to port 8443 on the CA host. `fleet init --broker-url` overrides it.
+
+### Fleet tasks through actl
+
+Fleet maintenance runs as [actl](https://github.com/ryanolson/agentic-control) tasks (agentic-control task 029). One controller runs on brev-x86-cpu. Each fleet machine runs one worker as the user. The broker serves the NATS address, the deployment CA, and the list of enrolled workers at `GET /v1/actl`, so the controller's name stays out of this repository. The commands need `python3`.
+
+`actl` and `actl-supervisor` are pinned in `fleet` as one pair (`ACTL_VERSION`, `ACTL_SHA256_*`, `ACTL_SUPERVISOR_SHA256_*`), and the broker serves them at `/v1/artifacts/actl/VERSION/TARGET` and `/v1/artifacts/actl-supervisor/VERSION/TARGET`. `fleet-config/artifacts/release actl` adds the pins. Until the first release, the commands below that need actl stop with `actl is not pinned`. For the laptop commands, `FLEET_ACTL=/path/to/actl` uses a local build instead.
+
+On a worker machine:
+
+```bash
+fleet worker install [--timeout S]   # prints ID=OS:PUBLIC_KEY
+fleet worker status
+```
+
+`fleet worker install` installs the pinned pair into `~/.local/bin` (`~/.local/<arch>/bin` on a no-sudo host) after it checks both checksums. It creates the worker seed once with `actl keygen`, and refuses an existing seed that is not a regular file with mode 600, one link, and the user as owner, in a mode-700 folder. Only the public key leaves the machine. It writes the configuration from `/v1/actl` and starts the service:
+
+| Path | Content |
+| --- | --- |
+| `~/.config/fleet/actl/worker.toml`, `ca.pem` | Principal `worker.ID`, where ID is the fleet name (`fleet status`), not an SSH alias. Capabilities `host-ID` and `os-linux` or `os-macos`. Repository `dotfiles` is this repository over HTTPS. Executors `fleet-apply`, `pylon-install`, `secrets-flush`, and `fleet-probe`: each runs `/usr/bin/env`, which removes the worker's Git variables and sets `HOME`, `USER`, `LOGNAME`, `LANG`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_RUNTIME_DIR` (Linux), and a fixed `PATH`, then `/bin/bash dot_local/bin/executable_fleet` from the task's checkout. |
+| `~/.local/state/fleet/actl/worker.seed`, `worker.pub` | The seed and its public key. |
+| `~/.local/state/fleet/actl-worker` | The worker root, with the drain files. |
+| `fleet-worker.service` (Linux) | systemd user service with linger, `Restart=always`, `RestartSec=30`, `TimeoutStopSec=90`. |
+| `dev.fleet.worker` (macOS) | launchd agent in the GUI domain, `ExitTimeOut` 60, log `~/Library/Logs/fleet-worker.log`. `KeepAlive` restarts it only after a failure, because launchd would start it again at once after a drain and replace its acknowledgement. |
+
+With nothing changed, install changes nothing, but it starts a stopped service. To change a running worker, install drains it first. It creates `<root>/drain` and waits up to `--timeout` seconds (default 600) for `<root>/drained` from the service's main process, which the worker writes when no attempt runs. Then it stops the service, replaces the files, removes both drain files, and starts the service. If the worker exits without the acknowledgement, or the service fails, install stops, keeps the drain file, and prints the worker log: inspect the worker as the actl operations guide requires. If the time runs out, install removes the drain file, so the worker keeps working. While `<root>/unsafe-exit` exists, install refuses to run. `fleet executor apply` and `fleet executor pylon-install` arrive with task 029 part 5. Until then they fail. `fleet-probe` prints the machine name and the task ID.
+
+On the admin laptop:
+
+```bash
+fleet actl client-init        # once, before the deployment: prints the client.cli public key
+fleet actl client-config      # after /v1/actl is published: writes client.toml and ca.pem
+fleet worker enroll HOST [--controller bb] [--provisioner ~/repos/agentic-control] [--fleet-config ~/repos/fleet-config] [--timeout 120]
+fleet task NAME --host ID... | --all [--commit SHA] [--timeout 600]
+fleet task --resume RUN [--timeout 600]
+```
+
+`fleet worker enroll HOST` runs `fleet worker install` on HOST over SSH and reads its `ID=OS:KEY` line. Next, it runs `sudo -n PROVISIONER/scripts/provision.py --config /etc/actl-fleet/deployment.json --environment prod --add-worker ID=OS:KEY` on the controller host. Then it adds `{"id": ID, "os": OS}` to `broker/actl.json` in the fleet-config checkout, once. Last, it waits until `actl workers` lists the worker. `FLEET_ACTL_CONTROLLER`, `FLEET_ACTL_PROVISIONER`, and `FLEET_CONFIG_REPO` change the defaults. It does not commit or deploy fleet-config. Commit the roster and deploy the broker yourself, as the fleet-config README describes. Each step is safe to repeat, so after a failure, run the same command again.
+
+`fleet task` sends one task for each machine, `actl submit --requires host-ID`, at an explicit commit of this repository. The default is `main` on GitHub. `--all` uses the workers from `/v1/actl`. An offline machine stays on the list, and its task waits in the queue. The run folder `~/.local/state/fleet/tasks/RUN` gets the run specification first, written atomically. Then each machine's task document is saved (`actl submit --save-task`) before it is sent. The command polls with backoff until each task ends or `--timeout` passes, and prints one line for each machine: `ID STATE DETAIL TASK_ID`. An unfinished machine is listed with the resume command. It exits 0 only when every task completed with exit status 0.
+
+`fleet task --resume RUN` holds a lock on the run folder. For each machine, it keeps a task that `actl status` knows. Otherwise it sends the saved document again (`--task-file`), and the controller deduplicates it. If the controller refuses that document, or no complete document was saved, it sends a new task with a new ID. The old task can still be admitted late. Then the machine runs the task twice. This is allowed, because every fleet executor is idempotent and refuses a stale commit. If the controller cannot be reached, resume creates no new task.
+
+The contract tests run these commands with the real actl and a real NATS broker on Linux. See the comment at the start of `test/test-fleet-actl-contract.py`.
 
 ### bb server
 

@@ -13,10 +13,22 @@ PYLON_VERSION=0.1.0-6282a55
 PYLON_SHA256_darwin_arm64=3d84ad229184310e7aab7d1f7d1ca85ae2985bf79f405861a461a829fdda4175
 PYLON_SHA256_linux_aarch64=807585cb429c4ac4e161532d0c65342e3d6a46af2669c9a0e0aa1cceccae6e84
 PYLON_SHA256_linux_x86_64=61e072bf0d9aa9dc221552437ffb314782fa27e6c4d9a069ce10fb1d4eab11a7
+# actl and actl-supervisor from agentic-control, one pair from one build, served by the broker at
+# /v1/artifacts/actl/VERSION/TARGET and /v1/artifacts/actl-supervisor/VERSION/TARGET.
+# fleet-config/artifacts/release actl inserts ACTL_VERSION and the ACTL_SHA256_* and
+# ACTL_SUPERVISOR_SHA256_* lines after the last checksum line, above this comment. Until the first
+# actl release (agentic-control task 029, part 6) they are absent, and the commands that need actl stop.
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fleet"
 CONFIG="$CONFIG_DIR/config"
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/fleet"
+# The actl fleet deployment (task 029). Tasks fetch the public dotfiles at a commit, without credentials.
+DOTFILES_URL=https://github.com/ryanolson/dynamo-dotfiles.git
+ACTL_CONFIG_DIR="$CONFIG_DIR/actl"
+ACTL_STATE="$STATE/actl"
+WORKER_ROOT="$STATE/actl-worker"
+TASK_RUNS="$STATE/tasks"
+TASK_TYPES="fleet-apply pylon-install secrets-flush fleet-probe"
 SSH_FLEET="$HOME/.ssh/fleet"
 SELF="$HOME/.local/bin/fleet"
 X509_RENEW_BEFORE=16h
@@ -83,6 +95,24 @@ Any machine:
                                         and delete the fleet keys and settings. Alias: remove.
   install-step                          Linux: install the pinned step CLI into ~/.local/bin (~/.local/<arch>/bin on no-sudo hosts).
   install-pylon                         Install the pinned pylon from the broker into the same folder, and restart the agent.
+
+Fleet tasks through actl (the controller runs on the host that the broker's /v1/actl names):
+  worker install [--timeout S]          Install or update the pinned actl pair, the worker seed, the
+                                        worker configuration from the broker, and the worker service.
+                                        Prints ID=OS:PUBLIC_KEY. An update drains the running worker first.
+  worker status                         The service, the pinned and installed actl, the connection,
+                                        running attempts, and drain markers.
+  worker enroll HOST [--controller HOST] [--provisioner PATH] [--fleet-config PATH] [--timeout S]
+                                        Laptop: install the worker on HOST over SSH, enroll it on the
+                                        controller host (default bb, provisioner ~/repos/agentic-control),
+                                        add it to the fleet-config roster, and wait until it connects.
+  actl client-init                      Laptop: create the client.cli seed and print its public key.
+  actl client-config                    Laptop: write client.toml and ca.pem from the broker.
+  task NAME (--host ID... | --all) [--commit SHA] [--timeout S]
+                                        Laptop: send the task NAME (fleet-apply, pylon-install,
+                                        secrets-flush, fleet-probe) to each machine and report the results.
+  task --resume RUN [--timeout S]       Finish a run that stopped or timed out.
+  executor apply|pylon-install|probe    Run by the worker for a task, from the task's checkout.
 EOF
 }
 
@@ -1172,12 +1202,16 @@ cmd_uninstall() {
     for f in "$TUNNELS"/*; do
         [[ -f "$f" ]] && cmd_tunnel remove "${f##*/}"
     done
+    # The actl worker reads its seed and configuration from the fleet folders removed below.
     if [[ "$(uname -s)" == Darwin ]]; then
         launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/dev.fleet.agent.plist" 2>/dev/null || true
         rm -f "$HOME/Library/LaunchAgents/dev.fleet.agent.plist"
+        launchctl bootout "gui/$(id -u)/dev.fleet.worker" 2>/dev/null || true
+        rm -f "$WORKER_PLIST"
     elif systemctl --user show-environment >/dev/null 2>&1; then
         systemctl --user disable --now fleet-agent.service 2>/dev/null || true
-        rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/fleet-agent.service"
+        systemctl --user disable --now fleet-worker.service 2>/dev/null || true
+        rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/fleet-agent.service" "$SYSTEMD_UNIT"
         systemctl --user daemon-reload 2>/dev/null || true
     fi
     rm -f "$(agent_sock)"
@@ -1185,7 +1219,7 @@ cmd_uninstall() {
     edit_authorized_keys ""
     rm -rf "$SSH_FLEET" "$STATE" "$CONFIG_DIR"
     printf 'fleet removed from this machine%s. Certificate: %s.\n' "${name:+ ($name)}" "$revoked"
-    printf 'Not removed: pylon (~/.local/bin/pylon) and any bb host daemon. Remove the machine from bb with bb machine remove.\n'
+    printf 'Not removed: pylon and actl (~/.local/bin), and any bb host daemon. Remove the machine from bb with bb machine remove.\n'
 }
 
 cmd_agent() {
@@ -1237,6 +1271,910 @@ cmd_status() {
     fi
 }
 
+# ---- actl fleet deployment (agentic-control task 029) ----
+# Each fleet machine runs one actl worker as the user, and the admin laptop sends tasks to it. The
+# broker serves the connection data at /v1/actl, so the controller's tailnet name stays out of this
+# public script. JSON is parsed by the helper below, so these commands need python3 (3.9 or later).
+FLEET_PY=$(cat <<'PY'
+import json, os, re, sys
+
+SERVER = re.compile(r'tls://[A-Za-z0-9][A-Za-z0-9.-]{0,252}:[0-9]{1,5}')
+PEM = re.compile(r'(-----BEGIN CERTIFICATE-----\n[A-Za-z0-9+/=\n]+-----END CERTIFICATE-----\n)+')
+WORKER_ID = re.compile(r'[A-Za-z0-9_-]{1,59}')
+TASK_KEYS = {'protocol_version', 'id', 'correlation_id', 'parent_task_id', 'repository', 'commit', 'task_type',
+             'context_refs', 'required_capabilities', 'policy', 'created_at'}
+
+
+def sync_dir(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic(path, text, mode=None):
+    """Write a temporary file, sync it, rename it over PATH, and sync the directory."""
+    d = os.path.dirname(os.path.abspath(path))
+    tmp = os.path.join(d, '.' + os.path.basename(path) + '.tmp')
+    with open(tmp, 'w') as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    if mode is not None:
+        os.chmod(tmp, mode)
+    os.replace(tmp, path)
+    sync_dir(d)
+
+
+def workers_of(data):
+    workers = data.get('workers')
+    if not isinstance(workers, list) or len(workers) > 50:
+        sys.exit('workers must be a list of at most 50 entries')
+    seen = set()
+    for w in workers:
+        if not isinstance(w, dict) or set(w) != {'id', 'os'} or not isinstance(w['id'], str) \
+                or not WORKER_ID.fullmatch(w['id']) or w['os'] not in ('linux', 'macos') or w['id'].lower() in seen:
+            sys.exit(f'invalid worker entry {w!r}')
+        seen.add(w['id'].lower())
+    return workers
+
+
+def load(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+cmd, a = sys.argv[1], sys.argv[2:]
+if cmd == 'actl-endpoint':
+    # /v1/actl from the broker: check it again here, then write server, ca.pem, and workers into a[1].
+    data = load(a[0])
+    if not isinstance(data, dict):
+        sys.exit('not an object')
+    server, ca = data.get('server'), data.get('ca_pem')
+    if not isinstance(server, str) or not SERVER.fullmatch(server):
+        sys.exit(f'invalid server {server!r}')
+    if not isinstance(ca, str) or not PEM.fullmatch(ca):
+        sys.exit('invalid ca_pem')
+    workers = workers_of(data)
+    with open(os.path.join(a[1], 'server'), 'w') as f:
+        f.write(server)
+    with open(os.path.join(a[1], 'ca.pem'), 'w') as f:
+        f.write(ca)
+    with open(os.path.join(a[1], 'workers'), 'w') as f:
+        f.write(''.join(f"{w['id']} {w['os']}\n" for w in workers))
+elif cmd == 'atomic-copy':
+    with open(a[1]) as f:
+        atomic(a[0], f.read(), int(a[2], 8))
+elif cmd == 'sync-dir':
+    sync_dir(a[0])
+elif cmd == 'drained-pid':
+    # The worker's drain acknowledgement: {"pid": N, "drained_at": UNIX_SECONDS}.
+    data = load(a[0])
+    pid = data.get('pid') if isinstance(data, dict) else None
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        sys.exit(1)
+    print(pid)
+elif cmd == 'roster-add':
+    path, wid, wos = a
+    data = load(path)
+    if not isinstance(data, dict):
+        sys.exit(f'{path} is not a JSON object')
+    workers = workers_of(data)
+    for w in workers:
+        if w['id'].lower() == wid.lower():
+            if w['id'] == wid and w['os'] == wos:
+                print('present')
+                sys.exit(0)
+            sys.exit(f"{wid} is already in the roster as {w['id']} ({w['os']}); fix {path} by hand")
+    workers.append({'id': wid, 'os': wos})
+    atomic(path, json.dumps(data, indent=2) + '\n', os.stat(path).st_mode & 0o777)
+    print('added')
+elif cmd == 'workers-has':
+    # One page of `actl --json workers`: print "found", or the cursor of the next page, or nothing.
+    data = load(a[0])
+    if any(r.get('worker', {}).get('worker_id') == a[1] for r in data.get('workers', [])):
+        print('found')
+    elif data.get('next'):
+        print(data['next'])
+elif cmd == 'spec-write':
+    path, task, commit, timeout, hosts, roster = a
+    with open(roster) as f:
+        entries = [line.split() for line in f if line.strip()]
+    spec = {'task': task, 'commit': commit, 'timeout': int(timeout), 'hosts': hosts.split(','),
+            'roster': [{'id': i, 'os': o} for i, o in entries], 'repository': 'dotfiles'}
+    atomic(path, json.dumps(spec, indent=2) + '\n')
+elif cmd == 'spec-read':
+    spec = load(a[0])
+    hosts = spec['hosts']
+    if not isinstance(hosts, list) or not all(isinstance(h, str) and WORKER_ID.fullmatch(h) for h in hosts):
+        sys.exit('invalid hosts')
+    if spec['task'] not in a[1].split() or not re.fullmatch(r'[0-9a-f]{40}', spec['commit']):
+        sys.exit('invalid task or commit')
+    print(spec['task'], spec['commit'])
+    for h in hosts:
+        print(h)
+elif cmd == 'task-doc':
+    # A saved task document counts only if it is complete and is the task of this run and machine.
+    path, task, commit, host = a
+    try:
+        doc = load(path)
+    except (OSError, ValueError):
+        sys.exit(1)
+    if not isinstance(doc, dict) or not TASK_KEYS <= set(doc) or not isinstance(doc['id'], str) \
+            or not re.fullmatch(r'[0-9a-f-]{36}', doc['id']) or doc['repository'] != 'dotfiles' \
+            or doc['task_type'] != task or doc['commit'] != commit or doc['required_capabilities'] != [f'host-{host}']:
+        sys.exit(1)
+    print(doc['id'])
+elif cmd == 'record':
+    # The reply of `actl --json submit` or `actl --json status`: print "TASK_ID STATE DETAIL".
+    data = load(a[0])
+    record = data['record']
+    state = record['state']
+    status = state['status']
+    detail = '-'
+    result = state.get('result') or {}
+    if status == 'completed':
+        detail = f"exit={result.get('exit_code')}"
+    elif status == 'failed':
+        detail = f"{state.get('reason')},exit={result.get('exit_code')}"
+    elif status == 'queued' and data.get('eligible_workers') == 0:
+        detail = 'no-eligible-worker'
+    print(record['task']['id'], status, detail)
+else:
+    sys.exit(f'unknown helper command {cmd}')
+PY
+)
+
+need_python() { command -v python3 >/dev/null 2>&1 || fail 'python3 is required for the actl commands'; }
+fpy() { python3 -c "$FLEET_PY" "$@"; }
+valid_worker_id() { [[ "$1" =~ ^[A-Za-z0-9_-]{1,59}$ ]]; }
+valid_nkey() { [[ "$1" =~ ^U[A-Z2-7]{55}$ ]]; }
+valid_commit() { [[ "$1" =~ ^[0-9a-f]{40}$ ]]; }
+
+actl_target() { printf '%s-%s' "$(uname -s | tr '[:upper:]' '[:lower:]')" "$(uname -m)"; }
+
+# actl_pin BINARY: the pinned SHA-256 of actl or actl-supervisor for this machine.
+actl_pin() {
+    local target var
+    [[ -n "${ACTL_VERSION:-}" ]] ||
+        fail 'actl is not pinned in this fleet script (ACTL_VERSION). The first actl release (agentic-control task 029, part 6) adds the pins. For client commands, FLEET_ACTL can name a local actl.'
+    target=$(actl_target)
+    var="$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')_SHA256_${target//-/_}"
+    [[ -n "${!var:-}" ]] || fail "actl is not pinned for $target ($var)"
+    printf '%s' "${!var}"
+}
+
+broker_get() {
+    curl -fsS --connect-timeout 5 --max-time 30 --cert "$STATE/node.crt" --key "$STATE/node.key" \
+        --cacert "$STATE/root_ca.crt" -H 'Accept: application/json' "$broker_url$1"
+}
+
+# Sets ACTL_BIN to the install folder and ACTL_STAGE to a folder with the pinned pair: the installed
+# binaries when both match, else both downloads, each checked before anything is replaced.
+# ACTL_NEW is 1 when the installed pair must be replaced.
+stage_actl_pair() {
+    local sum_a sum_s target name
+    sum_a=$(actl_pin actl)
+    sum_s=$(actl_pin actl-supervisor)
+    target=$(actl_target)
+    ACTL_BIN=$(local_bin)
+    if [[ -x "$ACTL_BIN/actl" && -x "$ACTL_BIN/actl-supervisor" && "$(sha256_of "$ACTL_BIN/actl")" == "$sum_a" &&
+          "$(sha256_of "$ACTL_BIN/actl-supervisor")" == "$sum_s" ]]; then
+        ACTL_STAGE="$ACTL_BIN" ACTL_NEW=0
+        return 0
+    fi
+    need_enrollment
+    need_broker
+    mkdir -p "$ACTL_BIN"
+    scratch "$ACTL_BIN"; ACTL_STAGE="$SCRATCH" ACTL_NEW=1
+    for name in actl actl-supervisor; do
+        curl -fsS --cert "$STATE/node.crt" --key "$STATE/node.key" --cacert "$STATE/root_ca.crt" \
+            -o "$ACTL_STAGE/$name" "$broker_url/v1/artifacts/$name/$ACTL_VERSION/$target" ||
+            fail "the broker did not return $name $ACTL_VERSION for $target"
+    done
+    [[ "$(sha256_of "$ACTL_STAGE/actl")" == "$sum_a" ]] || fail 'actl download checksum mismatch; nothing installed'
+    [[ "$(sha256_of "$ACTL_STAGE/actl-supervisor")" == "$sum_s" ]] ||
+        fail 'actl-supervisor download checksum mismatch; nothing installed'
+    chmod 0755 "$ACTL_STAGE/actl" "$ACTL_STAGE/actl-supervisor"
+}
+
+install_actl_pair() {
+    mv -f "$ACTL_STAGE/actl-supervisor" "$ACTL_BIN/actl-supervisor"
+    mv -f "$ACTL_STAGE/actl" "$ACTL_BIN/actl"
+    printf 'installed actl %s in %s\n' "$ACTL_VERSION" "$ACTL_BIN" >&2
+}
+
+# Sets ACTL for the laptop commands: FLEET_ACTL, else the pinned pair, installed when needed. The
+# pair of a machine that also runs a worker changes only through fleet worker install, which drains it.
+need_actl() {
+    if [[ -n "${FLEET_ACTL:-}" ]]; then
+        [[ -x "$FLEET_ACTL" ]] || fail "FLEET_ACTL ($FLEET_ACTL) is not executable"
+        ACTL="$FLEET_ACTL"
+        return 0
+    fi
+    stage_actl_pair
+    if [[ "$ACTL_NEW" == 1 ]]; then
+        [[ ! -f "$ACTL_CONFIG_DIR/worker.toml" ]] ||
+            fail 'this machine runs an actl worker with another actl; update it with fleet worker install'
+        install_actl_pair
+    fi
+    ACTL="$ACTL_BIN/actl"
+}
+
+file_stat() { stat -c '%a %u %h' "$1" 2>/dev/null || stat -f '%Lp %u %l' "$1"; }
+
+private_dir_ok() {
+    local mode uid links
+    [[ -d "$1" && ! -L "$1" ]] || return 1
+    read -r mode uid links <<<"$(file_stat "$1")"
+    [[ "$mode" == 700 && "$uid" == "$(id -u)" ]]
+}
+
+# seed_ready PATH: true for a seed that fleet may use, false when there is none. Anything else
+# stops, because a seed that someone else could read or replace must not identify this machine.
+seed_ready() {
+    local seed="$1" mode uid links
+    [[ -e "$seed" || -L "$seed" ]] || return 1
+    [[ -f "$seed" && ! -L "$seed" ]] || fail "the seed $seed is not a regular file; inspect it and remove it"
+    read -r mode uid links <<<"$(file_stat "$seed")"
+    [[ "$mode" == 600 && "$uid" == "$(id -u)" && "$links" == 1 ]] ||
+        fail "the seed $seed must have mode 600, one link, and owner $(id -un); inspect it and remove it"
+    private_dir_ok "$(dirname "$seed")" ||
+        fail "the seed directory $(dirname "$seed") must have mode 700 and owner $(id -un); inspect it"
+    return 0
+}
+
+# ensure_seed PATH ACTL: use the seed at PATH, or create it with actl keygen. Sets SEED_KEY to its
+# public key and SEED_NEW. The public key is kept in PATH.pub, because a seed does not give it back
+# without the NKey library. The seed appears last, so an interrupted run never leaves a seed
+# whose key was not recorded.
+ensure_seed() {
+    local seed="$1" actl="$2" dir pub key
+    dir=$(dirname "$seed") pub="${1%.seed}.pub"
+    if seed_ready "$seed"; then
+        [[ -f "$pub" ]] || fail "the seed $seed has no public key file $pub. If this key was never enrolled, remove the seed and run again."
+        key=$(<"$pub")
+        valid_nkey "$key" || fail "$pub does not hold a public user NKey"
+        SEED_KEY="$key" SEED_NEW=0
+        return 0
+    fi
+    if [[ ! -e "$dir" ]]; then
+        mkdir -p "$(dirname "$dir")"
+        mkdir -m 700 "$dir"
+    fi
+    private_dir_ok "$dir" || fail "the seed directory $dir must have mode 700 and owner $(id -un); inspect it"
+    rm -f "$seed.new"
+    key=$("$actl" keygen --seed-file "$seed.new") || fail 'actl keygen failed'
+    valid_nkey "$key" || { rm -f "$seed.new"; fail 'actl keygen did not print a public user NKey'; }
+    printf '%s\n' "$key" > "$pub.tmp"
+    mv -f "$pub.tmp" "$pub"
+    mv "$seed.new" "$seed"
+    SEED_KEY="$key" SEED_NEW=1
+}
+
+# fetch_actl DIR: read /v1/actl into DIR (server, ca.pem, workers) and set ACTL_SERVER.
+fetch_actl() {
+    need_python
+    need_enrollment
+    need_broker
+    broker_get /v1/actl > "$1/actl.json" ||
+        fail 'the broker did not return /v1/actl; the actl deployment is not published yet (fleet-config broker/actl.json)'
+    fpy actl-endpoint "$1/actl.json" "$1" || fail 'the broker returned malformed /v1/actl data'
+    ACTL_SERVER=$(<"$1/server")
+}
+
+# TOML basic strings without escapes. Paths and values with a quote, backslash, or control
+# character are refused rather than escaped, so the rendered file needs no TOML parser to check.
+toml_check() {
+    local v
+    for v in "$@"; do
+        [[ "$v" != *'"'* && "$v" != *'\'* && ! "$v" =~ [[:cntrl:]] ]] || fail "cannot write this value into TOML: $v"
+    done
+}
+toml_list() {
+    local v out=""
+    for v in "$@"; do out="${out:+$out, }\"$v\""; done
+    printf '[%s]' "$out"
+}
+
+worker_os() {
+    case "$(uname -s)" in
+        Linux) echo linux ;;
+        Darwin) echo macos ;;
+        *) fail "unsupported system $(uname -s)" ;;
+    esac
+}
+
+# The worker ID is the fleet machine name, not an SSH alias, and also names the principal
+# worker.ID and the capability host-ID.
+worker_id() {
+    load_config
+    valid_worker_id "$name" ||
+        fail "the fleet name '$name' is not a valid actl worker ID (1-59 letters, digits, _ or -)"
+    printf '%s' "$name"
+}
+
+# A fixed PATH, not the caller's: a rendered file that depends on the shell that ran install would
+# restart the worker after each install from a different shell.
+executor_path() {
+    local p out="" list
+    list=("$(local_bin)" "$HOME/.local/bin" "$HOME/.cargo/bin" "$HOME/.pixi/bin")
+    if [[ "$(uname -s)" == Darwin ]]; then
+        list+=(/opt/homebrew/bin /opt/homebrew/sbin /usr/local/bin /usr/bin /bin /usr/sbin /sbin)
+    else
+        list+=(/usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin)
+    fi
+    for p in "${list[@]}"; do
+        [[ ":$out:" == *":$p:"* ]] || out="${out:+$out:}$p"
+    done
+    printf '%s' "$out"
+}
+
+git_binary() {
+    if [[ -x /usr/bin/git ]]; then echo /usr/bin/git; return; fi
+    local git; git=$(command -v git 2>/dev/null || true)
+    [[ "$git" == /* ]] || fail 'git is required for the actl worker'
+    echo "$git"
+}
+
+# render_worker FILE ID OS: the worker configuration. The worker clears the environment of each
+# executor, so the executors are /usr/bin/env with fixed arguments that remove the worker's Git
+# variables and set the user's (ruling R5 of task 029). The command runs the fleet script of the
+# task's checkout, so the code that runs is the code at the task's commit.
+render_worker() {
+    local out="$1" id="$2" os="$3" user lang git bin env_args name run
+    user=$(id -un)
+    git=$(git_binary)
+    bin=$ACTL_BIN
+    if [[ "$os" == macos ]]; then lang=en_US.UTF-8; else lang=C.UTF-8; fi
+    env_args=(-u GIT_CONFIG_GLOBAL -u GIT_CONFIG_NOSYSTEM -u GIT_TERMINAL_PROMPT -u GIT_LFS_SKIP_SMUDGE
+        "HOME=$HOME" "USER=$user" "LOGNAME=$user" "LANG=$lang" "XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}"
+        "XDG_STATE_HOME=${XDG_STATE_HOME:-$HOME/.local/state}")
+    [[ "$os" == linux ]] && env_args+=("XDG_RUNTIME_DIR=/run/user/$(id -u)")
+    env_args+=("PATH=$(executor_path)")
+    toml_check "$ACTL_SERVER" "$ACTL_CONFIG_DIR" "$ACTL_STATE" "$WORKER_ROOT" "$git" "$bin" "${env_args[@]}"
+    {
+        printf '[connection]\nservers = [%s]\n' "\"$ACTL_SERVER\""
+        printf 'ca_certificate = "%s"\nseed_file = "%s"\nprincipal = "worker.%s"\n\n' \
+            "$ACTL_CONFIG_DIR/ca.pem" "$ACTL_STATE/worker.seed" "$id"
+        printf '[worker]\nroot = "%s"\ngit_binary = "%s"\nsupervisor_binary = "%s"\n' \
+            "$WORKER_ROOT" "$git" "$bin/actl-supervisor"
+        printf 'max_disk_bytes = 10737418240\nretain_attempts = 100\ncapabilities = ["host-%s", "os-%s"]\n\n' "$id" "$os"
+        printf '[worker.repositories]\ndotfiles = "%s"\n' "$DOTFILES_URL"
+        for name in fleet-apply pylon-install secrets-flush fleet-probe; do
+            case "$name" in
+                fleet-apply) run=(executor apply) ;;
+                pylon-install) run=(executor pylon-install) ;;
+                secrets-flush) run=(secret flush) ;;
+                fleet-probe) run=(executor probe) ;;
+            esac
+            printf '\n[worker.executors.%s]\nkind = "command"\nprogram = "/usr/bin/env"\nargs = %s\n' "$name" \
+                "$(toml_list "${env_args[@]}" /bin/bash dot_local/bin/executable_fleet "${run[@]}")"
+        done
+    } > "$out"
+}
+
+SYSTEMD_UNIT="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/fleet-worker.service"
+WORKER_PLIST="$HOME/Library/LaunchAgents/dev.fleet.worker.plist"
+WORKER_LOG="$HOME/Library/Logs/fleet-worker.log"
+
+# SSH sessions without a login session (Tailscale SSH) have no XDG_RUNTIME_DIR, and
+# systemctl --user needs it to find the user manager.
+user_bus() {
+    if [[ "$(uname -s)" == Linux && -z "${XDG_RUNTIME_DIR:-}" && -d "/run/user/$(id -u)" ]]; then
+        export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+    fi
+}
+
+worker_service_kind() {
+    if [[ "$(uname -s)" == Darwin ]]; then echo launchd
+    elif systemctl --user show-environment >/dev/null 2>&1; then echo systemd
+    else fail 'the actl worker needs a systemd user session or launchd'
+    fi
+}
+
+worker_service_file() { if [[ "$1" == launchd ]]; then echo "$WORKER_PLIST"; else echo "$SYSTEMD_UNIT"; fi; }
+
+# The service row of task 029. On macOS, KeepAlive restarts only a failed worker: launchd starts a
+# job again at once after any exit, and the new worker would replace the drain acknowledgement of
+# the one that drained before install could read it. systemd waits RestartSec first.
+render_worker_service() {
+    local out="$1" kind="$2" config="$ACTL_CONFIG_DIR/worker.toml" actl="$ACTL_BIN/actl"
+    [[ "$config$actl" != *[[:space:]]* ]] || fail 'the worker paths must not contain white space'
+    if [[ "$kind" == launchd ]]; then
+        cat > "$out" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>dev.fleet.worker</string>
+    <key>ProgramArguments</key><array><string>$actl</string><string>--config</string><string>$config</string><string>worker</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+    <key>ExitTimeOut</key><integer>60</integer>
+    <key>StandardOutPath</key><string>$WORKER_LOG</string>
+    <key>StandardErrorPath</key><string>$WORKER_LOG</string>
+</dict>
+</plist>
+EOF
+    else
+        printf '%s\n' '[Unit]' 'Description=Fleet actl worker' '' '[Service]' \
+            "ExecStart=$actl --config $config worker" 'Restart=always' 'RestartSec=30' 'TimeoutStopSec=90' '' \
+            '[Install]' 'WantedBy=default.target' > "$out"
+    fi
+}
+
+# The main process ID of the worker service, or 0.
+worker_pid() {
+    local pid
+    if [[ "$1" == launchd ]]; then
+        pid=$(launchctl print "gui/$(id -u)/dev.fleet.worker" 2>/dev/null | awk '$1 == "pid" && $2 == "=" {print $3; exit}') || true
+    else
+        pid=$(systemctl --user show -p MainPID --value fleet-worker.service 2>/dev/null) || true
+    fi
+    [[ "$pid" =~ ^[0-9]+$ ]] || pid=0
+    echo "$pid"
+}
+
+worker_failed() { [[ "$1" == systemd ]] && systemctl --user is-failed --quiet fleet-worker.service 2>/dev/null; }
+
+worker_log() {
+    if [[ "$1" == launchd ]]; then tail -n 40 "$WORKER_LOG" 2>/dev/null || true
+    else journalctl --user -u fleet-worker.service -n 40 --no-pager 2>&1 || true
+    fi
+}
+
+worker_stop() {
+    if [[ "$1" == launchd ]]; then launchctl bootout "gui/$(id -u)/dev.fleet.worker" 2>/dev/null || true
+    else systemctl --user stop fleet-worker.service 2>/dev/null || true
+    fi
+}
+
+# Load, enable, and start the service from its current files.
+worker_start() {
+    if [[ "$1" == launchd ]]; then
+        launchctl bootout "gui/$(id -u)/dev.fleet.worker" 2>/dev/null || true
+        launchctl bootstrap "gui/$(id -u)" "$WORKER_PLIST"
+    else
+        systemctl --user daemon-reload
+        systemctl --user enable fleet-worker.service >/dev/null 2>&1
+        systemctl --user start fleet-worker.service
+        local user; user=$(id -un)
+        if [[ "$(loginctl show-user "$user" -p Linger --value 2>/dev/null || true)" != yes ]]; then
+            loginctl enable-linger "$user" 2>/dev/null ||
+                printf 'fleet: linger is off, so the worker stops at logout. Ask an admin for: loginctl enable-linger %s\n' "$user" >&2
+        fi
+    fi
+}
+
+# Start a service that is installed but not running, without changing its files.
+worker_ensure_running() {
+    if [[ "$1" == launchd ]]; then
+        if ! launchctl print "gui/$(id -u)/dev.fleet.worker" >/dev/null 2>&1; then
+            launchctl bootstrap "gui/$(id -u)" "$WORKER_PLIST"
+        elif [[ "$(worker_pid launchd)" == 0 ]]; then
+            launchctl kickstart "gui/$(id -u)/dev.fleet.worker"
+        fi
+    else
+        systemctl --user is-active --quiet fleet-worker.service || systemctl --user start fleet-worker.service
+    fi
+}
+
+# drain_worker KIND PID TIMEOUT: ask the running worker to finish its attempt and exit (task 029,
+# part 4a). Only an acknowledgement from that process proves that no attempt was cut short.
+drain_worker() {
+    local kind="$1" p0="$2" timeout="$3" deadline pid ack failed
+    [[ -d "$WORKER_ROOT" ]] || mkdir -p -m 700 "$WORKER_ROOT"
+    rm -f "$WORKER_ROOT/drained"
+    : > "$WORKER_ROOT/drain"
+    printf 'fleet: draining the worker (pid %s), for up to %s seconds\n' "$p0" "$timeout" >&2
+    deadline=$((SECONDS + timeout))
+    while true; do
+        # The state first: a worker that acknowledged and then exited still shows its acknowledgement.
+        pid=$(worker_pid "$kind")
+        failed=0
+        if worker_failed "$kind"; then failed=1; fi
+        ack=$(fpy drained-pid "$WORKER_ROOT/drained" 2>/dev/null || true)
+        [[ "$ack" == "$p0" ]] && return 0
+        if [[ "$pid" != "$p0" || "$failed" == 1 ]]; then
+            worker_log "$kind" >&2
+            fail "the worker (pid $p0) exited without a drain acknowledgement. $WORKER_ROOT/drain stays, so the worker does not take new tasks. Inspect its processes and the log above as the actl operations guide requires, then remove the drain file and run fleet worker install again."
+        fi
+        if (( SECONDS >= deadline )); then
+            rm -f "$WORKER_ROOT/drain"
+            [[ "$(worker_pid "$kind")" != 0 ]] || worker_ensure_running "$kind"
+            fail "the worker did not drain within $timeout seconds; its attempt still runs. The drain file is removed and the worker keeps working. Run fleet worker install again later, or with a longer --timeout."
+        fi
+        sleep 1
+    done
+}
+
+cmd_worker_install() {
+    local timeout=600
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --timeout) [[ "${2:-}" =~ ^[0-9]+$ ]] || fail 'invalid --timeout (seconds)'; timeout="$2"; shift 2 ;;
+            *) fail "unknown option $1" ;;
+        esac
+    done
+    need_python
+    need_enrollment
+    user_bus
+    local id os kind work changed=0 f p0
+    id=$(worker_id)
+    os=$(worker_os)
+    [[ ! -e "$WORKER_ROOT/unsafe-exit" ]] ||
+        fail "$WORKER_ROOT/unsafe-exit exists: the worker stopped without a confirmed teardown. Inspect its processes and its log (fleet worker status) as the actl operations guide requires, then remove the marker and run again."
+    kind=$(worker_service_kind)
+    stage_actl_pair
+    scratch; work="$SCRATCH"
+    fetch_actl "$work"
+    ensure_seed "$ACTL_STATE/worker.seed" "$ACTL_STAGE/actl"
+    render_worker "$work/worker.toml" "$id" "$os"
+    render_worker_service "$work/service" "$kind"
+    [[ "$ACTL_NEW" == 1 || "$SEED_NEW" == 1 ]] && changed=1
+    cmp -s "$work/worker.toml" "$ACTL_CONFIG_DIR/worker.toml" || changed=1
+    cmp -s "$work/ca.pem" "$ACTL_CONFIG_DIR/ca.pem" || changed=1
+    cmp -s "$work/service" "$(worker_service_file "$kind")" || changed=1
+    if [[ "$changed" == 0 ]]; then
+        worker_ensure_running "$kind"
+        printf 'actl worker %s is current\n' "$id" >&2
+        printf '%s=%s:%s\n' "$id" "$os" "$SEED_KEY"
+        return 0
+    fi
+    p0=$(worker_pid "$kind")
+    [[ "$p0" == 0 ]] || drain_worker "$kind" "$p0" "$timeout"
+    worker_stop "$kind"
+    [[ "$ACTL_NEW" == 0 ]] || install_actl_pair
+    mkdir -p "$ACTL_CONFIG_DIR" "$(dirname "$(worker_service_file "$kind")")"
+    [[ "$kind" == systemd ]] || mkdir -p "$(dirname "$WORKER_LOG")"
+    for f in ca.pem worker.toml; do
+        cmp -s "$work/$f" "$ACTL_CONFIG_DIR/$f" || mv -f "$work/$f" "$ACTL_CONFIG_DIR/$f"
+    done
+    f=$(worker_service_file "$kind")
+    cmp -s "$work/service" "$f" || mv -f "$work/service" "$f"
+    rm -f "$WORKER_ROOT/drain" "$WORKER_ROOT/drained"
+    worker_start "$kind"
+    printf 'actl worker %s is running\n' "$id" >&2
+    printf '%s=%s:%s\n' "$id" "$os" "$SEED_KEY"
+}
+
+cmd_worker_status() {
+    load_config
+    user_bus
+    local kind pid bin sum server check="" attempts=0 drain=none
+    bin=$(local_bin)
+    printf 'worker: %s (%s)\n' "${name:-not enrolled}" "$(worker_os)"
+    kind=$(worker_service_kind)
+    if [[ ! -f "$(worker_service_file "$kind")" ]]; then
+        printf 'service: not installed\n'
+        pid=0
+    else
+        pid=$(worker_pid "$kind")
+        if [[ "$pid" != 0 ]]; then printf 'service: active, pid %s\n' "$pid"
+        elif worker_failed "$kind"; then printf 'service: failed\n'
+        else printf 'service: inactive\n'
+        fi
+    fi
+    if [[ -n "${ACTL_VERSION:-}" ]]; then printf 'pinned: actl %s\n' "$ACTL_VERSION"; else printf 'pinned: none\n'; fi
+    if [[ -x "$bin/actl" ]]; then
+        sum=$( (actl_pin actl) 2>/dev/null || true)
+        if [[ -n "$sum" && "$(sha256_of "$bin/actl")" == "$sum" ]]; then
+            printf 'installed: actl %s, matches the pin\n' "$ACTL_VERSION"
+        else
+            printf 'installed: %s, does not match the pin\n' "$("$bin/actl" --version 2>/dev/null || echo 'an unknown actl')"
+        fi
+    else
+        printf 'installed: none\n'
+    fi
+    if [[ -f "$ACTL_CONFIG_DIR/worker.toml" ]]; then
+        server=$(sed -n 's/^servers = \["\(.*\)"\]$/\1/p' "$ACTL_CONFIG_DIR/worker.toml")
+        if "$bin/actl" --config "$ACTL_CONFIG_DIR/worker.toml" doctor --offline >/dev/null 2>&1; then
+            check='configuration and credential OK'
+        else
+            check='configuration check failed: actl doctor --offline'
+        fi
+        printf 'connection: %s (%s)\n' "$server" "$check"
+    else
+        printf 'connection: not configured\n'
+    fi
+    # Each running attempt has one actl-supervisor child of the worker.
+    if [[ "$pid" != 0 ]]; then attempts=$(pgrep -P "$pid" -x actl-supervisor 2>/dev/null | grep -c . || true); fi
+    printf 'active attempts: %s\n' "${attempts:-0}"
+    if [[ -e "$WORKER_ROOT/unsafe-exit" ]]; then drain='unsafe-exit marker: inspect the worker, then remove the marker'
+    elif [[ -e "$WORKER_ROOT/drained" ]]; then drain="drained (pid $(fpy drained-pid "$WORKER_ROOT/drained" 2>/dev/null || echo '?'))"
+    elif [[ -e "$WORKER_ROOT/drain" ]]; then drain=requested
+    fi
+    printf 'drain: %s\n' "$drain"
+}
+
+CLIENT_TOML="$ACTL_CONFIG_DIR/client.toml"
+
+cmd_actl_client_init() {
+    [[ $# -eq 0 ]] || fail 'usage: fleet actl client-init'
+    need_actl
+    mkdir -p "$STATE"
+    ensure_seed "$ACTL_STATE/client.seed" "$ACTL"
+    printf '%s\n' "$SEED_KEY"
+}
+
+# The laptop's client configuration. It shares ca.pem with a worker on the same machine, so a
+# changed CA is left to fleet worker install, which restarts the worker with it.
+cmd_actl_client_config() {
+    [[ $# -eq 0 ]] || fail 'usage: fleet actl client-config'
+    seed_ready "$ACTL_STATE/client.seed" || fail 'no client seed; run fleet actl client-init first'
+    local work
+    scratch; work="$SCRATCH"
+    fetch_actl "$work"
+    if [[ -f "$ACTL_CONFIG_DIR/worker.toml" && -f "$ACTL_CONFIG_DIR/ca.pem" ]] && ! cmp -s "$work/ca.pem" "$ACTL_CONFIG_DIR/ca.pem"; then
+        fail 'the deployment CA changed; run fleet worker install first, which restarts the worker with it'
+    fi
+    toml_check "$ACTL_SERVER" "$ACTL_CONFIG_DIR" "$ACTL_STATE"
+    printf '[connection]\nservers = ["%s"]\nca_certificate = "%s"\nseed_file = "%s"\nprincipal = "client.cli"\n' \
+        "$ACTL_SERVER" "$ACTL_CONFIG_DIR/ca.pem" "$ACTL_STATE/client.seed" > "$work/client.toml"
+    mkdir -p "$ACTL_CONFIG_DIR"
+    mv -f "$work/ca.pem" "$ACTL_CONFIG_DIR/ca.pem"
+    mv -f "$work/client.toml" "$CLIENT_TOML"
+    printf 'wrote %s for %s\n' "$CLIENT_TOML" "$ACTL_SERVER"
+}
+
+need_client_config() { [[ -f "$CLIENT_TOML" ]] || cmd_actl_client_config >&2; }
+
+cmd_actl() {
+    local sub="${1:-}"; shift || true
+    case "$sub" in
+        client-init) cmd_actl_client_init "$@" ;;
+        client-config) cmd_actl_client_config "$@" ;;
+        *) fail 'usage: fleet actl client-init | fleet actl client-config' ;;
+    esac
+}
+
+# Laptop: enroll HOST as a worker. Each step converges, so a failed run is repaired by running the
+# same command again: install is idempotent, --add-worker converges, and the roster gains an ID once.
+cmd_worker_enroll() {
+    [[ $# -ge 1 ]] || fail 'usage: fleet worker enroll HOST [--controller HOST] [--provisioner PATH] [--fleet-config PATH] [--timeout S]'
+    local host="$1"; shift
+    [[ "$host" =~ ^[A-Za-z0-9@._-]+$ ]] || fail 'invalid HOST'
+    local controller="${FLEET_ACTL_CONTROLLER:-bb}" provisioner="${FLEET_ACTL_PROVISIONER:-~/repos/agentic-control}"
+    local fleet_config="${FLEET_CONFIG_REPO:-$HOME/repos/fleet-config}" timeout=120
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --controller) controller="${2:-}"; shift 2 ;;
+            --provisioner) provisioner="${2:-}"; shift 2 ;;
+            --fleet-config) fleet_config="${2:-}"; shift 2 ;;
+            --timeout) [[ "${2:-}" =~ ^[0-9]+$ ]] || fail 'invalid --timeout (seconds)'; timeout="$2"; shift 2 ;;
+            *) fail "unknown option $1" ;;
+        esac
+    done
+    [[ "$controller" =~ ^[A-Za-z0-9@._-]+$ ]] || fail 'invalid --controller'
+    [[ "$provisioner" =~ ^(/|~/)[A-Za-z0-9_./-]*$ ]] || fail 'invalid --provisioner (an absolute or ~/ path)'
+    need_python
+    need_client_config
+    need_actl
+    local out line id os
+    out=$(ssh "$host" '~/.local/bin/fleet worker install') || fail "fleet worker install failed on $host"
+    line=$(printf '%s\n' "$out" | grep -E '^[A-Za-z0-9_-]{1,59}=(linux|macos):U[A-Z2-7]{55}$' || true)
+    [[ -n "$line" && "$line" != *$'\n'* ]] || fail "fleet worker install on $host did not print one ID=OS:PUBLIC_KEY line"
+    id="${line%%=*}" os="${line#*=}" os="${os%%:*}"
+    printf '%s is the worker %s (%s)\n' "$host" "$id" "$os"
+    ssh "$controller" "sudo -n $provisioner/scripts/provision.py --config /etc/actl-fleet/deployment.json --environment prod --add-worker $line" ||
+        fail "provision.py --add-worker failed on $controller. Run the same fleet worker enroll again; each step is safe to repeat."
+    printf 'the controller on %s enrolls %s\n' "$controller" "$id"
+    local roster="$fleet_config/broker/actl.json" added
+    [[ -f "$roster" ]] || fail "$roster is missing; publish the actl deployment in fleet-config first (README, actl connection data)"
+    added=$(fpy roster-add "$roster" "$id" "$os") || fail "could not add $id to $roster"
+    if [[ "$added" == added ]]; then printf 'added %s to %s\n' "$id" "$roster"; else printf '%s is already in %s\n' "$id" "$roster"; fi
+    printf 'next, unless done already: commit broker/actl.json in %s and deploy the broker (copy broker/ to ca-1, sudo broker/install.sh)\n' "$fleet_config"
+    local deadline=$((SECONDS + timeout)) page after found work
+    scratch; work="$SCRATCH"
+    while true; do
+        after="" found=""
+        while true; do
+            if ! "$ACTL" --config "$CLIENT_TOML" --json workers --after "$after" > "$work/workers.json" 2>"$work/err"; then
+                break
+            fi
+            page=$(fpy workers-has "$work/workers.json" "$id")
+            if [[ "$page" == found ]]; then found=1; break; fi
+            [[ -n "$page" ]] || break
+            after="$page"
+        done
+        if [[ -n "$found" ]]; then
+            printf '%s is connected\n' "$id"
+            return 0
+        fi
+        (( SECONDS < deadline )) || fail "$id is not connected after $timeout seconds. Check fleet worker status on $host, then run the same fleet worker enroll again."
+        sleep 2
+    done
+}
+
+cmd_worker() {
+    local sub="${1:-}"; shift || true
+    case "$sub" in
+        install) cmd_worker_install "$@" ;;
+        enroll) cmd_worker_enroll "$@" ;;
+        status) [[ $# -eq 0 ]] || fail 'usage: fleet worker status'; cmd_worker_status ;;
+        *) fail 'usage: fleet worker install [--timeout S] | status | enroll HOST [options]' ;;
+    esac
+}
+
+# ---- fleet task: one actl task for each machine ----
+# actl delivers a task at least once, and each fleet executor is idempotent and refuses a stale
+# commit (part 5). So fleet task may run a task twice on a machine, and it must never skip one:
+# every machine ends with a result or an explicit unfinished status. The run directory keeps the
+# specification and each machine's task documents, so --resume can finish a run that stopped.
+
+valid_run() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; }
+
+# Hold an exclusive lock on RUN/lock until this process exits. flock belongs to the open file, which
+# this shell keeps on descriptor 9, so the lock outlives the python process that takes it.
+lock_run() {
+    exec 9>>"$1/lock"
+    python3 -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)' 2>/dev/null ||
+        fail "another fleet task holds the run $(basename "$1"); wait for it to finish"
+}
+
+actl_call() {
+    RUST_LOG=warn "$ACTL" --config "$CLIENT_TOML" --json "$@"
+}
+
+# TASK_STATE/<id> holds "TASK_ID STATE DETAIL" for each machine; STATE "unsent" has no task ID.
+note_state() { printf '%s\n' "$2" > "$TASK_STATE/$1"; }
+
+# submit_machine ID: make sure that the machine has a task that the controller holds.
+submit_machine() {
+    local id="$1" dir="$RUN/$1" n=0 last="" tid f num err
+    mkdir -p "$dir"
+    for f in "$dir"/task-*.json; do
+        [[ -e "$f" ]] || continue
+        num="${f##*/task-}" num="${num%.json}"
+        [[ "$num" =~ ^[0-9]+$ ]] || continue
+        if (( num > n )); then n=$num last=$f; fi
+    done
+    err="$TASK_STATE/$id.err"
+    if [[ -n "$last" ]] && tid=$(fpy task-doc "$last" "$RUN_TASK" "$RUN_COMMIT" "$id"); then
+        # A task that the controller knows is kept, whatever reply the first submission lost.
+        if actl_call status "$tid" > "$TASK_STATE/$id.json" 2>"$err"; then
+            note_state "$id" "$(fpy record "$TASK_STATE/$id.json")"
+            return 0
+        fi
+        # The controller deduplicates the same document.
+        if actl_call submit --task-file "$last" > "$TASK_STATE/$id.json" 2>"$err"; then
+            note_state "$id" "$(fpy record "$TASK_STATE/$id.json")"
+            return 0
+        fi
+        if ! grep -q 'controller rejected request' "$err"; then
+            note_state "$id" "- unsent controller-unreachable"
+            return 0
+        fi
+        printf 'fleet: the controller refused task %s for %s again; sending a new task\n' "$tid" "$id" >&2
+    fi
+    # No complete document, or a refused one: a new task with a new ID. The old one can still be
+    # admitted late, and then the machine runs the task twice, which the executors allow.
+    n=$((n + 1))
+    if actl_call submit --repo dotfiles --commit "$RUN_COMMIT" --type "$RUN_TASK" --requires "host-$id" \
+            --save-task "$dir/task-$n.json" > "$TASK_STATE/$id.json" 2>"$err"; then
+        fpy sync-dir "$dir"
+        note_state "$id" "$(fpy record "$TASK_STATE/$id.json")"
+    else
+        [[ -d "$dir" ]] && fpy sync-dir "$dir"
+        note_state "$id" "- unsent $(grep -v '^{' "$err" | head -1 | tr ' ' '-' | cut -c1-60)"
+    fi
+}
+
+terminal_state() { [[ "$1" == completed || "$1" == failed || "$1" == cancelled ]]; }
+
+cmd_task() {
+    local task="" all=0 commit="" timeout=600 resume="" h hosts=() roster
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --host) valid_worker_id "${2:-}" || fail 'invalid --host (a worker ID)'; hosts+=("$2"); shift 2 ;;
+            --all) all=1; shift ;;
+            --commit) valid_commit "${2:-}" || fail 'invalid --commit (a full lowercase commit SHA)'; commit="$2"; shift 2 ;;
+            --timeout) [[ "${2:-}" =~ ^[0-9]+$ ]] || fail 'invalid --timeout (seconds)'; timeout="$2"; shift 2 ;;
+            --resume) valid_run "${2:-}" || fail 'invalid --resume RUN'; resume="$2"; shift 2 ;;
+            -*) fail "unknown option $1" ;;
+            *) [[ -z "$task" ]] || fail "unexpected argument $1"; task="$1"; shift ;;
+        esac
+    done
+    need_python
+    need_actl
+    local work
+    scratch; work="$SCRATCH"
+    TASK_STATE="$work/state"
+    mkdir "$TASK_STATE"
+    if [[ -n "$resume" ]]; then
+        [[ -z "$task" && "$all" == 0 && ${#hosts[@]} -eq 0 && -z "$commit" ]] ||
+            fail 'fleet task --resume RUN takes only --timeout'
+        RUN="$TASK_RUNS/$resume"
+        [[ -f "$RUN/spec.json" ]] || fail "no fleet task run $resume in $TASK_RUNS"
+        lock_run "$RUN"
+        local spec
+        spec=$(fpy spec-read "$RUN/spec.json" "$TASK_TYPES") || fail "$RUN/spec.json is not a valid run specification"
+        read -r RUN_TASK RUN_COMMIT <<<"$(head -1 <<<"$spec")"
+        hosts=()
+        while read -r h; do [[ -n "$h" ]] && hosts+=("$h"); done < <(tail -n +2 <<<"$spec")
+        need_client_config
+    else
+        [[ " $TASK_TYPES " == *" $task "* ]] || fail "usage: fleet task NAME (--host ID... | --all) [--commit SHA] [--timeout S]; NAME is one of: $TASK_TYPES"
+        [[ "$all" == 1 || ${#hosts[@]} -gt 0 ]] || fail 'name the machines: --host ID or --all'
+        [[ "$all" == 0 || ${#hosts[@]} -eq 0 ]] || fail '--host and --all exclude each other'
+        if [[ -z "$commit" ]]; then
+            commit=$(git ls-remote "$DOTFILES_URL" refs/heads/main 2>/dev/null | awk '{print $1; exit}') || true
+            valid_commit "$commit" || fail "could not read main of $DOTFILES_URL; pass --commit SHA"
+        fi
+        fetch_actl "$work"
+        need_client_config
+        roster="$work/workers"
+        if [[ "$all" == 1 ]]; then
+            while read -r h _; do [[ -n "$h" ]] && hosts+=("$h"); done < "$roster"
+            [[ ${#hosts[@]} -gt 0 ]] || fail 'the roster from /v1/actl is empty; enroll a worker first'
+        else
+            for h in "${hosts[@]}"; do
+                awk -v h="$h" '$1 == h {found=1} END {exit !found}' "$roster" ||
+                    fail "$h is not in the roster from /v1/actl (a worker ID, not an SSH alias)"
+            done
+        fi
+        RUN_TASK="$task" RUN_COMMIT="$commit"
+        local run_id joined=""
+        run_id="$(date -u +%Y%m%dT%H%M%SZ)-$task-$$"
+        mkdir -p "$TASK_RUNS"
+        RUN="$TASK_RUNS/$run_id"
+        mkdir -m 700 "$RUN"
+        lock_run "$RUN"
+        for h in "${hosts[@]}"; do joined="${joined:+$joined,}$h"; done
+        # The specification is durable before any task is sent, so a resume knows every machine.
+        fpy spec-write "$RUN/spec.json" "$task" "$commit" "$timeout" "$joined" "$roster"
+        resume="$run_id"
+    fi
+    printf 'run %s: %s at %s on %s machine(s); resume with: fleet task --resume %s\n' \
+        "$resume" "$RUN_TASK" "$RUN_COMMIT" "${#hosts[@]}" "$resume"
+    for h in "${hosts[@]}"; do submit_machine "$h"; done
+    local deadline=$((SECONDS + timeout)) interval="${FLEET_TASK_POLL:-1}" pending tid st detail
+    while true; do
+        pending=0
+        for h in "${hosts[@]}"; do
+            read -r tid st detail < "$TASK_STATE/$h"
+            [[ "$st" != unsent ]] || continue
+            terminal_state "$st" && continue
+            if actl_call status "$tid" > "$TASK_STATE/$h.json" 2>"$TASK_STATE/$h.err"; then
+                note_state "$h" "$(fpy record "$TASK_STATE/$h.json")"
+                read -r tid st detail < "$TASK_STATE/$h"
+            fi
+            terminal_state "$st" || pending=$((pending + 1))
+        done
+        (( pending > 0 && SECONDS < deadline )) || break
+        sleep "$interval"
+        interval=$(awk -v i="$interval" 'BEGIN { i *= 2; if (i > 15) i = 15; print i }')
+    done
+    local unfinished=0 failed=0
+    for h in "${hosts[@]}"; do
+        read -r tid st detail < "$TASK_STATE/$h"
+        printf '%-20s %-10s %-24s %s\n' "$h" "$st" "$detail" "$tid"
+        if ! terminal_state "$st"; then unfinished=$((unfinished + 1))
+        elif [[ "$st" != completed || "$detail" != exit=0 ]]; then failed=$((failed + 1))
+        fi
+    done
+    if (( unfinished > 0 )); then
+        printf '%s machine%s unfinished. Resume: fleet task --resume %s\n' "$unfinished" "$([[ $unfinished == 1 ]] || echo s)" "$resume"
+    fi
+    (( failed > 0 )) && printf '%s machine%s failed\n' "$failed" "$([[ $failed == 1 ]] || echo s)"
+    (( unfinished == 0 && failed == 0 ))
+}
+
+# Executors: the worker runs these from the task's checkout of the dotfiles (see render_worker).
+cmd_executor() {
+    case "${1:-}" in
+        probe)
+            load_config
+            printf 'fleet-probe: %s task %s user %s home %s\n' "${name:-unknown}" "${ACTL_TASK_ID:-none}" \
+                "${USER:-?}" "$HOME" ;;
+        apply|pylon-install)
+            fail "fleet executor $1 is not implemented yet; it arrives with agentic-control task 029, part 5" ;;
+        *) fail 'usage: fleet executor apply|pylon-install|probe' ;;
+    esac
+}
+
 command="${1:-}"
 [[ $# -gt 0 ]] && shift
 case "$command" in
@@ -1261,6 +2199,10 @@ case "$command" in
     agent) cmd_agent "$@" ;;
     install-step) install_step ;;
     install-pylon) install_pylon ;;
+    worker) cmd_worker "$@" ;;
+    actl) cmd_actl "$@" ;;
+    task) cmd_task "$@" ;;
+    executor) cmd_executor "$@" ;;
     -h|--help|help|"") usage ;;
     *) usage >&2; exit 2 ;;
 esac
