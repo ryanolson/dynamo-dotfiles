@@ -16,8 +16,8 @@ PYLON_SHA256_linux_x86_64=e709cacffbf78057249cfaa13bcb6f5a20e904c58cba6e5a406070
 # actl and actl-supervisor from agentic-control, one pair from one build, served by the broker at
 # /v1/artifacts/actl/VERSION/TARGET and /v1/artifacts/actl-supervisor/VERSION/TARGET.
 # fleet-config/artifacts/release actl inserts ACTL_VERSION and the ACTL_SHA256_* and
-# ACTL_SUPERVISOR_SHA256_* lines after the last checksum line, above this comment. Until the first
-# actl release (agentic-control task 029, part 6) they are absent, and the commands that need actl stop.
+# ACTL_SUPERVISOR_SHA256_* lines after the last checksum line, above this comment. When they are
+# absent, the commands that need actl stop.
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fleet"
 CONFIG="$CONFIG_DIR/config"

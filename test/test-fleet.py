@@ -1360,6 +1360,14 @@ def pinned_script(home, actl=ACTL_BODY, supervisor=SUPERVISOR_BODY, version='0.2
     return script
 
 
+def unpinned_script(home):
+    """A copy of fleet without the actl pins, as before the first actl release."""
+    text = re.sub(r'^ACTL_(VERSION|SHA256_[a-z0-9_]+|SUPERVISOR_SHA256_[a-z0-9_]+)=\S*\n', '', SCRIPT.read_text(), flags=re.M)
+    script = home / 'fleet-unpinned'
+    script.write_text(text)
+    return script
+
+
 class ActlBase(FleetBase):
     SERVER = 'tls://ctl.example.ts.net:4222'
     CA = '-----BEGIN CERTIFICATE-----\nMIIBfakeCA==\n-----END CERTIFICATE-----\n'
@@ -1653,7 +1661,7 @@ class WorkerInstall(ActlBase):
         self.assertEqual(list((self.home / '.local/bin').glob('.fleet.*')), [])
 
     def test_install_fails_clearly_without_the_actl_pins(self):
-        result = self.fleet('worker', 'install')
+        result = self.run_script('worker', 'install', script=unpinned_script(self.home))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('actl is not pinned', result.stderr)
         self.assertFalse(self.downloads())
@@ -2327,7 +2335,8 @@ class ActlClient(ActlBase):
 
     def test_client_commands_fail_clearly_without_the_actl_pins(self):
         del self.env['FLEET_ACTL']
-        result = self.fleet('actl', 'client-init')
+        result = subprocess.run(['bash', str(unpinned_script(self.home)), 'actl', 'client-init'],
+                                capture_output=True, text=True, env=self.env)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('actl is not pinned', result.stderr)
 
