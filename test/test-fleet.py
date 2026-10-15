@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -1491,6 +1492,17 @@ class WorkerInstall(ActlBase):
         self.assertEqual(result.returncode, 0, result.stderr)
         args = self.executor_args((self.config_dir / 'worker.toml').read_text(), 'pylon-install')
         self.assertIn(f'XDG_RUNTIME_DIR=/run/user/{os.getuid()}', args)
+
+    def test_linux_install_refuses_paths_that_systemd_would_expand(self):
+        # systemd expands % specifiers and $ variables in ExecStart, so the unit would run another path.
+        for bad in ('%h', '$HOME'):
+            with self.subTest(bad):
+                config = self.home / f'conf{bad}'
+                shutil.copytree(self.home / '.config', config)
+                result = self.install(XDG_CONFIG_HOME=str(config))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('must not contain', result.stderr)
+                self.assertFalse((config / 'systemd/user/fleet-worker.service').exists())
 
     def test_macos_install_renders_a_launchd_agent(self):
         result = self.install(FAKE_OS='Darwin', FAKE_ARCH='arm64')

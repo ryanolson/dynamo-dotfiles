@@ -1755,6 +1755,8 @@ render_worker_service() {
 </plist>
 EOF
     else
+        # systemd expands % specifiers and $ variables in ExecStart, so the unit would run another path.
+        [[ "$config$actl" != *[%\$]* ]] || fail 'the worker paths must not contain % or $ for a systemd unit'
         printf '%s\n' '[Unit]' 'Description=Fleet actl worker' '' '[Service]' \
             "ExecStart=$actl --config $config worker" 'Restart=always' 'RestartSec=30' 'TimeoutStopSec=90' '' \
             '[Install]' 'WantedBy=default.target' > "$out"
