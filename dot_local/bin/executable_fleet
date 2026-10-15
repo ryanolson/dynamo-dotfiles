@@ -9,10 +9,10 @@ STEP_SHA256_amd64=2bc654b26ca467848edb764620d6f17febea9d7d3629368b76dd20ce40c6ef
 STEP_SHA256_arm64=3252032aded050abe93a642681995d3e36c66eaf1979da1980bf71b5e8973516
 # pylon from agentic-control, served by the broker at /v1/artifacts/pylon/VERSION/TARGET.
 # fleet-config/artifacts/publish prints these values.
-PYLON_VERSION=0.1.0-6282a55
-PYLON_SHA256_darwin_arm64=3d84ad229184310e7aab7d1f7d1ca85ae2985bf79f405861a461a829fdda4175
-PYLON_SHA256_linux_aarch64=807585cb429c4ac4e161532d0c65342e3d6a46af2669c9a0e0aa1cceccae6e84
-PYLON_SHA256_linux_x86_64=61e072bf0d9aa9dc221552437ffb314782fa27e6c4d9a069ce10fb1d4eab11a7
+PYLON_VERSION=0.2.0
+PYLON_SHA256_darwin_arm64=fa1fdecfe66ecb805ab81826c1bca6c80b3a82d1ae2f23861c0d58a45235b79a
+PYLON_SHA256_linux_aarch64=1c5b04b76d8fd57a0178ad3fa5cb8f82ec1eb7794fec021ffdd7d36fc27f03b3
+PYLON_SHA256_linux_x86_64=e709cacffbf78057249cfaa13bcb6f5a20e904c58cba6e5a4060707206f695d7
 # actl and actl-supervisor from agentic-control, one pair from one build, served by the broker at
 # /v1/artifacts/actl/VERSION/TARGET and /v1/artifacts/actl-supervisor/VERSION/TARGET.
 # fleet-config/artifacts/release actl inserts ACTL_VERSION and the ACTL_SHA256_* and
