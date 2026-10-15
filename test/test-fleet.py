@@ -1856,6 +1856,32 @@ class ExecutorApply(Executors):
         self.assertIn('already', result.stdout)
         self.assertEqual(self.snapshot(), before)
 
+    def test_the_same_commit_again_repairs_drift(self):
+        sha = self.commit(1_700_000_000, marker='one')
+        self.assertEqual(self.executor('apply', sha).returncode, 0)
+        fleet, keygen = self.targets()
+        good = fleet.read_bytes()
+        fleet.write_text('#!/bin/sh\n# edited by hand\n')
+        keygen.chmod(0o644)
+        record = self.applied.read_bytes()
+        result = self.executor('apply', sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(fleet.read_bytes(), good)
+        self.assertEqual((self.mode(fleet), self.mode(keygen)), (0o755, 0o755))
+        self.assertEqual(self.applied.read_bytes(), record)
+        self.assertIn(f'installed {fleet}', result.stdout)
+
+    def test_a_script_that_does_not_parse_changes_nothing(self):
+        good = self.commit(1_700_000_000, marker='one')
+        self.assertEqual(self.executor('apply', good).returncode, 0)
+        before = self.snapshot()
+        bad = self.commit(1_700_000_100, marker='two\nif then (')
+        result = self.executor('apply', bad)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('does not parse', result.stderr)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual([p.name for p in (self.home / '.local/bin').iterdir() if p.name.startswith('.')], [])
+
     def test_a_newer_commit_applies(self):
         old = self.commit(1_700_000_000, marker='one')
         new = self.commit(1_700_000_100, marker='two')

@@ -2261,28 +2261,31 @@ APPLY_FILES="dot_local/bin/executable_fleet:.local/bin/fleet dot_local/bin/execu
 
 executor_apply() {
     fence_open fleet-apply
-    if [[ "$FENCE" == repeat ]]; then
-        printf 'fleet-apply: %s is applied already\n' "${FENCE_COMMIT:0:12}"
-        return 0
-    fi
-    local pair src dst staged=() i
-    # Stage every file first, so a missing source changes nothing.
+    # The fence only refuses an older commit. A repeat of the same commit still compares and copies,
+    # so a file changed or removed by hand since the last apply is put back.
+    local pair src dst tmp staged=() i
+    # Stage and check every file first, so a missing source or a script that does not parse changes
+    # nothing. All the APPLY_FILES are bash scripts.
     for pair in $APPLY_FILES; do
         src="${pair%%:*}" dst="$HOME/${pair#*:}"
         [[ -f "$src" ]] || fail "this checkout has no $src"
         cmp -s "$src" "$dst" && [[ -x "$dst" ]] && continue
         mkdir -p "$(dirname "$dst")"
-        local tmp
         tmp=$(mktemp "$(dirname "$dst")/.fleet-apply.XXXXXX")
         CLEANUP+=("$tmp")
         cp "$src" "$tmp"
         chmod 0755 "$tmp"
+        bash -n "$tmp" 2>/dev/null || fail "$src of ${FENCE_COMMIT:0:12} does not parse (bash -n); nothing changed"
         staged+=("$tmp" "$dst")
     done
     for ((i = 0; i < ${#staged[@]}; i += 2)); do
         mv -f "${staged[i]}" "${staged[i + 1]}"
         printf 'installed %s\n' "${staged[i + 1]}"
     done
+    if [[ "$FENCE" == repeat ]]; then
+        printf 'fleet-apply: %s is applied already\n' "${FENCE_COMMIT:0:12}"
+        return 0
+    fi
     fence_record fleet-apply
     printf 'fleet-apply: applied %s\n' "${FENCE_COMMIT:0:12}"
 }
