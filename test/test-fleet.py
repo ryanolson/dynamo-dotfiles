@@ -2172,6 +2172,30 @@ class ExecutorPylonInstall(Executors):
         self.assertEqual(self.snapshot(), before)
         self.assertEqual((len(self.scheduler()), len(self.downloads())), (restarts, downloads))
 
+    def test_a_repeat_proves_the_running_daemon_without_a_restart(self):
+        sha = self.commit(1_700_000_000)
+        self.assertEqual(self.executor('pylon-install', sha).returncode, 0)
+        restarts, downloads = len(self.scheduler()), len(self.downloads())
+        polls = len((self.home / 'sockets.log').read_text().splitlines())
+        result = self.executor('pylon-install', sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('already', result.stdout)
+        self.assertGreater(len((self.home / 'sockets.log').read_text().splitlines()), polls)
+        self.assertEqual((len(self.scheduler()), len(self.downloads())), (restarts, downloads))
+
+    def test_a_repeat_fails_when_the_running_daemon_is_not_the_pin(self):
+        # Delivery is at least once: a repeat must not report success for a daemon that a later
+        # change replaced or stopped.
+        sha = self.commit(1_700_000_000)
+        self.assertEqual(self.executor('pylon-install', sha).returncode, 0)
+        restarts = len(self.scheduler())
+        self.set_status('0.1.9')
+        result = self.executor('pylon-install', sha)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("reports version '0.1.9'", result.stderr)
+        self.assertEqual(len(self.scheduler()), restarts)
+        self.assertEqual(self.record(), {'pylon-install': [sha, '1700000000']})
+
     def test_the_download_has_a_time_limit(self):
         self.assertEqual(self.executor('pylon-install', self.commit(1_700_000_000)).returncode, 0)
         (download,) = self.downloads()

@@ -2350,7 +2350,10 @@ prove_pylon() {
 
 executor_pylon_install() {
     fence_open pylon-install
+    # A repeat does not restart, but still proves the daemon that runs: something can have replaced
+    # or stopped it since the first delivery.
     if [[ "$FENCE" == repeat ]]; then
+        prove_pylon
         printf 'pylon-install: %s is installed already\n' "${FENCE_COMMIT:0:12}"
         return 0
     fi
