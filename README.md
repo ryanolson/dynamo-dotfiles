@@ -338,7 +338,7 @@ timeout 300 python3 test/test-fleet.py
 timeout 300 python3 test/test-join.py
 ```
 
-The tests do not pass the parent environment to `fleet`. They pass only `PATH`, `LANG`, `LC_*`, and `TMPDIR`, and set their own `HOME`, `XDG_RUNTIME_DIR`, and `FLEET_RUNTIME_BASE` (the folder that replaces `/run/user` when `XDG_RUNTIME_DIR` is unset). An inherited `FLEET_AGENT_SOCK`, `FLEET_SECRETS_SOCK`, or `SSH_AUTH_SOCK` would point a test at the live sockets, and some tests remove their socket.
+The tests do not pass the parent environment to `fleet`. They pass only `PATH`, `LANG`, `LC_*`, `TMPDIR`, `USER`, and `LOGNAME`, and set their own `HOME`, `XDG_RUNTIME_DIR`, and `FLEET_RUNTIME_BASE` (the folder that replaces `/run/user` when `XDG_RUNTIME_DIR` is unset). An inherited `FLEET_AGENT_SOCK`, `FLEET_SECRETS_SOCK`, or `SSH_AUTH_SOCK` would point a test at the live sockets, and some tests remove their socket.
 
 ### Remove a machine from the fleet
 

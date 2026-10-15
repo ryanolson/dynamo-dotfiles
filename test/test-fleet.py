@@ -20,7 +20,7 @@ TOKEN = 'eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.c2ln'
 def clean_env(**values):
     # Never all of os.environ: an inherited FLEET_AGENT_SOCK, FLEET_SECRETS_SOCK, SSH_AUTH_SOCK, or
     # XDG_RUNTIME_DIR points fleet at the host's live sockets, and some tests remove "their" socket.
-    env = {k: v for k, v in os.environ.items() if k in ('PATH', 'LANG', 'TMPDIR') or k.startswith('LC_')}
+    env = {k: v for k, v in os.environ.items() if k in ('PATH', 'LANG', 'TMPDIR', 'USER', 'LOGNAME') or k.startswith('LC_')}
     env.update(values)
     return env
 
