@@ -2919,6 +2919,11 @@ class Pki:
                                       'keyUsage=critical,keyCertSign,cRLSign\n', ['-days', '2'])
         return self.dir / f'{root}.crt'
 
+    def fingerprint(self, crt):
+        out = subprocess.run([OPENSSL3, 'x509', '-noout', '-fingerprint', '-sha256', '-in', str(crt)],
+                             check=True, capture_output=True, text=True).stdout
+        return out.strip().split('=', 1)[1].replace(':', '').lower()
+
     def leaf(self, file, name, intermediate, eku='serverAuth,clientAuth', validity=('-days', '1')):
         # file names the output; name is the certificate's CN and DNS name.
         self.key(file)
@@ -2941,7 +2946,13 @@ class Door(FleetBase):
         self.prefix = self.home / 'root'
         self.env['FLEET_DOOR_PREFIX'] = str(self.prefix)
 
+    def pin(self, fingerprint):
+        config = self.home / '.config/fleet/config'
+        config.write_text(re.sub(r'^fingerprint=.*$', f'fingerprint={fingerprint}', config.read_text(), flags=re.M))
+
     def render(self, *args):
+        if not (self.home / '.config/fleet/config').exists():
+            self.enroll()
         out = self.home / 'out'
         result = self.fleet('door', 'render', str(out), *args)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -2961,9 +2972,9 @@ class Door(FleetBase):
         conf = self.lines(files['etc/fleet-door/nginx.conf'])
         for line in ['load_module /usr/lib/nginx/modules/ngx_stream_module.so;', f'pid {p}/run/fleet-door.pid;', 'worker_shutdown_timeout 1h;',
                      'listen 0.0.0.0:8461 ssl;', 'limit_conn door_source 64;', 'limit_conn door_all 1024;',
-                     f'ssl_certificate {p}/etc/fleet-door/tls/node.crt;',
-                     f'ssl_certificate_key {p}/etc/fleet-door/tls/node.key;',
-                     f'ssl_client_certificate {p}/etc/fleet-door/tls/root_ca.crt;', 'ssl_verify_client on;',
+                     f'ssl_certificate {p}/etc/fleet-door/tls/current/node.crt;',
+                     f'ssl_certificate_key {p}/etc/fleet-door/tls/current/node.key;',
+                     f'ssl_client_certificate {p}/etc/fleet-door/tls/current/root_ca.crt;', 'ssl_verify_client on;',
                      'ssl_verify_depth 1;', 'ssl_protocols TLSv1.2 TLSv1.3;', 'ssl_ciphers HIGH:!aNULL:!eNULL:!PSK;',
                      'ssl_handshake_timeout 10s;', 'proxy_pass 127.0.0.1:38886;']:
             self.assertIn(line, conf)
@@ -2990,7 +3001,17 @@ class Door(FleetBase):
                      'limit_conn door_all 8;', 'ssl_handshake_timeout 2s;']:
             self.assertIn(line, conf)
 
+    def test_render_needs_the_fleet_ca_fingerprint_from_enrollment(self):
+        # The root-run sync trusts only this CA, not whatever root_ca.crt the user's state holds.
+        r = self.fleet('door', 'render', str(self.home / 'out'))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('fingerprint', r.stderr)
+        self.enroll()
+        _, files = self.render()
+        self.assertIn(f"fingerprint={'ab' * 32}", files['usr/local/libexec/fleet-door-sync'])
+
     def test_render_rejects_bad_options(self):
+        self.enroll()
         out = str(self.home / 'out')
         for args in [('--listen', '0.0.0.0:8461;'), ('--to', '127.0.0.1:1 ssl'), ('--per-source', '0'),
                      ('--per-source', 'x'), ('--max', '8;'), ('--handshake-timeout', '0'),
@@ -3056,37 +3077,116 @@ class Door(FleetBase):
         good, good_key, serial = pki.leaf('door', 'door', 'inter')
         pki.ca('evil', 'evilinter')
         evil, evil_key, _ = pki.leaf('evildoor', 'door', 'evilinter')
+        evil_root = pki.dir / 'evil.crt'
         expired, expired_key, _ = pki.leaf('old', 'door', 'inter',
                                             validity=('-not_before', '20200101000000Z', '-not_after', '20200102000000Z'))
+        self.pin(pki.fingerprint(root))
         out, _ = self.render()
         sync = out / 'usr/local/libexec/fleet-door-sync'
         env = dict(PATH=f'{Path(OPENSSL3).parent}:{self.env["PATH"]}')
         tls = self.prefix / 'etc/fleet-door/tls'
 
-        def use(crt, key):
+        def use(crt, key, ca=root):
             shutil.copy(crt, self.state / 'node.crt')
             shutil.copy(key, self.state / 'node.key')
-            shutil.copy(root, self.state / 'root_ca.crt')
+            shutil.copy(ca, self.state / 'root_ca.crt')
             return subprocess.run([str(sync), 'copy'], capture_output=True, text=True, env=dict(self.env, **env))
 
         r = use(good, good_key)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn(f'serial {serial}', r.stderr)
-        self.assertEqual((tls / 'node.crt').read_text(), good.read_text())
+        self.assertEqual((tls / 'current/node.crt').read_text(), good.read_text())
         self.assertEqual(self.mode(tls), 0o700)
-        self.assertEqual(self.mode(tls / 'node.key'), 0o600)
+        self.assertEqual(self.mode(tls / 'current/node.key'), 0o600)
         r = use(good, good_key)
         self.assertEqual((r.returncode, r.stderr), (0, ''))
-        for crt, key, why in [(good, evil_key, 'do not match'), (evil, evil_key, 'not issued by the fleet CA'),
-                              (expired, expired_key, 'expired')]:
-            r = use(crt, key)
+        # The last case is a user-writable state with its own CA: a consistent chain under another root.
+        for crt, key, ca, why in [(good, evil_key, root, 'do not match'),
+                                  (evil, evil_key, root, 'not issued by the fleet CA'),
+                                  (expired, expired_key, root, 'expired'),
+                                  (evil, evil_key, evil_root, 'is not the fleet CA')]:
+            r = use(crt, key, ca)
             self.assertNotEqual(r.returncode, 0, why)
             self.assertIn(why, r.stderr)
-            self.assertEqual((tls / 'node.crt').read_text(), good.read_text(), why)
-        self.assertEqual(sorted(p.name for p in tls.iterdir()), ['node.crt', 'node.key', 'root_ca.crt'])
+            self.assertEqual((tls / 'current/node.crt').read_text(), good.read_text(), why)
+            self.assertEqual((tls / 'current/root_ca.crt').read_text(), root.read_text(), why)
+        self.assertEqual(sorted(p.name for p in tls.iterdir() if p.name != '.lock' and p.name != 'current'),
+                         [os.readlink(tls / 'current')])
         (self.state / 'node.key').unlink()
         r = subprocess.run([str(sync), 'copy'], capture_output=True, text=True, env=dict(self.env, **env))
         self.assertIn('cannot read', r.stderr)
+
+    @unittest.skipUnless(OPENSSL3, 'needs OpenSSL 3.4 or later for test certificates')
+    def test_sync_copy_runs_one_at_a_time_and_swaps_all_files_at_once(self):
+        self.enroll()
+        pki = Pki(self.home / 'pki')
+        root = pki.ca('root', 'inter')
+        self.pin(pki.fingerprint(root))
+        pairs = [pki.leaf(f'door{n}', 'door', 'inter')[:2] for n in range(2)]
+        known = {(c.read_text(), k.read_text()) for c, k in pairs}
+        out, _ = self.render()
+        sync = out / 'usr/local/libexec/fleet-door-sync'
+        env = dict(self.env, PATH=f'{Path(OPENSSL3).parent}:{self.env["PATH"]}')
+        tls = self.prefix / 'etc/fleet-door/tls'
+        # Each run reads its own state, so the runs disagree about what the door should hold.
+        states = []
+        for n in range(8):
+            state = self.home / f'state{n}/fleet'
+            state.mkdir(parents=True)
+            shutil.copy(pairs[n % 2][0], state / 'node.crt')
+            shutil.copy(pairs[n % 2][1], state / 'node.key')
+            shutil.copy(root, state / 'root_ca.crt')
+            states.append(state)
+        seen, stop = [], threading.Event()
+
+        def read():
+            # nginx reads the files through current at reload; every read must see one matching pair.
+            while not stop.is_set():
+                try:
+                    d = tls / os.readlink(tls / 'current')
+                    seen.append(((d / 'node.crt').read_text(), (d / 'node.key').read_text()))
+                except OSError:
+                    pass
+
+        reader = threading.Thread(target=read)
+        reader.start()
+        procs = [subprocess.Popen(['bash', '-c', f'sed "s#^src=.*#src={state}#" "$1" > "$1.$2" && '
+                                  f'chmod +x "$1.$2" && exec "$1.$2" copy', '-', str(sync), str(n)],
+                                  env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                 for n, state in enumerate(states * 3)]
+        results = [p.communicate(timeout=120) + (p.returncode,) for p in procs]
+        stop.set()
+        reader.join()
+        for out_, err, rc in results:
+            self.assertEqual(rc, 0, err)
+        self.assertTrue(seen)
+        self.assertEqual(set(seen) - known, set())
+        self.assertEqual(sorted(p.name for p in tls.iterdir() if p.name not in ('.lock', 'current')),
+                         [os.readlink(tls / 'current')])
+
+    @unittest.skipUnless(OPENSSL3 and shutil.which('timeout'), 'needs OpenSSL 3.4 or later and timeout')
+    def test_served_check_ends_when_the_door_does_not_answer(self):
+        self.enroll()
+        pki = Pki(self.home / 'pki')
+        root = pki.ca('root', 'inter')
+        self.pin(pki.fingerprint(root))
+        crt, key, _ = pki.leaf('door', 'door', 'inter')
+        shutil.copy(crt, self.state / 'node.crt')
+        shutil.copy(key, self.state / 'node.key')
+        shutil.copy(root, self.state / 'root_ca.crt')
+        # A listener that accepts TCP and never speaks TLS.
+        mute = socket.socket()
+        mute.bind(('127.0.0.1', 0))
+        mute.listen(16)
+        self.addCleanup(mute.close)
+        out, _ = self.render('--listen', f'127.0.0.1:{mute.getsockname()[1]}')
+        env = dict(self.env, PATH=f'{Path(OPENSSL3).parent}:{self.env["PATH"]}')
+        start = time.time()
+        r = subprocess.run([str(out / 'usr/local/libexec/fleet-door-sync')], capture_output=True, text=True,
+                           env=env, timeout=120)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('serves serial none', r.stderr)
+        self.assertLess(time.time() - start, 40)
 
 
 DOOR_IMAGE = os.environ.get('FLEET_DOOR_IMAGE')
@@ -3116,6 +3216,9 @@ class DoorNginx(FleetBase):
         self.port = free_port()
         self.prefix = self.home / 'root'
         self.env.update(FLEET_DOOR_PREFIX=str(self.prefix), PATH=f'{Path(OPENSSL3).parent}:{self.env["PATH"]}')
+        config = self.home / '.config/fleet/config'
+        config.write_text(re.sub(r'^fingerprint=.*$', f'fingerprint={pki.fingerprint(self.root)}',
+                                 config.read_text(), flags=re.M))
         out = self.prefix
         r = self.fleet('door', 'render', str(out), '--listen', f'127.0.0.1:{self.port}',
                        '--to', f'127.0.0.1:{self.backend.getsockname()[1]}', '--per-source', '3', '--max', '6',
@@ -3261,7 +3364,7 @@ class DoorNginx(FleetBase):
         # A door with a certificate from another CA, under the expected name.
         self.pki.ca('evil', 'evilinter')
         chain, key, _ = self.pki.leaf('evildoor', 'door', 'evilinter')
-        tls = self.prefix / 'etc/fleet-door/tls'
+        tls = self.prefix / 'etc/fleet-door/tls/current'
         shutil.copy(chain, tls / 'node.crt')
         shutil.copy(key, tls / 'node.key')
         subprocess.run(['docker', 'exec', self.name, '/usr/sbin/nginx', '-c', str(self.conf), '-s', 'reload'],
@@ -3290,6 +3393,22 @@ class DoorNginx(FleetBase):
             s['thread'].join(10)
             self.assertLess(s['closed'], self.DEADLINE + 1.5)
         self.assertTrue(self.echoes(self.client, '127.0.0.5'))
+
+    def test_sync_checks_the_served_certificate_while_the_global_limit_is_full(self):
+        # Established fleet connections, not slow ones: they hold the global limit (6) past any deadline.
+        held = []
+        for source in ('127.0.0.2', '127.0.0.2', '127.0.0.3', '127.0.0.3', '127.0.0.4', '127.0.0.4'):
+            s = self.tls(self.client, source)
+            s.sendall(b'ping')
+            self.assertEqual(s.recv(4), b'ping')
+            held.append(s)
+        self.addCleanup(lambda: [s.close() for s in held])
+        self.assertFalse(self.echoes(self.client, '127.0.0.5'))
+        renewed = self.pki.leaf('door2', 'door', 'inter')
+        self.install_identity(*renewed)
+        r = subprocess.run([str(self.sync)], capture_output=True, text=True, env=self.env, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.served_serial(), renewed[2])
 
     def test_sync_reloads_the_served_certificate_and_fails_when_it_is_stale(self):
         self.assertEqual(self.served_serial(), self.door[2])

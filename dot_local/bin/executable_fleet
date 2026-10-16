@@ -1266,6 +1266,9 @@ door_options() {
 
 door_render() {
     local out="$1" p="$DOOR_PREFIX" tls="$DOOR_PREFIX/etc/fleet-door/tls"
+    # The sync runs as root but reads the user's state, so it trusts only the CA that enrollment pinned.
+    load_config
+    [[ -n "$fingerprint" ]] || fail 'no fleet CA fingerprint in the fleet config; enroll this machine first'
     local sync="$DOOR_PREFIX/usr/local/libexec/fleet-door-sync" units="$out/etc/systemd/system"
     local check="$door_listen"
     [[ "${check%:*}" == 0.0.0.0 ]] && check="127.0.0.1:${check##*:}"
@@ -1286,14 +1289,19 @@ events {
 }
 stream {
     limit_conn_zone \$binary_remote_addr zone=door_source:10m;
-    limit_conn_zone \$server_port zone=door_all:1m;
+    # The sync checks the served certificate from 127.0.0.1, so a full door does not fail that check.
+    map \$remote_addr \$door_all_key {
+        127.0.0.1 "";
+        default \$server_port;
+    }
+    limit_conn_zone \$door_all_key zone=door_all:1m;
     server {
         listen $door_listen ssl;
         limit_conn door_source $door_per_source;
         limit_conn door_all $door_max;
-        ssl_certificate $tls/node.crt;
-        ssl_certificate_key $tls/node.key;
-        ssl_client_certificate $tls/root_ca.crt;
+        ssl_certificate $tls/current/node.crt;
+        ssl_certificate_key $tls/current/node.key;
+        ssl_client_certificate $tls/current/root_ca.crt;
         ssl_verify_client on;
         ssl_verify_depth 1;
         ssl_protocols TLSv1.2 TLSv1.3;
@@ -1307,10 +1315,12 @@ stream {
 EOF
     {
         printf '#!/bin/bash\n# Rendered by fleet door install.\nset -euo pipefail\n'
-        printf 'src=%q\ndst=%q\ncheck=%q\n' "$STATE" "$tls" "$check"
+        printf 'src=%q\ndst=%q\ncheck=%q\nfingerprint=%s\n' "$STATE" "$tls" "$check" "$fingerprint"
         cat <<'EOF'
 # copy: copy this machine's fleet certificate for nginx, which reads it as root at start and reload.
 # Without an argument, also reload nginx when the copy changed, then check what the door serves.
+# nginx reads $dst/current, a link to a complete version folder, so a reload never sees a key from
+# one copy and a certificate from another.
 stale=28800
 say() { printf 'fleet-door: %s\n' "$*" >&2; }
 die() { say "$*"; exit 1; }
@@ -1318,34 +1328,53 @@ serial() { openssl x509 -noout -serial | sed 's/^serial=//'; }
 umask 077
 mkdir -p "$dst"
 chmod 700 "$dst"
-tmp=$(mktemp -d "$dst/.new.XXXXXX")
-trap 'rm -rf "$tmp"' EXIT
+# ExecStartPre, the path unit, and the timer can run at once: one at a time, under a lock.
+if [[ -z "${FLEET_DOOR_LOCKED:-}" ]]; then
+    FLEET_DOOR_LOCKED=1 exec perl -MFcntl=:flock -e 'BEGIN { $^F = 255 }
+        open(my $lock, ">>", shift) or die "fleet-door: lock: $!\n";
+        flock($lock, LOCK_EX) or die "fleet-door: lock: $!\n";
+        exec { $ARGV[0] } @ARGV or die "fleet-door: $!\n"' "$dst/.lock" "$0" "$@"
+fi
+tmp=$(mktemp -d "$dst/v.XXXXXX")
+trap 'rm -rf "$tmp" "$dst/.next"' EXIT
 for f in node.crt node.key root_ca.crt; do
     cp -- "$src/$f" "$tmp/$f" 2>/dev/null || die "cannot read $src/$f; is this machine enrolled?"
 done
+# Anyone who runs as the fleet user can write $src; only the CA that enrollment pinned admits clients.
+[[ "$(openssl x509 -noout -fingerprint -sha256 -in "$tmp/root_ca.crt" | sed 's/^.*=//; s/://g' |
+      tr 'A-F' 'a-f')" == "$fingerprint" ]] || die "$src/root_ca.crt is not the fleet CA (fingerprint $fingerprint)"
 # fleet renew writes the certificate and the key one after the other; the path unit runs again.
 [[ "$(openssl x509 -noout -pubkey -in "$tmp/node.crt")" == "$(openssl pkey -pubout -in "$tmp/node.key")" ]] ||
     die "the certificate and key in $src do not match; retrying at the next change or timer"
 openssl verify -CAfile "$tmp/root_ca.crt" -untrusted "$tmp/node.crt" "$tmp/node.crt" >/dev/null 2>&1 ||
     die "the certificate in $src is expired or not issued by the fleet CA"
 changed=0
-for f in node.crt node.key root_ca.crt; do cmp -s "$tmp/$f" "$dst/$f" || changed=1; done
+for f in node.crt node.key root_ca.crt; do cmp -s "$tmp/$f" "$dst/current/$f" || changed=1; done
 if [[ "$changed" == 1 ]]; then
-    for f in node.key node.crt root_ca.crt; do mv -f "$tmp/$f" "$dst/$f"; done
-    say "copied certificate serial $(serial < "$dst/node.crt")"
+    chmod 700 "$tmp"
+    ln -sfn "${tmp##*/}" "$dst/.next"
+    # rename(2) replaces the link in one step; mv would move it into the old version folder.
+    perl -e 'rename($ARGV[0], $ARGV[1]) or die "fleet-door: $!\n"' "$dst/.next" "$dst/current"
+    for old in "$dst"/v.*; do [[ "${old##*/}" == "${tmp##*/}" ]] || rm -rf "$old"; done
+    tmp=""
+    say "copied certificate serial $(serial < "$dst/current/node.crt")"
 fi
 [[ "${1:-}" == copy ]] && exit 0
 [[ "$changed" == 0 ]] || systemctl reload fleet-door.service || die 'could not reload fleet-door.service'
 # A reload that nginx rejects keeps the old certificate, so check the served one, not the copy.
-want=$(serial < "$dst/node.crt") served=""
-for _ in $(seq 20); do
-    openssl s_client -connect "$check" -tls1_3 </dev/null 2>/dev/null | openssl x509 > "$tmp/served" 2>/dev/null || true
-    served=$(serial < "$tmp/served" 2>/dev/null || true)
+# Each try is bounded, and so is the whole check: a door that accepts and never answers fails it.
+want=$(serial < "$dst/current/node.crt") served="" served_file=$(mktemp)
+trap 'rm -f "$served_file" "$dst/.next"; [[ -z "$tmp" ]] || rm -rf "$tmp"' EXIT
+end=$((SECONDS + 20))
+while (( SECONDS < end )); do
+    timeout 5 openssl s_client -connect "$check" -tls1_3 </dev/null 2>/dev/null |
+        openssl x509 > "$served_file" 2>/dev/null || true
+    served=$(serial < "$served_file" 2>/dev/null || true)
     [[ "$served" == "$want" ]] && break
     sleep 0.5
 done
 [[ "$served" == "$want" ]] || die "the door at $check serves serial ${served:-none}, not $want"
-openssl x509 -noout -checkend "$stale" -in "$tmp/served" >/dev/null ||
+openssl x509 -noout -checkend "$stale" -in "$served_file" >/dev/null ||
     die "the served certificate expires within 8 hours; check fleet renew on this machine"
 EOF
     } > "$out/usr/local/libexec/fleet-door-sync"
