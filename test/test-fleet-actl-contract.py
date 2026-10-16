@@ -15,6 +15,11 @@ on a real NATS broker (agentic-control task 029, part 4). Linux only. They skip 
                               test uses the host's systemd user manager: it creates two transient units
                               named fleet-contract-*, a target and a worker, and removes them.
 
+The machine's fleet certificate is real: a P-256 leaf for the worker name, signed by a contract fleet
+root. actl 0.3.0 and later loads it as its client certificate. With such an actl, ActlContractMutual
+runs the same tests again against a broker that the provisioner renders with `enforcement: mutual`,
+so every connection must present a certificate of the fleet root, with TLS first.
+
 The worker fetches the public dotfiles from GitHub. Only the CA host is simulated: stubs stand in for
 step, the broker (curl), and systemctl, as in test-fleet.py. The executors run the fleet script of the
 commit with the rendered environment, whose PATH starts with the test home's ~/.local/bin. Stubs
@@ -54,6 +59,16 @@ case "$url" in
   */v1/artifacts/actl-supervisor/*) cp "$HOME/supervisor-body" "$out" ;;
   */v1/artifacts/actl/*) cp "$HOME/actl-body" "$out" ;;
   *) exit 22 ;;
+esac
+'''
+
+# step: the stub of test-fleet.py, then the contract's fleet root and machine certificate in place of
+# its placeholders, which actl 0.3.0 cannot load.
+STEP_STUB = '''#!/bin/sh
+"$0-base" "$@" || exit $?
+case "$1 $2" in
+  "ca root") cp "$CONTRACT_PKI/root_ca.crt" "$3" ;;
+  "ca certificate") cp "$CONTRACT_PKI/node.crt" "$4" && cp "$CONTRACT_PKI/node.key" "$5" ;;
 esac
 '''
 
@@ -159,6 +174,11 @@ def free_port():
         return s.getsockname()[1]
 
 
+def actl_version(actl):
+    out = subprocess.run([str(actl), '--version'], capture_output=True, text=True, check=True).stdout
+    return tuple(int(n) for n in out.split()[1].split('.')[:3])
+
+
 def uuid7():
     ms = int(time.time() * 1000)
     r = os.urandom(10)
@@ -168,16 +188,21 @@ def uuid7():
 @unittest.skipUnless(ACTL_DIR and NATS and SOURCE and sys.platform.startswith('linux'),
                      'set FLEET_CONTRACT_ACTL_DIR, FLEET_CONTRACT_NATS_SERVER, and FLEET_CONTRACT_SOURCE on Linux')
 class ActlContract(unittest.TestCase):
+    ENFORCEMENT = 'off'
+
     @classmethod
     def setUpClass(cls):
         cls.procs = {}
         cls.tmp = Path(tempfile.mkdtemp(prefix='fleet-contract-', dir=os.environ.get('FLEET_CONTRACT_TMP')))
+        # A class cleanup runs also when setUpClass fails, which tearDownClass does not.
+        cls.addClassCleanup(cls.stop)
         home = cls.home = cls.tmp / 'home'
         home.mkdir(mode=0o700)
         bindir = home / 'bin'
         bindir.mkdir()
         recorder = '#!/bin/sh\nprintf "%s %s\\n" "$(basename "$0")" "$*" >> "$HOME/scheduler.log"\n'
-        for name, body in [('step', tf.STEP_STUB), ('systemctl', tf.SYSTEMCTL_STUB), ('loginctl', recorder),
+        for name, body in [('step', STEP_STUB), ('step-base', tf.STEP_STUB), ('systemctl', tf.SYSTEMCTL_STUB),
+                           ('loginctl', recorder),
                            ('journalctl', '#!/bin/sh\ntail -n 40 "$HOME/worker.log"\n'), ('curl', CURL_STUB)]:
             (bindir / name).write_text(body)
             (bindir / name).chmod(0o700)
@@ -186,7 +211,8 @@ class ActlContract(unittest.TestCase):
                        EXPECT_TOKEN=tf.TOKEN, USER_CA=tf.USER_CA, HOST_CA=tf.HOST_CA,
                        XDG_CONFIG_HOME=str(home / '.config'), XDG_STATE_HOME=str(home / '.local/state'),
                        FLEET_PYLON=str(home / 'no-pylon'), FLEET_TAILSCALE=str(home / 'no-tailscale'),
-                       FLEET_ACTL=str(cls.actl), FLEET_TASK_POLL='0.5', RUST_LOG='warn')
+                       FLEET_ACTL=str(cls.actl), FLEET_TASK_POLL='0.5', RUST_LOG='warn',
+                       CONTRACT_PKI=str(cls.tmp / 'fleet'))
         # Never the host's runtime folder: fleet keeps its agent and secrets sockets there on Linux.
         (cls.tmp / 'run').mkdir(mode=0o700)
         cls.env['XDG_RUNTIME_DIR'] = str(cls.tmp / 'run')
@@ -195,9 +221,9 @@ class ActlContract(unittest.TestCase):
         cls.commit = os.environ.get('FLEET_CONTRACT_COMMIT') or subprocess.run(
             ['git', 'ls-remote', 'https://github.com/ryanolson/dynamo-dotfiles.git', 'refs/heads/main'],
             capture_output=True, text=True, check=True).stdout.split()[0]
+        cls.tls()
         cls.fleet('enroll', WORKER, '--ca-url', 'https://ca.example', '--fingerprint', 'ab' * 32, '--no-trust',
                   stdin=tf.TOKEN + '\n')
-        cls.tls()
         keys = cls.tmp / 'keys'
         keys.mkdir(mode=0o700)
         cls.public = {}
@@ -207,7 +233,8 @@ class ActlContract(unittest.TestCase):
         cls.public['client'] = cls.fleet('actl', 'client-init').stdout.strip()
         cls.port = free_port()
         server = f'tls://localhost:{cls.port}'
-        (home / 'actl.json').write_text(json.dumps({'server': server, 'servers': [server], 'tls_first': False,
+        (home / 'actl.json').write_text(json.dumps({'server': server, 'servers': [server],
+                                                   'tls_first': cls.ENFORCEMENT == 'mutual',
                                                    'ca_pem': (cls.tmp / 'ca.pem').read_text(),
                                                    'workers': [{'id': WORKER, 'os': 'linux'}]}))
         shutil.copy(cls.actl, home / 'actl-body')
@@ -237,7 +264,7 @@ class ActlContract(unittest.TestCase):
         cls.wait_for_worker()
 
     @classmethod
-    def tearDownClass(cls):
+    def stop(cls):
         for proc in cls.procs.values():
             if proc.poll() is None:
                 proc.terminate()
@@ -267,6 +294,17 @@ class ActlContract(unittest.TestCase):
         (t / 'san.ext').write_text('subjectAltName=DNS:localhost,IP:127.0.0.1\n')
         run('x509', '-req', '-in', 'server.csr', '-CA', 'ca.pem', '-CAkey', 'ca.key', '-CAcreateserial',
             '-out', 'server.pem', '-days', '2', '-extfile', 'san.ext')
+        # The fleet root and the machine's certificate as step-ca issues it, for client and server auth.
+        (t / 'fleet').mkdir(mode=0o700)
+        run('req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes', '-keyout',
+            'fleet/root_ca.key', '-out', 'fleet/root_ca.crt', '-subj', '/CN=contract fleet root', '-days', '2',
+            '-addext', 'basicConstraints=critical,CA:TRUE', '-addext', 'keyUsage=critical,keyCertSign,cRLSign')
+        run('req', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes', '-keyout', 'fleet/node.key',
+            '-out', 'fleet/node.csr', '-subj', f'/CN={WORKER}')
+        (t / 'fleet/node.ext').write_text(f'subjectAltName=DNS:{WORKER}\nkeyUsage=critical,digitalSignature\n'
+                                          'extendedKeyUsage=serverAuth,clientAuth\n')
+        run('x509', '-req', '-in', 'fleet/node.csr', '-CA', 'fleet/root_ca.crt', '-CAkey', 'fleet/root_ca.key',
+            '-CAcreateserial', '-out', 'fleet/node.crt', '-days', '2', '-extfile', 'fleet/node.ext')
 
     @classmethod
     def start_nats(cls, keys):
@@ -274,13 +312,15 @@ class ActlContract(unittest.TestCase):
         provision = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(provision)
         config = {'accounts': {'prod': {role: cls.public[role] for role in ('admin', 'controller', 'client', 'operator')}},
-                  'workers': [{'id': WORKER, 'os': 'linux', 'key': cls.worker_key}]}
+                  'workers': [{'id': WORKER, 'os': 'linux', 'key': cls.worker_key}], 'enforcement': cls.ENFORCEMENT}
         text = provision.render_fleet_nats(config)
         store = cls.tmp / 'jetstream'
         replacements = {'$ACTL_NATS_LISTEN': f'127.0.0.1:{cls.port}', 'http: 127.0.0.1:8222': f'http: 127.0.0.1:{free_port()}',
                         'store_dir: /data': f'store_dir: {store}',
                         '/run/actl-tls/server.pem': str(cls.tmp / 'server.pem'),
                         '/run/actl-tls/server.key': str(cls.tmp / 'server.key')}
+        if cls.ENFORCEMENT == 'mutual':
+            replacements['/run/actl-tls/client_ca.pem'] = str(cls.tmp / 'fleet/root_ca.crt')
         for old, new in replacements.items():
             assert text.count(old) == 1, old
             text = text.replace(old, new)
@@ -298,6 +338,10 @@ class ActlContract(unittest.TestCase):
     def connection(cls, name, principal, seed):
         text = (f'[connection]\nservers = ["tls://localhost:{cls.port}"]\nca_certificate = "{cls.tmp}/ca.pem"\n'
                 f'seed_file = "{seed}"\nprincipal = "{principal}"\n')
+        # As the provisioner renders the principals on the broker host: with its machine certificate.
+        if cls.ENFORCEMENT == 'mutual':
+            text += (f'client_certificate = "{cls.tmp}/fleet/node.crt"\nclient_key = "{cls.tmp}/fleet/node.key"\n'
+                     'tls_first = true\n')
         (cls.tmp / f'{name}.toml').write_text(text)
         return text
 
@@ -569,6 +613,29 @@ class ActlContract(unittest.TestCase):
                 subprocess.run(['systemctl', '--user', 'reset-failed', unit], env=host, capture_output=True)
             self.start_worker()
             self.wait_for_worker()
+
+
+class ActlContractMutual(ActlContract):
+    """The same tests against a broker that requires TLS first and a client certificate of the fleet root."""
+    ENFORCEMENT = 'mutual'
+
+    @classmethod
+    def setUpClass(cls):
+        if actl_version(Path(ACTL_DIR) / 'actl') < (0, 3, 0):
+            raise unittest.SkipTest('actl before 0.3.0 cannot present a client certificate')
+        super().setUpClass()
+
+    def test_the_broker_refuses_a_client_without_a_certificate(self):
+        client = self.home / '.config/fleet/actl/client.toml'
+        text = client.read_text()
+        self.assertIn('tls_first = true', text)
+        bare = self.tmp / 'client-without-certificate.toml'
+        bare.write_text(''.join(l for l in text.splitlines(keepends=True)
+                                if not l.startswith(('client_certificate', 'client_key'))))
+        for config in (client, bare):
+            result = subprocess.run([str(self.actl), '--config', str(config), '--json', 'workers'],
+                                    capture_output=True, text=True, env=self.env, timeout=60)
+            self.assertEqual(result.returncode != 0, config == bare, (config, result.stderr))
 
 
 if __name__ == '__main__':
