@@ -2994,9 +2994,15 @@ class Door(FleetBase):
                      f'ssl_certificate_key {p}/etc/fleet-door/tls/current/node.key;',
                      f'ssl_client_certificate {p}/etc/fleet-door/tls/current/root_ca.crt;', 'ssl_verify_client on;',
                      'ssl_verify_depth 1;', 'ssl_protocols TLSv1.2 TLSv1.3;', 'ssl_ciphers HIGH:!aNULL:!eNULL:!PSK;',
-                     'ssl_handshake_timeout 10s;', 'proxy_pass 127.0.0.1:38886;', '127.0.0.1 "";',
-                     'limit_conn_zone $door_all_key zone=door_all:1m;']:
+                     'ssl_handshake_timeout 10s;', 'proxy_pass 127.0.0.1:38886;']:
             self.assertIn(line, conf)
+        # The total limit leaves out 127.0.0.1 only, where the sync checks the served certificate.
+        loopback = ['map $remote_addr $door_all_key {', '127.0.0.1 "";', 'default $server_port;', '}',
+                    'limit_conn_zone $door_all_key zone=door_all:1m;']
+        start = conf.index(loopback[0])
+        self.assertEqual(conf[start:start + len(loopback)], loopback)
+        self.assertEqual([l for l in conf if l.startswith('limit_conn_zone')],
+                         ['limit_conn_zone $binary_remote_addr zone=door_source:10m;', loopback[-1]])
         unit = self.lines(files['etc/systemd/system/fleet-door.service'])
         for line in [f'ExecStartPre={p}/usr/local/libexec/fleet-door-sync copy',
                      f"ExecStart=/usr/sbin/nginx -c {p}/etc/fleet-door/nginx.conf -g 'daemon off;'",
