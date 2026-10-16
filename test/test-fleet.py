@@ -3327,6 +3327,12 @@ class Door(FleetBase):
         r = subprocess.run([str(sync)], capture_output=True, text=True, env=env, timeout=120)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(log.read_text().splitlines().count('reloaded'), 1)
+        # A door that does not answer is reported, not reloaded: a failed probe is not another serial.
+        subprocess.run(['sh', '-c', 'kill $(cat "$HOME/door.pid")'], env=env)
+        r = subprocess.run([str(sync)], capture_output=True, text=True, env=env, timeout=120)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('serves serial none', r.stderr)
+        self.assertEqual(log.read_text().splitlines().count('reloaded'), 1)
 
     def test_install_writes_nothing_when_a_file_fails_to_render(self):
         # A cat that stops partway when it writes to a pipe stands in for a render that dies midway.
