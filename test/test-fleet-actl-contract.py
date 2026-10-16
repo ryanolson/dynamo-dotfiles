@@ -206,7 +206,8 @@ class ActlContract(unittest.TestCase):
                                               capture_output=True, text=True, check=True).stdout.strip()
         cls.public['client'] = cls.fleet('actl', 'client-init').stdout.strip()
         cls.port = free_port()
-        (home / 'actl.json').write_text(json.dumps({'server': f'tls://localhost:{cls.port}',
+        server = f'tls://localhost:{cls.port}'
+        (home / 'actl.json').write_text(json.dumps({'server': server, 'servers': [server], 'tls_first': False,
                                                    'ca_pem': (cls.tmp / 'ca.pem').read_text(),
                                                    'workers': [{'id': WORKER, 'os': 'linux'}]}))
         shutil.copy(cls.actl, home / 'actl-body')

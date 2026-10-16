@@ -362,7 +362,7 @@ The broker URL defaults to port 8443 on the CA host. `fleet init --broker-url` o
 
 ### Fleet tasks through actl
 
-Fleet maintenance runs as [actl](https://github.com/ryanolson/agentic-control) tasks (agentic-control task 029). One controller runs on brev-x86-cpu. Each fleet machine runs one worker as the user. The broker serves the NATS address, the deployment CA, and the list of enrolled workers at `GET /v1/actl`, so the controller's name stays out of this repository. The commands need `python3`.
+Fleet maintenance runs as [actl](https://github.com/ryanolson/agentic-control) tasks (agentic-control task 029). One controller runs on brev-x86-cpu. Each fleet machine runs one worker as the user. The broker serves the NATS addresses (`servers`), `tls_first`, the deployment CA, and the list of enrolled workers at `GET /v1/actl`, so the controller's name stays out of this repository. The commands need `python3`.
 
 `actl` and `actl-supervisor` are pinned in `fleet` as one pair (`ACTL_VERSION`, `ACTL_SHA256_*`, `ACTL_SUPERVISOR_SHA256_*`), and the broker serves them at `/v1/artifacts/actl/VERSION/TARGET` and `/v1/artifacts/actl-supervisor/VERSION/TARGET`. `fleet-config/artifacts/release actl` adds the pins. Until the first release, the commands below that need actl stop with `actl is not pinned`. For the laptop commands, `FLEET_ACTL=/path/to/actl` uses a local build instead.
 
@@ -371,19 +371,22 @@ On a worker machine:
 ```bash
 fleet worker install [--timeout S] [--server URL|default]   # prints ID=OS:PUBLIC_KEY
 fleet worker status
+fleet worker refresh                                         # the service runs this before each start
 ```
 
 `fleet worker install` installs the pinned pair into `~/.local/bin` (`~/.local/<arch>/bin` on a no-sudo host) after it checks both checksums. It creates the worker seed once with `actl keygen`, and refuses an existing seed that is not a regular file with mode 600, one link, and the user as owner, in a mode-700 folder. Only the public key leaves the machine. It writes the configuration from `/v1/actl` and starts the service:
 
 | Path | Content |
 | --- | --- |
-| `~/.config/fleet/actl/worker.toml`, `ca.pem` | Principal `worker.ID`, where ID is the fleet name (`fleet status`), not an SSH alias. Capabilities `host-ID` and `os-linux` or `os-macos`. Repository `dotfiles` is this repository over HTTPS. Executors `fleet-apply`, `pylon-install`, `secrets-flush`, and `fleet-probe`: each runs `/usr/bin/env`, which removes the worker's Git variables and sets `HOME`, `USER`, `LOGNAME`, `LANG`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_RUNTIME_DIR` (Linux: the folder of the shell that ran install, else `/run/user/UID`), and a fixed `PATH`, then `/bin/bash dot_local/bin/executable_fleet` from the task's checkout. `systemctl --user` reaches the user manager through `XDG_RUNTIME_DIR`, so no D-Bus address is set. |
+| `~/.config/fleet/actl/worker.toml`, `ca.pem` | The `[connection]` section has every URL of `servers` from `/v1/actl`, in order, and `ca.pem` is the deployment CA, which checks the NATS server. With actl 0.3.0 or later it also has `client_certificate` and `client_key`, this machine's fleet certificate `~/.local/state/fleet/node.crt` and `node.key`, and `tls_first` from `/v1/actl` (agentic-control task 030). An older actl refuses these settings, so fleet writes them only when the actl that reads the file reports 0.3.0 or later. Principal `worker.ID`, where ID is the fleet name (`fleet status`), not an SSH alias. Capabilities `host-ID` and `os-linux` or `os-macos`. Repository `dotfiles` is this repository over HTTPS. Executors `fleet-apply`, `pylon-install`, `secrets-flush`, and `fleet-probe`: each runs `/usr/bin/env`, which removes the worker's Git variables and sets `HOME`, `USER`, `LOGNAME`, `LANG`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_RUNTIME_DIR` (Linux: the folder of the shell that ran install, else `/run/user/UID`), and a fixed `PATH`, then `/bin/bash dot_local/bin/executable_fleet` from the task's checkout. `systemctl --user` reaches the user manager through `XDG_RUNTIME_DIR`, so no D-Bus address is set. |
 | `~/.local/state/fleet/actl/worker.seed`, `worker.pub` | The seed and its public key. |
 | `~/.local/state/fleet/actl-worker` | The worker root, with the drain files. |
-| `fleet-worker.service` (Linux) | systemd user service with linger, `Restart=always`, `RestartSec=30`, `TimeoutStopSec=90`. |
-| `dev.fleet.worker` (macOS) | launchd agent in the GUI domain, `ExitTimeOut` 60, log `~/Library/Logs/fleet-worker.log`. `KeepAlive` restarts it only after a failure, because launchd would start it again at once after a drain and replace its acknowledgement. |
+| `fleet-worker.service` (Linux) | systemd user service with linger, `Restart=always`, `RestartSec=30`, `TimeoutStopSec=90`. `ExecStartPre=-fleet worker refresh`; the `-` lets the worker start when the refresh fails. |
+| `dev.fleet.worker` (macOS) | launchd agent in the GUI domain, `ExitTimeOut` 60, log `~/Library/Logs/fleet-worker.log`. `KeepAlive` restarts it only after a failure, because launchd would start it again at once after a drain and replace its acknowledgement. Its program is `fleet worker run`: it runs the refresh, then `exec`s `actl worker`, so the worker keeps the process ID that launchd and the drain check see. |
 
-`--server tls://HOST:PORT` writes that NATS URL instead of the one from `/v1/actl`, for a machine that reaches NATS through a fleet tunnel. gb300 uses `--server tls://127.0.0.1:38910`, the client end of its `bb-nats` tunnel through spark-p. The fleet NATS certificate names `127.0.0.1`, so TLS checks pass. Install saves the URL as `actl_server` in `~/.config/fleet/config` and uses it for later installs, so an actl update keeps the tunnel. `--server default` removes it and returns to the broker's URL.
+Before each start, the service runs `fleet worker refresh`. It reads `/v1/actl` again and rewrites the `[connection]` section of `worker.toml` and `ca.pem`; the rest of `worker.toml` stays as install wrote it. So a changed NATS address reaches every worker on its next restart (a reboot, `systemctl --user restart fleet-worker`, or a crash), without SSH to each machine. The new files are checked first: the data from the broker, then the whole new `worker.toml` with the installed `actl doctor --offline`. When the broker cannot be reached, returns invalid data, or actl refuses the new file, both files stay as they were, the refresh exits with an error that says so, and the worker starts with them. Each file is replaced atomically and keeps its mode. A refresh does not change the actl binary or the service; that is `fleet worker install`.
+
+`--server tls://HOST:PORT` writes that NATS URL instead of the URLs from `/v1/actl`, for a machine that reaches NATS through a fleet tunnel. gb300 uses `--server tls://127.0.0.1:38910`, the client end of its `bb-nats` tunnel through spark-p. The fleet NATS certificate names `127.0.0.1`, so TLS checks pass. Install saves the URL as `actl_server` in `~/.config/fleet/config` and uses it for later installs and for each refresh, so an actl update or a restart keeps the tunnel. `--server default` removes it and returns to the broker's URLs. Task 030 removes this option with the gb300 tunnel.
 
 With nothing changed, install changes nothing, but it starts a stopped service. To change a running worker, install drains it first. It creates `<root>/drain` and waits up to `--timeout` seconds (default 600) for `<root>/drained` from the service's main process, which the worker writes when no attempt runs. Then it stops the service, replaces the files, removes both drain files, and starts the service. If the worker exits without the acknowledgement, or the service fails, install stops, keeps the drain file, and prints the worker log: inspect the worker as the actl operations guide requires. If the time runs out, install removes the drain file, so the worker keeps working. While `<root>/unsafe-exit` exists, install refuses to run.
 
@@ -402,12 +405,14 @@ On the admin laptop:
 
 ```bash
 fleet actl client-init        # once, before the deployment: prints the client.cli public key
-fleet actl client-config      # after /v1/actl is published: writes client.toml and ca.pem
+fleet actl client-config      # after /v1/actl is published, and after it changes: writes client.toml and ca.pem
 fleet worker enroll HOST [--controller bb] [--provisioner '~/repos/agentic-control-fleet'] [--fleet-config ~/repos/fleet-config] [--timeout 120]
 fleet task NAME --host ID... | --all [--commit SHA] [--timeout 600]
 fleet task --resume RUN [--timeout 600]
 fleet secret flush --all [--commit SHA] [--timeout 600]   # fleet task secrets-flush --all
 ```
+
+`fleet actl client-config` writes `client.toml` (principal `client.cli`, seed `~/.local/state/fleet/actl/client.seed`) with the same `[connection]` settings as a worker, for the actl that the laptop commands use. It writes the file again on each run, so run it after `/v1/actl` changes, for example to move to a new address. Each file is replaced atomically and keeps its mode. When this machine also runs a worker and the deployment CA changed, it stops and asks for `fleet worker install` first. Other laptop commands write `client.toml` only when it is missing.
 
 `fleet worker enroll HOST` runs `fleet worker install` on HOST over SSH and reads its `ID=OS:KEY` line. Next, it runs `sudo -n PROVISIONER/scripts/provision.py --config /etc/actl-fleet/deployment.json --environment prod --add-worker ID=OS:KEY` on the controller host. Then it adds `{"id": ID, "os": OS}` to `broker/actl.json` in the fleet-config checkout, once. Last, it waits until `actl workers` lists the worker. The provisioner path is on the controller host. It is a clean checkout of agentic-control at the deployed commit, apart from the working copy there. Quote a path that starts with `~`, or your local shell expands it, and `sudo -n` fails. `FLEET_ACTL_CONTROLLER`, `FLEET_ACTL_PROVISIONER`, and `FLEET_CONFIG_REPO` change the defaults. It does not commit or deploy fleet-config. Commit the roster and deploy the broker yourself, as the fleet-config README describes. Each step is safe to repeat, so after a failure, run the same command again.
 

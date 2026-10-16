@@ -1175,7 +1175,16 @@ if cmd == 'keygen':
     print(os.environ.get('ACTL_PUBKEY', 'U' + 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'[n] * 55))
     sys.exit(0)
 if cmd == 'doctor':
+    # actl before 0.3.0 refuses the client certificate and TLS-first settings (deny_unknown_fields).
+    text = Path(opt('--config')).read_text()
+    old = tuple(int(x) for x in os.environ.get('ACTL_STUB_VERSION', '0.2.0').split('.')) < (0, 3, 0)
+    if (home / 'doctor-fails').exists() or (old and ('client_certificate' in text or 'tls_first' in text)):
+        sys.stderr.write('Error: unknown field\n')
+        sys.exit(1)
     print('configuration and credential OK')
+    sys.exit(0)
+if cmd == 'worker':
+    (home / 'worker-run.json').write_text(json.dumps({'pid': os.getpid(), 'args': a}))
     sys.exit(0)
 state_path = home / 'controller.json'
 state = json.loads(state_path.read_text()) if state_path.exists() else {}
@@ -1373,6 +1382,7 @@ def unpinned_script(home):
 
 class ActlBase(FleetBase):
     SERVER = 'tls://ctl.example.ts.net:4222'
+    PUBLIC = 'tls://203.0.113.7:4222'
     CA = '-----BEGIN CERTIFICATE-----\nMIIBfakeCA==\n-----END CERTIFICATE-----\n'
 
     def setUp(self):
@@ -1401,9 +1411,23 @@ class ActlBase(FleetBase):
         self.root = self.state / 'actl-worker'
         self.seed = self.state / 'actl/worker.seed'
 
-    def publish(self, workers=()):
+    def publish(self, workers=(), servers=None, tls_first=False, ca=None):
+        # The broker's reply: server is the first of servers, for fleet scripts from before task 030.
+        servers = servers or [self.SERVER]
         (self.home / 'actl.json').write_text(json.dumps({
-            'server': self.SERVER, 'ca_pem': self.CA, 'workers': [{'id': i, 'os': o} for i, o in workers]}))
+            'server': servers[0], 'servers': servers, 'tls_first': tls_first, 'ca_pem': ca or self.CA,
+            'workers': [{'id': i, 'os': o} for i, o in workers]}))
+
+    def connection(self, servers, principal='worker.node-1', seed='worker.seed', tls_first=None):
+        """The [connection] section that fleet renders; tls_first None means an actl without TLS settings."""
+        h = str(self.home)
+        text = (f'[connection]\nservers = [{", ".join(chr(34) + x + chr(34) for x in servers)}]\n'
+                f'ca_certificate = "{h}/.config/fleet/actl/ca.pem"\nseed_file = "{h}/.local/state/fleet/actl/{seed}"\n'
+                f'principal = "{principal}"\n')
+        if tls_first is not None:
+            text += (f'client_certificate = "{h}/.local/state/fleet/node.crt"\n'
+                     f'client_key = "{h}/.local/state/fleet/node.key"\ntls_first = {str(tls_first).lower()}\n')
+        return text
 
     def enroll_as(self, name):
         result = self.fleet('enroll', name, '--ca-url', 'https://ca.example', '--fingerprint', 'ab' * 32,
@@ -1495,6 +1519,9 @@ class WorkerInstall(ActlBase):
             self.assertNotIn('DBUS_SESSION_BUS_ADDRESS', ' '.join(args))
         unit = (self.home / '.config/systemd/user/fleet-worker.service').read_text()
         self.assertIn(f'ExecStart={h}/.local/bin/actl --config {h}/.config/fleet/actl/worker.toml worker\n', unit)
+        # The connection data is read again before each start; a failed refresh does not stop the start.
+        self.assertIn(f'ExecStartPre=-{h}/.local/bin/fleet worker refresh\n', unit)
+        self.assertLess(unit.index('ExecStartPre='), unit.index('ExecStart='))
         for line in ['Restart=always', 'RestartSec=30', 'TimeoutStopSec=90', 'WantedBy=default.target']:
             self.assertIn(line + '\n', unit)
         log = self.scheduler()
@@ -1540,8 +1567,8 @@ class WorkerInstall(ActlBase):
         self.assertIn('/opt/homebrew/bin', dict(x.split('=', 1) for x in args if '=' in x)['PATH'].split(':'))
         plist = (self.home / 'Library/LaunchAgents/dev.fleet.worker.plist').read_text()
         h = str(self.home)
-        for part in ['<string>dev.fleet.worker</string>', f'<string>{h}/.local/bin/actl</string><string>--config</string>'
-                     f'<string>{h}/.config/fleet/actl/worker.toml</string><string>worker</string>',
+        for part in ['<string>dev.fleet.worker</string>',
+                     f'<array><string>{h}/.local/bin/fleet</string><string>worker</string><string>run</string></array>',
                      '<key>ExitTimeOut</key><integer>60</integer>', '<key>RunAtLoad</key><true/>',
                      '<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>',
                      f'{h}/Library/Logs/fleet-worker.log']:
@@ -1712,6 +1739,41 @@ class WorkerInstall(ActlBase):
                 self.assertFalse((self.config_dir / 'worker.toml').exists())
                 self.assertNotIn('actl_server', (self.home / '.config/fleet/config').read_text())
 
+    def test_install_renders_every_server_and_the_tls_settings_for_actl_0_3(self):
+        self.publish(servers=[self.PUBLIC, self.SERVER], tls_first=True)
+        result = self.install(ACTL_STUB_VERSION='0.3.0')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        toml = (self.config_dir / 'worker.toml').read_text()
+        self.assertTrue(toml.startswith(self.connection([self.PUBLIC, self.SERVER], tls_first=True) + '\n[worker]\n'), toml)
+
+    def test_install_leaves_the_tls_settings_out_for_an_older_actl(self):
+        # actl 0.2.0 refuses unknown fields, so the settings appear only with an actl that reads them.
+        self.publish(servers=[self.PUBLIC, self.SERVER], tls_first=True)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        toml = (self.config_dir / 'worker.toml').read_text()
+        self.assertTrue(toml.startswith(self.connection([self.PUBLIC, self.SERVER]) + '\n[worker]\n'), toml)
+
+    def test_install_refuses_connection_data_without_valid_servers_and_tls_first(self):
+        base = {'server': self.SERVER, 'servers': [self.SERVER], 'tls_first': False, 'ca_pem': self.CA, 'workers': []}
+        cases = {
+            'only server': {k: v for k, v in base.items() if k not in ('servers', 'tls_first')},
+            'no tls_first': {k: v for k, v in base.items() if k != 'tls_first'},
+            'tls_first a string': dict(base, tls_first='true'),
+            'no servers': dict(base, servers=[]),
+            'nine servers': dict(base, servers=[f'tls://s{i}.example:4222' for i in range(9)]),
+            'nats url': dict(base, servers=['nats://ctl.example:4222']),
+            'credentials': dict(base, servers=['tls://u@ctl.example:4222']),
+            'servers a string': dict(base, servers=self.SERVER),
+        }
+        for label, data in cases.items():
+            with self.subTest(label):
+                (self.home / 'actl.json').write_text(json.dumps(data))
+                result = self.install()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('/v1/actl', result.stderr)
+                self.assertFalse((self.config_dir / 'worker.toml').exists())
+
     def test_install_needs_published_connection_data_and_a_valid_worker_id(self):
         (self.home / 'actl.json').unlink()
         result = self.install()
@@ -1743,8 +1805,11 @@ class WorkerInstall(ActlBase):
         self.assertIn(f'service: active, pid {self.svc()["pid"]}\n', out)
         self.assertIn('pinned: actl 0.2.0\n', out)
         self.assertIn('installed: actl 0.2.0, matches the pin\n', out)
-        self.assertIn(f'connection: {self.SERVER}', out)
+        self.assertIn(f'connection: {self.SERVER} (', out)
         self.assertIn('active attempts: 0\n', out)
+        self.publish(servers=[self.PUBLIC, self.SERVER])
+        self.assertEqual(self.install().returncode, 0)
+        self.assertIn(f'connection: {self.PUBLIC}, {self.SERVER} (', self.run_script('worker', 'status').stdout)
         self.assertIn('drain: none\n', out)
 
     def test_executor_commands(self):
@@ -1759,6 +1824,130 @@ class WorkerInstall(ActlBase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('checkout of the dotfiles', result.stderr)
             self.assertFalse((self.state / 'applied').exists())
+
+
+class WorkerRefresh(ActlBase):
+    """The worker service reads /v1/actl again before each start (task 030 part 3): fleet worker refresh."""
+
+    def setUp(self):
+        super().setUp()
+        self.enroll_as('node-1')
+        self.env['ACTL_STUB_VERSION'] = '0.3.0'
+        result = self.run_script('worker', 'install')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.toml = self.config_dir / 'worker.toml'
+
+    def refresh(self, **env):
+        return self.run_script('worker', 'refresh', **env)
+
+    def snapshot(self):
+        return {f: (f.stat().st_mtime_ns, f.read_bytes()) for f in (self.toml, self.config_dir / 'ca.pem')}
+
+    def leftovers(self):
+        return sorted(p.name for p in self.config_dir.iterdir() if p.name not in ('worker.toml', 'ca.pem'))
+
+    def test_refresh_rewrites_only_the_connection_data(self):
+        before = self.toml.read_text()
+        self.publish(servers=[self.PUBLIC, self.SERVER], tls_first=True)
+        result = self.refresh()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        after = self.toml.read_text()
+        self.assertTrue(after.startswith(self.connection([self.PUBLIC, self.SERVER], tls_first=True) + '\n[worker]\n'))
+        self.assertEqual(after.split('\n\n', 1)[1], before.split('\n\n', 1)[1])
+        self.assertEqual(self.mode(self.toml), 0o600)
+        self.assertEqual(self.leftovers(), [])
+        self.assertIn(self.PUBLIC, result.stderr)
+
+    def test_refresh_of_current_data_changes_nothing(self):
+        before = self.snapshot()
+        result = self.refresh()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('current', result.stderr)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_refresh_keeps_the_last_good_config_when_the_broker_fails(self):
+        before = self.snapshot()
+        (self.home / 'actl.json').unlink()
+        result = self.refresh()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('kept', result.stderr)
+        for bad in [{'server': self.PUBLIC, 'ca_pem': self.CA, 'workers': []},
+                    {'server': self.PUBLIC, 'servers': [], 'tls_first': True, 'ca_pem': self.CA, 'workers': []},
+                    {'server': self.PUBLIC, 'servers': [self.PUBLIC], 'tls_first': True, 'ca_pem': 'x', 'workers': []}]:
+            (self.home / 'actl.json').write_text(json.dumps(bad))
+            result = self.refresh()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('kept', result.stderr)
+        (self.home / 'actl.json').write_text('{')
+        self.assertNotEqual(self.refresh().returncode, 0)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_refresh_keeps_the_last_good_config_when_actl_refuses_the_new_one(self):
+        before = self.snapshot()
+        self.publish(servers=[self.PUBLIC], tls_first=True, ca=self.CA.replace('fakeCA', 'otherCA'))
+        (self.home / 'doctor-fails').write_text('')
+        result = self.refresh()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('kept', result.stderr)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_refresh_follows_the_installed_actl(self):
+        self.publish(servers=[self.PUBLIC], tls_first=True)
+        result = self.refresh(ACTL_STUB_VERSION='0.2.0')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.toml.read_text().startswith(self.connection([self.PUBLIC]) + '\n[worker]\n'))
+        result = self.refresh()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.toml.read_text().startswith(self.connection([self.PUBLIC], tls_first=True) + '\n'))
+
+    def test_refresh_keeps_a_saved_server_override(self):
+        tunnel = 'tls://127.0.0.1:38910'
+        self.assertEqual(self.run_script('worker', 'install', '--server', tunnel).returncode, 0)
+        self.publish(servers=[self.PUBLIC, self.SERVER], tls_first=True)
+        result = self.refresh()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.toml.read_text().startswith(self.connection([tunnel], tls_first=True) + '\n'))
+
+    def test_refresh_replaces_a_changed_ca(self):
+        other = self.CA.replace('fakeCA', 'otherCA')
+        self.publish(ca=other)
+        result = self.refresh()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.config_dir / 'ca.pem').read_text(), other)
+        self.assertEqual(self.mode(self.config_dir / 'ca.pem'), 0o600)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_refresh_without_an_installed_worker_writes_nothing(self):
+        self.toml.unlink()
+        self.publish(servers=[self.PUBLIC])
+        result = self.refresh()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.toml.exists())
+        self.assertEqual(self.leftovers(), [])
+
+    def test_worker_run_refreshes_then_becomes_the_worker(self):
+        # launchd has no ExecStartPre: the agent runs fleet worker run, which refreshes and then execs actl,
+        # so the worker keeps the process ID that launchd and the drain check see.
+        self.publish(servers=[self.PUBLIC], tls_first=True)
+        proc = subprocess.Popen(['bash', str(self.script), 'worker', 'run'], env=self.env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        out, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 0, err)
+        run = json.loads((self.home / 'worker-run.json').read_text())
+        self.assertEqual(run['pid'], proc.pid)
+        self.assertEqual(run['args'], ['--config', str(self.toml), 'worker'])
+        self.assertTrue(self.toml.read_text().startswith(self.connection([self.PUBLIC], tls_first=True) + '\n'))
+        # A failed refresh still starts the worker, with the last good configuration.
+        (self.home / 'worker-run.json').unlink()
+        (self.home / 'actl.json').unlink()
+        before = self.snapshot()
+        result = self.run_script('worker', 'run')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('kept', result.stderr)
+        self.assertTrue((self.home / 'worker-run.json').exists())
+        self.assertEqual(self.snapshot(), before)
 
 
 # Stubs for the executors (task 029 part 5). curl plays the broker and, for --unix-socket requests,
@@ -2369,6 +2558,19 @@ class ActlClient(ActlBase):
                          f'[connection]\nservers = ["{self.SERVER}"]\nca_certificate = "{h}/.config/fleet/actl/ca.pem"\n'
                          f'seed_file = "{h}/.local/state/fleet/actl/client.seed"\nprincipal = "client.cli"\n')
         self.assertEqual((self.config_dir / 'ca.pem').read_text(), self.CA)
+
+    def test_client_config_rewrites_an_existing_config_and_keeps_its_mode(self):
+        self.assertEqual(self.fleet('actl', 'client-init').returncode, 0)
+        self.assertEqual(self.fleet('actl', 'client-config').returncode, 0)
+        toml = self.config_dir / 'client.toml'
+        toml.chmod(0o640)
+        self.publish(servers=[self.PUBLIC, self.SERVER], tls_first=True)
+        result = self.fleet('actl', 'client-config', ACTL_STUB_VERSION='0.3.0')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(toml.read_text(), self.connection([self.PUBLIC, self.SERVER], principal='client.cli',
+                                                           seed='client.seed', tls_first=True))
+        self.assertEqual(self.mode(toml), 0o640)
+        self.assertEqual(sorted(p.name for p in self.config_dir.iterdir()), ['ca.pem', 'client.toml'])
 
     def test_client_commands_fail_clearly_without_the_actl_pins(self):
         del self.env['FLEET_ACTL']

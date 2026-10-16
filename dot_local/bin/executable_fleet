@@ -117,9 +117,12 @@ Fleet tasks through actl (the controller runs on the host that the broker's /v1/
                                         Install or update the pinned actl pair, the worker seed, the
                                         worker configuration from the broker, and the worker service.
                                         Prints ID=OS:PUBLIC_KEY. An update drains the running worker first.
-                                        --server tls://HOST:PORT replaces the broker's NATS URL on this
+                                        --server tls://HOST:PORT replaces the broker's NATS URLs on this
                                         machine, for example a loopback fleet tunnel, and is kept for later
-                                        installs; --server default returns to the broker's URL.
+                                        installs and refreshes; --server default returns to the broker's URLs.
+  worker refresh                        Rewrite the connection data in worker.toml and ca.pem from the broker.
+                                        The service runs it before each start; on any failure the files stay.
+  worker run                            Refresh, then exec the worker (the launchd agent's program).
   worker status                         The service, the pinned and installed actl, the connection,
                                         running attempts, and drain markers.
   worker enroll HOST [--controller HOST] [--provisioner PATH] [--fleet-config PATH] [--timeout S]
@@ -127,7 +130,7 @@ Fleet tasks through actl (the controller runs on the host that the broker's /v1/
                                         controller host (default bb, provisioner ~/repos/agentic-control-fleet),
                                         add it to the fleet-config roster, and wait until it connects.
   actl client-init                      Laptop: create the client.cli seed and print its public key.
-  actl client-config                    Laptop: write client.toml and ca.pem from the broker.
+  actl client-config                    Laptop: write client.toml and ca.pem from the broker, again on each run.
   task NAME (--host ID... | --all) [--commit SHA] [--timeout S]
                                         Laptop: send the task NAME (fleet-apply, pylon-install,
                                         secrets-flush, fleet-probe) to each machine and report the results.
@@ -1574,24 +1577,41 @@ def load(path):
 
 cmd, a = sys.argv[1], sys.argv[2:]
 if cmd == 'actl-endpoint':
-    # /v1/actl from the broker: check it again here, then write server, ca.pem, and workers into a[1].
+    # /v1/actl from the broker: check it again here, then write servers (one per line), tls_first,
+    # ca.pem, and workers into a[1]. actl takes one to eight servers.
     data = load(a[0])
     if not isinstance(data, dict):
         sys.exit('not an object')
-    server, ca = data.get('server'), data.get('ca_pem')
-    if not isinstance(server, str) or not SERVER.fullmatch(server):
-        sys.exit(f'invalid server {server!r}')
+    servers, tls_first, ca = data.get('servers'), data.get('tls_first'), data.get('ca_pem')
+    if not isinstance(servers, list) or not 1 <= len(servers) <= 8 or len(set(map(str, servers))) != len(servers):
+        sys.exit(f'invalid servers {servers!r}')
+    for server in servers:
+        if not isinstance(server, str) or not SERVER.fullmatch(server) or not 0 < int(server.rsplit(':', 1)[1]) < 65536:
+            sys.exit(f'invalid server {server!r}')
+    if not isinstance(tls_first, bool):
+        sys.exit(f'invalid tls_first {tls_first!r}')
     if not isinstance(ca, str) or not PEM.fullmatch(ca):
         sys.exit('invalid ca_pem')
     workers = workers_of(data)
-    with open(os.path.join(a[1], 'server'), 'w') as f:
-        f.write(server)
+    with open(os.path.join(a[1], 'servers'), 'w') as f:
+        f.write(''.join(s + '\n' for s in servers))
+    with open(os.path.join(a[1], 'tls_first'), 'w') as f:
+        f.write('true' if tls_first else 'false')
     with open(os.path.join(a[1], 'ca.pem'), 'w') as f:
         f.write(ca)
     with open(os.path.join(a[1], 'workers'), 'w') as f:
         f.write(''.join(f"{w['id']} {w['os']}\n" for w in workers))
 elif cmd == 'sync-dir':
     sync_dir(a[0])
+elif cmd == 'install-file':
+    # Replace a[1] with the contents of a[0] atomically, keeping the mode of the file it replaces.
+    with open(a[0]) as f:
+        text = f.read()
+    try:
+        mode = os.stat(a[1]).st_mode & 0o777
+    except FileNotFoundError:
+        mode = 0o600
+    atomic(a[1], text, mode)
 elif cmd == 'drained-pid':
     # The worker's drain acknowledgement: {"pid": N, "drained_at": UNIX_SECONDS}.
     data = load(a[0])
@@ -1830,7 +1850,7 @@ ensure_seed() {
     SEED_KEY="$key" SEED_NEW=1
 }
 
-# fetch_actl DIR: read /v1/actl into DIR (server, ca.pem, workers) and set ACTL_SERVER.
+# fetch_actl DIR: read /v1/actl into DIR (servers, tls_first, ca.pem, workers) and load it.
 fetch_actl() {
     need_python
     need_enrollment
@@ -1838,7 +1858,40 @@ fetch_actl() {
     broker_get /v1/actl > "$1/actl.json" ||
         fail 'the broker did not return /v1/actl; the actl deployment is not published yet (fleet-config broker/actl.json)'
     fpy actl-endpoint "$1/actl.json" "$1" || fail 'the broker returned malformed /v1/actl data'
-    ACTL_SERVER=$(<"$1/server")
+    load_actl "$1"
+}
+
+# load_actl DIR: set ACTL_SERVERS and ACTL_TLS_FIRST from the files of fetch_actl.
+load_actl() {
+    local line
+    ACTL_SERVERS=()
+    while IFS= read -r line; do ACTL_SERVERS+=("$line"); done < "$1/servers"
+    ACTL_TLS_FIRST=$(<"$1/tls_first")
+}
+
+# actl reads client_certificate, client_key, and tls_first from 0.3.0 on (agentic-control task
+# 030), and an older actl refuses a configuration with fields it does not know. So the settings
+# follow the actl that reads the file, not the pin: a fleet-apply can update this script before
+# fleet worker install replaces the binary.
+actl_reads_tls() {
+    local v
+    v=$("$1" --version 2>/dev/null) || return 1
+    [[ "$v" =~ ^actl\ ([0-9]+)\.([0-9]+)\.[0-9]+ ]] || return 1
+    (( BASH_REMATCH[1] > 0 || BASH_REMATCH[2] >= 3 ))
+}
+
+# render_connection PRINCIPAL SEED ACTL: the [connection] section for ACTL. The client certificate is
+# this machine's fleet certificate, which fleet renew replaces atomically; actl reads it again on
+# each connect.
+render_connection() {
+    local principal="$1" seed="$2" actl="$3"
+    toml_check "${ACTL_SERVERS[@]}" "$ACTL_CONFIG_DIR" "$seed" "$STATE"
+    printf '[connection]\nservers = %s\nca_certificate = "%s"\nseed_file = "%s"\nprincipal = "%s"\n' \
+        "$(toml_list "${ACTL_SERVERS[@]}")" "$ACTL_CONFIG_DIR/ca.pem" "$seed" "$principal"
+    if actl_reads_tls "$actl"; then
+        printf 'client_certificate = "%s"\nclient_key = "%s"\ntls_first = %s\n' \
+            "$STATE/node.crt" "$STATE/node.key" "$ACTL_TLS_FIRST"
+    fi
 }
 
 # TOML basic strings without escapes. Paths and values with a quote, backslash, or control
@@ -1895,12 +1948,12 @@ git_binary() {
     echo "$git"
 }
 
-# render_worker FILE ID OS: the worker configuration. The worker clears the environment of each
+# render_worker FILE ID OS ACTL: the worker configuration. The worker clears the environment of each
 # executor, so the executors are /usr/bin/env with fixed arguments that remove the worker's Git
 # variables and set the user's (ruling R5 of task 029). The command runs the fleet script of the
 # task's checkout, so the code that runs is the code at the task's commit.
 render_worker() {
-    local out="$1" id="$2" os="$3" user lang git bin env_args name run
+    local out="$1" id="$2" os="$3" actl="$4" user lang git bin env_args name run
     user=$(id -un)
     git=$(git_binary)
     bin=$ACTL_BIN
@@ -1912,12 +1965,10 @@ render_worker() {
     # one): systemctl --user finds the user manager through it, and pylon keeps its sockets in it.
     [[ "$os" == linux ]] && env_args+=("XDG_RUNTIME_DIR=$(user_runtime_dir)")
     env_args+=("PATH=$(executor_path)")
-    toml_check "$ACTL_SERVER" "$ACTL_CONFIG_DIR" "$ACTL_STATE" "$WORKER_ROOT" "$git" "$bin" "${env_args[@]}"
+    toml_check "$WORKER_ROOT" "$git" "$bin" "${env_args[@]}"
     {
-        printf '[connection]\nservers = [%s]\n' "\"$ACTL_SERVER\""
-        printf 'ca_certificate = "%s"\nseed_file = "%s"\nprincipal = "worker.%s"\n\n' \
-            "$ACTL_CONFIG_DIR/ca.pem" "$ACTL_STATE/worker.seed" "$id"
-        printf '[worker]\nroot = "%s"\ngit_binary = "%s"\nsupervisor_binary = "%s"\n' \
+        render_connection "worker.$id" "$ACTL_STATE/worker.seed" "$actl"
+        printf '\n[worker]\nroot = "%s"\ngit_binary = "%s"\nsupervisor_binary = "%s"\n' \
             "$WORKER_ROOT" "$git" "$bin/actl-supervisor"
         printf 'max_disk_bytes = 10737418240\nretain_attempts = 100\ncapabilities = ["host-%s", "os-%s"]\n\n' "$id" "$os"
         printf '[worker.repositories]\ndotfiles = "%s"\n' "$DOTFILES_URL"
@@ -1959,9 +2010,12 @@ worker_service_file() { if [[ "$1" == launchd ]]; then echo "$WORKER_PLIST"; els
 # The service row of task 029. On macOS, KeepAlive restarts only a failed worker: launchd starts a
 # job again at once after any exit, and the new worker would replace the drain acknowledgement of
 # the one that drained before install could read it. systemd waits RestartSec first.
+# Each start runs fleet worker refresh first. systemd ignores its failure ("-"), and launchd has no
+# such hook, so the agent runs fleet worker run, which refreshes and then execs actl in the same
+# process: launchd and the drain check see the worker's process ID.
 render_worker_service() {
     local out="$1" kind="$2" config="$ACTL_CONFIG_DIR/worker.toml" actl="$ACTL_BIN/actl"
-    [[ "$config$actl" != *[[:space:]]* ]] || fail 'the worker paths must not contain white space'
+    [[ "$config$actl$SELF" != *[[:space:]]* ]] || fail 'the worker paths must not contain white space'
     if [[ "$kind" == launchd ]]; then
         cat > "$out" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -1969,7 +2023,7 @@ render_worker_service() {
 <plist version="1.0">
 <dict>
     <key>Label</key><string>dev.fleet.worker</string>
-    <key>ProgramArguments</key><array><string>$actl</string><string>--config</string><string>$config</string><string>worker</string></array>
+    <key>ProgramArguments</key><array><string>$SELF</string><string>worker</string><string>run</string></array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
     <key>ExitTimeOut</key><integer>60</integer>
@@ -1980,9 +2034,9 @@ render_worker_service() {
 EOF
     else
         # systemd expands % specifiers and $ variables in ExecStart, so the unit would run another path.
-        [[ "$config$actl" != *[%\$]* ]] || fail 'the worker paths must not contain % or $ for a systemd unit'
+        [[ "$config$actl$SELF" != *[%\$]* ]] || fail 'the worker paths must not contain % or $ for a systemd unit'
         printf '%s\n' '[Unit]' 'Description=Fleet actl worker' '' '[Service]' \
-            "ExecStart=$actl --config $config worker" 'Restart=always' 'RestartSec=30' 'TimeoutStopSec=90' '' \
+            "ExecStartPre=-$SELF worker refresh" "ExecStart=$actl --config $config worker" 'Restart=always' 'RestartSec=30' 'TimeoutStopSec=90' '' \
             '[Install]' 'WantedBy=default.target' > "$out"
     fi
 }
@@ -2100,9 +2154,9 @@ cmd_worker_install() {
     stage_actl_pair
     scratch; work="$SCRATCH"
     fetch_actl "$work"
-    [[ -z "$actl_server" ]] || ACTL_SERVER="$actl_server"
+    [[ -z "$actl_server" ]] || ACTL_SERVERS=("$actl_server")
     ensure_seed "$ACTL_STATE/worker.seed" "$ACTL_STAGE/actl"
-    render_worker "$work/worker.toml" "$id" "$os"
+    render_worker "$work/worker.toml" "$id" "$os" "$ACTL_STAGE/actl"
     render_worker_service "$work/service" "$kind"
     [[ "$ACTL_NEW" == 1 || "$SEED_NEW" == 1 ]] && changed=1
     cmp -s "$work/worker.toml" "$ACTL_CONFIG_DIR/worker.toml" || changed=1
@@ -2129,6 +2183,48 @@ cmd_worker_install() {
     worker_start "$kind"
     printf 'actl worker %s is running\n' "$id" >&2
     printf '%s=%s:%s\n' "$id" "$os" "$SEED_KEY"
+}
+
+# The worker service runs this before each start (render_worker_service). It reads /v1/actl again and
+# rewrites the [connection] section of worker.toml, and ca.pem, so a changed server address reaches
+# every worker on its next restart, without SSH to each machine (agentic-control task 030). The rest
+# of worker.toml stays as install wrote it. When the broker cannot be reached, returns invalid data,
+# or the installed actl refuses the new file (actl doctor --offline), both files stay as they were.
+# Both are checked before either is replaced; if a crash comes between the two renames, the next
+# start finishes the change.
+cmd_worker_refresh() {
+    [[ $# -eq 0 ]] || fail 'usage: fleet worker refresh'
+    local toml="$ACTL_CONFIG_DIR/worker.toml" actl work id kept='kept the last good worker configuration'
+    actl="$(local_bin)/actl"
+    [[ -f "$toml" && -x "$actl" ]] || fail "no installed worker ($toml, $actl); run fleet worker install"
+    scratch; work="$SCRATCH"
+    (fetch_actl "$work") || fail "could not read /v1/actl; $kept"
+    load_actl "$work"
+    load_config
+    id=$(worker_id)
+    [[ -z "$actl_server" ]] || ACTL_SERVERS=("$actl_server")
+    (render_connection "worker.$id" "$ACTL_STATE/worker.seed" "$actl") > "$work/worker.toml" || fail "$kept"
+    printf '\n' >> "$work/worker.toml"
+    sed -n '/^\[worker\]$/,$p' "$toml" > "$work/rest"
+    [[ -s "$work/rest" ]] || fail "$toml has no [worker] section; $kept. Run fleet worker install."
+    cat "$work/rest" >> "$work/worker.toml"
+    if cmp -s "$work/worker.toml" "$toml" && cmp -s "$work/ca.pem" "$ACTL_CONFIG_DIR/ca.pem"; then
+        printf 'fleet: the worker configuration is current (%s)\n' "${ACTL_SERVERS[*]}" >&2
+        return 0
+    fi
+    "$actl" --config "$work/worker.toml" doctor --offline >/dev/null 2>&1 ||
+        fail "$actl doctor --offline refuses the new configuration; $kept"
+    cmp -s "$work/ca.pem" "$ACTL_CONFIG_DIR/ca.pem" || fpy install-file "$work/ca.pem" "$ACTL_CONFIG_DIR/ca.pem"
+    cmp -s "$work/worker.toml" "$toml" || fpy install-file "$work/worker.toml" "$toml"
+    printf 'fleet: refreshed %s for %s\n' "$toml" "${ACTL_SERVERS[*]}" >&2
+}
+
+# The launchd agent's program: refresh, then become the worker. A failed refresh has printed why and
+# kept the old files, and the worker still starts with them.
+cmd_worker_run() {
+    [[ $# -eq 0 ]] || fail 'usage: fleet worker run'
+    (cmd_worker_refresh) || true
+    exec "$(local_bin)/actl" --config "$ACTL_CONFIG_DIR/worker.toml" worker
 }
 
 cmd_worker_status() {
@@ -2160,7 +2256,7 @@ cmd_worker_status() {
         printf 'installed: none\n'
     fi
     if [[ -f "$ACTL_CONFIG_DIR/worker.toml" ]]; then
-        server=$(sed -n 's/^servers = \["\(.*\)"\]$/\1/p' "$ACTL_CONFIG_DIR/worker.toml")
+        server=$(sed -n 's/^servers = \[\(.*\)\]$/\1/p' "$ACTL_CONFIG_DIR/worker.toml" | tr -d '"')
         if "$bin/actl" --config "$ACTL_CONFIG_DIR/worker.toml" doctor --offline >/dev/null 2>&1; then
             check='configuration and credential OK'
         else
@@ -2190,24 +2286,24 @@ cmd_actl_client_init() {
     printf '%s\n' "$SEED_KEY"
 }
 
-# The laptop's client configuration. It shares ca.pem with a worker on the same machine, so a
-# changed CA is left to fleet worker install, which restarts the worker with it.
+# The laptop's client configuration, written again on each run, so a laptop follows a changed
+# /v1/actl. It shares ca.pem with a worker on the same machine, so a changed CA is left to fleet
+# worker install, which restarts the worker with it.
 cmd_actl_client_config() {
     [[ $# -eq 0 ]] || fail 'usage: fleet actl client-config'
     seed_ready "$ACTL_STATE/client.seed" || fail 'no client seed; run fleet actl client-init first'
     local work
+    need_actl
     scratch; work="$SCRATCH"
     fetch_actl "$work"
     if [[ -f "$ACTL_CONFIG_DIR/worker.toml" && -f "$ACTL_CONFIG_DIR/ca.pem" ]] && ! cmp -s "$work/ca.pem" "$ACTL_CONFIG_DIR/ca.pem"; then
         fail 'the deployment CA changed; run fleet worker install first, which restarts the worker with it'
     fi
-    toml_check "$ACTL_SERVER" "$ACTL_CONFIG_DIR" "$ACTL_STATE"
-    printf '[connection]\nservers = ["%s"]\nca_certificate = "%s"\nseed_file = "%s"\nprincipal = "client.cli"\n' \
-        "$ACTL_SERVER" "$ACTL_CONFIG_DIR/ca.pem" "$ACTL_STATE/client.seed" > "$work/client.toml"
+    render_connection client.cli "$ACTL_STATE/client.seed" "$ACTL" > "$work/client.toml"
     mkdir -p "$ACTL_CONFIG_DIR"
-    mv -f "$work/ca.pem" "$ACTL_CONFIG_DIR/ca.pem"
-    mv -f "$work/client.toml" "$CLIENT_TOML"
-    printf 'wrote %s for %s\n' "$CLIENT_TOML" "$ACTL_SERVER"
+    fpy install-file "$work/ca.pem" "$ACTL_CONFIG_DIR/ca.pem"
+    fpy install-file "$work/client.toml" "$CLIENT_TOML"
+    printf 'wrote %s for %s\n' "$CLIENT_TOML" "${ACTL_SERVERS[*]}"
 }
 
 need_client_config() { [[ -f "$CLIENT_TOML" ]] || cmd_actl_client_config >&2; }
@@ -2285,7 +2381,9 @@ cmd_worker() {
         install) cmd_worker_install "$@" ;;
         enroll) cmd_worker_enroll "$@" ;;
         status) [[ $# -eq 0 ]] || fail 'usage: fleet worker status'; cmd_worker_status ;;
-        *) fail 'usage: fleet worker install [--timeout S] [--server URL|default] | status | enroll HOST [options]' ;;
+        refresh) cmd_worker_refresh "$@" ;;
+        run) cmd_worker_run "$@" ;;
+        *) fail 'usage: fleet worker install [--timeout S] [--server URL|default] | status | refresh | run | enroll HOST [options]' ;;
     esac
 }
 
