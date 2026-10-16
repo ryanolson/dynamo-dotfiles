@@ -106,6 +106,9 @@ Any machine:
   secret env VAR=NAME... -- CMD...      Run CMD with secrets in its environment. Values are not printed.
                                         NAME can be an op://VAULT/ITEM/[SECTION/]FIELD reference: pylon
                                         answers it from its cache, else the broker looks it up.
+                                        In a task of an ephemeral worker, FLEET_EPH_SOCKET names pylon's
+                                        socket: names and references come only from it, with no broker
+                                        request, no op and no enrollment files. A 403 is final.
   secret flush                          Empty the secrets cache of the local pylon.
   secret flush --all [--commit SHA] [--timeout S]
                                         Laptop: empty it on every enrolled machine (fleet task secrets-flush --all).
@@ -885,7 +888,36 @@ ref_value() {
         fail "the broker did not return the secret $1"
 }
 
+# In a task of an ephemeral worker, pylon sets FLEET_EPH_SOCKET and holds the worker's identity
+# in memory. There are no enrollment files, so the socket is the only source: no broker request
+# and no op. A refusal is final, because a retry or another source could outlive the admission.
+eph_value() {
+    local sock="$FLEET_EPH_SOCKET" path out status
+    if [[ "$1" == op://* ]]; then
+        valid_ref "$1" || fail "invalid secret reference: $1"
+        path="/v1/secrets?ref=$(encode_ref "$1")"
+    else
+        valid_secret "$1" || fail "invalid secret name: $1"
+        path="/v1/secrets/$1"
+    fi
+    [[ -S "$sock" ]] || fail "FLEET_EPH_SOCKET is not a socket: $sock"
+    # The status follows the body on its own line, so curl writes nothing to disk.
+    out=$(curl -sS --connect-timeout 5 --max-time 60 --unix-socket "$sock" -w '\n%{http_code}' \
+        "http://pylon$path") || fail "pylon did not answer on $sock"
+    status="${out##*$'\n'}"
+    case "$status" in
+        200) printf '%s' "${out%$'\n'*}" ;;
+        403) fail "pylon refused the secret $1 (403): this worker may not read it, or its admission has ended" ;;
+        404) fail "pylon has no secret $1 (404)" ;;
+        *) fail "pylon did not return the secret $1 (HTTP $status)" ;;
+    esac
+}
+
 secret_value() {
+    if [[ -n "${FLEET_EPH_SOCKET:-}" ]]; then
+        eph_value "$1"
+        return
+    fi
     if [[ "$1" == op://* ]]; then
         ref_value "$1"
         return

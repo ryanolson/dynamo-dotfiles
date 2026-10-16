@@ -968,6 +968,131 @@ class FleetLaptop(FleetBase):
         self.assertTrue((self.home / 'curl-args').read_text().splitlines()[-1].endswith('/v1/secrets/codex-access-token'))
 
 
+class FleetEphSocket(FleetBase):
+    # Task 032 part 1d. In a task of an ephemeral worker, pylon sets FLEET_EPH_SOCKET and holds the
+    # identity in memory; there are no enrollment files. A real unix-socket HTTP server plays pylon,
+    # and the real curl talks to it. curl to anything else, and op, record the call and fail.
+    NAME = 'claude-oauth-token'
+    REF = 'op://Fleet/NGC NIM Operations PAT/credential'
+    ENCODED = 'op%3A%2F%2FFleet%2FNGC%20NIM%20Operations%20PAT%2Fcredential'
+
+    def setUp(self):
+        super().setUp()
+        import http.server
+        import socketserver
+        real_curl = shutil.which('curl')
+        self.assertIsNotNone(real_curl)
+        self.sock = self.home / 'eph.sock'
+        self.forbidden = self.home / 'forbidden.log'
+        bin_dir = self.home / 'bin'
+        (bin_dir / 'curl').write_text(
+            '#!/bin/sh\nprev=\nfor a in "$@"; do\n'
+            '  if [ "$prev" = --unix-socket ] && [ "$a" = "$EPH_TEST_SOCK" ]; then exec ' + real_curl + ' "$@"; fi\n'
+            '  prev=$a\ndone\nprintf "curl %s\\n" "$*" >> "$HOME/forbidden.log"\nexit 97\n')
+        (bin_dir / 'op').write_text('#!/bin/sh\nprintf "op %s\\n" "$*" >> "$HOME/forbidden.log"\nexit 97\n')
+        for name in ('curl', 'op'):
+            (bin_dir / name).chmod(0o700)
+        self.answers = {}
+        self.requests = []
+        test = self
+
+        class Pylon(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                test.requests.append(self.path)
+                status, body = test.answers.get(self.path, (404, b'Not Found\n'))
+                self.send_response(status)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+            daemon_threads = True
+
+            def get_request(self):
+                conn, _ = self.socket.accept()
+                return conn, ('pylon', 0)
+
+        server = Server(str(self.sock), Pylon)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+    def eph(self, *args):
+        return self.fleet(*args, FLEET_EPH_SOCKET=str(self.sock), EPH_TEST_SOCK=str(self.sock))
+
+    def assert_socket_only(self):
+        self.assertFalse(self.forbidden.exists(), self.forbidden.read_text() if self.forbidden.exists() else '')
+        self.assertFalse(self.state.exists())
+        self.assertFalse((self.home / '.config/fleet').exists())
+
+    def test_a_named_secret_comes_from_the_socket(self):
+        self.answers[f'/v1/secrets/{self.NAME}'] = (200, b'eph-token-1\n')
+        result = self.eph('secret', 'get', self.NAME)
+        self.assertEqual((result.returncode, result.stdout), (0, 'eph-token-1\n'), result.stderr)
+        self.assertEqual(self.requests, [f'/v1/secrets/{self.NAME}'])
+        self.assert_socket_only()
+
+    def test_a_reference_comes_from_the_socket(self):
+        self.answers[f'/v1/secrets?ref={self.ENCODED}'] = (200, b'ngc-value')
+        result = self.eph('secret', 'get', self.REF)
+        self.assertEqual((result.returncode, result.stdout), (0, 'ngc-value'), result.stderr)
+        self.assertEqual(self.requests, [f'/v1/secrets?ref={self.ENCODED}'])
+        self.assert_socket_only()
+
+    def test_claude_and_codex_start_with_only_the_socket(self):
+        self.answers['/v1/secrets/claude-oauth-token'] = (200, b'claude-tok')
+        self.answers['/v1/secrets/codex-access-token'] = (200, b'codex-tok')
+        for tool, var, args in [('claude', 'CLAUDE_CODE_OAUTH_TOKEN', ('--version',)),
+                                ('codex', 'CODEX_ACCESS_TOKEN', ('exec', 'hi'))]:
+            launcher = self.home / 'bin' / tool
+            launcher.write_text(f'#!/bin/sh\nprintf "%s %s" "${var}" "$*" > "$HOME/{tool}-run"\n')
+            launcher.chmod(0o700)
+            result = self.eph(tool, *args)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((self.home / f'{tool}-run').read_text(), f'{tool}-tok {" ".join(args)}')
+        self.assertEqual(self.requests, ['/v1/secrets/claude-oauth-token', '/v1/secrets/codex-access-token'])
+        self.assert_socket_only()
+
+    def test_a_refusal_is_final(self):
+        claude = self.home / 'bin/claude'
+        claude.write_text('#!/bin/sh\ntouch "$HOME/claude-ran"\n')
+        claude.chmod(0o700)
+        for status, word in [(403, 'refused'), (404, 'no secret')]:
+            for args, path in [(('secret', 'get', self.NAME), f'/v1/secrets/{self.NAME}'),
+                               (('secret', 'get', self.REF), f'/v1/secrets?ref={self.ENCODED}'),
+                               (('claude',), f'/v1/secrets/{self.NAME}')]:
+                self.requests.clear()
+                self.answers[path] = (status, b'Forbidden\n' if status == 403 else b'Not Found\n')
+                result = self.eph(*args)
+                self.assertNotEqual(result.returncode, 0, args)
+                self.assertEqual(result.stdout, '')
+                self.assertIn(word, result.stderr)
+                self.assertIn(str(status), result.stderr)
+                self.assertEqual(self.requests, [path], 'one request, no retry')
+        self.assertFalse((self.home / 'claude-ran').exists())
+        self.assert_socket_only()
+
+    def test_bad_input_and_a_missing_socket_make_no_request(self):
+        for bad in ['Bad_Name', '-x', 'op://Fleet/x', 'op://Fleet/a?b/c']:
+            self.assertNotEqual(self.eph('secret', 'get', bad).returncode, 0, bad)
+        result = self.fleet('secret', 'get', self.NAME, FLEET_EPH_SOCKET=str(self.home / 'missing.sock'),
+                            EPH_TEST_SOCK=str(self.sock))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('missing.sock', result.stderr)
+        self.assertEqual(self.requests, [])
+        self.assert_socket_only()
+
+    def test_without_the_variable_the_socket_is_not_used(self):
+        self.answers[f'/v1/secrets/{self.NAME}'] = (200, b'eph-token-1')
+        result = self.fleet('secret', 'get', self.NAME, EPH_TEST_SOCK=str(self.sock))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('not enrolled', result.stderr)
+        self.assertEqual(self.requests, [])
+
+
 class FleetEphemeral(FleetBase):
     def start(self, *extra):
         runtime = self.home / 'run'
