@@ -46,7 +46,8 @@ ENROLL_QUIET=0
 SSH_RENEW_BEFORE=8h
 
 CLEANUP=()
-trap 'rm -rf "${CLEANUP[@]+"${CLEANUP[@]}"}"' EXIT
+cleanup() { rm -rf "${CLEANUP[@]+"${CLEANUP[@]}"}"; }
+trap cleanup EXIT
 fail() { printf 'fleet: %s\n' "$*" >&2; exit 1; }
 # Sets SCRATCH in the caller; a $(...) subshell would lose the cleanup entry.
 scratch() { SCRATCH=$(mktemp -d "${1:-${TMPDIR:-/tmp}}/.fleet.XXXXXX"); CLEANUP+=("$SCRATCH"); }
@@ -1909,14 +1910,14 @@ actl_reads_tls() {
     (( BASH_REMATCH[1] > 0 || BASH_REMATCH[2] >= 3 ))
 }
 
-# render_connection PRINCIPAL SEED ACTL: the [connection] section for ACTL. The client certificate is
-# this machine's fleet certificate, which fleet renew replaces atomically; actl reads it again on
-# each connect.
+# render_connection PRINCIPAL SEED ACTL [CA]: the [connection] section for ACTL. CA defaults to the
+# installed ca.pem. The client certificate is this machine's fleet certificate, which fleet renew
+# replaces atomically; actl reads it again on each connect.
 render_connection() {
-    local principal="$1" seed="$2" actl="$3"
-    toml_check "${ACTL_SERVERS[@]}" "$ACTL_CONFIG_DIR" "$seed" "$STATE"
+    local principal="$1" seed="$2" actl="$3" ca="${4:-$ACTL_CONFIG_DIR/ca.pem}"
+    toml_check "${ACTL_SERVERS[@]}" "$ca" "$seed" "$STATE"
     printf '[connection]\nservers = %s\nca_certificate = "%s"\nseed_file = "%s"\nprincipal = "%s"\n' \
-        "$(toml_list "${ACTL_SERVERS[@]}")" "$ACTL_CONFIG_DIR/ca.pem" "$seed" "$principal"
+        "$(toml_list "${ACTL_SERVERS[@]}")" "$ca" "$seed" "$principal"
     if actl_reads_tls "$actl"; then
         printf 'client_certificate = "%s"\nclient_key = "%s"\ntls_first = %s\n' \
             "$STATE/node.crt" "$STATE/node.key" "$ACTL_TLS_FIRST"
@@ -2218,12 +2219,12 @@ cmd_worker_install() {
 # rewrites the [connection] section of worker.toml, and ca.pem, so a changed server address reaches
 # every worker on its next restart, without SSH to each machine (agentic-control task 030). The rest
 # of worker.toml stays as install wrote it. When the broker cannot be reached, returns invalid data,
-# or the installed actl refuses the new file (actl doctor --offline), both files stay as they were.
-# Both are checked before either is replaced; if a crash comes between the two renames, the next
-# start finishes the change.
+# or the installed actl refuses the new files (actl doctor --offline on a copy that names the new
+# ca.pem), both files stay as they were. Both are checked before either is replaced; if a crash
+# comes between the two renames, the next start finishes the change.
 cmd_worker_refresh() {
     [[ $# -eq 0 ]] || fail 'usage: fleet worker refresh'
-    local toml="$ACTL_CONFIG_DIR/worker.toml" actl work id kept='kept the last good worker configuration'
+    local toml="$ACTL_CONFIG_DIR/worker.toml" actl work id f kept='kept the last good worker configuration'
     actl="$(local_bin)/actl"
     [[ -f "$toml" && -x "$actl" ]] || fail "no installed worker ($toml, $actl); run fleet worker install"
     scratch; work="$SCRATCH"
@@ -2232,16 +2233,20 @@ cmd_worker_refresh() {
     load_config
     id=$(worker_id)
     [[ -z "$actl_server" ]] || ACTL_SERVERS=("$actl_server")
-    (render_connection "worker.$id" "$ACTL_STATE/worker.seed" "$actl") > "$work/worker.toml" || fail "$kept"
-    printf '\n' >> "$work/worker.toml"
     sed -n '/^\[worker\]$/,$p' "$toml" > "$work/rest"
     [[ -s "$work/rest" ]] || fail "$toml has no [worker] section; $kept. Run fleet worker install."
-    cat "$work/rest" >> "$work/worker.toml"
+    (render_connection "worker.$id" "$ACTL_STATE/worker.seed" "$actl") > "$work/worker.toml" || fail "$kept"
+    (render_connection "worker.$id" "$ACTL_STATE/worker.seed" "$actl" "$work/ca.pem") > "$work/check.toml" ||
+        fail "$kept"
+    for f in worker.toml check.toml; do
+        printf '\n' >> "$work/$f"
+        cat "$work/rest" >> "$work/$f"
+    done
     if cmp -s "$work/worker.toml" "$toml" && cmp -s "$work/ca.pem" "$ACTL_CONFIG_DIR/ca.pem"; then
         printf 'fleet: the worker configuration is current (%s)\n' "${ACTL_SERVERS[*]}" >&2
         return 0
     fi
-    "$actl" --config "$work/worker.toml" doctor --offline >/dev/null 2>&1 ||
+    "$actl" --config "$work/check.toml" doctor --offline >/dev/null 2>&1 ||
         fail "$actl doctor --offline refuses the new configuration; $kept"
     cmp -s "$work/ca.pem" "$ACTL_CONFIG_DIR/ca.pem" || fpy install-file "$work/ca.pem" "$ACTL_CONFIG_DIR/ca.pem"
     cmp -s "$work/worker.toml" "$toml" || fpy install-file "$work/worker.toml" "$toml"
@@ -2249,10 +2254,12 @@ cmd_worker_refresh() {
 }
 
 # The launchd agent's program: refresh, then become the worker. A failed refresh has printed why and
-# kept the old files, and the worker still starts with them.
+# kept the old files, and the worker still starts with them. The refresh runs in a subshell, which
+# does not inherit the EXIT trap, and exec skips this shell's trap, so the subshell sets its own to
+# remove its scratch folder.
 cmd_worker_run() {
     [[ $# -eq 0 ]] || fail 'usage: fleet worker run'
-    (cmd_worker_refresh) || true
+    (trap cleanup EXIT; cmd_worker_refresh) || true
     exec "$(local_bin)/actl" --config "$ACTL_CONFIG_DIR/worker.toml" worker
 }
 

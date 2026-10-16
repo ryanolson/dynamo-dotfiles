@@ -1176,9 +1176,12 @@ if cmd == 'keygen':
     sys.exit(0)
 if cmd == 'doctor':
     # actl before 0.3.0 refuses the client certificate and TLS-first settings (deny_unknown_fields).
+    # The CA file that the configuration names must exist, and one that holds "refusedCA" does not parse.
     text = Path(opt('--config')).read_text()
     old = tuple(int(x) for x in os.environ.get('ACTL_STUB_VERSION', '0.2.0').split('.')) < (0, 3, 0)
-    if (home / 'doctor-fails').exists() or (old and ('client_certificate' in text or 'tls_first' in text)):
+    ca = Path(next(l for l in text.splitlines() if l.startswith('ca_certificate = ')).split('"')[1])
+    if (home / 'doctor-fails').exists() or (old and ('client_certificate' in text or 'tls_first' in text)) \
+            or not ca.is_file() or 'refusedCA' in ca.read_text():
         sys.stderr.write('Error: unknown field\n')
         sys.exit(1)
     print('configuration and credential OK')
@@ -1885,6 +1888,12 @@ class WorkerRefresh(ActlBase):
 
     def test_refresh_keeps_the_last_good_config_when_actl_refuses_the_new_one(self):
         before = self.snapshot()
+        # actl doctor checks the new CA, not the installed one.
+        self.publish(servers=[self.PUBLIC], tls_first=True, ca=self.CA.replace('fakeCA', 'refusedCA'))
+        result = self.refresh()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('kept', result.stderr)
+        self.assertEqual(self.snapshot(), before)
         self.publish(servers=[self.PUBLIC], tls_first=True, ca=self.CA.replace('fakeCA', 'otherCA'))
         (self.home / 'doctor-fails').write_text('')
         result = self.refresh()
@@ -1918,6 +1927,8 @@ class WorkerRefresh(ActlBase):
         self.assertEqual((self.config_dir / 'ca.pem').read_text(), other)
         self.assertEqual(self.mode(self.config_dir / 'ca.pem'), 0o600)
         self.assertEqual(self.leftovers(), [])
+        # The installed file names the installed CA, not the copy that doctor checked.
+        self.assertTrue(self.toml.read_text().startswith(self.connection([self.SERVER], tls_first=False) + '\n'))
 
     def test_refresh_without_an_installed_worker_writes_nothing(self):
         self.toml.unlink()
@@ -1929,7 +1940,11 @@ class WorkerRefresh(ActlBase):
 
     def test_worker_run_refreshes_then_becomes_the_worker(self):
         # launchd has no ExecStartPre: the agent runs fleet worker run, which refreshes and then execs actl,
-        # so the worker keeps the process ID that launchd and the drain check see.
+        # so the worker keeps the process ID that launchd and the drain check see. The exec must not
+        # leave the refresh's scratch folder behind: a launchd agent starts often.
+        tmp = self.home / 'tmp'
+        tmp.mkdir()
+        self.env['TMPDIR'] = str(tmp)
         self.publish(servers=[self.PUBLIC], tls_first=True)
         proc = subprocess.Popen(['bash', str(self.script), 'worker', 'run'], env=self.env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -1948,6 +1963,7 @@ class WorkerRefresh(ActlBase):
         self.assertIn('kept', result.stderr)
         self.assertTrue((self.home / 'worker-run.json').exists())
         self.assertEqual(self.snapshot(), before)
+        self.assertEqual(list(tmp.iterdir()), [])
 
 
 # Stubs for the executors (task 029 part 5). curl plays the broker and, for --unix-socket requests,
