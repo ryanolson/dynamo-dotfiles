@@ -3282,6 +3282,69 @@ class Door(FleetBase):
         self.assertEqual(r.returncode, 0, r.stderr + (self.home / 'scheduler.log').read_text())
         self.assertIn('reload copy rc=0', (self.home / 'scheduler.log').read_text())
 
+    @unittest.skipUnless(OPENSSL3 and shutil.which('timeout'), 'needs OpenSSL 3.4 or later and timeout')
+    def test_a_failed_reload_is_retried_by_the_next_sync(self):
+        # After a failed reload, or a sync killed between swap and reload, the copy is already current.
+        # The next run must compare what the door serves, not only the files.
+        self.enroll()
+        pki = Pki(self.home / 'pki')
+        root = pki.ca('root', 'inter')
+        self.pin(pki.fingerprint(root))
+        first, renewed = pki.leaf('door', 'door', 'inter'), pki.leaf('door2', 'door', 'inter')
+        env = dict(self.env, PATH=f'{Path(OPENSSL3).parent}:{self.env["PATH"]}')
+
+        def use(identity):
+            shutil.copy(identity[0], self.state / 'node.crt')
+            shutil.copy(identity[1], self.state / 'node.key')
+            shutil.copy(root, self.state / 'root_ca.crt')
+
+        use(first)
+        port = free_port()
+        out, _ = self.render('--listen', f'127.0.0.1:{port}')
+        sync = out / 'usr/local/libexec/fleet-door-sync'
+        self.assertEqual(subprocess.run([str(sync), 'copy'], capture_output=True, env=env).returncode, 0)
+        current = self.prefix / 'etc/fleet-door/tls/current'
+        door = (f'{OPENSSL3} s_server -accept 127.0.0.1:{port} -www -cert {current}/node.crt '
+                f'-key {current}/node.key </dev/null >/dev/null 2>&1 & echo $! > "$HOME/door.pid"')
+        subprocess.run(['sh', '-c', door], env=env, check=True)
+        self.addCleanup(lambda: subprocess.run(['sh', '-c', 'kill $(cat "$HOME/door.pid")'], env=env))
+        (self.home / 'bin/systemctl').write_text(
+            '#!/bin/sh\n[ "$1" = reload ] || exit 0\n[ -e "$HOME/reload-fails" ] && exit 1\n'
+            'echo reloaded >> "$HOME/scheduler.log"\n'
+            f'kill $(cat "$HOME/door.pid"); sleep 0.5; {door}\n')
+        (self.home / 'bin/systemctl').chmod(0o700)
+        log = self.home / 'scheduler.log'
+        use(renewed)
+        (self.home / 'reload-fails').touch()
+        r = subprocess.run([str(sync)], capture_output=True, text=True, env=env, timeout=120)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('could not reload', r.stderr)
+        (self.home / 'reload-fails').unlink()
+        r = subprocess.run([str(sync)], capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(log.read_text().splitlines().count('reloaded'), 1)
+        # A door that already serves the current certificate is not reloaded.
+        r = subprocess.run([str(sync)], capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(log.read_text().splitlines().count('reloaded'), 1)
+
+    def test_install_writes_nothing_when_a_file_fails_to_render(self):
+        # A cat that stops partway when it writes to a pipe stands in for a render that dies midway.
+        self.enroll()
+        env = self.install_stubs()
+        real = shutil.which('cat')
+        # Only the nginx.conf render fails; fleet uses cat elsewhere too.
+        (self.home / 'bin/cat').write_text(
+            f'#!/bin/sh\n[ $# -eq 0 ] || exec {real} "$@"\nt=$(mktemp)\n{real} > "$t"\n'
+            'if [ -p /dev/stdout ] && grep -q worker_connections "$t"; then head -n 3 "$t"; rm -f "$t"; exit 1; fi\n'
+            f'{real} "$t"\nrm -f "$t"\n')
+        (self.home / 'bin/cat').chmod(0o700)
+        result = self.fleet('door', 'install', **env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.prefix / 'etc/fleet-door').is_dir(), result.stderr)
+        self.assertFalse((self.prefix / 'etc/fleet-door/nginx.conf').exists())
+        self.assertFalse((self.prefix / 'usr/local/libexec/fleet-door-sync').exists())
+
     def test_renew_warns_when_the_fleet_ca_differs_from_the_door(self):
         self.enroll()
         env = self.install_stubs()

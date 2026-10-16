@@ -1377,18 +1377,25 @@ changed=$(FLEET_DOOR_LOCKED=1 perl -MFcntl=:flock -e 'BEGIN { $^F = 255 }
     flock($lock, LOCK_EX) or die "fleet-door: lock: $!\n";
     exec { $ARGV[0] } @ARGV or die "fleet-door: $!\n"' "$dst/.lock" "$0" --locked-copy)
 [[ "${1:-}" == copy ]] && exit 0
-[[ "$changed" == unchanged ]] || systemctl reload fleet-door.service || die 'could not reload fleet-door.service'
-# A reload that nginx rejects keeps the old certificate, so check the served one, not the copy.
-# Each try is bounded, and so is the whole check: a door that accepts and never answers fails it.
+# Each probe is bounded, and so is the whole check: a door that accepts and never answers fails it.
 want=$(serial < "$dst/current/node.crt") served="" served_file=$(mktemp)
 trap 'rm -f "$served_file"' EXIT
-end=$((SECONDS + 20))
-while (( SECONDS < end )); do
+probe() {
     timeout 5 openssl s_client -connect "$check" -tls1_3 </dev/null 2>/dev/null |
         openssl x509 > "$served_file" 2>/dev/null || true
     served=$(serial < "$served_file" 2>/dev/null || true)
-    [[ "$served" == "$want" ]] && break
+}
+# Reload when the copy changed, and also when the door serves another serial: an earlier reload
+# may have failed, or an earlier run may have stopped between the swap and the reload.
+if [[ "$changed" == unchanged ]]; then probe; fi
+if [[ "$changed" != unchanged || "$served" != "$want" ]]; then
+    systemctl reload fleet-door.service || die 'could not reload fleet-door.service'
+fi
+# A reload that nginx rejects keeps the old certificate, so check the served one, not the copy.
+end=$((SECONDS + 20))
+while [[ "$served" != "$want" ]] && (( SECONDS < end )); do
     sleep 0.5
+    probe
 done
 [[ "$served" == "$want" ]] || die "the door at $check serves serial ${served:-none}, not $want"
 openssl x509 -noout -checkend "$stale" -in "$served_file" >/dev/null ||
@@ -1468,7 +1475,7 @@ cmd_door() {
             [[ -x "$DOOR_NGINX" && -f "$DOOR_MODULE" ]] ||
                 fail "nginx with the stream module is required: sudo apt-get install nginx-core libnginx-mod-stream"
             door_fingerprint
-            local p="$DOOR_PREFIX" entry rel
+            local p="$DOOR_PREFIX" entry rel content
             sudo -v
             sudo install -d -m 755 "$p/etc/fleet-door" "$p/usr/local/libexec" "$p/etc/systemd/system"
             sudo install -d -m 700 "$p/etc/fleet-door/tls"
@@ -1476,7 +1483,10 @@ cmd_door() {
             # write is installed, so nothing can be swapped in while sudo asks for a password.
             for entry in $DOOR_FILES; do
                 rel="${entry%:*}"
-                door_file "$rel" | sudo sh -c 'umask 077; cat > "$1.new" && chmod "$2" "$1.new" && mv -f "$1.new" "$1"' \
+                # Render first: a render that fails stops the install before root writes anything.
+                content=$(door_file "$rel")
+                printf '%s\n' "$content" |
+                    sudo sh -c 'umask 077; cat > "$1.new" && chmod "$2" "$1.new" && mv -f "$1.new" "$1"' \
                     sh "$p/$rel" "${entry##*:}"
             done
             sudo systemctl daemon-reload
