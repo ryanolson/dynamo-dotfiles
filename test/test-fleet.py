@@ -1361,6 +1361,10 @@ NEW_ACTL_BODY = ACTL_STUB.encode() + b'# 0.3.0\n'
 SUPERVISOR_BODY = b'\x7fELF fake actl-supervisor 0.2.0'
 
 
+# The actl version that the fleet script pins; a release changes it.
+ACTL_PIN = re.search(r'^ACTL_VERSION=(\S+)$', SCRIPT.read_text(), re.M).group(1)
+
+
 def pinned_script(home, actl=ACTL_BODY, supervisor=SUPERVISOR_BODY, version='0.2.0'):
     """A copy of fleet with the actl pins that artifacts/release would add after the last checksum line."""
     text = SCRIPT.read_text()
@@ -1532,8 +1536,8 @@ class WorkerInstall(ActlBase):
         self.assertTrue(self.svc()['active'])
         self.assertTrue(any(l.startswith('loginctl ') for l in log), log)
         (dl_actl, dl_sup) = sorted(self.downloads(), key=lambda l: 'supervisor' in l)
-        self.assertIn('https://ca.example:8443/v1/artifacts/actl/0.2.0/linux-aarch64', dl_actl)
-        self.assertIn('https://ca.example:8443/v1/artifacts/actl-supervisor/0.2.0/linux-aarch64', dl_sup)
+        self.assertIn(f'https://ca.example:8443/v1/artifacts/actl/{ACTL_PIN}/linux-aarch64', dl_actl)
+        self.assertIn(f'https://ca.example:8443/v1/artifacts/actl-supervisor/{ACTL_PIN}/linux-aarch64', dl_sup)
         self.assertIn(f'--cert {self.state}/node.crt', dl_actl)
 
     def test_install_without_a_runtime_folder_renders_the_user_runtime_folder(self):
@@ -1806,8 +1810,8 @@ class WorkerInstall(ActlBase):
         out = result.stdout
         self.assertIn('worker: node-1 (linux)\n', out)
         self.assertIn(f'service: active, pid {self.svc()["pid"]}\n', out)
-        self.assertIn('pinned: actl 0.2.0\n', out)
-        self.assertIn('installed: actl 0.2.0, matches the pin\n', out)
+        self.assertIn(f'pinned: actl {ACTL_PIN}\n', out)
+        self.assertIn(f'installed: actl {ACTL_PIN}, matches the pin\n', out)
         self.assertIn(f'connection: {self.SERVER} (', out)
         self.assertIn('active attempts: 0\n', out)
         self.publish(servers=[self.PUBLIC, self.SERVER])
