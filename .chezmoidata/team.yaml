@@ -45,6 +45,15 @@ fleet_secrets:
   hf_token: "op://Fleet/HuggingFace/credential"
   ngc_api_key: "op://Fleet/NGC NIM Operations PAT/credential"
 
+# Agent plugin marketplaces on GitHub. run_after_agent-plugins adds each one and installs and
+# updates its plugins in the listed tools (claude, codex). Set agent_plugins: [] in
+# ~/.config/chezmoi/chezmoi.yaml to opt out on a machine.
+agent_plugins:
+  - marketplace: "nv-gitlab"
+    github: "NVIDIA-dev/nv-gitlab-plugin"
+    plugins: ["nv-gitlab"]
+    tools: ["claude", "codex"]
+
 tools:
   # Core development tools that everyone should have
   required:

@@ -149,6 +149,19 @@ Sources: [`ai-dynamo/rhino`](https://github.com/ai-dynamo/rhino),
 [`ishandhanani/dotfiles`](https://github.com/ishandhanani/dotfiles), plus practice distilled from
 `ryanolson/kvbm`, `ai-dynamo/velo`, and `ryanolson/roundhouse`. Each `SKILL.md` names its upstream.
 
+### Agent plugins
+
+`agent_plugins` in `.chezmoidata/team.yaml` lists plugin marketplaces on GitHub. On each `chezmoi apply`, `run_after_agent-plugins` uses the `claude` and `codex` CLIs to add each marketplace, install its plugins, and update them. It does this when the list changed or at most once per 7 days. The CLIs own `~/.claude/settings.json` and `~/.codex/config.toml`, so chezmoi does not manage those files.
+
+- A tool that is not on `PATH` is skipped.
+- A private marketplace repository needs a git credential for github.com: run `gh auth login` and `gh auth setup-git`. Without one, the clone fails and does not wait at a prompt.
+- A failure only warns, and the next apply tries again.
+- To opt out on a machine, set `agent_plugins: []` in `~/.config/chezmoi/chezmoi.yaml`.
+
+```bash
+timeout 300 python3 test/agent-plugins.py
+```
+
 Both agents are instructed to read [the environment guide](dot_agents/ENVIRONMENT.md) once per session. It maps tasks to tools, separates source ownership, and requires validation, scoped apply, commit, and push. Shared changes must work in both agents. See [the evaluation protocol](agent-docs/environment-evaluation.md) for behavioral checks.
 
 Verify a machine after the intended scoped apply:

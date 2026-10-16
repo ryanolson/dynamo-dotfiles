@@ -1,0 +1,70 @@
+{{ if .agent_plugins -}}
+#!/bin/bash
+# Add the agent plugin marketplaces in agent_plugins, install their plugins, and update them,
+# with the claude and codex CLIs. The CLIs own ~/.claude/settings.json and ~/.codex/config.toml,
+# so chezmoi does not manage those files. Each call is idempotent.
+#
+# chezmoi runs this script on each apply. It does the work when the list changed or the stamp is
+# more than 7 days old. A failure only warns and does not write the stamp, so the next apply tries
+# again. A private marketplace repository needs a git credential for github.com: without one, git
+# would wait at a username prompt, so GIT_TERMINAL_PROMPT=0 makes it fail instead.
+set -uo pipefail
+export GIT_TERMINAL_PROMPT=0
+
+want="{{ .agent_plugins | toJson | sha256sum }}"
+stamp="${XDG_STATE_HOME:-$HOME/.local/state}/dotfiles/agent-plugins"
+if [[ -n "$(find "$stamp" -mtime -7 2>/dev/null)" && "$(cat "$stamp")" == "$want" ]]; then
+    exit 0
+fi
+
+# Each line: marketplace, GitHub owner/repo, plugin, tools (comma-separated).
+entries=(
+{{- range .agent_plugins }}{{ $m := . }}{{ range .plugins }}
+    "{{ $m.marketplace }} {{ $m.github }} {{ . }} {{ $m.tools | join "," }}"
+{{- end }}{{ end }}
+)
+
+# macOS has no coreutils timeout; perl's alarm survives exec and kills the command the same way.
+bounded() {
+    local seconds="$1"; shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$seconds" "$@"
+    else
+        perl -e 'alarm shift; exec @ARGV or exit 127' "$seconds" "$@"
+    fi
+}
+
+failed=0 ran=0
+run() {
+    local out
+    if ! out=$(bounded 300 "$@" </dev/null 2>&1); then
+        echo "WARN: '$*' failed: ${out##*$'\n'}" >&2
+        echo "WARN: for a private repository, run 'gh auth login' and 'gh auth setup-git'" >&2
+        failed=1
+        return 1
+    fi
+}
+
+for entry in "${entries[@]}"; do
+    read -r mkt repo plugin tools <<< "$entry"
+    if [[ ",$tools," == *,claude,* ]] && command -v claude >/dev/null 2>&1; then
+        ran=1
+        run claude plugin marketplace add "$repo" &&
+            run claude plugin marketplace update "$mkt" &&
+            run claude plugin install "$plugin@$mkt" &&
+            run claude plugin update "$plugin@$mkt"
+    fi
+    if [[ ",$tools," == *,codex,* ]] && command -v codex >/dev/null 2>&1; then
+        ran=1
+        # The plugin cache path has the version in it, so add runs again after the upgrade.
+        run codex plugin marketplace add "$repo" &&
+            run codex plugin marketplace upgrade "$mkt" &&
+            run codex plugin add "$plugin@$mkt"
+    fi
+done
+
+if [[ "$failed" == 0 && "$ran" == 1 ]]; then
+    mkdir -p "$(dirname "$stamp")" && printf '%s' "$want" > "$stamp"
+fi
+exit 0
+{{ end -}}
