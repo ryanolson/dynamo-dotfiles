@@ -2859,6 +2859,8 @@ class FleetTask(ActlBase):
         holder = subprocess.Popen(['python3', '-c', 'import fcntl, sys, time\n'
                                    'f = open(sys.argv[1], "a"); fcntl.flock(f, fcntl.LOCK_EX); print("held", flush=True)\n'
                                    'time.sleep(30)', str(run / 'lock')], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.stdout.close)
+        self.addCleanup(holder.wait)
         self.addCleanup(holder.kill)
         self.assertEqual(holder.stdout.readline().strip(), 'held')
         resumed = self.fleet('task', '--resume', run.name, '--timeout', '1')
