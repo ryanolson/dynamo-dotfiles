@@ -4,10 +4,13 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
+import ssl
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -2667,6 +2670,448 @@ class FleetTask(ActlBase):
         self.assertEqual(json.loads((run / 'spec.json').read_text())['task'], 'fleet-apply')
         self.assertEqual(list(run.glob('.spec*')), [])
         self.assertIn('unsent', result.stdout)
+
+
+def find_openssl3():
+    # The test certificates need OpenSSL 3.4 or later, for -not_before and -not_after.
+    for path in [os.environ.get('FLEET_TEST_OPENSSL'), '/opt/homebrew/opt/openssl@3/bin/openssl',
+                 str(Path.home() / '.pixi/envs/socat/bin/openssl'), shutil.which('openssl')]:
+        if path and os.path.exists(path):
+            usage = subprocess.run([path, 'x509', '-help'], capture_output=True, text=True)
+            if '-not_before' in usage.stdout + usage.stderr:
+                return path
+    return None
+
+
+OPENSSL3 = find_openssl3()
+
+
+class Pki:
+    # The fleet's shape: a root, an intermediate, and leaves; node.crt holds the leaf and the intermediate.
+    def __init__(self, folder):
+        self.dir = Path(folder)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.serial = 1000
+
+    def ssl(self, *args):
+        subprocess.run([OPENSSL3, *args], check=True, capture_output=True, cwd=self.dir)
+
+    def key(self, name):
+        self.ssl('genpkey', '-algorithm', 'EC', '-pkeyopt', 'ec_paramgen_curve:P-256', '-out', f'{name}.key')
+        return self.dir / f'{name}.key'
+
+    def sign(self, name, issuer, ext, validity):
+        self.serial += 1
+        self.ssl('req', '-new', '-key', f'{name}.key', '-subj', f'/CN={name}', '-out', f'{name}.csr')
+        (self.dir / f'{name}.ext').write_text(ext)
+        self.ssl('x509', '-req', '-in', f'{name}.csr', '-CA', f'{issuer}.crt', '-CAkey', f'{issuer}.key',
+                 '-set_serial', str(self.serial), '-extfile', f'{name}.ext', '-out', f'{name}.crt', *validity)
+
+    def ca(self, root, intermediate):
+        self.key(root)
+        self.ssl('req', '-x509', '-new', '-key', f'{root}.key', '-subj', f'/CN={root}', '-days', '2',
+                 '-addext', 'basicConstraints=critical,CA:TRUE', '-addext', 'keyUsage=critical,keyCertSign,cRLSign',
+                 '-out', f'{root}.crt')
+        self.key(intermediate)
+        self.sign(intermediate, root, 'basicConstraints=critical,CA:TRUE,pathlen:0\n'
+                                      'keyUsage=critical,keyCertSign,cRLSign\n', ['-days', '2'])
+        return self.dir / f'{root}.crt'
+
+    def leaf(self, file, name, intermediate, eku='serverAuth,clientAuth', validity=('-days', '1')):
+        # file names the output; name is the certificate's CN and DNS name.
+        self.key(file)
+        self.serial += 1
+        self.ssl('req', '-new', '-key', f'{file}.key', '-subj', f'/CN={name}', '-out', f'{file}.csr')
+        (self.dir / f'{file}.ext').write_text('basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\n'
+                                              f'extendedKeyUsage={eku}\nsubjectAltName=DNS:{name}\n')
+        self.ssl('x509', '-req', '-in', f'{file}.csr', '-CA', f'{intermediate}.crt', '-CAkey', f'{intermediate}.key',
+                 '-set_serial', str(self.serial), '-extfile', f'{file}.ext', '-out', f'{file}.leaf', *validity)
+        chain = self.dir / f'{file}.crt'
+        chain.write_text((self.dir / f'{file}.leaf').read_text() + (self.dir / f'{intermediate}.crt').read_text())
+        serial = f'{self.serial:X}'
+        # OpenSSL and Python print a serial as whole bytes.
+        return chain, self.dir / f'{file}.key', serial.zfill(len(serial) + len(serial) % 2)
+
+
+class Door(FleetBase):
+    def setUp(self):
+        super().setUp()
+        self.prefix = self.home / 'root'
+        self.env['FLEET_DOOR_PREFIX'] = str(self.prefix)
+
+    def render(self, *args):
+        out = self.home / 'out'
+        result = self.fleet('door', 'render', str(out), *args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        files = {str(p.relative_to(out)): p.read_text() for p in out.rglob('*') if p.is_file()}
+        return out, files
+
+    def lines(self, text):
+        return [l.strip() for l in text.splitlines()]
+
+    def test_render_defaults_to_a_public_door_with_client_certificates_and_limits(self):
+        out, files = self.render()
+        p = self.prefix
+        self.assertEqual(sorted(files), ['etc/fleet-door/nginx.conf', 'etc/systemd/system/fleet-door-sync.path',
+                                         'etc/systemd/system/fleet-door-sync.service',
+                                         'etc/systemd/system/fleet-door-sync.timer',
+                                         'etc/systemd/system/fleet-door.service', 'usr/local/libexec/fleet-door-sync'])
+        conf = self.lines(files['etc/fleet-door/nginx.conf'])
+        for line in ['load_module /usr/lib/nginx/modules/ngx_stream_module.so;', f'pid {p}/run/fleet-door.pid;', 'worker_shutdown_timeout 1h;',
+                     'listen 0.0.0.0:8461 ssl;', 'limit_conn door_source 64;', 'limit_conn door_all 1024;',
+                     f'ssl_certificate {p}/etc/fleet-door/tls/node.crt;',
+                     f'ssl_certificate_key {p}/etc/fleet-door/tls/node.key;',
+                     f'ssl_client_certificate {p}/etc/fleet-door/tls/root_ca.crt;', 'ssl_verify_client on;',
+                     'ssl_verify_depth 1;', 'ssl_protocols TLSv1.2 TLSv1.3;', 'ssl_ciphers HIGH:!aNULL:!eNULL:!PSK;',
+                     'ssl_handshake_timeout 10s;', 'proxy_pass 127.0.0.1:38886;']:
+            self.assertIn(line, conf)
+        unit = self.lines(files['etc/systemd/system/fleet-door.service'])
+        for line in [f'ExecStartPre={p}/usr/local/libexec/fleet-door-sync copy',
+                     f"ExecStart=/usr/sbin/nginx -c {p}/etc/fleet-door/nginx.conf -g 'daemon off;'",
+                     'ExecReload=/bin/kill -HUP $MAINPID', 'Restart=always', 'RestartSec=5', 'TasksMax=32',
+                     'MemoryMax=256M', 'LimitNOFILE=16384', 'ProtectSystem=full',
+                     f'ReadWritePaths={p}/etc/fleet-door/tls']:
+            self.assertIn(line, unit)
+        path = self.lines(files['etc/systemd/system/fleet-door-sync.path'])
+        self.assertIn(f'PathChanged={self.state}/node.crt', path)
+        self.assertIn(f'PathChanged={self.state}/node.key', path)
+        self.assertIn('OnUnitActiveSec=15min', self.lines(files['etc/systemd/system/fleet-door-sync.timer']))
+        self.assertIn(f'ExecStart={p}/usr/local/libexec/fleet-door-sync',
+                      self.lines(files['etc/systemd/system/fleet-door-sync.service']))
+        self.assertTrue(os.access(out / 'usr/local/libexec/fleet-door-sync', os.X_OK))
+
+    def test_render_takes_the_listener_target_limits_and_deadline(self):
+        _, files = self.render('--listen', '127.0.0.1:9461', '--to', '127.0.0.1:9000', '--per-source', '3',
+                               '--max', '8', '--handshake-timeout', '2')
+        conf = self.lines(files['etc/fleet-door/nginx.conf'])
+        for line in ['listen 127.0.0.1:9461 ssl;', 'proxy_pass 127.0.0.1:9000;', 'limit_conn door_source 3;',
+                     'limit_conn door_all 8;', 'ssl_handshake_timeout 2s;']:
+            self.assertIn(line, conf)
+
+    def test_render_rejects_bad_options(self):
+        out = str(self.home / 'out')
+        for args in [('--listen', '0.0.0.0:8461;'), ('--to', '127.0.0.1:1 ssl'), ('--per-source', '0'),
+                     ('--per-source', 'x'), ('--max', '8;'), ('--handshake-timeout', '0'),
+                     ('--handshake-timeout', '61'), ('--handshake-timeout', '5s'), ('--bogus', '1')]:
+            self.assertNotEqual(self.fleet('door', 'render', out, *args).returncode, 0, args)
+        self.assertNotEqual(self.fleet('door', 'bogus').returncode, 0)
+        self.assertNotEqual(self.fleet('door', 'render').returncode, 0)
+
+    def install_stubs(self):
+        bin_dir = self.home / 'bin'
+        (bin_dir / 'sudo').write_text('#!/bin/sh\nexec "$@"\n')
+        (bin_dir / 'sudo').chmod(0o700)
+        nginx = self.home / 'nginx'
+        nginx.write_text('#!/bin/sh\nexit 0\n')
+        nginx.chmod(0o700)
+        module = self.home / 'ngx_stream_module.so'
+        module.write_text('')
+        return dict(FLEET_DOOR_NGINX=str(nginx), FLEET_DOOR_MODULE=str(module))
+
+    def test_install_writes_root_files_and_starts_the_units(self):
+        self.enroll()
+        env = self.install_stubs()
+        result = self.fleet('door', 'install', **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.prefix / 'etc/fleet-door/nginx.conf').exists())
+        self.assertTrue((self.prefix / 'etc/systemd/system/fleet-door.service').exists())
+        self.assertEqual(self.mode(self.prefix / 'usr/local/libexec/fleet-door-sync'), 0o755)
+        self.assertEqual(self.mode(self.prefix / 'etc/fleet-door/nginx.conf'), 0o644)
+        self.assertEqual(self.mode(self.prefix / 'etc/fleet-door/tls'), 0o700)
+        log = (self.home / 'scheduler.log').read_text().splitlines()
+        self.assertEqual(log, ['systemctl daemon-reload',
+                               'systemctl enable fleet-door.service fleet-door-sync.path fleet-door-sync.timer',
+                               'systemctl restart fleet-door.service',
+                               'systemctl restart fleet-door-sync.path fleet-door-sync.timer',
+                               'systemctl start fleet-door-sync.service'])
+
+    def test_install_needs_enrollment_and_the_nginx_stream_module(self):
+        env = self.install_stubs()
+        self.assertIn('not enrolled', self.fleet('door', 'install', **env).stderr)
+        self.enroll()
+        missing = dict(env, FLEET_DOOR_MODULE=str(self.home / 'none.so'))
+        self.assertIn('libnginx-mod-stream', self.fleet('door', 'install', **missing).stderr)
+        self.assertFalse(self.prefix.exists())
+
+    def test_remove_and_uninstall_stop_the_door(self):
+        self.enroll()
+        env = self.install_stubs()
+        self.assertEqual(self.fleet('door', 'install', **env).returncode, 0)
+        (self.home / 'scheduler.log').unlink()
+        result = self.fleet('uninstall', '--yes', '--keep-cert', **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('systemctl disable --now fleet-door.service fleet-door-sync.path fleet-door-sync.timer',
+                      (self.home / 'scheduler.log').read_text())
+        self.assertFalse((self.prefix / 'etc/fleet-door').exists())
+        self.assertFalse((self.prefix / 'etc/systemd/system/fleet-door.service').exists())
+        self.assertFalse((self.prefix / 'usr/local/libexec/fleet-door-sync').exists())
+
+    @unittest.skipUnless(OPENSSL3, 'needs OpenSSL 3.4 or later for test certificates')
+    def test_sync_copy_takes_only_a_matching_current_fleet_certificate(self):
+        self.enroll()
+        pki = Pki(self.home / 'pki')
+        root = pki.ca('root', 'inter')
+        good, good_key, serial = pki.leaf('door', 'door', 'inter')
+        pki.ca('evil', 'evilinter')
+        evil, evil_key, _ = pki.leaf('evildoor', 'door', 'evilinter')
+        expired, expired_key, _ = pki.leaf('old', 'door', 'inter',
+                                            validity=('-not_before', '20200101000000Z', '-not_after', '20200102000000Z'))
+        out, _ = self.render()
+        sync = out / 'usr/local/libexec/fleet-door-sync'
+        env = dict(PATH=f'{Path(OPENSSL3).parent}:{self.env["PATH"]}')
+        tls = self.prefix / 'etc/fleet-door/tls'
+
+        def use(crt, key):
+            shutil.copy(crt, self.state / 'node.crt')
+            shutil.copy(key, self.state / 'node.key')
+            shutil.copy(root, self.state / 'root_ca.crt')
+            return subprocess.run([str(sync), 'copy'], capture_output=True, text=True, env=dict(self.env, **env))
+
+        r = use(good, good_key)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f'serial {serial}', r.stderr)
+        self.assertEqual((tls / 'node.crt').read_text(), good.read_text())
+        self.assertEqual(self.mode(tls), 0o700)
+        self.assertEqual(self.mode(tls / 'node.key'), 0o600)
+        r = use(good, good_key)
+        self.assertEqual((r.returncode, r.stderr), (0, ''))
+        for crt, key, why in [(good, evil_key, 'do not match'), (evil, evil_key, 'not issued by the fleet CA'),
+                              (expired, expired_key, 'expired')]:
+            r = use(crt, key)
+            self.assertNotEqual(r.returncode, 0, why)
+            self.assertIn(why, r.stderr)
+            self.assertEqual((tls / 'node.crt').read_text(), good.read_text(), why)
+        self.assertEqual(sorted(p.name for p in tls.iterdir()), ['node.crt', 'node.key', 'root_ca.crt'])
+        (self.state / 'node.key').unlink()
+        r = subprocess.run([str(sync), 'copy'], capture_output=True, text=True, env=dict(self.env, **env))
+        self.assertIn('cannot read', r.stderr)
+
+
+DOOR_IMAGE = os.environ.get('FLEET_DOOR_IMAGE')
+
+
+@unittest.skipUnless(DOOR_IMAGE and OPENSSL3 and shutil.which('docker') and shutil.which('socat')
+                     and sys.platform == 'linux', 'set FLEET_DOOR_IMAGE to an nginx image; needs docker, socat, '
+                                                  'OpenSSL 3.4 or later, and Linux (127.0.0.0/8 sources)')
+class DoorNginx(FleetBase):
+    # The rendered door, run by the deployed nginx (an image of the target's nginx package), against
+    # real fleet-shaped certificates. Sources 127.0.0.2 and up stand for distinct client addresses.
+    DEADLINE = 2
+
+    def setUp(self):
+        super().setUp()
+        self.enroll()
+        pki = self.pki = Pki(self.home / 'pki')
+        self.root = pki.ca('root', 'inter')
+        self.door = pki.leaf('door', 'door', 'inter')
+        self.client = pki.leaf('client', 'client', 'inter')
+        self.install_identity(*self.door)
+        self.backend = socket.socket()
+        self.backend.bind(('127.0.0.1', 0))
+        self.backend.listen(64)
+        self.addCleanup(self.backend.close)
+        threading.Thread(target=self.echo, daemon=True).start()
+        self.port = free_port()
+        self.prefix = self.home / 'root'
+        self.env.update(FLEET_DOOR_PREFIX=str(self.prefix), PATH=f'{Path(OPENSSL3).parent}:{self.env["PATH"]}')
+        out = self.prefix
+        r = self.fleet('door', 'render', str(out), '--listen', f'127.0.0.1:{self.port}',
+                       '--to', f'127.0.0.1:{self.backend.getsockname()[1]}', '--per-source', '3', '--max', '6',
+                       '--handshake-timeout', str(self.DEADLINE))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        (self.prefix / 'run').mkdir()
+        self.sync = self.prefix / 'usr/local/libexec/fleet-door-sync'
+        r = subprocess.run([str(self.sync), 'copy'], capture_output=True, text=True, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.conf = self.prefix / 'etc/fleet-door/nginx.conf'
+        self.name = f'fleet-door-test-{os.getpid()}-{self.port}'
+        subprocess.run(['docker', 'run', '-d', '--rm', '--name', self.name, '--network', 'host',
+                        '-v', f'{self.home}:{self.home}', DOOR_IMAGE, '/usr/sbin/nginx', '-c', str(self.conf),
+                        '-g', 'daemon off;'], check=True, capture_output=True, timeout=60)
+        self.addCleanup(subprocess.run, ['docker', 'rm', '-f', self.name], capture_output=True, timeout=60)
+        # nginx runs as root in the container and writes the pid file; let the test remove it.
+        self.addCleanup(subprocess.run, ['docker', 'exec', self.name, 'chmod', '-R', 'a+rwX', str(self.prefix)],
+                        capture_output=True, timeout=60)
+        (self.home / 'bin/systemctl').write_text(
+            f'#!/bin/sh\n[ "$1" = reload ] && exec docker exec {self.name} /usr/sbin/nginx -c {self.conf} -s reload\n'
+            'printf "systemctl %s\\n" "$*" >> "$HOME/scheduler.log"\n')
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            try:
+                socket.create_connection(('127.0.0.1', self.port), timeout=1).close()
+                break
+            except OSError:
+                time.sleep(0.2)
+        else:
+            logs = subprocess.run(['docker', 'logs', self.name], capture_output=True, text=True).stderr
+            self.fail(f'nginx did not listen: {logs}')
+
+    def install_identity(self, chain, key, _serial):
+        shutil.copy(chain, self.state / 'node.crt')
+        shutil.copy(key, self.state / 'node.key')
+        shutil.copy(self.root, self.state / 'root_ca.crt')
+
+    def echo(self):
+        while True:
+            try:
+                conn, _ = self.backend.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.echo_one, args=(conn,), daemon=True).start()
+
+    @staticmethod
+    def echo_one(conn):
+        with conn:
+            while data := conn.recv(4096):
+                conn.sendall(data)
+
+    def tls(self, identity=None, source='127.0.0.1', root=None, name='door'):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.load_verify_locations(root or self.root)
+        if identity:
+            ctx.load_cert_chain(identity[0], identity[1])
+        raw = socket.create_connection(('127.0.0.1', self.port), timeout=5, source_address=(source, 0))
+        return ctx.wrap_socket(raw, server_hostname=name)
+
+    def echoes(self, identity=None, source='127.0.0.1'):
+        # In TLS 1.3 the server checks the client certificate after the client's handshake ends, so
+        # a rejection shows as an alert or a close on the first read.
+        try:
+            with self.tls(identity, source) as s:
+                s.sendall(b'ping')
+                return s.recv(4) == b'ping'
+        except (OSError, ssl.SSLError):
+            return False
+
+    def slow(self, source, drip):
+        # A client that never finishes the handshake: silent, or one ClientHello byte every 0.3 s.
+        s = socket.create_connection(('127.0.0.1', self.port), timeout=10, source_address=(source, 0))
+        result = {'start': time.time(), 'closed': None}
+
+        def run():
+            hello = bytes([0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00, 0x01, 0xfc, 0x03, 0x03]) + bytes(600)
+            s.settimeout(0.3)
+            for i in range(len(hello)):
+                try:
+                    if drip:
+                        s.send(hello[i:i + 1])
+                    if s.recv(100) == b'':
+                        break
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+            result['closed'] = time.time() - result['start']
+            s.close()
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        result['thread'] = thread
+        return result
+
+    def served_serial(self):
+        with self.tls(self.client) as s:
+            return s.getpeercert()['serialNumber']
+
+    def test_only_current_fleet_client_certificates_reach_the_service(self):
+        pki = self.pki
+        pki.ca('evil', 'evilinter')
+        evil = pki.leaf('evilclient', 'client', 'evilinter')
+        expired = pki.leaf('expired', 'client', 'inter',
+                           validity=('-not_before', '20200101000000Z', '-not_after', '20200102000000Z'))
+        server_only = pki.leaf('serveronly', 'client', 'inter', eku='serverAuth')
+        self.assertTrue(self.echoes(self.client))
+        for label, identity in [('no certificate', None), ('another CA', evil), ('expired', expired),
+                                ('server use only', server_only)]:
+            self.assertFalse(self.echoes(identity), label)
+        old = subprocess.run([OPENSSL3, 's_client', '-connect', f'127.0.0.1:{self.port}', '-tls1_1', '-cipher',
+                              'DEFAULT:@SECLEVEL=0', '-cert', str(self.client[0]), '-key', str(self.client[1])],
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(old.returncode, 0)
+        self.assertIn('alert protocol version', old.stdout + old.stderr)
+
+    def tunnel_client(self, peer):
+        port = free_port()
+        r = self.fleet('tunnel', 'add', 'bb', '--mode', 'client', '--listen', f'127.0.0.1:{port}',
+                       '--to', f'127.0.0.1:{self.port}', '--peer', peer, FLEET_TUNNEL_NO_SERVICE='1')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        proc = subprocess.Popen(['bash', str(SCRIPT), 'tunnel', 'run', 'bb'], env=self.env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(proc.wait, 10)
+        self.addCleanup(proc.terminate)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                s = socket.create_connection(('127.0.0.1', port), timeout=5)
+                break
+            except OSError:
+                time.sleep(0.1)
+        with s:
+            s.sendall(b'ping')
+            try:
+                return s.recv(4) == b'ping'
+            except OSError:
+                return False
+
+    def test_the_fleet_tunnel_client_checks_the_server_name_and_ca(self):
+        self.assertTrue(self.tunnel_client('door'))
+        self.assertFalse(self.tunnel_client('brev-x86-cpu'))
+        # A door with a certificate from another CA, under the expected name.
+        self.pki.ca('evil', 'evilinter')
+        chain, key, _ = self.pki.leaf('evildoor', 'door', 'evilinter')
+        tls = self.prefix / 'etc/fleet-door/tls'
+        shutil.copy(chain, tls / 'node.crt')
+        shutil.copy(key, tls / 'node.key')
+        subprocess.run(['docker', 'exec', self.name, '/usr/sbin/nginx', '-c', str(self.conf), '-s', 'reload'],
+                       check=True, capture_output=True, timeout=30)
+        time.sleep(1)
+        self.assertFalse(self.tunnel_client('door'))
+
+    def test_slow_handshakes_end_at_the_deadline_and_capacity_returns(self):
+        # Fill the per-source limit (3) from one address with clients that never finish a handshake.
+        slow = [self.slow('127.0.0.2', drip) for drip in (False, True, True)]
+        time.sleep(0.3)
+        self.assertFalse(self.echoes(self.client, '127.0.0.2'))
+        self.assertTrue(self.echoes(self.client, '127.0.0.3'))
+        for s in slow:
+            s['thread'].join(10)
+            self.assertIsNotNone(s['closed'])
+            self.assertGreater(s['closed'], self.DEADLINE - 0.5)
+            self.assertLess(s['closed'], self.DEADLINE + 1.5)
+        self.assertTrue(self.echoes(self.client, '127.0.0.2'))
+
+    def test_the_global_limit_holds_across_sources_and_frees_at_the_deadline(self):
+        slow = [self.slow(f'127.0.0.{n}', True) for n in (2, 2, 3, 3, 4, 4)]
+        time.sleep(0.3)
+        self.assertFalse(self.echoes(self.client, '127.0.0.5'))
+        for s in slow:
+            s['thread'].join(10)
+            self.assertLess(s['closed'], self.DEADLINE + 1.5)
+        self.assertTrue(self.echoes(self.client, '127.0.0.5'))
+
+    def test_sync_reloads_the_served_certificate_and_fails_when_it_is_stale(self):
+        self.assertEqual(self.served_serial(), self.door[2])
+        renewed = self.pki.leaf('door2', 'door', 'inter')
+        self.install_identity(*renewed)
+        r = subprocess.run([str(self.sync)], capture_output=True, text=True, env=self.env, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.served_serial(), renewed[2])
+        # Unchanged: no reload, and the served certificate still checks out.
+        r = subprocess.run([str(self.sync)], capture_output=True, text=True, env=self.env, timeout=60)
+        self.assertEqual((r.returncode, r.stderr), (0, ''))
+        soon = time.strftime('%Y%m%d%H%M%SZ', time.gmtime(time.time() + 7200))
+        short = self.pki.leaf('door3', 'door', 'inter', validity=('-not_after', soon))
+        self.install_identity(*short)
+        r = subprocess.run([str(self.sync)], capture_output=True, text=True, env=self.env, timeout=60)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('expires within 8 hours', r.stderr)
+        self.assertEqual(self.served_serial(), short[2])
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
 
 
 class TestEnvironment(unittest.TestCase):

@@ -88,6 +88,12 @@ Any machine:
                                         gate: fleet certificates in, ciphertext through. --via sends a
                                         client through a gate with TLS inside TLS. --allow limits sources.
   tunnel run NAME | remove NAME | list
+  door install [--listen HOST:PORT] [--to HOST:PORT] [--per-source N] [--max N] [--handshake-timeout S]
+                                        Linux, sudo: run a public mTLS listener for fleet machines in front of a
+                                        local service (nginx stream, a root system service). Defaults: 0.0.0.0:8461
+                                        -> 127.0.0.1:38886, 64 connections per address, 1024 in all, 10 s to finish
+                                        the TLS handshake. Each certificate renewal reloads it.
+  door render DIR [same options] | door remove
   secret get NAME                       Print a secret from the broker, if the policy allows this machine.
   secret env VAR=NAME... -- CMD...      Run CMD with secrets in its environment. Values are not printed.
                                         NAME can be an op://VAULT/ITEM/[SECTION/]FIELD reference: pylon
@@ -100,7 +106,7 @@ Any machine:
   timer install | timer remove          Schedule renew every hour.
   status
   uninstall [--yes] [--keep-cert]       Revoke this machine's certificate, stop the fleet services
-                                        (renew, agent, tunnels), remove the authorized_keys CA line,
+                                        (renew, agent, tunnels, door), remove the authorized_keys CA line,
                                         and delete the fleet keys and settings. Alias: remove.
   install-step                          Linux: install the pinned step CLI into ~/.local/bin (~/.local/<arch>/bin on no-sudo hosts).
   install-pylon                         Install the pinned pylon from the broker into the same folder, and restart
@@ -1218,6 +1224,197 @@ cmd_tunnel() {
     esac
 }
 
+# The door is the public mTLS listener for fleet machines in front of a local TCP service (bb on
+# brev). A tunnel server cannot face the internet: socat forks before the TLS handshake, has no
+# handshake deadline (only a per-read timeout, which one byte every few seconds defeats), and so a
+# few slow clients fill any child limit (task 030 part 3b). nginx's stream module has a deadline for
+# the whole handshake (ssl_handshake_timeout, also in Ubuntu 22.04's 1.18), connection limits
+# that apply before the handshake, and event-driven workers. It runs as a root system service and
+# reads a root-only copy of this machine's certificate; a path unit and a timer copy each renewal
+# and reload nginx, then check the certificate it serves. Fleet clients keep fleet tunnel client
+# mode, which checks the door's fleet name.
+DOOR_PREFIX="${FLEET_DOOR_PREFIX:-}"
+DOOR_NGINX="${FLEET_DOOR_NGINX:-/usr/sbin/nginx}"
+DOOR_MODULE="${FLEET_DOOR_MODULE:-/usr/lib/nginx/modules/ngx_stream_module.so}"
+DOOR_UNITS="fleet-door.service fleet-door-sync.path fleet-door-sync.timer"
+DOOR_USAGE='usage: fleet door render DIR|install [--listen HOST:PORT] [--to HOST:PORT] [--per-source N] [--max N] [--handshake-timeout S] | remove'
+
+door_options() {
+    door_listen=0.0.0.0:8461 door_to=127.0.0.1:38886 door_per_source=64 door_max=1024 door_deadline=10
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --listen) door_listen="${2:-}"; shift 2 ;;
+            --to) door_to="${2:-}"; shift 2 ;;
+            --per-source) door_per_source="${2:-}"; shift 2 ;;
+            --max) door_max="${2:-}"; shift 2 ;;
+            --handshake-timeout) door_deadline="${2:-}"; shift 2 ;;
+            *) fail "$DOOR_USAGE" ;;
+        esac
+    done
+    valid_addr "$door_listen" || fail 'invalid --listen (HOST:PORT)'
+    valid_addr "$door_to" || fail 'invalid --to (HOST:PORT)'
+    [[ "$door_per_source" =~ ^[1-9][0-9]{0,4}$ ]] || fail 'invalid --per-source (connections per address)'
+    [[ "$door_max" =~ ^[1-9][0-9]{0,4}$ ]] || fail 'invalid --max (connections in all)'
+    [[ "$door_deadline" =~ ^[1-9][0-9]?$ && "$door_deadline" -le 60 ]] || fail 'invalid --handshake-timeout (1 to 60 seconds)'
+    # The paths go into nginx and systemd files unquoted.
+    [[ "$STATE$DOOR_PREFIX$DOOR_NGINX$DOOR_MODULE" =~ ^[A-Za-z0-9/._-]+$ ]] ||
+        fail "the fleet state or door paths have characters the door files cannot hold: $STATE"
+}
+
+door_render() {
+    local out="$1" p="$DOOR_PREFIX" tls="$DOOR_PREFIX/etc/fleet-door/tls"
+    local sync="$DOOR_PREFIX/usr/local/libexec/fleet-door-sync" units="$out/etc/systemd/system"
+    local check="$door_listen"
+    [[ "${check%:*}" == 0.0.0.0 ]] && check="127.0.0.1:${check##*:}"
+    mkdir -p "$out/etc/fleet-door" "$out/usr/local/libexec" "$units"
+    # worker_connections counts both sides of each connection, so it is above twice --max.
+    cat > "$out/etc/fleet-door/nginx.conf" <<EOF
+# Rendered by fleet door install. Mutual TLS with fleet certificates in front of $door_to.
+load_module $DOOR_MODULE;
+user www-data;
+worker_processes 2;
+worker_rlimit_nofile 16384;
+pid $p/run/fleet-door.pid;
+# A reload starts new workers; old ones keep their connections, for at most this long.
+worker_shutdown_timeout 1h;
+error_log stderr notice;
+events {
+    worker_connections 4096;
+}
+stream {
+    limit_conn_zone \$binary_remote_addr zone=door_source:10m;
+    limit_conn_zone \$server_port zone=door_all:1m;
+    server {
+        listen $door_listen ssl;
+        limit_conn door_source $door_per_source;
+        limit_conn door_all $door_max;
+        ssl_certificate $tls/node.crt;
+        ssl_certificate_key $tls/node.key;
+        ssl_client_certificate $tls/root_ca.crt;
+        ssl_verify_client on;
+        ssl_verify_depth 1;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers HIGH:!aNULL:!eNULL:!PSK;
+        ssl_handshake_timeout ${door_deadline}s;
+        proxy_connect_timeout 5s;
+        proxy_timeout 24h;
+        proxy_pass $door_to;
+    }
+}
+EOF
+    {
+        printf '#!/bin/bash\n# Rendered by fleet door install.\nset -euo pipefail\n'
+        printf 'src=%q\ndst=%q\ncheck=%q\n' "$STATE" "$tls" "$check"
+        cat <<'EOF'
+# copy: copy this machine's fleet certificate for nginx, which reads it as root at start and reload.
+# Without an argument, also reload nginx when the copy changed, then check what the door serves.
+stale=28800
+say() { printf 'fleet-door: %s\n' "$*" >&2; }
+die() { say "$*"; exit 1; }
+serial() { openssl x509 -noout -serial | sed 's/^serial=//'; }
+umask 077
+mkdir -p "$dst"
+chmod 700 "$dst"
+tmp=$(mktemp -d "$dst/.new.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+for f in node.crt node.key root_ca.crt; do
+    cp -- "$src/$f" "$tmp/$f" 2>/dev/null || die "cannot read $src/$f; is this machine enrolled?"
+done
+# fleet renew writes the certificate and the key one after the other; the path unit runs again.
+[[ "$(openssl x509 -noout -pubkey -in "$tmp/node.crt")" == "$(openssl pkey -pubout -in "$tmp/node.key")" ]] ||
+    die "the certificate and key in $src do not match; retrying at the next change or timer"
+openssl verify -CAfile "$tmp/root_ca.crt" -untrusted "$tmp/node.crt" "$tmp/node.crt" >/dev/null 2>&1 ||
+    die "the certificate in $src is expired or not issued by the fleet CA"
+changed=0
+for f in node.crt node.key root_ca.crt; do cmp -s "$tmp/$f" "$dst/$f" || changed=1; done
+if [[ "$changed" == 1 ]]; then
+    for f in node.key node.crt root_ca.crt; do mv -f "$tmp/$f" "$dst/$f"; done
+    say "copied certificate serial $(serial < "$dst/node.crt")"
+fi
+[[ "${1:-}" == copy ]] && exit 0
+[[ "$changed" == 0 ]] || systemctl reload fleet-door.service || die 'could not reload fleet-door.service'
+# A reload that nginx rejects keeps the old certificate, so check the served one, not the copy.
+want=$(serial < "$dst/node.crt") served=""
+for _ in $(seq 20); do
+    openssl s_client -connect "$check" -tls1_3 </dev/null 2>/dev/null | openssl x509 > "$tmp/served" 2>/dev/null || true
+    served=$(serial < "$tmp/served" 2>/dev/null || true)
+    [[ "$served" == "$want" ]] && break
+    sleep 0.5
+done
+[[ "$served" == "$want" ]] || die "the door at $check serves serial ${served:-none}, not $want"
+openssl x509 -noout -checkend "$stale" -in "$tmp/served" >/dev/null ||
+    die "the served certificate expires within 8 hours; check fleet renew on this machine"
+EOF
+    } > "$out/usr/local/libexec/fleet-door-sync"
+    chmod 755 "$out/usr/local/libexec/fleet-door-sync"
+    # nginx measured on Ubuntu 22.04's 1.18: about 60 KB per connection, so 1024 connections take
+    # about 70 MB; a reload can keep a second set of workers for up to an hour. TasksMax and MemoryMax
+    # leave room for that and stop a runaway.
+    printf '%s\n' '[Unit]' "Description=Fleet door: mTLS on $door_listen to $door_to" \
+        'After=network-online.target' 'Wants=network-online.target' 'StartLimitIntervalSec=0' '' '[Service]' \
+        "ExecStartPre=$sync copy" "ExecStart=$DOOR_NGINX -c $p/etc/fleet-door/nginx.conf -g 'daemon off;'" \
+        'ExecReload=/bin/kill -HUP $MAINPID' 'Restart=always' 'RestartSec=5' 'TasksMax=32' 'MemoryMax=256M' \
+        'LimitNOFILE=16384' 'NoNewPrivileges=yes' 'ProtectSystem=full' "ReadWritePaths=$tls" 'PrivateTmp=yes' '' \
+        '[Install]' 'WantedBy=multi-user.target' > "$units/fleet-door.service"
+    printf '%s\n' '[Unit]' 'Description=Copy the fleet certificate to the fleet door and check what it serves' \
+        '' '[Service]' 'Type=oneshot' "ExecStart=$sync" > "$units/fleet-door-sync.service"
+    printf '%s\n' '[Unit]' 'Description=Refresh the fleet door when the fleet certificate changes' '' '[Path]' \
+        "PathChanged=$STATE/node.crt" "PathChanged=$STATE/node.key" 'Unit=fleet-door-sync.service' '' \
+        '[Install]' 'WantedBy=multi-user.target' > "$units/fleet-door-sync.path"
+    printf '%s\n' '[Unit]' 'Description=Retry the fleet door refresh and check for a stale certificate' '' \
+        '[Timer]' 'OnBootSec=2min' 'OnUnitActiveSec=15min' '' '[Install]' 'WantedBy=timers.target' \
+        > "$units/fleet-door-sync.timer"
+}
+
+door_remove() {
+    local p="$DOOR_PREFIX"
+    # shellcheck disable=SC2086
+    sudo systemctl disable --now $DOOR_UNITS 2>/dev/null || true
+    sudo rm -rf "$p/etc/fleet-door" "$p/usr/local/libexec/fleet-door-sync" "$p/etc/systemd/system/fleet-door.service" \
+        "$p/etc/systemd/system/fleet-door-sync.service" "$p/etc/systemd/system/fleet-door-sync.path" \
+        "$p/etc/systemd/system/fleet-door-sync.timer"
+    sudo systemctl daemon-reload 2>/dev/null || true
+}
+
+cmd_door() {
+    local sub="${1:-}"; shift || true
+    case "$sub" in
+        render)
+            [[ -n "${1:-}" ]] || fail "$DOOR_USAGE"
+            local out="$1"; shift
+            door_options "$@"
+            door_render "$out" ;;
+        install)
+            door_options "$@"
+            need_enrollment
+            [[ -x "$DOOR_NGINX" && -f "$DOOR_MODULE" ]] ||
+                fail "nginx with the stream module is required: sudo apt-get install nginx-core libnginx-mod-stream"
+            scratch
+            door_render "$SCRATCH"
+            local p="$DOOR_PREFIX" f
+            sudo install -d -m 755 "$p/etc/fleet-door" "$p/usr/local/libexec" "$p/etc/systemd/system"
+            sudo install -d -m 700 "$p/etc/fleet-door/tls"
+            sudo install -m 644 "$SCRATCH/etc/fleet-door/nginx.conf" "$p/etc/fleet-door/nginx.conf"
+            sudo install -m 755 "$SCRATCH/usr/local/libexec/fleet-door-sync" "$p/usr/local/libexec/fleet-door-sync"
+            for f in fleet-door.service fleet-door-sync.service fleet-door-sync.path fleet-door-sync.timer; do
+                sudo install -m 644 "$SCRATCH/etc/systemd/system/$f" "$p/etc/systemd/system/$f"
+            done
+            sudo systemctl daemon-reload
+            # shellcheck disable=SC2086
+            sudo systemctl enable $DOOR_UNITS
+            sudo systemctl restart fleet-door.service
+            sudo systemctl restart fleet-door-sync.path fleet-door-sync.timer
+            # The first sync checks that the door serves this machine's certificate.
+            sudo systemctl start fleet-door-sync.service
+            printf 'fleet door: %s -> %s, %s per address, %s in all, handshake within %ss\n' \
+                "$door_listen" "$door_to" "$door_per_source" "$door_max" "$door_deadline" ;;
+        remove)
+            [[ $# -eq 0 ]] || fail "$DOOR_USAGE"
+            door_remove ;;
+        *) fail "$DOOR_USAGE" ;;
+    esac
+}
+
 # Remove everything fleet set up on this machine. The dotfiles still own the fleet script and the
 # Include line in ~/.ssh/config, which is harmless once ~/.ssh/fleet is gone.
 cmd_uninstall() {
@@ -1250,6 +1447,8 @@ cmd_uninstall() {
     for f in "$TUNNELS"/*; do
         [[ -f "$f" ]] && cmd_tunnel remove "${f##*/}"
     done
+    # The door reads this machine's certificate, which is deleted below.
+    [[ -f "$DOOR_PREFIX/etc/systemd/system/fleet-door.service" ]] && door_remove
     # The actl worker reads its seed and configuration from the fleet folders removed below.
     if [[ "$(uname -s)" == Darwin ]]; then
         launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/dev.fleet.agent.plist" 2>/dev/null || true
@@ -2453,6 +2652,7 @@ case "$command" in
     list) cmd_list "$@" ;;
     secret) cmd_secret "$@" ;;
     tunnel) cmd_tunnel "$@" ;;
+    door) cmd_door "$@" ;;
     uninstall|remove) cmd_uninstall "$@" ;;
     claude) cmd_secret env CLAUDE_CODE_OAUTH_TOKEN=claude-oauth-token -- claude "$@" ;;
     agent) cmd_agent "$@" ;;

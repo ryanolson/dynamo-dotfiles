@@ -438,6 +438,34 @@ Verification:
 timeout 300 python3 test/bb-server-url.py
 ```
 
+### Fleet door
+
+`fleet door` puts a public mutual-TLS listener in front of a local TCP service, for example the bb server on brev. Only fleet machines get through: a client must show a current fleet certificate that permits client use. Clients connect with `fleet tunnel add NAME --mode client --to HOST:8461 --peer NAME`, where `--peer` is the door machine's fleet name. A client checks the door's name and CA. A tunnel server (`fleet tunnel --mode server`) must not face the internet, because socat cannot limit how long a TLS handshake takes. The door uses nginx's stream module instead, as a root system service.
+
+```bash
+sudo apt-get install nginx-core libnginx-mod-stream   # Ubuntu 22.04: nginx 1.18
+sudo systemctl disable --now nginx                     # the door runs its own nginx
+fleet door install                                     # 0.0.0.0:8461 -> 127.0.0.1:38886
+fleet door remove
+```
+
+`install` takes `--listen HOST:PORT`, `--to HOST:PORT`, `--per-source N` (default 64 connections per address), `--max N` (default 1024 in all), and `--handshake-timeout S` (default 10 seconds). It writes `/etc/fleet-door/nginx.conf`, `/usr/local/libexec/fleet-door-sync`, and four units: `fleet-door.service`, and `fleet-door-sync.service` with a `.path` and a `.timer`.
+
+- A client that does not finish the TLS handshake within the deadline is disconnected, including a client that sends one byte at a time. The connection limits apply before the handshake. A full-size mTLS handshake from macOS to brev took 0.6 to 1.5 seconds.
+- nginx reads a root-only copy of this machine's certificate in `/etc/fleet-door/tls`. When `fleet renew` changes the certificate, the path unit copies it and reloads nginx. Before copying, it checks that the key matches the certificate and that the fleet CA issued the certificate. The timer repeats this every 15 minutes. Each run also checks the certificate that the door serves. The run fails, and shows in `systemctl --failed`, when that certificate does not match the copy or expires within 8 hours.
+- A reload keeps old connections on the old workers for at most one hour (`worker_shutdown_timeout`). An idle connection is closed after 24 hours.
+- nginx 1.18 has no `proxy_half_close`. When a client closes its sending side, nginx ends the connection, and the reply is lost. HTTP and WebSocket clients do not do this.
+- Measured on nginx 1.18: about 60 KB per connection, or about 70 MB for 1024 connections. The unit sets `MemoryMax=256M` and `TasksMax=32`.
+- `fleet uninstall` also removes the door.
+
+Verification: `test/test-fleet.py` checks the files that the door command writes. The `DoorNginx` tests run the door with a real nginx in Docker. They need Linux, docker, socat, and OpenSSL 3.4 or later (`FLEET_TEST_OPENSSL`), and an image of the target's nginx package:
+
+```bash
+printf 'FROM ubuntu:22.04\nRUN apt-get update && apt-get install -y --no-install-recommends nginx-core libnginx-mod-stream\n' |
+  docker build -t fleet-door-test:jammy -
+FLEET_DOOR_IMAGE=fleet-door-test:jammy timeout 600 python3 test/test-fleet.py Door DoorNginx
+```
+
 ### GitHub auth policy
 
 **`gh auth login` only. Never a personal access token.** No `GITHUB_TOKEN`, `GH_TOKEN`, or
