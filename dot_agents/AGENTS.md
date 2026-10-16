@@ -188,6 +188,10 @@ validation, or fallback behavior merely to satisfy a reviewer.
 - Use the `simple-english` skill for documentation, READMEs, PR descriptions, issue descriptions,
   and commit messages. Not for conversation.
 
+## Fleet
+
+`fleet` enrolls my machines with my own CA. On an enrolled machine (`fleet status` succeeds), a broker serves secrets, SSH signing, and tunnels without 1Password. Read `fleet --help` before use.
+
 ## Secrets
 
 Secrets live in 1Password and are injected on demand: `openv <cmd>` runs a command with the
@@ -195,6 +199,8 @@ variables in `~/.config/dynamo/dev.env.fleet`, from the fleet broker first and f
 `op run --env-file` when the broker fails. Never inline a secret, never echo one into a
 transcript or a log, and never write one to disk except as below. If a command needs a credential,
 wrap it in `openv` rather than exporting the value into the shell.
+
+**A command that prints a secret.** When a doc says to pipe in a token (for example `<command that prints your token> | tool login --stdin`), pipe `fleet secret get "<op ref>"`. If fleet returns 404 and `op` is installed, pipe `op read "<op ref>"`. Take the reference from the known items below. If none fits, find candidates with `op item list` and ask me which one to use.
 
 **The one on-disk exception: a rendered `.env`.** A tool that must run without prompts (an MCP
 server, a daemon) may read a `.env` that is gitignored, mode 600, and generated from a mapping of
@@ -208,6 +214,9 @@ json`), never print a value, and ask only when the right item is ambiguous. Know
 
 - NGC personal key, NIM Operations (`goirlvsxnepa`): `op://Development/NGC NIM Operations PAT/credential`.
   An `nvapi-` key; works for the API gateway and the `ngc` CLI in that org.
-- GitLab PAT for `gitlab-master.nvidia.com`: `op://Personal/glab pat/credential`. Log `glab` in
-  with `op read ... | glab auth login --hostname gitlab-master.nvidia.com --stdin`.
+  The `Fleet` vault has a copy: `op://Fleet/NGC NIM Operations PAT/credential`.
+- GitLab PAT for `gitlab-master.nvidia.com`: `op://Fleet/NV Gitlab PAT/credential`. Log in with
+  `<command that prints the secret> | glab auth login --hostname gitlab-master.nvidia.com
+  --git-protocol ssh --stdin`. On 2026-10-15 the broker policy did not list this item (404), so
+  only `op read` worked.
 - `Development/NGC` and `Corp/NGC` are legacy NGC keys: the API gateway rejects them (401).
