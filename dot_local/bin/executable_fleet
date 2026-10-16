@@ -103,6 +103,7 @@ Any machine:
   secret flush --all [--commit SHA] [--timeout S]
                                         Laptop: empty it on every enrolled machine (fleet task secrets-flush --all).
   claude [ARGS...]                      Run claude with CLAUDE_CODE_OAUTH_TOKEN from the secret claude-oauth-token.
+  codex [ARGS...]                       Run codex with CODEX_ACCESS_TOKEN from the secret codex-access-token.
   trust [--principal NAME] | untrust    Add or remove the CA line in ~/.ssh/authorized_keys.
   timer install | timer remove          Schedule renew every hour.
   status
@@ -2849,6 +2850,7 @@ case "$command" in
     door) cmd_door "$@" ;;
     uninstall|remove) cmd_uninstall "$@" ;;
     claude) cmd_secret env CLAUDE_CODE_OAUTH_TOKEN=claude-oauth-token -- claude "$@" ;;
+    codex) cmd_secret env CODEX_ACCESS_TOKEN=codex-access-token -- codex "$@" ;;
     agent) cmd_agent "$@" ;;
     install-step) install_step ;;
     install-pylon) install_pylon ;;

@@ -957,6 +957,17 @@ class FleetLaptop(FleetBase):
         self.assertTrue((self.home / 'curl-args').read_text().splitlines()[-1].endswith('/v1/secrets/claude-oauth-token'))
 
 
+    def test_codex_launcher_supplies_the_access_token(self):
+        self.secret_curl()
+        codex = self.home / 'bin/codex'
+        codex.write_text('#!/bin/sh\nprintf "%s %s" "$CODEX_ACCESS_TOKEN" "$*" > "$HOME/codex-run"\n')
+        codex.chmod(0o700)
+        result = self.fleet('codex', 'exec', 'hi')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.home / 'codex-run').read_text(), 'tok-123 exec hi')
+        self.assertTrue((self.home / 'curl-args').read_text().splitlines()[-1].endswith('/v1/secrets/codex-access-token'))
+
+
 class FleetEphemeral(FleetBase):
     def start(self, *extra):
         runtime = self.home / 'run'

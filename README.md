@@ -350,12 +350,13 @@ The tests do not pass the parent environment to `fleet`. They pass only `PATH`, 
 
 ### Fleet secrets
 
-The broker serves named secrets to fleet machines. A policy on the CA host decides which machine names can read each secret. Values are not printed by `fleet secret env` or `fleet claude`.
+The broker serves named secrets to fleet machines. A policy on the CA host decides which machine names can read each secret. Values are not printed by `fleet secret env`, `fleet claude`, or `fleet codex`.
 
 ```bash
 fleet secret get NAME                          # print the value
 fleet secret env VAR=NAME... -- CMD...         # run CMD with the values in its environment
 fleet claude [ARGS...]                         # run claude with CLAUDE_CODE_OAUTH_TOKEN from the secret claude-oauth-token
+fleet codex [ARGS...]                          # run codex with CODEX_ACCESS_TOKEN from the secret codex-access-token
 ```
 
 The broker URL defaults to port 8443 on the CA host. `fleet init --broker-url` overrides it.
