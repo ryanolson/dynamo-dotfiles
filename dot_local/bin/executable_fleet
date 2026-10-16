@@ -893,6 +893,7 @@ ref_value() {
 # and no op. A refusal is final, because a retry or another source could outlive the admission.
 eph_value() {
     local sock="$FLEET_EPH_SOCKET" path out status
+    [[ -n "$sock" ]] || fail 'FLEET_EPH_SOCKET is set but empty'
     if [[ "$1" == op://* ]]; then
         valid_ref "$1" || fail "invalid secret reference: $1"
         path="/v1/secrets?ref=$(encode_ref "$1")"
@@ -914,7 +915,8 @@ eph_value() {
 }
 
 secret_value() {
-    if [[ -n "${FLEET_EPH_SOCKET:-}" ]]; then
+    # Set but empty is a broken task environment, not "no socket": it must not reach the broker.
+    if [[ -n "${FLEET_EPH_SOCKET+x}" ]]; then
         eph_value "$1"
         return
     fi

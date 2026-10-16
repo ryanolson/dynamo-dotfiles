@@ -1085,6 +1085,24 @@ class FleetEphSocket(FleetBase):
         self.assertEqual(self.requests, [])
         self.assert_socket_only()
 
+    def test_an_empty_variable_is_refused_without_another_source(self):
+        result = self.fleet('secret', 'get', self.NAME, FLEET_EPH_SOCKET='', EPH_TEST_SOCK=str(self.sock))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('FLEET_EPH_SOCKET', result.stderr)
+        self.assertNotIn('not enrolled', result.stderr)
+        self.assertEqual(self.requests, [])
+        self.assert_socket_only()
+
+    def test_another_status_is_an_error(self):
+        self.answers[f'/v1/secrets/{self.NAME}'] = (503, b'unavailable\n')
+        result = self.eph('secret', 'get', self.NAME)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, '')
+        self.assertIn('503', result.stderr)
+        self.assertNotIn('unavailable', result.stderr)
+        self.assertEqual(self.requests, [f'/v1/secrets/{self.NAME}'])
+        self.assert_socket_only()
+
     def test_without_the_variable_the_socket_is_not_used(self):
         self.answers[f'/v1/secrets/{self.NAME}'] = (200, b'eph-token-1')
         result = self.fleet('secret', 'get', self.NAME, EPH_TEST_SOCK=str(self.sock))
