@@ -128,7 +128,7 @@ Fleet tasks through actl (the controller runs on the host that the broker's /v1/
                                         running attempts, and drain markers.
   worker enroll HOST [--controller HOST] [--provisioner PATH] [--fleet-config PATH] [--timeout S]
                                         Laptop: install the worker on HOST over SSH, enroll it on the
-                                        controller host (default bb, provisioner ~/repos/agentic-control-fleet),
+                                        controller host (default fleet-command, provisioner ~/repos/agentic-control-fleet),
                                         add it to the fleet-config roster, and wait until it connects.
   actl client-init                      Laptop: create the client.cli seed and print its public key.
   actl client-config                    Laptop: write client.toml and ca.pem from the broker, again on each run.
@@ -2419,7 +2419,7 @@ cmd_worker_enroll() {
     [[ $# -ge 1 ]] || fail 'usage: fleet worker enroll HOST [--controller HOST] [--provisioner PATH] [--fleet-config PATH] [--timeout S]'
     local host="$1"; shift
     valid_ssh_host "$host" || fail 'invalid HOST'
-    local controller="${FLEET_ACTL_CONTROLLER:-bb}" provisioner="${FLEET_ACTL_PROVISIONER:-~/repos/agentic-control-fleet}"
+    local controller="${FLEET_ACTL_CONTROLLER:-fleet-command}" provisioner="${FLEET_ACTL_PROVISIONER:-~/repos/agentic-control-fleet}"
     local fleet_config="${FLEET_CONFIG_REPO:-$HOME/repos/fleet-config}" timeout=120
     while [[ $# -gt 0 ]]; do
         case "$1" in

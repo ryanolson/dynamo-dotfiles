@@ -406,7 +406,7 @@ On the admin laptop:
 ```bash
 fleet actl client-init        # once, before the deployment: prints the client.cli public key
 fleet actl client-config      # after /v1/actl is published, and after it changes: writes client.toml and ca.pem
-fleet worker enroll HOST [--controller bb] [--provisioner '~/repos/agentic-control-fleet'] [--fleet-config ~/repos/fleet-config] [--timeout 120]
+fleet worker enroll HOST [--controller fleet-command] [--provisioner '~/repos/agentic-control-fleet'] [--fleet-config ~/repos/fleet-config] [--timeout 120]
 fleet task NAME --host ID... | --all [--commit SHA] [--timeout 600]
 fleet task --resume RUN [--timeout 600]
 fleet secret flush --all [--commit SHA] [--timeout 600]   # fleet task secrets-flush --all
