@@ -2994,7 +2994,8 @@ class Door(FleetBase):
                      f'ssl_certificate_key {p}/etc/fleet-door/tls/current/node.key;',
                      f'ssl_client_certificate {p}/etc/fleet-door/tls/current/root_ca.crt;', 'ssl_verify_client on;',
                      'ssl_verify_depth 1;', 'ssl_protocols TLSv1.2 TLSv1.3;', 'ssl_ciphers HIGH:!aNULL:!eNULL:!PSK;',
-                     'ssl_handshake_timeout 10s;', 'proxy_pass 127.0.0.1:38886;']:
+                     'ssl_handshake_timeout 10s;', 'proxy_pass 127.0.0.1:38886;', '127.0.0.1 "";',
+                     'limit_conn_zone $door_all_key zone=door_all:1m;']:
             self.assertIn(line, conf)
         unit = self.lines(files['etc/systemd/system/fleet-door.service'])
         for line in [f'ExecStartPre={p}/usr/local/libexec/fleet-door-sync copy',
@@ -3035,12 +3036,18 @@ class Door(FleetBase):
                      ('--per-source', 'x'), ('--max', '8;'), ('--handshake-timeout', '0'),
                      ('--handshake-timeout', '61'), ('--handshake-timeout', '5s'), ('--bogus', '1')]:
             self.assertNotEqual(self.fleet('door', 'render', out, *args).returncode, 0, args)
+        # The served-certificate check runs from loopback, which the total limit does not count.
+        for listen in ['10.0.0.5:8461', '100.112.182.96:8461', 'door.example:8461']:
+            r = self.fleet('door', 'render', out, '--listen', listen)
+            self.assertNotEqual(r.returncode, 0, listen)
+            self.assertIn('0.0.0.0 or a 127.', r.stderr)
         self.assertNotEqual(self.fleet('door', 'bogus').returncode, 0)
         self.assertNotEqual(self.fleet('door', 'render').returncode, 0)
 
     def install_stubs(self):
         bin_dir = self.home / 'bin'
-        (bin_dir / 'sudo').write_text('#!/bin/sh\nexec "$@"\n')
+        (bin_dir / 'sudo').write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$HOME/sudo.log"\n'
+                                      '[ "$1" = -v ] && exit 0\nexec "$@"\n')
         (bin_dir / 'sudo').chmod(0o700)
         nginx = self.home / 'nginx'
         nginx.write_text('#!/bin/sh\nexit 0\n')
@@ -3065,6 +3072,26 @@ class Door(FleetBase):
                                'systemctl restart fleet-door.service',
                                'systemctl restart fleet-door-sync.path fleet-door-sync.timer',
                                'systemctl start fleet-door-sync.service'])
+
+    def test_install_never_gives_root_a_file_the_user_can_write(self):
+        # A process running as the user could swap such a file during the sudo prompt; the sync
+        # script then runs as root. Content goes to root on stdin, and sudo names only destinations.
+        self.enroll()
+        env = self.install_stubs()
+        result = self.fleet('door', 'install', **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = (self.home / 'sudo.log').read_text().splitlines()
+        self.assertEqual(calls[0], '-v')
+        for call in calls:
+            for word in call.split():
+                if word.startswith('/'):
+                    self.assertTrue(word.startswith(str(self.prefix) + '/'), call)
+        out = self.home / 'out'
+        self.assertEqual(self.fleet('door', 'render', str(out), **env).returncode, 0)
+        for path in [p for p in out.rglob('*') if p.is_file()]:
+            rel = path.relative_to(out)
+            self.assertEqual((self.prefix / rel).read_text(), path.read_text(), rel)
+            self.assertEqual(self.mode(self.prefix / rel), self.mode(path), rel)
 
     def test_install_needs_enrollment_and_the_nginx_stream_module(self):
         env = self.install_stubs()
@@ -3110,9 +3137,15 @@ class Door(FleetBase):
             shutil.copy(ca, self.state / 'root_ca.crt')
             return subprocess.run([str(sync), 'copy'], capture_output=True, text=True, env=dict(self.env, **env))
 
+        # A door from before the version folders kept its files flat in tls/.
+        tls.mkdir(parents=True)
+        for f in ('node.crt', 'node.key', 'root_ca.crt'):
+            (tls / f).write_text('old')
         r = use(good, good_key)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn(f'serial {serial}', r.stderr)
+        for f in ('node.crt', 'node.key', 'root_ca.crt'):
+            self.assertFalse((tls / f).exists(), f)
         self.assertEqual((tls / 'current/node.crt').read_text(), good.read_text())
         self.assertEqual(self.mode(tls), 0o700)
         self.assertEqual(self.mode(tls / 'current/node.key'), 0o600)
@@ -3205,6 +3238,56 @@ class Door(FleetBase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn('serves serial none', r.stderr)
         self.assertLess(time.time() - start, 40)
+
+    @unittest.skipUnless(OPENSSL3 and shutil.which('timeout'), 'needs OpenSSL 3.4 or later and timeout')
+    def test_sync_releases_the_lock_before_it_reloads_the_door(self):
+        # systemctl reload waits for a start in progress, whose ExecStartPre (sync copy) takes the lock.
+        # systemd starts ExecStartPre with its own environment, so the stand-in drops FLEET_DOOR_LOCKED.
+        self.enroll()
+        pki = Pki(self.home / 'pki')
+        root = pki.ca('root', 'inter')
+        self.pin(pki.fingerprint(root))
+        first, renewed = pki.leaf('door', 'door', 'inter'), pki.leaf('door2', 'door', 'inter')
+        env = dict(self.env, PATH=f'{Path(OPENSSL3).parent}:{self.env["PATH"]}')
+
+        def use(identity):
+            shutil.copy(identity[0], self.state / 'node.crt')
+            shutil.copy(identity[1], self.state / 'node.key')
+            shutil.copy(root, self.state / 'root_ca.crt')
+
+        use(first)
+        port = free_port()
+        out, _ = self.render('--listen', f'127.0.0.1:{port}')
+        sync = out / 'usr/local/libexec/fleet-door-sync'
+        self.assertEqual(subprocess.run([str(sync), 'copy'], capture_output=True, env=env).returncode, 0)
+        # The door stand-in serves tls/current; a reload restarts it, as nginx rereads the files.
+        current = self.prefix / 'etc/fleet-door/tls/current'
+        door = (f'{OPENSSL3} s_server -accept 127.0.0.1:{port} -www -cert {current}/node.crt '
+                f'-key {current}/node.key </dev/null >/dev/null 2>&1 & echo $! > "$HOME/door.pid"')
+        subprocess.run(['sh', '-c', door], env=env, check=True)
+        self.addCleanup(lambda: subprocess.run(['sh', '-c', 'kill $(cat "$HOME/door.pid")'], env=env))
+        (self.home / 'bin/systemctl').write_text(
+            f'#!/bin/sh\n[ "$1" = reload ] || exit 0\nenv -u FLEET_DOOR_LOCKED timeout 20 {sync} copy\nrc=$?\n'
+            'echo "reload copy rc=$rc" >> "$HOME/scheduler.log"\n'
+            f'kill $(cat "$HOME/door.pid"); sleep 0.5; {door}\nexit $rc\n')
+        (self.home / 'bin/systemctl').chmod(0o700)
+        use(renewed)
+        r = subprocess.run([str(sync)], capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr + (self.home / 'scheduler.log').read_text())
+        self.assertIn('reload copy rc=0', (self.home / 'scheduler.log').read_text())
+
+    def test_renew_warns_when_the_fleet_ca_differs_from_the_door(self):
+        self.enroll()
+        env = self.install_stubs()
+        self.assertEqual(self.fleet('door', 'install', **env).returncode, 0)
+        r = self.fleet('renew', **env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn('fleet door', r.stderr)
+        self.pin('cd' * 32)
+        r = self.fleet('renew', **env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('fleet door install', r.stderr)
+        self.assertIn('ab' * 32, r.stderr)
 
 
 DOOR_IMAGE = os.environ.get('FLEET_DOOR_IMAGE')
