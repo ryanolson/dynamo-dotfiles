@@ -3066,6 +3066,19 @@ class Door(FleetBase):
         module.write_text('')
         return dict(FLEET_DOOR_NGINX=str(nginx), FLEET_DOOR_MODULE=str(module))
 
+    def test_install_works_where_sudo_v_asks_for_a_password(self):
+        # A sudoers file with both a password rule and a NOPASSWD rule makes sudo -v ask for a
+        # password (verifypw=all), while sudo -n runs commands. brev is set up this way.
+        self.enroll()
+        env = self.install_stubs()
+        (self.home / 'bin/sudo').write_text(
+            '#!/bin/sh\nprintf "%s\\n" "$*" >> "$HOME/sudo.log"\n'
+            '[ "$1" = -v ] && { echo "sudo: a password is required" >&2; exit 1; }\n'
+            '[ "$1" = -n ] && shift\nexec "$@"\n')
+        result = self.fleet('door', 'install', **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.prefix / 'etc/fleet-door/nginx.conf').exists())
+
     def test_install_writes_root_files_and_starts_the_units(self):
         self.enroll()
         env = self.install_stubs()
@@ -3091,7 +3104,8 @@ class Door(FleetBase):
         result = self.fleet('door', 'install', **env)
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = (self.home / 'sudo.log').read_text().splitlines()
-        self.assertEqual(calls[0], '-v')
+        # Credentials come first: sudo -n true where no password is needed, else sudo -v.
+        self.assertIn(calls[0], ('-n true', '-v'))
         for call in calls:
             for word in call.split():
                 if word.startswith('/'):

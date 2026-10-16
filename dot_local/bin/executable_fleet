@@ -1477,7 +1477,9 @@ cmd_door() {
                 fail "nginx with the stream module is required: sudo apt-get install nginx-core libnginx-mod-stream"
             door_fingerprint
             local p="$DOOR_PREFIX" entry rel content
-            sudo -v
+            # sudo -v asks for a password when any sudoers rule needs one, even beside a NOPASSWD
+            # rule, so try a command without a password first.
+            sudo -n true 2>/dev/null || sudo -v
             sudo install -d -m 755 "$p/etc/fleet-door" "$p/usr/local/libexec" "$p/etc/systemd/system"
             sudo install -d -m 700 "$p/etc/fleet-door/tls"
             # Each file goes to root on stdin and lands in a root-owned folder: no file the user can
