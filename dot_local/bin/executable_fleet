@@ -28,7 +28,14 @@ ACTL_VERSION=0.3.0
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fleet"
 CONFIG="$CONFIG_DIR/config"
-STATE="${XDG_STATE_HOME:-$HOME/.local/state}/fleet"
+STATE="${FLEET_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/fleet}"
+# FLEET_STATE_DIR keeps the identity on node-local disk when the home is shared (Slurm). Services get
+# it in their unit files, so it must be absolute and hold no character a unit, plist, or crontab
+# line would read as syntax.
+if [[ -n "${FLEET_STATE_DIR:-}" && ! "$FLEET_STATE_DIR" =~ ^/[A-Za-z0-9/._-]+$ ]]; then
+    printf 'fleet: FLEET_STATE_DIR must be an absolute path of letters, digits, and /._-: %s\n' "$FLEET_STATE_DIR" >&2
+    exit 1
+fi
 # The actl fleet deployment (task 029). Tasks fetch the public dotfiles at a commit, without credentials.
 DOTFILES_URL=https://github.com/ryanolson/dynamo-dotfiles.git
 ACTL_CONFIG_DIR="$CONFIG_DIR/actl"
@@ -107,6 +114,10 @@ Any machine:
   trust [--principal NAME] | untrust    Add or remove the CA line in ~/.ssh/authorized_keys.
   timer install | timer remove          Schedule renew every hour.
   status
+  doctor                                Print the state directory and its file system type. Warn when it is
+                                        on a network file system (NFS, Lustre, GPFS, SMB, BeeGFS).
+                                        FLEET_STATE_DIR moves the state directory (default
+                                        ~/.local/state/fleet) to node-local disk; services get it too.
   uninstall [--yes] [--keep-cert]       Revoke this machine's certificate, stop the fleet services
                                         (renew, agent, tunnels, door), remove the authorized_keys CA line,
                                         and delete the fleet keys and settings. Alias: remove.
@@ -707,11 +718,21 @@ cmd_renew() {
     write_ssh_config
 }
 
+# A service starts without the caller's environment, so its unit names FLEET_STATE_DIR when it is set.
+state_env_systemd() { [[ -z "${FLEET_STATE_DIR:-}" ]] || printf 'Environment=FLEET_STATE_DIR=%s\n' "$FLEET_STATE_DIR"; }
+state_env_launchd() {
+    [[ -z "${FLEET_STATE_DIR:-}" ]] ||
+        printf '    <key>EnvironmentVariables</key><dict><key>FLEET_STATE_DIR</key><string>%s</string></dict>\n' "$FLEET_STATE_DIR"
+}
+
 timer_systemd() {
     local dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
     mkdir -p "$dir"
-    printf '%s\n' '[Unit]' 'Description=Renew fleet certificates' '' '[Service]' 'Type=oneshot' \
-        "ExecStart=$SELF renew" > "$dir/fleet-renew.service"
+    {
+        printf '%s\n' '[Unit]' 'Description=Renew fleet certificates' '' '[Service]' 'Type=oneshot'
+        state_env_systemd
+        printf '%s\n' "ExecStart=$SELF renew"
+    } > "$dir/fleet-renew.service"
     printf '%s\n' '[Unit]' 'Description=Renew fleet certificates every hour' '' '[Timer]' 'OnBootSec=2min' \
         'OnUnitActiveSec=1h' 'Persistent=true' '' '[Install]' 'WantedBy=timers.target' > "$dir/fleet-renew.timer"
     systemctl --user daemon-reload
@@ -732,6 +753,7 @@ timer_launchd() {
 <dict>
     <key>Label</key><string>dev.fleet.renew</string>
     <key>ProgramArguments</key><array><string>$SELF</string><string>renew</string></array>
+$(state_env_launchd)
     <key>StartInterval</key><integer>3600</integer>
     <key>RunAtLoad</key><true/>
 </dict>
@@ -744,7 +766,8 @@ EOF
 timer_cron() {
     command -v crontab >/dev/null || fail 'no systemd user session, launchd, or crontab. Run: fleet renew --loop'
     { crontab -l 2>/dev/null | grep -v '# fleet-renew$' || true
-      printf '17 * * * * %s renew >/dev/null 2>&1 # fleet-renew\n' "$SELF"; } | crontab -
+      printf '17 * * * * %s%s renew >/dev/null 2>&1 # fleet-renew\n' \
+          "${FLEET_STATE_DIR:+FLEET_STATE_DIR=$FLEET_STATE_DIR }" "$SELF"; } | crontab -
 }
 
 cmd_timer() {
@@ -1011,6 +1034,7 @@ agent_install() {
 <dict>
     <key>Label</key><string>dev.fleet.agent</string>
     <key>ProgramArguments</key><array><string>$SELF</string><string>agent</string></array>
+$(state_env_launchd)
     <key>KeepAlive</key><true/>
     <key>RunAtLoad</key><true/>
     <key>StandardErrorPath</key><string>$HOME/Library/Logs/fleet-agent.log</string>
@@ -1022,8 +1046,11 @@ EOF
     elif systemctl --user show-environment >/dev/null 2>&1; then
         local dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
         mkdir -p "$dir"
-        printf '%s\n' '[Unit]' 'Description=Fleet SSH agent bridge' '' '[Service]' "ExecStart=$SELF agent" \
-            'Restart=always' 'RestartSec=5' '' '[Install]' 'WantedBy=default.target' > "$dir/fleet-agent.service"
+        {
+            printf '%s\n' '[Unit]' 'Description=Fleet SSH agent bridge' '' '[Service]'
+            state_env_systemd
+            printf '%s\n' "ExecStart=$SELF agent" 'Restart=always' 'RestartSec=5' '' '[Install]' 'WantedBy=default.target'
+        } > "$dir/fleet-agent.service"
         systemctl --user daemon-reload
         systemctl --user enable --now fleet-agent.service
     else
@@ -1117,6 +1144,7 @@ tunnel_unit_install() {
 <dict>
     <key>Label</key><string>dev.fleet.tunnel.$tname</string>
     <key>ProgramArguments</key><array><string>$SELF</string><string>tunnel</string><string>run</string><string>$tname</string></array>
+$(state_env_launchd)
     <key>KeepAlive</key><true/>
     <key>RunAtLoad</key><true/>
     <key>StandardErrorPath</key><string>$HOME/Library/Logs/fleet-tunnel-$tname.log</string>
@@ -1129,8 +1157,9 @@ EOF
         local dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
         mkdir -p "$dir"
         {
-            printf '%s\n' '[Unit]' "Description=Fleet tunnel $tname ($mode)" '' '[Service]' \
-                "ExecStart=$SELF tunnel run $tname" 'Restart=always' 'RestartSec=5'
+            printf '%s\n' '[Unit]' "Description=Fleet tunnel $tname ($mode)" '' '[Service]'
+            state_env_systemd
+            printf '%s\n' "ExecStart=$SELF tunnel run $tname" 'Restart=always' 'RestartSec=5'
             [[ "$mode" != client ]] && printf '%s\n' 'RuntimeMaxSec=6h'
             printf '%s\n' '' '[Install]' 'WantedBy=default.target'
         } > "$dir/fleet-tunnel-$tname.service"
@@ -1570,6 +1599,46 @@ cmd_agent() {
         remove) agent_remove ;;
         *) fail 'usage: fleet agent [run|install|remove]' ;;
     esac
+}
+
+# network_fs TYPE: true when TYPE, as findmnt, GNU stat -f, or the macOS mount table names it, is a
+# network or cluster file system. Shared state there lets two nodes renew one identity at once.
+network_fs() {
+    case "$(tr '[:upper:]' '[:lower:]' <<<"$1")" in
+        nfs|nfs3|nfs4|lustre|gpfs|cifs|smb|smb2|smb3|smbfs|beegfs|afs|ceph|glusterfs|9p|v9fs|davfs|webdav|afpfs|\
+        panfs|wekafs|ocfs2|gfs2|sshfs|fuse.sshfs|fuse.glusterfs|fuse.ceph*|fuse.s3fs|fuse.gcsfuse|fuse.rclone|\
+        fuse.juicefs|fuse.beegfs) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# fs_type DIR: the file system type of DIR, or nothing when the platform tools cannot tell.
+fs_type() {
+    if [[ "$(uname -s)" == Darwin ]]; then
+        # macOS stat has no file system type. Find the mount point with df, then its type in mount.
+        local mp
+        mp=$(df -P "$1" 2>/dev/null | awk 'NR == 2 { for (i = 6; i <= NF; i++) printf "%s%s", (i > 6 ? " " : ""), $i }') || true
+        [[ -n "$mp" ]] || return 0
+        { command -v mount >/dev/null && mount || /sbin/mount; } 2>/dev/null |
+            awk -v mp="$mp" '{ i = index($0, " on " mp " ("); if (i) { s = substr($0, i + length(mp) + 6); sub(/[,)].*/, "", s); t = s } }
+                END { if (t != "") print t }' || true
+    elif command -v findmnt >/dev/null; then
+        findmnt -n -o FSTYPE -T "$1" 2>/dev/null || true
+    else
+        stat -f -c %T "$1" 2>/dev/null || true
+    fi
+}
+
+cmd_doctor() {
+    local dir="$STATE" type
+    while [[ ! -e "$dir" ]]; do dir=$(dirname "$dir"); done
+    type=$(fs_type "$dir")
+    printf 'state: %s (%s)\n' "$STATE" "${type:-file system type unknown}"
+    if [[ -n "$type" ]] && network_fs "$type"; then
+        printf 'fleet: warning: the state directory %s is on a network file system (%s). Keys and the renewal lock belong on node-local disk; set FLEET_STATE_DIR to a local directory.\n' \
+            "$STATE" "$type" >&2
+    fi
+    return 0
 }
 
 cmd_status() {
@@ -2052,6 +2121,7 @@ render_worker() {
     env_args=(-u GIT_CONFIG_GLOBAL -u GIT_CONFIG_NOSYSTEM -u GIT_TERMINAL_PROMPT -u GIT_LFS_SKIP_SMUDGE
         "HOME=$HOME" "USER=$user" "LOGNAME=$user" "LANG=$lang" "XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}"
         "XDG_STATE_HOME=${XDG_STATE_HOME:-$HOME/.local/state}")
+    [[ -z "${FLEET_STATE_DIR:-}" ]] || env_args+=("FLEET_STATE_DIR=$FLEET_STATE_DIR")
     # The runtime folder of the user who runs install (user_bus fills it for an SSH session without
     # one): systemctl --user finds the user manager through it, and pylon keeps its sockets in it.
     [[ "$os" == linux ]] && env_args+=("XDG_RUNTIME_DIR=$(user_runtime_dir)")
@@ -2115,6 +2185,7 @@ render_worker_service() {
 <dict>
     <key>Label</key><string>dev.fleet.worker</string>
     <key>ProgramArguments</key><array><string>$SELF</string><string>worker</string><string>run</string></array>
+$(state_env_launchd)
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
     <key>ExitTimeOut</key><integer>60</integer>
@@ -2126,9 +2197,12 @@ EOF
     else
         # systemd expands % specifiers and $ variables in ExecStart, so the unit would run another path.
         [[ "$config$actl$SELF" != *[%\$]* ]] || fail 'the worker paths must not contain % or $ for a systemd unit'
-        printf '%s\n' '[Unit]' 'Description=Fleet actl worker' '' '[Service]' \
-            "ExecStartPre=-$SELF worker refresh" "ExecStart=$actl --config $config worker" 'Restart=always' 'RestartSec=30' 'TimeoutStopSec=90' '' \
-            '[Install]' 'WantedBy=default.target' > "$out"
+        {
+            printf '%s\n' '[Unit]' 'Description=Fleet actl worker' '' '[Service]'
+            state_env_systemd
+            printf '%s\n' "ExecStartPre=-$SELF worker refresh" "ExecStart=$actl --config $config worker" 'Restart=always' \
+                'RestartSec=30' 'TimeoutStopSec=90' '' '[Install]' 'WantedBy=default.target'
+        } > "$out"
     fi
 }
 
@@ -2844,6 +2918,7 @@ case "$command" in
     untrust) cmd_untrust ;;
     timer) cmd_timer "$@" ;;
     status) cmd_status ;;
+    doctor) cmd_doctor ;;
     list) cmd_list "$@" ;;
     secret) cmd_secret "$@" ;;
     tunnel) cmd_tunnel "$@" ;;

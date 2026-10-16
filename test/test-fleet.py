@@ -1015,6 +1015,111 @@ class FleetEphemeral(FleetBase):
         self.assertIn('persistent', result.stderr)
 
 
+class FleetStateDir(FleetBase):
+    # Task 032, part 2: a Slurm home is shared, so the identity goes to a node-local FLEET_STATE_DIR.
+    NETWORK = ['nfs', 'nfs4', 'lustre', 'gpfs', 'cifs', 'smb2', 'smbfs', 'beegfs', 'fuse.sshfs']
+    LOCAL = ['ext4', 'ext2/ext3', 'xfs', 'btrfs', 'apfs', 'tmpfs', 'overlay']
+
+    def setUp(self):
+        super().setUp()
+        self.local = self.home / 'node-local/fleet'
+
+    def linux(self):
+        (self.home / 'bin/uname').write_text('#!/bin/sh\n[ "$1" = -m ] && echo x86_64 || echo Linux\n')
+        (self.home / 'bin/uname').chmod(0o700)
+
+    def test_state_goes_to_fleet_state_dir_when_set(self):
+        result = self.fleet('enroll', 'node-1.fleet', '--ca-url', 'https://ca.example', '--fingerprint', 'ab' * 32,
+                            stdin=TOKEN + '\n', FLEET_STATE_DIR=str(self.local))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('CERT node-1.fleet', (self.local / 'node.crt').read_text())
+        self.assertEqual(self.mode(self.local), 0o700)
+        self.assertFalse(self.state.exists())
+        self.assertIn(str(self.local / 'id_fleet'), (self.home / '.ssh/fleet/config').read_text())
+
+    def test_state_goes_to_the_default_when_unset(self):
+        self.enroll()
+        self.assertTrue((self.state / 'node.crt').exists())
+        self.assertFalse(self.local.exists())
+
+    def test_a_relative_state_dir_is_refused(self):
+        for bad in ['node-local/fleet', '/tmp/a b', '/tmp/a%b']:
+            result = self.fleet('status', FLEET_STATE_DIR=bad)
+            self.assertNotEqual(result.returncode, 0, bad)
+            self.assertIn('FLEET_STATE_DIR', result.stderr)
+
+    def test_services_receive_the_state_dir(self):
+        self.linux()
+        env = {'FLEET_STATE_DIR': str(self.local)}
+        units = self.home / '.config/systemd/user'
+        self.assertEqual(self.fleet('timer', 'install', **env).returncode, 0)
+        self.assertIn(f'Environment=FLEET_STATE_DIR={self.local}\n', (units / 'fleet-renew.service').read_text())
+        enrolled = self.fleet('enroll', 'node-1.fleet', '--ca-url', 'https://ca.example', '--fingerprint', 'ab' * 32,
+                              stdin=TOKEN + '\n', **env)
+        self.assertEqual(enrolled.returncode, 0, enrolled.stderr)
+        (self.home / 'bin/socat').write_text('#!/bin/sh\n')
+        (self.home / 'bin/socat').chmod(0o700)
+        self.fleet('agent', 'install', FLEET_AGENT_WAIT='0', FLEET_SOCAT=str(self.home / 'bin/socat'), **env)
+        self.assertIn(f'Environment=FLEET_STATE_DIR={self.local}\n', (units / 'fleet-agent.service').read_text())
+        self.assertEqual(self.fleet('timer', 'install').returncode, 0)
+        self.assertNotIn('FLEET_STATE_DIR', (units / 'fleet-renew.service').read_text())
+
+    def test_launchd_agents_receive_the_state_dir(self):
+        (self.home / 'bin/uname').write_text('#!/bin/sh\n[ "$1" = -m ] && echo arm64 || echo Darwin\n')
+        (self.home / 'bin/uname').chmod(0o700)
+        self.assertEqual(self.fleet('timer', 'install', FLEET_STATE_DIR=str(self.local)).returncode, 0)
+        plist = (self.home / 'Library/LaunchAgents/dev.fleet.renew.plist').read_text()
+        self.assertIn('<key>EnvironmentVariables</key><dict><key>FLEET_STATE_DIR</key>'
+                      f'<string>{self.local}</string></dict>', plist)
+
+    def doctor(self, fstype, **env):
+        self.linux()
+        (self.home / 'bin/findmnt').write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" > "$HOME/findmnt-args"\necho {fstype}\n')
+        (self.home / 'bin/findmnt').chmod(0o700)
+        return self.fleet('doctor', **env)
+
+    def test_doctor_warns_for_each_network_file_system(self):
+        for fstype in self.NETWORK:
+            with self.subTest(fstype=fstype):
+                result = self.doctor(fstype)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'network file system ({fstype})', result.stderr)
+                self.assertIn('FLEET_STATE_DIR', result.stderr)
+
+    def test_doctor_is_quiet_for_local_file_systems(self):
+        for fstype in self.LOCAL:
+            with self.subTest(fstype=fstype):
+                result = self.doctor(fstype)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn('warning', result.stderr)
+                self.assertIn(f'({fstype})', result.stdout)
+
+    def test_doctor_checks_the_state_dir_or_its_nearest_parent(self):
+        result = self.doctor('nfs4', FLEET_STATE_DIR=str(self.local))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(str(self.local), result.stdout)
+        self.assertEqual((self.home / 'findmnt-args').read_text().split()[-1], str(self.home))
+
+    def test_doctor_reads_the_macos_mount_table(self):
+        (self.home / 'bin/uname').write_text('#!/bin/sh\n[ "$1" = -m ] && echo arm64 || echo Darwin\n')
+        (self.home / 'bin/uname').chmod(0o700)
+        (self.home / 'bin/df').write_text('#!/bin/sh\necho "Filesystem 512-blocks Used Available Capacity Mounted on"\n'
+                                          'echo "srv:/home 100 1 99 1% /Volumes/home dir"\n')
+        (self.home / 'bin/mount').write_text('#!/bin/sh\necho "/dev/disk3s1 on / (apfs, local, journaled)"\n'
+                                             'echo "srv:/home on /Volumes/home dir (nfs, nodev, nosuid)"\n')
+        for name in ('df', 'mount'):
+            (self.home / f'bin/{name}').chmod(0o700)
+        result = self.fleet('doctor')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('network file system (nfs)', result.stderr)
+
+    def test_doctor_reports_an_unknown_type_without_failing(self):
+        result = self.doctor('')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('unknown', result.stdout)
+        self.assertNotIn('warning', result.stderr)
+
+
 class InstallStep(FleetBase):
     # A Linux host with fake download tools. The step binary is a script that prints a version.
     def setUp(self):
@@ -1594,6 +1699,25 @@ class WorkerInstall(ActlBase):
         self.assertIn(f'launchctl bootstrap gui/{os.getuid()} {h}/Library/LaunchAgents/dev.fleet.worker.plist',
                       self.scheduler())
         self.assertTrue(self.svc()['active'])
+
+    def test_install_keeps_the_worker_in_fleet_state_dir(self):
+        local = self.home / 'node-local/fleet'
+        env = {'FLEET_STATE_DIR': str(local)}
+        result = self.fleet('enroll', 'node-1', '--ca-url', 'https://ca.example', '--fingerprint', 'ab' * 32,
+                            '--no-trust', stdin=TOKEN + '\n', **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for os_name, arch in (('Linux', 'aarch64'), ('Darwin', 'arm64')):
+            with self.subTest(os=os_name):
+                result = self.install(FAKE_OS=os_name, FAKE_ARCH=arch, **env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                toml = (self.config_dir / 'worker.toml').read_text()
+                self.assertIn(f'root = "{local}/actl-worker"\n', toml)
+                self.assertIn(f'seed_file = "{local}/actl/worker.seed"\n', toml)
+                self.assertIn(f'FLEET_STATE_DIR={local}', self.executor_args(toml, 'fleet-apply'))
+        unit = (self.home / '.config/systemd/user/fleet-worker.service').read_text()
+        self.assertIn(f'Environment=FLEET_STATE_DIR={local}\n', unit)
+        plist = (self.home / 'Library/LaunchAgents/dev.fleet.worker.plist').read_text()
+        self.assertIn(f'<key>FLEET_STATE_DIR</key><string>{local}</string>', plist)
 
     def test_unchanged_install_changes_nothing_and_starts_a_stopped_service(self):
         self.assertEqual(self.install().returncode, 0)
