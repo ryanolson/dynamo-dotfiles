@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""List and toggle the stop-time review gate of the Codex Claude Code plugin, per workspace.
+"""Install the Codex Claude Code plugin and list or toggle its stop-time review gate, per workspace.
 
 The plugin keeps the gate in one state folder per workspace, named for the folder name and a
 hash of the real path. The state does not record the path, so `list` finds repositories and
 their worktrees and computes the same names to map each state folder back to its workspace.
 
 `enable` and `disable` run the plugin's own `setup --cwd PATH` command, so this tool never
-writes plugin state. Only `list` depends on the folder naming. If the plugin changes that
+writes plugin state. `disable-all` runs `disable` in each workspace that `list --enabled` shows.
+Only `list` and `disable-all` depend on the folder naming. If the plugin changes that
 naming, `list` shows each workspace as unresolved; toggles still work.
+
+`install` and `uninstall` run `claude plugin install` and `claude plugin uninstall`. Each does
+nothing when the plugin is already in the requested state.
 
 Uses only the standard library and Python 3.6 features.
 """
@@ -21,6 +25,8 @@ import subprocess
 import sys
 
 PLUGIN_ID = 'codex@openai-codex'
+PLUGIN_NAME = 'codex'
+MARKETPLACE = 'openai/codex-plugin-cc'
 DEFAULT_DEPTH = 2
 
 
@@ -29,15 +35,29 @@ def fail(message):
     return 1
 
 
+def claude_home():
+    return os.environ.get('CLAUDE_CONFIG_DIR') or os.path.join(os.path.expanduser('~'), '.claude')
+
+
+def record_file():
+    return os.path.join(claude_home(), 'plugins', 'installed_plugins.json')
+
+
+def installed_path():
+    """Return the install folder that Claude Code records for the plugin, or None if it records none."""
+    try:
+        with open(record_file()) as handle:
+            return json.load(handle)['plugins'][PLUGIN_ID][0]['installPath']
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        return None
+
+
 class Plugin(object):
     def __init__(self):
-        claude = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.join(os.path.expanduser('~'), '.claude')
-        record_file = os.path.join(claude, 'plugins', 'installed_plugins.json')
-        try:
-            with open(record_file) as handle:
-                install = json.load(handle)['plugins'][PLUGIN_ID][0]['installPath']
-        except (OSError, ValueError, KeyError, IndexError, TypeError):
-            raise LookupError('{} is not installed (no entry in {})'.format(PLUGIN_ID, record_file))
+        claude = claude_home()
+        install = installed_path()
+        if install is None:
+            raise LookupError('{} is not installed (no entry in {})'.format(PLUGIN_ID, record_file()))
         self.script = os.path.join(install, 'scripts', 'codex-companion.mjs')
         if not os.path.isfile(self.script):
             raise LookupError('{} has no {}'.format(PLUGIN_ID, self.script))
@@ -108,12 +128,18 @@ def find_workspaces(roots, depth):
     return found
 
 
-def cmd_list(plugin, args):
+def gate_rows(plugin, args, enabled=None):
+    """Return {state, path, enabled} rows for the known gates, filtered to enabled when it is not None."""
     states = list(plugin.states())
     found = find_workspaces(args.root or [os.path.expanduser('~')], args.depth) if states else {}
-    rows = [{'state': name, 'path': found.get(name), 'enabled': enabled} for name, enabled in states
-            if args.enabled is None or enabled == args.enabled]
+    rows = [{'state': name, 'path': found.get(name), 'enabled': on} for name, on in states
+            if enabled is None or on == enabled]
     rows.sort(key=lambda row: (row['path'] is None, row['path'] or row['state']))
+    return rows
+
+
+def cmd_list(plugin, args):
+    rows = gate_rows(plugin, args, args.enabled)
     if args.json:
         json.dump(rows, sys.stdout, indent=2)
         sys.stdout.write('\n')
@@ -124,22 +150,75 @@ def cmd_list(plugin, args):
     return 0
 
 
-def cmd_set(plugin, args):
+def set_gates(plugin, paths, enable):
     status = 0
-    for path in args.paths:
+    for path in paths:
         if not os.path.isdir(path):
             status = fail('{} is not a folder'.format(path))
             continue
         try:
-            enabled = plugin.set_gate(os.path.abspath(path), args.enable)
+            enabled = plugin.set_gate(os.path.abspath(path), enable)
         except (LookupError, RuntimeError, ValueError) as error:
             status = fail(str(error))
             continue
-        if enabled != args.enable:
+        if enabled != enable:
             status = fail('plugin reports the gate {} in {}'.format('on' if enabled else 'off', path))
             continue
         sys.stdout.write('{:<4}{}\n'.format('on' if enabled else 'off', path))
     return status
+
+
+def cmd_set(plugin, args):
+    return set_gates(plugin, args.paths, args.enable)
+
+
+def cmd_disable_all(plugin, args):
+    rows = gate_rows(plugin, args, True)
+    # A gate with no known workspace stays on: setup needs a folder, and this tool never writes plugin state.
+    unresolved = [row['state'] for row in rows if row['path'] is None]
+    status = set_gates(plugin, [row['path'] for row in rows if row['path'] is not None], False)
+    for state in unresolved:
+        status = fail('the gate is still on in {}: no workspace found; scan more folders with --root'.format(state))
+    return status
+
+
+def run_claude(*argv):
+    claude = shutil.which('claude')
+    if claude is None:
+        raise LookupError('claude is not on PATH')
+    return subprocess.call([claude, 'plugin'] + list(argv))
+
+
+def change_install(action, argv, want_installed):
+    """Run `claude plugin argv` unless the plugin is already in the wanted state, then check the record."""
+    if (installed_path() is not None) == want_installed:
+        sys.stdout.write('{} is already {}\n'.format(PLUGIN_ID, 'installed' if want_installed else 'not installed'))
+        return 0
+    try:
+        code = run_claude(*argv)
+    except LookupError as error:
+        return fail(str(error))
+    if code != 0:
+        return fail('claude plugin {} exited with status {}'.format(argv[0], code))
+    if (installed_path() is not None) != want_installed:
+        return fail('claude plugin {} succeeded but the record in {} did not change'.format(argv[0], record_file()))
+    sys.stdout.write('{} {}\n'.format(PLUGIN_ID, action))
+    return 0
+
+
+def cmd_install(args):
+    return change_install('installed', ['install', PLUGIN_NAME, '--marketplace', MARKETPLACE], True)
+
+
+def cmd_uninstall(args):
+    return change_install('uninstalled', ['uninstall', PLUGIN_ID], False)
+
+
+def add_scan_options(parser):
+    parser.add_argument('--root', action='append', metavar='DIR',
+                        help='folder to scan for repositories; repeatable (default: home folder)')
+    parser.add_argument('--depth', type=int, default=DEFAULT_DEPTH,
+                        help='folder levels to scan below each root (default: %(default)s)')
 
 
 def main():
@@ -150,10 +229,7 @@ def main():
     pick = show.add_mutually_exclusive_group()
     pick.add_argument('--enabled', dest='enabled', action='store_const', const=True, help='only gates that are on')
     pick.add_argument('--disabled', dest='enabled', action='store_const', const=False, help='only gates that are off')
-    show.add_argument('--root', action='append', metavar='DIR',
-                      help='folder to scan for repositories; repeatable (default: home folder)')
-    show.add_argument('--depth', type=int, default=DEFAULT_DEPTH,
-                      help='folder levels to scan below each root (default: %(default)s)')
+    add_scan_options(show)
     show.add_argument('--json', action='store_true', help='write a JSON list of {state, path, enabled}')
     show.set_defaults(func=cmd_list)
     for name, enable in (('enable', True), ('disable', False)):
@@ -161,7 +237,17 @@ def main():
             'on' if enable else 'off'))
         toggle.add_argument('paths', nargs='+', metavar='PATH')
         toggle.set_defaults(func=cmd_set, enable=enable)
+    clear = sub.add_parser('disable-all', help='turn the gate off in every workspace where it is on')
+    add_scan_options(clear)
+    clear.set_defaults(func=cmd_disable_all)
+    for name, func, help_text in (
+            ('install', cmd_install, 'install {} unless it is installed'.format(PLUGIN_ID)),
+            ('uninstall', cmd_uninstall, 'uninstall {} if it is installed; this also deletes its gate state'.format(
+                PLUGIN_ID))):
+        sub.add_parser(name, help=help_text).set_defaults(func=func, bare=True)
     args = parser.parse_args()
+    if getattr(args, 'bare', False):
+        return args.func(args)
     try:
         plugin = Plugin()
     except LookupError as error:

@@ -1,9 +1,14 @@
-"""Drive codex-review-gate against the installed Codex plugin, with a scratch home and scratch repositories."""
+"""Drive codex-review-gate with a scratch home.
+
+The gate tests use the installed Codex plugin and scratch repositories. The install tests use a fake
+`claude` and never touch the real plugin: a real uninstall deletes the plugin and all of its gate state.
+"""
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -113,10 +118,147 @@ class ReviewGate(unittest.TestCase):
 
     def test_missing_plugin_fails(self):
         (self.home / '.claude/plugins/installed_plugins.json').write_text('{"version": 2, "plugins": {}}')
-        for args in (['list'], ['disable', str(self.repo_a)]):
+        for args in (['list'], ['disable', str(self.repo_a)], ['disable-all']):
             code, _, err = self.gate(*args)
             self.assertEqual(code, 1)
             self.assertIn('codex@openai-codex', err)
+
+    def test_disable_all_turns_off_every_enabled_gate(self):
+        self.gate('enable', str(self.repo_a), str(self.worktree))
+        self.gate('disable', str(self.repo_b))
+        code, out, err = self.gate('disable-all')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sorted(line.split()[1] for line in out.splitlines()),
+                         sorted([str(self.repo_a), str(self.worktree)]))
+        self.assertEqual(self.listed('--enabled'), set())
+        self.assertEqual(len(self.listed('--disabled')), 3)
+
+    def test_disable_all_with_nothing_enabled_is_quiet(self):
+        self.gate('disable', str(self.repo_a))
+        code, out, err = self.gate('disable-all')
+        self.assertEqual((code, out, err), (0, '', ''))
+
+    def test_disable_all_reports_a_gate_it_cannot_reach(self):
+        self.gate('enable', str(self.repo_a), str(self.repo_b))
+        shutil.rmtree(str(self.repo_b))
+        code, out, err = self.gate('disable-all')
+        self.assertEqual(code, 1)
+        self.assertIn('b-', err)
+        self.assertIn('--root', err)
+        self.assertEqual(out.split(), ['off', str(self.repo_a)])
+        rows = json.loads(self.gate('list', '--json', '--enabled')[1])
+        self.assertEqual([row['path'] for row in rows], [None])
+
+    def test_disable_all_root_option_limits_the_scan(self):
+        self.gate('enable', str(self.repo_a), str(self.repo_b))
+        code, _, err = self.gate('disable-all', '--root', str(self.repo_b))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.listed('--enabled') - {(None, True)}, {(str(self.repo_a), True)})
+        self.assertEqual(self.listed('--disabled'), {(str(self.repo_b), False)})
+
+
+class FakeClaude(unittest.TestCase):
+    """`install` and `uninstall` against a fake `claude` that edits the scratch plugin record."""
+    FAKE = """#!{python}
+import json, os, sys
+with open(os.environ['FAKE_LOG'], 'a') as log:
+    log.write(json.dumps(sys.argv[1:]) + '\\n')
+if os.environ.get('FAKE_FAIL'):
+    sys.exit(3)
+if not os.environ.get('FAKE_NOOP'):
+    record = os.path.join(os.environ['HOME'], '.claude/plugins/installed_plugins.json')
+    plugins = {{'codex@openai-codex': [{{'scope': 'user', 'installPath': '/x'}}]}} if sys.argv[2] == 'install' \
+        or sys.argv[1] == 'install' else {{}}
+    with open(record, 'w') as handle:
+        json.dump({{'version': 2, 'plugins': plugins}}, handle)
+"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name).resolve()
+        self.record = self.home / '.claude/plugins/installed_plugins.json'
+        self.record.parent.mkdir(parents=True)
+        self.log = self.home / 'claude.log'
+        self.bin = self.home / 'bin'
+        self.bin.mkdir()
+        fake = self.bin / 'claude'
+        fake.write_text(self.FAKE.format(python=sys.executable))
+        fake.chmod(0o755)
+        self.set_installed(False)
+
+    def set_installed(self, installed):
+        plugins = {'codex@openai-codex': [{'scope': 'user', 'installPath': '/x'}]} if installed else {}
+        self.record.write_text(json.dumps({'version': 2, 'plugins': plugins}))
+
+    def run_gate(self, command, path=None, **extra):
+        env = {'HOME': str(self.home), 'PATH': str(self.bin) if path is None else path, 'FAKE_LOG': str(self.log)}
+        env.update(extra)
+        result = subprocess.run([sys.executable, str(SCRIPT), command], env=env, stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, timeout=30)
+        return result.returncode, result.stdout, result.stderr
+
+    def calls(self):
+        return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    def installed(self):
+        return 'codex@openai-codex' in json.loads(self.record.read_text())['plugins']
+
+    def test_install_runs_the_cli_when_absent(self):
+        code, out, err = self.run_gate('install')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.calls(), [['plugin', 'install', 'codex', '--marketplace', 'openai/codex-plugin-cc']])
+        self.assertTrue(self.installed())
+        self.assertIn('installed', out)
+
+    def test_install_does_nothing_when_present(self):
+        self.set_installed(True)
+        code, out, err = self.run_gate('install')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.calls(), [])
+        self.assertIn('already installed', out)
+
+    def test_uninstall_runs_the_cli_when_present(self):
+        self.set_installed(True)
+        code, out, err = self.run_gate('uninstall')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.calls(), [['plugin', 'uninstall', 'codex@openai-codex']])
+        self.assertFalse(self.installed())
+        self.assertIn('uninstalled', out)
+
+    def test_uninstall_does_nothing_when_absent(self):
+        code, out, err = self.run_gate('uninstall')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.calls(), [])
+        self.assertIn('not installed', out)
+
+    def test_uninstall_works_when_the_plugin_script_is_missing(self):
+        # A record that points at a missing folder is a broken install. It must still be removable.
+        self.set_installed(True)
+        self.assertFalse(Path('/x/scripts/codex-companion.mjs').exists())
+        self.assertEqual(self.run_gate('uninstall')[0], 0)
+        self.assertFalse(self.installed())
+
+    def test_cli_failure_is_reported(self):
+        for command in ('install', 'uninstall'):
+            self.set_installed(command == 'uninstall')
+            code, _, err = self.run_gate(command, FAKE_FAIL='1')
+            self.assertEqual(code, 1)
+            self.assertIn('status 3', err)
+
+    def test_unchanged_record_after_the_cli_is_reported(self):
+        code, _, err = self.run_gate('install', FAKE_NOOP='1')
+        self.assertEqual(code, 1)
+        self.assertIn('did not change', err)
+
+    def test_missing_claude_fails(self):
+        empty = self.home / 'empty'
+        empty.mkdir()
+        for command in ('install', 'uninstall'):
+            self.set_installed(command == 'uninstall')
+            code, _, err = self.run_gate(command, path=str(empty))
+            self.assertEqual(code, 1)
+            self.assertIn('claude is not on PATH', err)
 
 
 if __name__ == '__main__':

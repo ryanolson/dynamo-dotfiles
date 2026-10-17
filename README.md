@@ -84,23 +84,29 @@ and `#!/bin/bash -l` SLURM batch scripts are unaffected).
 - **codex** - OpenAI Codex CLI (`npm i -g @openai/codex`; run `codex login` to authenticate)
 
 > **Codex Claude Code plugin** ([openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc))
-> is a separate, manual step — it installs interactively *inside* Claude Code and
-> cannot be scripted by bootstrap:
+> is a separate step that bootstrap does not run. Install it with `codex-review-gate install`, which runs
+> `claude plugin install codex --marketplace openai/codex-plugin-cc`. Then run `/codex:setup` inside Claude Code:
 > ```
-> /plugin marketplace add openai/codex-plugin-cc
-> /plugin install codex@openai-codex
+> codex-review-gate install
 > /codex:setup
 > ```
 >
 > Leave the stop-time review gate off. `/codex:setup --enable-review-gate` makes Codex review each Claude turn when the turn stops. Instead, the agent suggests a review and its level when a unit of work is complete. See the "Review cadence" section of `dot_agents/AGENTS.md`.
 >
-> `codex-review-gate` lists and sets the gate for each workspace:
+> `codex-review-gate` installs the plugin and sets the gate for each workspace:
 > ```
-> codex-review-gate list [--enabled | --disabled] [--root DIR] [--json]
+> codex-review-gate install
+> codex-review-gate uninstall
+> codex-review-gate list [--enabled | --disabled] [--root DIR] [--depth N] [--json]
 > codex-review-gate disable PATH...
+> codex-review-gate disable-all [--root DIR] [--depth N]
 > codex-review-gate enable PATH...
 > ```
+> `install` does nothing if the plugin is installed. `uninstall` does nothing if it is not installed. `uninstall` runs `claude plugin uninstall`, which deletes the gate state of every workspace. Both commands need the `claude` command.
+>
 > `list` scans the home folder two levels deep and the worktrees of each repository that it finds. A gate whose workspace was not found shows as `(no workspace found: NAME)`. Such a gate cannot run until a repository is created at the same path again. `enable` and `disable` run the plugin's own `setup` command and need `node`.
+>
+> `disable-all` runs `disable` in each workspace that `list --enabled` shows, and takes the same `--root` and `--depth` options. If a gate is on in a workspace that the scan did not find, `disable-all` leaves it on, names it on stderr, and exits with status 1. Scan more folders with `--root`.
 
 ## 🤖 Shared agent scaffold
 
