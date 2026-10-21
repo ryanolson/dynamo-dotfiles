@@ -276,6 +276,7 @@ API keys and tokens are managed via 1Password CLI (`op`) with on-demand injectio
 - `openv <cmd...>` asks `fleet secret get` for each reference on an enrolled machine. `fleet` asks the local `pylon` cache, then the fleet broker. If any value fails, or the machine is not enrolled, `openv` runs `op run --env-file ~/.config/dynamo/dev.env.fleet` instead. A command never gets values from both.
 - `fleet secret flush` empties the `pylon` cache, for example after a rotation in 1Password. On the admin laptop, `fleet secret flush --all` empties it on every enrolled machine through actl (`fleet task secrets-flush --all`; see Fleet tasks through actl).
 - `openv-file <env-file> <cmd...>` does the same for an alternate env-reference file
+- `wcie-codex [args...]` runs `codex -p wcie`, which layers `~/.codex/wcie.config.toml` (OpenRouter, pinned to the NVIDIA endpoint) over the base Codex config. It sets `OPENROUTER_API_KEY` from `op://Fleet/OpenRouter-WCIE-Limited/credential`: `fleet secret get` first, then `op read` when the machine is not enrolled or the broker fails. The key reaches only the codex process.
 - No service-account token is stored in `chezmoi` config or auto-exported into every shell
 
 **SSH Agent (1Password):**

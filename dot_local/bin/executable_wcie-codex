@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Run codex with the wcie profile (~/.codex/wcie.config.toml). The OpenRouter key comes from
+# fleet first, as openv does, and from op when the machine is not enrolled or the broker fails.
+# The key reaches only the codex process. Arguments pass through to codex.
+REF="op://Fleet/OpenRouter-WCIE-Limited/credential"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/fleet"
+
+key=""
+fleet=$(command -v fleet || echo "$HOME/.local/bin/fleet")
+if [[ -x "$fleet" && -f "$STATE/node.crt" ]]; then
+    key=$("$fleet" secret get "$REF" 2>/dev/null) || key=""
+fi
+if [[ -z "$key" ]] && command -v op >/dev/null 2>&1; then
+    key=$(op read "$REF" 2>/dev/null) || key=""
+fi
+if [[ -z "$key" ]]; then
+    echo "wcie-codex: could not read $REF from the fleet broker or 1Password (op)" >&2
+    exit 1
+fi
+
+export OPENROUTER_API_KEY="$key"
+unset key
+exec codex -p wcie "$@"

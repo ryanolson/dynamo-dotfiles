@@ -1,0 +1,14 @@
+# OpenRouter pilot workspace, pinned to the NVIDIA provider endpoint.
+# Start with: wcie-codex (it sets OPENROUTER_API_KEY, then runs codex -p wcie)
+model = "moonshotai/kimi-k3"
+model_provider = "openrouter-nvidia-pilot"
+
+[model_providers.openrouter-nvidia-pilot]
+name = "OpenRouter BYOK (pilot key, NVIDIA-pinned)"
+base_url = "https://openrouter.ai/api/v1"
+env_key = "OPENROUTER_API_KEY"
+env_key_instructions = "Run wcie-codex, or set OPENROUTER_API_KEY (OpenRouter pilot workspace key). BYOK must be configured."
+wire_api = "responses"
+# OpenRouter reads routing preferences from the provider URL query param.
+# only=[nvidia] + allow_fallbacks=false pins every request to the NVIDIA endpoint.
+query_params = { provider = "{\"only\":[\"nvidia\"],\"allow_fallbacks\":false}" }
