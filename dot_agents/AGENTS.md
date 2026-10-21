@@ -217,6 +217,7 @@ json`), never print a value, and ask only when the right item is ambiguous. Know
   The `Fleet` vault has a copy: `op://Fleet/NGC NIM Operations PAT/credential`.
 - GitLab PAT for `gitlab-master.nvidia.com`: `op://Fleet/NV Gitlab PAT/credential`. Log in with
   `<command that prints the secret> | glab auth login --hostname gitlab-master.nvidia.com
-  --git-protocol ssh --stdin`. On 2026-10-15 the broker policy did not list this item (404), so
-  only `op read` worked.
+  --git-protocol ssh --stdin`.
+- Every fleet machine can read any `op://Fleet/...` reference through `fleet secret get`, with
+  no broker policy entry (fleet-config `ae76cc5`, deployed 2026-10-21).
 - `Development/NGC` and `Corp/NGC` are legacy NGC keys: the API gateway rejects them (401).

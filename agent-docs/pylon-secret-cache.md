@@ -78,3 +78,7 @@ Rules:
 2. Dotfiles: `dev.env.fleet` with references on every machine, `fleet secret env VAR=op://...`, `fleet secret flush`, and the `openv` order, with tests.
 3. pylon: the secrets socket, cache, flush, status, and peer check, with tests (agentic-control, stacked on `pylon/renew`). `fleet agent` passes the new flags when the installed pylon has them.
 4. Release the new pylon through the artifacts bucket and pin it in `fleet`.
+
+## Addendum 2026-10-21: every Fleet vault reference
+
+The broker now serves any `op://` reference in a vault of `--op-vaults` (only `Fleet`) to every fleet machine, with no entry in `secrets.json` (fleet-config `ae76cc5`). Before, `GET /v1/secrets?ref=` returned 404 for a reference without an entry, so each new Fleet item needed a policy edit and a broker deploy, and a machine without a signed-in `op` (for example spark-p running `wcie-codex`) could not read the item until then. The `Fleet` vault holds only fleet secrets, and the service account can read only that vault, so an entry for each item added a step but no protection. An entry still applies to its exact reference: its machine patterns and `admin_only` still limit it. Ephemeral workers do not get this rule; their ticket must still name each secret. A reference to an item that does not exist now gives 503 (the `op read` fails), not 404.
