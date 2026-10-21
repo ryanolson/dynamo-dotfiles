@@ -1,25 +1,191 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env python3
+"""Run codex with the wcie profile (~/.codex/wcie.config.toml).
 
-# Run codex with the wcie profile (~/.codex/wcie.config.toml). The OpenRouter key comes from
-# fleet first, as openv does, and from op when the machine is not enrolled or the broker fails.
-# The key reaches only the codex process. Arguments pass through to codex.
-REF="op://Fleet/OpenRouter-WCIE-Limited/credential"
-STATE="${XDG_STATE_HOME:-$HOME/.local/state}/fleet"
+The OpenRouter key comes from fleet first, as openv does, and from op when the machine is not
+enrolled or the broker fails. The key reaches only the codex process. Arguments pass through to
+codex.
 
-key=""
-fleet=$(command -v fleet || echo "$HOME/.local/bin/fleet")
-if [[ -x "$fleet" && -f "$STATE/node.crt" ]]; then
-    key=$("$fleet" secret get "$REF" 2>/dev/null) || key=""
-fi
-if [[ -z "$key" ]] && command -v op >/dev/null 2>&1; then
-    key=$(op read "$REF" 2>/dev/null) || key=""
-fi
-if [[ -z "$key" ]]; then
-    echo "wcie-codex: could not read $REF from the fleet broker or 1Password (op)" >&2
-    exit 1
-fi
+`wcie-codex app-server ...` is for ACP adapters that take a codex executable (CODEX_PATH): codex
+refuses --profile for app-server, so the profile is passed as -c overrides instead.
 
-export OPENROUTER_API_KEY="$key"
-unset key
-exec codex -p wcie "$@"
+Both modes pass a model catalog that lists K3 (the profile's model), Sol 6.1, and Astra 6. The
+Sol and Astra entries come from the live OpenAI catalog with their slugs moved to OpenRouter's.
+"""
+import copy
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+REF = "op://Fleet/OpenRouter-WCIE-Limited/credential"
+PROFILE = "wcie"
+OPENROUTER_SLUGS = {"gpt-6.1-sol": "openai/gpt-6.1-sol", "gpt-6-astra": "openai/gpt-6-astra"}
+# Tables codex writes back into the profile file. They are TUI state, not config for the agent.
+CODEX_WRITTEN_TABLES = ("tui", "notice", "projects")
+
+
+def die(message):
+    print(f"wcie-codex: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def read_key():
+    home = Path.home()
+    state = Path(os.environ.get("XDG_STATE_HOME") or home / ".local/state") / "fleet"
+    sources = []
+    fleet = shutil.which("fleet") or str(home / ".local/bin/fleet")
+    if os.access(fleet, os.X_OK) and (state / "node.crt").is_file():
+        sources.append([fleet, "secret", "get", REF])
+    if shutil.which("op"):
+        sources.append(["op", "read", REF])
+    for command in sources:
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    die(f"could not read {REF} from the fleet broker or 1Password (op)")
+
+
+def find_codex():
+    # npx puts the ACP adapter's node_modules/.bin first on PATH, and the adapter depends on its own
+    # codex package. Skip those so the adapter runs the one installed codex.
+    dirs = os.environ.get("PATH", "").split(os.pathsep)
+    path = os.pathsep.join(d for d in dirs if not d.rstrip("/").endswith("node_modules/.bin"))
+    return shutil.which("codex", path=path) or die("no codex on PATH outside node_modules/.bin")
+
+
+def codex_home():
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+
+
+def load_profile():
+    try:
+        import tomllib
+    except ImportError:
+        return None
+    with open(codex_home() / f"{PROFILE}.config.toml", "rb") as f:
+        return tomllib.load(f)
+
+
+def toml_key(key):
+    return key if re.fullmatch(r"[A-Za-z0-9_-]+", key) else json.dumps(key)
+
+
+def toml_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_value(v) for v in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{toml_key(k)} = {toml_value(v)}" for k, v in value.items()) + "}"
+    raise TypeError(f"unsupported TOML value {value!r}")
+
+
+def overrides(profile, prefix=""):
+    """Flatten the profile into -c key=value arguments, one per leaf."""
+    args = []
+    for key, value in profile.items():
+        if not prefix and key in CODEX_WRITTEN_TABLES:
+            continue
+        path = prefix + toml_key(key)
+        if isinstance(value, dict):
+            args += overrides(value, path + ".")
+        else:
+            args += ["-c", f"{path}={toml_value(value)}"]
+    return args
+
+
+def k3_entry(model, template):
+    # Codex's metadata for a model it does not know (models-manager model_info_from_slug), which is
+    # what K3 ran on before it had an entry, with the instructions of the catalog's lead model.
+    return {
+        "slug": model,
+        "display_name": "Kimi K3",
+        "description": "Moonshot Kimi K3 on the NVIDIA endpoint through OpenRouter.",
+        "supported_reasoning_levels": [],
+        "shell_type": "unified_exec",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": -1,
+        "availability_nux": None,
+        "upgrade": None,
+        "model_messages": template["model_messages"],
+        "support_verbosity": False,
+        "default_verbosity": None,
+        "apply_patch_tool_type": None,
+        "web_search_tool_type": "text",
+        "truncation_policy": {"mode": "bytes", "limit": 10000},
+        "context_window": 272000,
+        "max_context_window": 272000,
+        "experimental_supported_tools": [],
+        "auto_review_model_override": model,
+    }
+
+
+def openrouter_entry(entry, slug, model):
+    entry = copy.deepcopy(entry)
+    entry.update(slug=slug, availability_nux=None, upgrade=None, auto_review_model_override=model)
+    return entry
+
+
+def build_catalog(live, model):
+    by_slug = {m["slug"]: m for m in live["models"]}
+    missing = [s for s in OPENROUTER_SLUGS if s not in by_slug]
+    if missing:
+        raise KeyError(f"the OpenAI catalog has no {', '.join(missing)}")
+    template = by_slug[next(iter(OPENROUTER_SLUGS))]
+    models = [k3_entry(model, template)]
+    models += [openrouter_entry(by_slug[s], OPENROUTER_SLUGS[s], model) for s in OPENROUTER_SLUGS]
+    return {"models": models}
+
+
+def catalog_path(profile, codex):
+    """Write the catalog to the cache and return its path, or None when there is none to use."""
+    cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "wcie-codex/models.json"
+    if profile is None:
+        print("wcie-codex: python3 has no tomllib; running without the K3/Sol/Astra catalog", file=sys.stderr)
+        return None
+    try:
+        result = subprocess.run([codex, "debug", "models"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                universal_newlines=True, timeout=60)
+        if result.returncode != 0:
+            raise RuntimeError(f"codex debug models exited {result.returncode}")
+        catalog = build_catalog(json.loads(result.stdout), profile["model"])
+    except Exception as error:  # Any failure leaves the last good catalog in place.
+        if cache.is_file():
+            print(f"wcie-codex: {error}; using the cached catalog", file=sys.stderr)
+            return cache
+        print(f"wcie-codex: {error}; running without the K3/Sol/Astra catalog", file=sys.stderr)
+        return None
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cache.with_suffix(".tmp")
+    tmp.write_text(json.dumps(catalog))
+    tmp.replace(cache)
+    return cache
+
+
+def main():
+    args = sys.argv[1:]
+    app_server = bool(args) and args[0] == "app-server"
+    profile = load_profile()
+    if app_server and profile is None:
+        die("app-server mode reads the profile with tomllib, which needs python3 >= 3.11")
+    os.environ["OPENROUTER_API_KEY"] = read_key()
+    codex = find_codex()
+    catalog = catalog_path(profile, codex)
+    catalog_args = ["-c", f"model_catalog_json={json.dumps(str(catalog))}"] if catalog else []
+    if app_server:
+        command = [codex, *overrides(profile), *catalog_args, *args]
+    else:
+        command = [codex, "-p", PROFILE, *catalog_args, *args]
+    os.execv(codex, command)
+
+
+if __name__ == "__main__":
+    main()
