@@ -279,13 +279,16 @@ API keys and tokens are managed via 1Password CLI (`op`) with on-demand injectio
 - `wcie-codex [args...]` runs `codex -p wcie`, which layers `~/.codex/wcie.config.toml` over the base Codex config. The profile sends requests to OpenRouter. OpenRouter serves Kimi K3 from the NVIDIA endpoint, and GPT-6 Astra from OpenAI. The profile also sends the side work that Codex gives to Luna and Terra (reviews, memories, subagents) to K3. `wcie-codex` sets `OPENROUTER_API_KEY` from `op://Fleet/OpenRouter-WCIE-Limited/credential`: `fleet secret get` first, then `op read` when the machine is not enrolled or the broker fails. The key reaches only the codex process.
   - On each run, `wcie-codex` writes a model catalog to `~/.cache/wcie-codex/models.json` from `codex debug models` and gives it to codex. The `/model` picker then lists K3 and Astra 6. If `codex debug models` fails, `wcie-codex` uses the last catalog.
   - `wcie-codex app-server` gives the profile to codex as `-c` overrides, because codex does not accept `--profile` for `app-server`. ACP adapters use this mode through `CODEX_PATH`. This mode reads `~/.codex/wcie.profile.json`, which chezmoi renders from the source profile, so a hand edit to `~/.codex/wcie.config.toml` changes the TUI but not this mode. Codex gives `-c` overrides priority over a repository's `.codex/config.toml`, so in this mode the profile wins over repository settings. With `-p`, the repository settings win.
-  - bb shows the profile as the agent "Codex (WCIE)" (provider `acp-wcie`). The entry is bb server state, not a file in this repository. To add it to a bb server, run this command once:
+  - bb shows the profile as the agent "Codex (WCIE)" (provider `acp-wcie`). The entry is bb server state, not a file in this repository. To add it to a bb server, run this command once in bash:
 
     ```bash
-    bb plugin config provider-acp set customAgents '[{"id":"wcie","displayName":"Codex (WCIE)","command":"sh","args":["-c","PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:$PATH\" exec npx -y @agentclientprotocol/codex-acp@2.2.2"],"env":{"CODEX_PATH":"wcie-codex","npm_config_omit":"optional"},"supportsManualCompaction":true}]'
+    bb plugin config provider-acp set customAgents "$(cat <<'EOF'
+    [{"id":"wcie","displayName":"Codex (WCIE)","command":"sh","args":["-c","p=$(\"${SHELL:-/bin/sh}\" -lc env 2>/dev/null | sed -n 's/^PATH=//p' | head -n 1); export PATH=\"${p:+$p:}$PATH\"; exec npx -y @agentclientprotocol/codex-acp@2.2.2"],"env":{"CODEX_PATH":"wcie-codex","npm_config_omit":"optional"},"supportsManualCompaction":true}]
+    EOF
+    )"
     ```
 
-    bb finds models with the environment of the host daemon, which does not have `~/.local/bin` on `PATH`. The `sh -c` wrapper adds it. `npm_config_omit=optional` stops npx from installing the codex binary that the adapter bundles, so the adapter runs the installed codex.
+    bb finds models with the environment of the host daemon. That `PATH` does not have `~/.local/bin`, and on macOS it does not have Homebrew. The `sh -c` wrapper takes `PATH` from the login shell of the user, so it finds `npx`, `wcie-codex`, and `codex`. `npm_config_omit=optional` stops npx from installing the codex binary that the adapter bundles, so the adapter runs the installed codex.
 - No service-account token is stored in `chezmoi` config or auto-exported into every shell
 
 **SSH Agent (1Password):**
