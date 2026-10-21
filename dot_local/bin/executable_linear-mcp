@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Stdio MCP server for Linear, for Claude and Codex. The API key comes from fleet first, as openv
+# does, and from op when the machine is not enrolled or the broker fails. The key reaches only the
+# mcp-remote process, through LINEAR_AUTH: it is never in a config file or on a command line, and
+# the agent does not have to be started through openv or `fleet claude`.
+# stdout is the MCP protocol channel, so everything here goes to stderr.
+REF="op://Fleet/Linear Stargate Command/credential"
+URL="https://mcp.linear.app/mcp"
+# Pinned: this process holds the key. Raise it on purpose.
+MCP_REMOTE="mcp-remote@0.15.2"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/fleet"
+
+die() {
+    echo "linear-mcp: $*" >&2
+    exit 1
+}
+
+command -v npx >/dev/null 2>&1 || die "npx is not on PATH; mcp-remote needs node"
+
+key=""
+fleet=$(command -v fleet || echo "$HOME/.local/bin/fleet")
+if [[ -x "$fleet" && -f "$STATE/node.crt" ]]; then
+    key=$("$fleet" secret get "$REF" 2>/dev/null) || key=""
+fi
+if [[ -z "${key//[$' \t\r\n']/}" ]] && command -v op >/dev/null 2>&1; then
+    key=$(op read "$REF" 2>/dev/null) || key=""
+fi
+key="${key//[$' \t\r\n']/}"
+[[ -n "$key" ]] || die "could not read $REF from the fleet broker or 1Password (op)"
+
+# mcp-remote expands ${LINEAR_AUTH} in the header itself; the single quotes keep the shell out.
+export LINEAR_AUTH="Bearer $key"
+unset key
+# shellcheck disable=SC2016
+exec npx -y "$MCP_REMOTE" "$URL" --header 'Authorization:${LINEAR_AUTH}'

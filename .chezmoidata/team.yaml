@@ -54,6 +54,14 @@ agent_plugins:
     plugins: ["nv-gitlab"]
     tools: ["claude", "codex"]
 
+# MCP servers that run_after_agent-mcp registers with claude and codex. `command` is a script in
+# ~/.local/bin. linear-mcp reads its key from the Fleet vault itself, so nothing secret goes here.
+# Set agent_mcp_servers: [] in ~/.config/chezmoi/chezmoi.yaml to opt out on a machine.
+agent_mcp_servers:
+  - name: "linear"
+    command: "linear-mcp"
+    tools: ["claude", "codex"]
+
 tools:
   # Core development tools that everyone should have
   required:

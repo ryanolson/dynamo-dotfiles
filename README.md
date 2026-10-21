@@ -168,6 +168,19 @@ Sources: [`ai-dynamo/rhino`](https://github.com/ai-dynamo/rhino),
 timeout 300 python3 test/agent-plugins.py
 ```
 
+### Agent MCP servers: Linear
+
+`agent_mcp_servers` in `.chezmoidata/team.yaml` lists MCP servers that `run_after_agent-mcp` registers with `claude` (user scope) and `codex`. Today it holds one: Linear. A tool that is not on `PATH` is skipped, and a server that the tool already lists is left alone. The script runs again only when the list changes. A failure only warns, and the next apply tries again. To opt out on a machine, set `agent_mcp_servers: []` in `~/.config/chezmoi/chezmoi.yaml`.
+
+`linear-mcp` is the command that both tools run. It reads the API key from `op://Fleet/Linear Stargate Command/credential` with `fleet secret get`, and with `op read` when the machine is not enrolled or the broker fails. Then it runs `npx mcp-remote` (version pinned in the script) against `https://mcp.linear.app/mcp`. The key reaches only that process, in the `LINEAR_AUTH` variable. It is not in a config file or on a command line, and the agent does not need to start through `openv` or `fleet claude`. It needs `node` on the machine.
+
+To rotate the key, change the 1Password item, run `fleet secret flush --all`, and restart the agent session.
+
+```bash
+timeout 300 python3 test/test-linear-mcp.py
+timeout 300 python3 test/agent-mcp.py
+```
+
 Both agents are instructed to read [the environment guide](dot_agents/ENVIRONMENT.md) once per session. It maps tasks to tools, separates source ownership, and requires validation, scoped apply, commit, and push. Shared changes must work in both agents. See [the evaluation protocol](agent-docs/environment-evaluation.md) for behavioral checks.
 
 Verify a machine after the intended scoped apply:

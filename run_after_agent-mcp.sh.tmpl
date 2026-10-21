@@ -1,0 +1,65 @@
+{{ if .agent_mcp_servers -}}
+#!/bin/bash
+# Register the MCP servers in agent_mcp_servers with the claude and codex CLIs. The CLIs own
+# ~/.claude.json and ~/.codex/config.toml, so chezmoi does not manage those files.
+#
+# A server the tool already lists is left alone, so an entry that someone removed or edited by hand
+# stays that way until the list changes. The command is a script from ~/.local/bin, registered by
+# absolute path because an agent started outside a login shell may not have that folder on PATH.
+# chezmoi runs this script on each apply. It does the work only when the list changed. A failure
+# only warns and does not write the stamp, so the next apply tries again.
+set -uo pipefail
+
+want="{{ .agent_mcp_servers | toJson | sha256sum }}"
+stamp="${XDG_STATE_HOME:-$HOME/.local/state}/dotfiles/agent-mcp"
+if [[ "$(cat "$stamp" 2>/dev/null)" == "$want" ]]; then
+    exit 0
+fi
+
+# Each line: server name, command in ~/.local/bin, tools (comma-separated).
+entries=(
+{{- range .agent_mcp_servers }}
+    "{{ .name }} {{ .command }} {{ .tools | join "," }}"
+{{- end }}
+)
+
+# macOS has no coreutils timeout; perl's alarm survives exec and kills the command the same way.
+bounded() {
+    local seconds="$1"; shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$seconds" "$@"
+    else
+        perl -e 'alarm shift; exec @ARGV or exit 127' "$seconds" "$@"
+    fi
+}
+
+failed=0 ran=0
+run() {
+    local out
+    if ! out=$(bounded 120 "$@" </dev/null 2>&1); then
+        echo "WARN: '$*' failed: ${out##*$'\n'}" >&2
+        failed=1
+        return 1
+    fi
+}
+
+for entry in "${entries[@]}"; do
+    read -r name command tools <<< "$entry"
+    path="$HOME/.local/bin/$command"
+    if [[ ",$tools," == *,claude,* ]] && command -v claude >/dev/null 2>&1; then
+        ran=1
+        bounded 120 claude mcp get "$name" </dev/null >/dev/null 2>&1 ||
+            run claude mcp add --scope user "$name" -- "$path"
+    fi
+    if [[ ",$tools," == *,codex,* ]] && command -v codex >/dev/null 2>&1; then
+        ran=1
+        bounded 120 codex mcp get "$name" </dev/null >/dev/null 2>&1 ||
+            run codex mcp add "$name" -- "$path"
+    fi
+done
+
+if [[ "$failed" == 0 && "$ran" == 1 ]]; then
+    mkdir -p "$(dirname "$stamp")" && printf '%s' "$want" > "$stamp"
+fi
+exit 0
+{{ end -}}
