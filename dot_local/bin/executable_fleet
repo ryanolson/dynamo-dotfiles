@@ -335,7 +335,10 @@ ssh_aliases() {
         [[ "$jump" == - ]] && jump=""
         [[ -z "$jump" || "$jump" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || continue
         [[ -z "$key_alias" || "$key_alias" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] || continue
-        printf 'Host %s\n    HostName %s\n    User %s\n    StrictHostKeyChecking accept-new\n' "$alias" "$host" "$user"
+        # Port 22 explicitly: SSH takes the first value of each option, and a config included later
+        # (~/.brev/ssh_config names spark-p with Port 11009) would otherwise set the port.
+        printf 'Host %s\n    HostName %s\n    User %s\n    Port 22\n    StrictHostKeyChecking accept-new\n' \
+            "$alias" "$host" "$user"
         # if, not &&: a false test as the loop's last command would fail renew under set -e.
         if [[ -n "$jump" ]]; then printf '    ProxyJump %s\n' "$jump"; fi
         if [[ -n "$key_alias" ]]; then printf '    HostKeyAlias %s\n' "$key_alias"; fi

@@ -248,11 +248,11 @@ class Fleet(FleetBase):
         self.assertEqual(self.fleet('renew').returncode, 0)
         config = self.home / '.ssh/fleet/config'
         text = config.read_text()
-        self.assertIn('Host bb\n    HostName brev.example.ts.net\n    User ubuntu\n    StrictHostKeyChecking accept-new\n', text)
+        self.assertIn('Host bb\n    HostName brev.example.ts.net\n    User ubuntu\n    Port 22\n    StrictHostKeyChecking accept-new\n', text)
         self.assertNotIn('ProxyCommand', text)
-        self.assertIn('Host gpu\n    HostName gpu.corp.example\n    User ryan\n    StrictHostKeyChecking accept-new\n    ProxyJump bb\n', text)
+        self.assertIn('Host gpu\n    HostName gpu.corp.example\n    User ryan\n    Port 22\n    StrictHostKeyChecking accept-new\n    ProxyJump bb\n', text)
         self.assertNotIn('Host evil', text)
-        self.assertIn('Host ip\n    HostName 100.64.0.7\n    User u\n    StrictHostKeyChecking accept-new\n    HostKeyAlias ip-host.example.ts.net\n', text)
+        self.assertIn('Host ip\n    HostName 100.64.0.7\n    User u\n    Port 22\n    StrictHostKeyChecking accept-new\n    HostKeyAlias ip-host.example.ts.net\n', text)
         self.assertNotIn('ProxyJump -', text)
         self.assertLess(text.index('Host bb'), text.index('Host *'))
         resolved = subprocess.run(['ssh', '-G', '-F', str(config), 'bb'], capture_output=True, text=True, check=True).stdout
@@ -263,7 +263,7 @@ class Fleet(FleetBase):
         curl.write_text('#!/bin/sh\ncase "$*" in *v1/ssh-hosts*) printf "ip 100.64.0.7 u - k.example\\nbb h ubuntu\\n" ;; esac\n')
         result = self.fleet('renew')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('Host bb\n    HostName h\n    User ubuntu\n    StrictHostKeyChecking accept-new\nHost *.ts.net ', config.read_text())
+        self.assertIn('Host bb\n    HostName h\n    User ubuntu\n    Port 22\n    StrictHostKeyChecking accept-new\nHost *.ts.net ', config.read_text())
         curl.write_text('#!/bin/sh\ncase "$*" in *v1/ssh-hosts*) [ -f "$HOME/broker-down" ] && exit 7\n'
                         '  printf "bb brev.example.ts.net ubuntu\\n" ;; esac\n')
         self.assertEqual(self.fleet('renew').returncode, 0)
@@ -271,6 +271,24 @@ class Fleet(FleetBase):
         (self.home / 'broker-down').write_text('')
         self.assertEqual(self.fleet('renew').returncode, 0)
         self.assertIn('Host bb\n', config.read_text())
+
+    def test_a_fleet_alias_keeps_port_22_when_a_later_config_names_the_same_host(self):
+        # ~/.brev/ssh_config is included after the fleet config and sets Port 11009 for spark-p.
+        # SSH takes the first value of each option, so without a port of its own the alias got 11009.
+        self.enroll()
+        curl = self.home / 'bin/curl'
+        curl.write_text('#!/bin/sh\ncase "$*" in *v1/ssh-hosts*) printf "spark-p 100.64.0.9 ryan - spark-p\\n" ;; esac\n')
+        curl.chmod(0o700)
+        self.assertEqual(self.fleet('renew').returncode, 0)
+        main = self.home / '.ssh/config'
+        brev = self.home / 'brev_ssh_config'
+        brev.write_text('Host spark-p\n  HostName 127.0.0.1\n  Port 11009\n  User other\n')
+        main.write_text(f'Include {self.home}/.ssh/fleet/config\nInclude {brev}\n')
+        resolved = subprocess.run(['ssh', '-G', '-F', str(main), 'spark-p'], capture_output=True, text=True,
+                                  check=True).stdout
+        self.assertIn('port 22\n', resolved)
+        self.assertIn('hostname 100.64.0.9\n', resolved)
+        self.assertIn('user ryan\n', resolved)
 
     def test_ssh_config_accepts_new_host_keys_only_for_fleet_hosts(self):
         self.enroll()
