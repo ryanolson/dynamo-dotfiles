@@ -22,7 +22,7 @@ from acp import PROTOCOL_VERSION, spawn_agent_process, text_block
 FRIENDS = ("claude", "agent", "devin")
 SPEEDS = ("fast", "balanced", "deep")
 CAPABILITIES = ("verify", "act")
-CLAUDE_ACP_ADAPTER = "@agentclientprotocol/claude-agent-acp@0.65.0"
+CLAUDE_ACP_ADAPTER = "@agentclientprotocol/claude-agent-acp@0.94.0"
 
 SPEED_DEFAULT_FRIEND = {"fast": "devin", "balanced": "claude", "deep": "claude"}
 DEFAULT_MODELS: dict[tuple[str, str], str] = {
