@@ -6,7 +6,9 @@ enrolled or the broker fails. The key reaches only the codex process. Arguments 
 codex.
 
 `wcie-codex app-server ...` is for ACP adapters that take a codex executable (CODEX_PATH): codex
-refuses --profile for app-server, so the profile is passed as -c overrides instead.
+refuses --profile for app-server, so the profile is passed as -c overrides instead. These read
+~/.codex/wcie.profile.json, which chezmoi renders from the source profile: the deployed TOML also
+holds TUI state that codex writes back, and older python3 (macOS ships 3.9) has no tomllib.
 
 Both modes pass a model catalog that lists K3 (the profile's model) and Astra 6. The Astra entry
 comes from the live OpenAI catalog with its slug moved to OpenRouter's.
@@ -18,18 +20,23 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REF = "op://Fleet/OpenRouter-WCIE-Limited/credential"
 PROFILE = "wcie"
 OPENROUTER_SLUGS = {"gpt-6-astra": "openai/gpt-6-astra"}
-# Tables codex writes back into the profile file. They are TUI state, not config for the agent.
-CODEX_WRITTEN_TABLES = ("tui", "notice", "projects")
+# Well under the 30 s that bb gives an ACP agent to start; a timeout falls back to the cache.
+CATALOG_TIMEOUT_S = 10
 
 
 def die(message):
     print(f"wcie-codex: {message}", file=sys.stderr)
     sys.exit(1)
+
+
+def warn(message):
+    print(f"wcie-codex: {message}", file=sys.stderr)
 
 
 def read_key():
@@ -56,21 +63,13 @@ def find_codex():
     return shutil.which("codex", path=path) or die("no codex on PATH outside node_modules/.bin")
 
 
-def codex_home():
-    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
-
-
 def load_profile():
+    """The rendered profile, or None when chezmoi has not rendered it."""
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
     try:
-        import tomllib
-    except ImportError:
+        return json.loads((home / f"{PROFILE}.profile.json").read_text())
+    except (OSError, ValueError):
         return None
-    with open(codex_home() / f"{PROFILE}.config.toml", "rb") as f:
-        return tomllib.load(f)
-
-
-def toml_key(key):
-    return key if re.fullmatch(r"[A-Za-z0-9_-]+", key) else json.dumps(key)
 
 
 def toml_value(value):
@@ -87,12 +86,17 @@ def toml_value(value):
     raise TypeError(f"unsupported TOML value {value!r}")
 
 
+def toml_key(key):
+    # Codex splits -c keys on dots and does not read quotes, so only bare keys survive.
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", key):
+        die(f"the profile key {key!r} cannot be passed to codex as a -c override")
+    return key
+
+
 def overrides(profile, prefix=""):
     """Flatten the profile into -c key=value arguments, one per leaf."""
     args = []
     for key, value in profile.items():
-        if not prefix and key in CODEX_WRITTEN_TABLES:
-            continue
         path = prefix + toml_key(key)
         if isinstance(value, dict):
             args += overrides(value, path + ".")
@@ -103,28 +107,53 @@ def overrides(profile, prefix=""):
 
 def k3_entry(model, template):
     # Codex's metadata for a model it does not know (models-manager model_info_from_slug), which is
-    # what K3 ran on before it had an entry, with the instructions of the catalog's lead model.
+    # what K3 ran on before it had an entry. Every field is explicit, so no serde default decides.
+    # Only the name, picker placement, review model, and instructions (from Astra) differ.
     return {
         "slug": model,
         "display_name": "Kimi K3",
-        "description": "Moonshot Kimi K3 on the NVIDIA endpoint through OpenRouter.",
+        "description": None,
+        "default_reasoning_level": None,
         "supported_reasoning_levels": [],
         "shell_type": "unified_exec",
         "visibility": "list",
         "supported_in_api": True,
         "priority": -1,
+        "additional_speed_tiers": [],
+        "service_tiers": [],
+        "default_service_tier": None,
+        "available_access_programs": None,
         "availability_nux": None,
         "upgrade": None,
         "model_messages": template["model_messages"],
+        "include_skills_usage_instructions": False,
+        "include_plugin_usage_instructions": False,
+        "include_apps_usage_instructions": False,
+        "supports_reasoning_summary_parameter": True,
+        "default_reasoning_summary": "auto",
         "support_verbosity": False,
         "default_verbosity": None,
         "apply_patch_tool_type": None,
         "web_search_tool_type": "text",
         "truncation_policy": {"mode": "bytes", "limit": 10000},
+        "supports_image_detail_original": False,
         "context_window": 272000,
         "max_context_window": 272000,
+        "auto_compact_token_limit": None,
+        "comp_hash": None,
+        "effective_context_window_percent": 95,
         "experimental_supported_tools": [],
+        "input_modalities": ["text", "image"],
+        "supports_search_tool": False,
+        "supports_experimental_context": False,
+        "use_responses_lite": False,
+        "supports_reasoning_effort_updates": False,
+        "guardian": None,
+        "node_repl_auto_review_required": False,
+        "node_repl_disabled": False,
         "auto_review_model_override": model,
+        "model_specialty": None,
+        "tool_mode": None,
     }
 
 
@@ -139,35 +168,51 @@ def build_catalog(live, model):
     missing = [s for s in OPENROUTER_SLUGS if s not in by_slug]
     if missing:
         raise KeyError(f"the OpenAI catalog has no {', '.join(missing)}")
-    template = by_slug[next(iter(OPENROUTER_SLUGS))]
-    models = [k3_entry(model, template)]
+    models = [k3_entry(model, by_slug["gpt-6-astra"])]
     models += [openrouter_entry(by_slug[s], OPENROUTER_SLUGS[s], model) for s in OPENROUTER_SLUGS]
     return {"models": models}
 
 
+def cached_catalog(cache, model):
+    """True when the cache parses and was built for this model."""
+    try:
+        return json.loads(cache.read_text())["models"][0]["slug"] == model
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        return False
+
+
+def write_catalog(cache, catalog):
+    # A unique temporary file per launch: bb can start several app-servers at once.
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(cache.parent), prefix=".models-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(catalog, f)
+        os.replace(tmp, str(cache))
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
 def catalog_path(profile, codex):
     """Write the catalog to the cache and return its path, or None when there is none to use."""
-    cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "wcie-codex/models.json"
     if profile is None:
-        print("wcie-codex: python3 has no tomllib; running without the K3/Astra catalog", file=sys.stderr)
+        warn("~/.codex/wcie.profile.json is missing; running without the K3/Astra catalog")
         return None
+    cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "wcie-codex/models.json"
     try:
         result = subprocess.run([codex, "debug", "models"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                universal_newlines=True, timeout=60)
+                                universal_newlines=True, timeout=CATALOG_TIMEOUT_S)
         if result.returncode != 0:
             raise RuntimeError(f"codex debug models exited {result.returncode}")
-        catalog = build_catalog(json.loads(result.stdout), profile["model"])
-    except Exception as error:  # Any failure leaves the last good catalog in place.
-        if cache.is_file():
-            print(f"wcie-codex: {error}; using the cached catalog", file=sys.stderr)
+        write_catalog(cache, build_catalog(json.loads(result.stdout), profile["model"]))
+        return cache
+    except Exception as error:  # Any failure leaves codex running, with the last good catalog if any.
+        if cached_catalog(cache, profile["model"]):
+            warn(f"{error}; using the cached catalog")
             return cache
-        print(f"wcie-codex: {error}; running without the K3/Astra catalog", file=sys.stderr)
+        warn(f"{error}; running without the K3/Astra catalog")
         return None
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    tmp = cache.with_suffix(".tmp")
-    tmp.write_text(json.dumps(catalog))
-    tmp.replace(cache)
-    return cache
 
 
 def main():
@@ -175,16 +220,13 @@ def main():
     app_server = bool(args) and args[0] == "app-server"
     profile = load_profile()
     if app_server and profile is None:
-        die("app-server mode reads the profile with tomllib, which needs python3 >= 3.11")
+        die("~/.codex/wcie.profile.json is missing or invalid; run chezmoi apply")
+    profile_args = overrides(profile) if app_server else ["-p", PROFILE]
     os.environ["OPENROUTER_API_KEY"] = read_key()
     codex = find_codex()
     catalog = catalog_path(profile, codex)
     catalog_args = ["-c", f"model_catalog_json={json.dumps(str(catalog))}"] if catalog else []
-    if app_server:
-        command = [codex, *overrides(profile), *catalog_args, *args]
-    else:
-        command = [codex, "-p", PROFILE, *catalog_args, *args]
-    os.execv(codex, command)
+    os.execv(codex, [codex, *profile_args, *catalog_args, *args])
 
 
 if __name__ == "__main__":

@@ -1,4 +1,8 @@
-"""Run wcie-codex with stub fleet, op, and codex commands."""
+"""Run wcie-codex with stub fleet, op, and codex commands.
+
+WCIE_PYTHON selects the interpreter that runs the launcher (default python3), so the suite can
+check an older python3, such as the 3.9 that macOS ships.
+"""
 import json
 import os
 from pathlib import Path
@@ -12,6 +16,7 @@ WCIE = ROOT / 'dot_local/bin/executable_wcie-codex'
 CONFIG = ROOT / 'dot_codex/wcie.config.toml'
 REF = 'op://Fleet/OpenRouter-WCIE-Limited/credential'
 K3 = 'moonshotai/kimi-k3'
+PYTHON = os.environ.get('WCIE_PYTHON', 'python3')
 
 
 def live_entry(slug, priority):
@@ -21,6 +26,24 @@ def live_entry(slug, priority):
 
 LIVE_CATALOG = {'models': [live_entry('gpt-6.1-sol', 0), live_entry('gpt-6-astra', 2), live_entry('gpt-6-luna', 4)]}
 
+# The metadata codex gives a model it does not know (models-manager model_info_from_slug), which
+# is what K3 ran on before it had a catalog entry.
+FALLBACK_FIELDS = {
+    'description': None, 'default_reasoning_level': None, 'supported_reasoning_levels': [],
+    'shell_type': 'unified_exec', 'supported_in_api': True, 'additional_speed_tiers': [], 'service_tiers': [],
+    'default_service_tier': None, 'available_access_programs': None, 'availability_nux': None, 'upgrade': None,
+    'include_skills_usage_instructions': False, 'include_plugin_usage_instructions': False,
+    'include_apps_usage_instructions': False, 'supports_reasoning_summary_parameter': True,
+    'default_reasoning_summary': 'auto', 'support_verbosity': False, 'default_verbosity': None,
+    'apply_patch_tool_type': None, 'web_search_tool_type': 'text',
+    'truncation_policy': {'mode': 'bytes', 'limit': 10000}, 'supports_image_detail_original': False,
+    'context_window': 272000, 'max_context_window': 272000, 'auto_compact_token_limit': None, 'comp_hash': None,
+    'effective_context_window_percent': 95, 'experimental_supported_tools': [], 'input_modalities': ['text', 'image'],
+    'supports_search_tool': False, 'supports_experimental_context': False, 'use_responses_lite': False,
+    'supports_reasoning_effort_updates': False, 'guardian': None, 'node_repl_auto_review_required': False,
+    'node_repl_disabled': False, 'model_specialty': None, 'tool_mode': None,
+}
+
 
 class WcieCodex(unittest.TestCase):
     def setUp(self):
@@ -29,11 +52,13 @@ class WcieCodex(unittest.TestCase):
         self.home = Path(tmp.name)
         self.bin = self.home / 'bin'
         self.bin.mkdir()
-        codex_home = self.home / '.codex'
-        codex_home.mkdir()
-        # The deployed profile also holds TUI state that codex writes back.
-        (codex_home / 'wcie.config.toml').write_text(
+        self.codex_home = self.home / '.codex'
+        self.codex_home.mkdir()
+        # The deployed profile also holds TUI state that codex writes back. App-server mode must not
+        # see it: it reads the JSON that chezmoi renders from the source profile.
+        (self.codex_home / 'wcie.config.toml').write_text(
             CONFIG.read_text() + '\n[tui]\nscreen_reader_detection_done = true\n')
+        self.write_profile_json(tomllib.loads(CONFIG.read_text()))
         (self.home / 'live.json').write_text(json.dumps(LIVE_CATALOG))
         self.stub('codex', 'if [ "$1" = debug ]; then\n'
                            '  [ -n "${DEBUG_FAIL:-}" ] && exit 1\n  cat "$HOME/live.json"; exit 0\nfi\n'
@@ -47,6 +72,9 @@ class WcieCodex(unittest.TestCase):
         path.write_text('#!/bin/sh\n' + body + '\n')
         path.chmod(0o755)
 
+    def write_profile_json(self, profile):
+        (self.codex_home / 'wcie.profile.json').write_text(json.dumps(profile))
+
     def enroll(self):
         state = self.home / '.local/state/fleet'
         state.mkdir(parents=True)
@@ -54,7 +82,7 @@ class WcieCodex(unittest.TestCase):
 
     def run_wcie(self, *args, **env):
         full = {'HOME': str(self.home), 'PATH': f'{self.bin}:/usr/bin:/bin', **env}
-        return subprocess.run(['python3', str(WCIE), *args], env=full, capture_output=True, text=True, timeout=30)
+        return subprocess.run([PYTHON, str(WCIE), *args], env=full, capture_output=True, text=True, timeout=30)
 
     def calls(self):
         calls = self.home / 'calls'
@@ -103,9 +131,13 @@ class WcieCodex(unittest.TestCase):
         self.assertEqual([m['slug'] for m in sorted(models, key=lambda m: m['priority'])],
                          [K3, 'openai/gpt-6-astra'])
         self.assertTrue(all(m['auto_review_model_override'] == K3 for m in models))
-        k3 = models[0]
-        self.assertEqual(k3['model_messages'], {'instructions_template': 'gpt-6-astra instructions'})
         self.assertIsNone(models[1]['availability_nux'])
+
+    def test_the_k3_entry_keeps_the_metadata_codex_gives_an_unknown_model(self):
+        self.assertEqual(self.run_wcie().returncode, 0)
+        k3 = json.loads(self.cache().read_text())['models'][0]
+        self.assertEqual({k: k3.get(k, 'MISSING') for k in FALLBACK_FIELDS}, FALLBACK_FIELDS)
+        self.assertEqual(k3['model_messages'], {'instructions_template': 'gpt-6-astra instructions'})
 
     def test_a_failed_catalog_read_reuses_the_cached_catalog(self):
         self.assertEqual(self.run_wcie().returncode, 0)
@@ -113,6 +145,29 @@ class WcieCodex(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('using the cached catalog', result.stderr)
         self.assertEqual(self.got()[1], ['-p', 'wcie', '-c', self.catalog_arg(), 'exec'])
+
+    def test_a_cached_catalog_for_another_model_is_not_used(self):
+        self.assertEqual(self.run_wcie().returncode, 0)
+        profile = tomllib.loads(CONFIG.read_text())
+        profile['model'] = 'moonshotai/kimi-k4'
+        self.write_profile_json(profile)
+        result = self.run_wcie('exec', DEBUG_FAIL='1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.got()[1], ['-p', 'wcie', 'exec'])
+
+    def test_a_corrupt_cached_catalog_is_not_used(self):
+        self.cache().parent.mkdir(parents=True)
+        self.cache().write_text('{"models": [')
+        result = self.run_wcie('exec', DEBUG_FAIL='1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.got()[1], ['-p', 'wcie', 'exec'])
+
+    def test_an_unwritable_cache_still_runs_codex(self):
+        (self.home / '.cache').mkdir()
+        (self.home / '.cache/wcie-codex').write_text('a file where the cache directory goes')
+        result = self.run_wcie('exec')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.got()[1], ['-p', 'wcie', 'exec'])
 
     def test_no_catalog_at_all_still_runs_codex_without_one(self):
         result = self.run_wcie('exec', DEBUG_FAIL='1')
@@ -130,27 +185,39 @@ class WcieCodex(unittest.TestCase):
         self.assertEqual(argv[start:], ['app-server', '-c', 'hooks={}'])
         flags = argv[:start]
         self.assertEqual(flags[-2:], ['-c', self.catalog_arg()])
-        pairs = [flags[i + 1] for i in range(0, len(flags) - 2, 2)]
         self.assertTrue(all(flags[i] == '-c' for i in range(0, len(flags), 2)))
         rebuilt = {}
-        for pair in pairs:
+        for pair in (flags[i + 1] for i in range(0, len(flags) - 2, 2)):
             key, _, value = pair.partition('=')
             node = rebuilt
-            *parents, leaf = self.key_path(key)
+            *parents, leaf = key.split('.')  # codex splits -c keys on dots
             for parent in parents:
                 node = node.setdefault(parent, {})
             node[leaf] = tomllib.loads(f'v = {value}')['v']
         self.assertEqual(rebuilt, tomllib.loads(CONFIG.read_text()))
 
-    @staticmethod
-    def key_path(dotted):
-        # Resolve a dotted TOML key, quoted parts included, to its parts.
-        doc = tomllib.loads(f'{dotted} = 0')
-        parts = []
-        while isinstance(doc, dict):
-            (key, doc), = doc.items()
-            parts.append(key)
-        return parts
+    def test_app_server_refuses_a_key_that_codex_cannot_take_as_an_override(self):
+        profile = tomllib.loads(CONFIG.read_text())
+        profile['projects'] = {'/home/me/repo.v2': {'trust_level': 'trusted'}}
+        self.write_profile_json(profile)
+        result = self.run_wcie('app-server')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('/home/me/repo.v2', result.stderr)
+        self.assertFalse((self.home / 'got').exists())
+
+    def test_app_server_without_the_rendered_profile_asks_for_chezmoi_apply(self):
+        (self.codex_home / 'wcie.profile.json').unlink()
+        result = self.run_wcie('app-server')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('chezmoi apply', result.stderr)
+        self.assertFalse((self.home / 'got').exists())
+
+    def test_the_tui_without_the_rendered_profile_runs_without_the_catalog(self):
+        (self.codex_home / 'wcie.profile.json').unlink()
+        result = self.run_wcie('exec')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('without the K3/Astra catalog', result.stderr)
+        self.assertEqual(self.got()[1], ['-p', 'wcie', 'exec'])
 
     def test_codex_from_an_npx_package_bin_is_skipped(self):
         # npx puts the adapter's node_modules/.bin, with its own codex package, first on PATH.
@@ -175,6 +242,13 @@ class WcieCodex(unittest.TestCase):
         self.assertEqual(config['review_model'], model)
         self.assertEqual(config['agents']['default_subagent_model'], model)
         self.assertEqual(config['memories'], {'extract_model': model, 'consolidation_model': model})
+
+    def test_chezmoi_renders_the_profile_json_from_the_source_profile(self):
+        template = ROOT / 'dot_codex/wcie.profile.json.tmpl'
+        rendered = subprocess.run(['chezmoi', '--source', str(ROOT), 'execute-template'], input=template.read_text(),
+                                  capture_output=True, text=True, timeout=30)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertEqual(json.loads(rendered.stdout), tomllib.loads(CONFIG.read_text()))
 
 
 if __name__ == '__main__':

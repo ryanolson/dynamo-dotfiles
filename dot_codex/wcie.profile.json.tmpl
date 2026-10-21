@@ -1,0 +1,2 @@
+{{- /* JSON copy of wcie.config.toml for wcie-codex app-server, which runs on python3 without tomllib. */ -}}
+{{ include "dot_codex/wcie.config.toml" | fromToml | toPrettyJson }}
