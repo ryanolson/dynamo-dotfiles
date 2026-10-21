@@ -8,8 +8,8 @@ codex.
 `wcie-codex app-server ...` is for ACP adapters that take a codex executable (CODEX_PATH): codex
 refuses --profile for app-server, so the profile is passed as -c overrides instead.
 
-Both modes pass a model catalog that lists K3 (the profile's model), Sol 6.1, and Astra 6. The
-Sol and Astra entries come from the live OpenAI catalog with their slugs moved to OpenRouter's.
+Both modes pass a model catalog that lists K3 (the profile's model) and Astra 6. The Astra entry
+comes from the live OpenAI catalog with its slug moved to OpenRouter's.
 """
 import copy
 import json
@@ -22,7 +22,7 @@ from pathlib import Path
 
 REF = "op://Fleet/OpenRouter-WCIE-Limited/credential"
 PROFILE = "wcie"
-OPENROUTER_SLUGS = {"gpt-6.1-sol": "openai/gpt-6.1-sol", "gpt-6-astra": "openai/gpt-6-astra"}
+OPENROUTER_SLUGS = {"gpt-6-astra": "openai/gpt-6-astra"}
 # Tables codex writes back into the profile file. They are TUI state, not config for the agent.
 CODEX_WRITTEN_TABLES = ("tui", "notice", "projects")
 
@@ -149,7 +149,7 @@ def catalog_path(profile, codex):
     """Write the catalog to the cache and return its path, or None when there is none to use."""
     cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "wcie-codex/models.json"
     if profile is None:
-        print("wcie-codex: python3 has no tomllib; running without the K3/Sol/Astra catalog", file=sys.stderr)
+        print("wcie-codex: python3 has no tomllib; running without the K3/Astra catalog", file=sys.stderr)
         return None
     try:
         result = subprocess.run([codex, "debug", "models"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -161,7 +161,7 @@ def catalog_path(profile, codex):
         if cache.is_file():
             print(f"wcie-codex: {error}; using the cached catalog", file=sys.stderr)
             return cache
-        print(f"wcie-codex: {error}; running without the K3/Sol/Astra catalog", file=sys.stderr)
+        print(f"wcie-codex: {error}; running without the K3/Astra catalog", file=sys.stderr)
         return None
     cache.parent.mkdir(parents=True, exist_ok=True)
     tmp = cache.with_suffix(".tmp")

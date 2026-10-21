@@ -97,14 +97,14 @@ class WcieCodex(unittest.TestCase):
         self.assertIn('could not read', result.stderr)
         self.assertFalse((self.home / 'got').exists())
 
-    def test_the_catalog_lists_k3_first_then_sol_and_astra_on_openrouter(self):
+    def test_the_catalog_lists_k3_first_then_astra_on_openrouter(self):
         self.assertEqual(self.run_wcie().returncode, 0)
         models = json.loads(self.cache().read_text())['models']
         self.assertEqual([m['slug'] for m in sorted(models, key=lambda m: m['priority'])],
-                         [K3, 'openai/gpt-6.1-sol', 'openai/gpt-6-astra'])
+                         [K3, 'openai/gpt-6-astra'])
         self.assertTrue(all(m['auto_review_model_override'] == K3 for m in models))
         k3 = models[0]
-        self.assertEqual(k3['model_messages'], {'instructions_template': 'gpt-6.1-sol instructions'})
+        self.assertEqual(k3['model_messages'], {'instructions_template': 'gpt-6-astra instructions'})
         self.assertIsNone(models[1]['availability_nux'])
 
     def test_a_failed_catalog_read_reuses_the_cached_catalog(self):
@@ -117,7 +117,7 @@ class WcieCodex(unittest.TestCase):
     def test_no_catalog_at_all_still_runs_codex_without_one(self):
         result = self.run_wcie('exec', DEBUG_FAIL='1')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('without the K3/Sol/Astra catalog', result.stderr)
+        self.assertIn('without the K3/Astra catalog', result.stderr)
         self.assertEqual(self.got()[1], ['-p', 'wcie', 'exec'])
 
     def test_app_server_gets_the_profile_as_overrides_and_keeps_trailing_args(self):

@@ -1,5 +1,5 @@
-# OpenRouter pilot workspace. K3 is served from the NVIDIA endpoint; Sol 6.1 and Astra 6 from OpenAI.
-# Start with: wcie-codex (it sets OPENROUTER_API_KEY and the K3/Sol/Astra model catalog, then runs codex -p wcie)
+# OpenRouter pilot workspace. K3 is served from the NVIDIA endpoint, and Astra 6 from OpenAI.
+# Start with: wcie-codex (it sets OPENROUTER_API_KEY and the K3/Astra model catalog, then runs codex -p wcie)
 model = "moonshotai/kimi-k3"
 model_provider = "openrouter-nvidia-pilot"
 
@@ -25,5 +25,5 @@ env_key = "OPENROUTER_API_KEY"
 env_key_instructions = "Run wcie-codex, or set OPENROUTER_API_KEY (OpenRouter pilot workspace key). BYOK must be configured."
 wire_api = "responses"
 # OpenRouter reads routing preferences from the provider URL query param. K3 has no OpenAI endpoint
-# and Sol and Astra have only OpenAI ones, so this keeps K3 on NVIDIA. No fallbacks.
+# and Astra has only OpenAI ones, so this keeps K3 on NVIDIA. No fallbacks.
 query_params = { provider = "{\"only\":[\"nvidia\",\"openai\"],\"allow_fallbacks\":false}" }
