@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["agent-client-protocol==0.12.0"]
+# dependencies = ["agent-client-protocol==0.12.1"]
 # ///
 """Run independent or persistent friend-agent sessions over ACP."""
 
