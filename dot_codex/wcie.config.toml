@@ -2,6 +2,8 @@
 # Start with: wcie-codex (it sets OPENROUTER_API_KEY and the K3/Astra model catalog, then runs codex -p wcie)
 model = "moonshotai/kimi-k3"
 model_provider = "openrouter-nvidia-pilot"
+# OpenRouter passes this to K3 as reasoning.effort. Codex sends "medium" when it is not set.
+model_reasoning_effort = "max"
 
 # Codex runs Luna and Terra for side work by default. Send that work to K3 instead.
 # Thread titles and the guardian-v2 scorer name Luna in code, and config cannot move them.

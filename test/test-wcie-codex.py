@@ -19,17 +19,21 @@ K3 = 'moonshotai/kimi-k3'
 PYTHON = os.environ.get('WCIE_PYTHON', 'python3')
 
 
+EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
+
+
 def live_entry(slug, priority):
     return {'slug': slug, 'display_name': slug.upper(), 'priority': priority, 'availability_nux': {'message': 'try'},
-            'model_messages': {'instructions_template': f'{slug} instructions'}}
+            'model_messages': {'instructions_template': f'{slug} instructions'},
+            'supported_reasoning_levels': [{'effort': e, 'description': f'{e} reasoning'} for e in EFFORTS]}
 
 
 LIVE_CATALOG = {'models': [live_entry('gpt-6.1-sol', 0), live_entry('gpt-6-astra', 2), live_entry('gpt-6-luna', 4)]}
 
 # The metadata codex gives a model it does not know (models-manager model_info_from_slug), which
-# is what K3 ran on before it had a catalog entry.
+# is what K3 ran on before it had a catalog entry. The reasoning fields differ and have their own test.
 FALLBACK_FIELDS = {
-    'description': None, 'default_reasoning_level': None, 'supported_reasoning_levels': [],
+    'description': None,
     'shell_type': 'unified_exec', 'supported_in_api': True, 'additional_speed_tiers': [], 'service_tiers': [],
     'default_service_tier': None, 'available_access_programs': None, 'availability_nux': None, 'upgrade': None,
     'include_skills_usage_instructions': False, 'include_plugin_usage_instructions': False,
@@ -40,7 +44,7 @@ FALLBACK_FIELDS = {
     'context_window': 272000, 'max_context_window': 272000, 'auto_compact_token_limit': None, 'comp_hash': None,
     'effective_context_window_percent': 95, 'experimental_supported_tools': [], 'input_modalities': ['text', 'image'],
     'supports_search_tool': False, 'supports_experimental_context': False, 'use_responses_lite': False,
-    'supports_reasoning_effort_updates': False, 'guardian': None, 'node_repl_auto_review_required': False,
+    'guardian': None, 'node_repl_auto_review_required': False,
     'node_repl_disabled': False, 'model_specialty': None, 'tool_mode': None,
 }
 
@@ -138,6 +142,14 @@ class WcieCodex(unittest.TestCase):
         k3 = json.loads(self.cache().read_text())['models'][0]
         self.assertEqual({k: k3.get(k, 'MISSING') for k in FALLBACK_FIELDS}, FALLBACK_FIELDS)
         self.assertEqual(k3['model_messages'], {'instructions_template': 'gpt-6-astra instructions'})
+
+    def test_k3_offers_the_openrouter_efforts_and_defaults_to_max(self):
+        self.assertEqual(self.run_wcie().returncode, 0)
+        k3 = json.loads(self.cache().read_text())['models'][0]
+        self.assertEqual([l['effort'] for l in k3['supported_reasoning_levels']], EFFORTS[:-1])
+        self.assertEqual(k3['default_reasoning_level'], 'max')
+        self.assertTrue(k3['supports_reasoning_effort_updates'])
+        self.assertEqual(tomllib.loads(CONFIG.read_text())['model_reasoning_effort'], 'max')
 
     def test_a_failed_catalog_read_reuses_the_cached_catalog(self):
         self.assertEqual(self.run_wcie().returncode, 0)

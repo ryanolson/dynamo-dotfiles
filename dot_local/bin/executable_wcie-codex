@@ -28,6 +28,7 @@ PROFILE = "wcie"
 OPENROUTER_SLUGS = {"gpt-6-astra": "openai/gpt-6-astra"}
 # Well under the 30 s that bb gives an ACP agent to start; a timeout falls back to the cache.
 CATALOG_TIMEOUT_S = 10
+K3_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
 def die(message):
@@ -108,13 +109,15 @@ def overrides(profile, prefix=""):
 def k3_entry(model, template):
     # Codex's metadata for a model it does not know (models-manager model_info_from_slug), which is
     # what K3 ran on before it had an entry. Every field is explicit, so no serde default decides.
-    # Only the name, picker placement, review model, and instructions (from Astra) differ.
+    # Only the name, picker placement, review model, reasoning efforts, and instructions (from Astra)
+    # differ. The efforts make K3's reasoning selectable in the codex and bb pickers, with max as the
+    # default. Ultra is left out: it is Codex task delegation, not an OpenRouter effort.
     return {
         "slug": model,
         "display_name": "Kimi K3",
         "description": None,
-        "default_reasoning_level": None,
-        "supported_reasoning_levels": [],
+        "default_reasoning_level": "max",
+        "supported_reasoning_levels": [l for l in template["supported_reasoning_levels"] if l["effort"] in K3_EFFORTS],
         "shell_type": "unified_exec",
         "visibility": "list",
         "supported_in_api": True,
@@ -147,7 +150,7 @@ def k3_entry(model, template):
         "supports_search_tool": False,
         "supports_experimental_context": False,
         "use_responses_lite": False,
-        "supports_reasoning_effort_updates": False,
+        "supports_reasoning_effort_updates": True,
         "guardian": None,
         "node_repl_auto_review_required": False,
         "node_repl_disabled": False,
