@@ -29,6 +29,7 @@ OPENROUTER_SLUGS = {"gpt-6-astra": "openai/gpt-6-astra"}
 # Well under the 30 s that bb gives an ACP agent to start; a timeout falls back to the cache.
 CATALOG_TIMEOUT_S = 10
 K3_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+K3_CONTEXT_WINDOW = 1_048_576
 
 
 def die(message):
@@ -109,9 +110,11 @@ def overrides(profile, prefix=""):
 def k3_entry(model, template):
     # Codex's metadata for a model it does not know (models-manager model_info_from_slug), which is
     # what K3 ran on before it had an entry. Every field is explicit, so no serde default decides.
-    # Only the name, picker placement, review model, reasoning efforts, and instructions (from Astra)
-    # differ. The efforts make K3's reasoning selectable in the codex and bb pickers, with max as the
-    # default. Ultra is left out: it is Codex task delegation, not an OpenRouter effort.
+    # Only the name, picker placement, review model, reasoning efforts, instructions (from Astra), and
+    # context window differ. The efforts make K3's reasoning selectable in the codex and bb pickers, with
+    # max as the default. Ultra is left out: it is Codex task delegation, not an OpenRouter effort. The
+    # window is K3's own, 1,048,576 tokens on every OpenRouter endpoint: codex compacts against it, so
+    # the unknown-model 272,000 cut K3's sessions to about a quarter of what it serves.
     return {
         "slug": model,
         "display_name": "Kimi K3",
@@ -140,8 +143,8 @@ def k3_entry(model, template):
         "web_search_tool_type": "text",
         "truncation_policy": {"mode": "bytes", "limit": 10000},
         "supports_image_detail_original": False,
-        "context_window": 272000,
-        "max_context_window": 272000,
+        "context_window": K3_CONTEXT_WINDOW,
+        "max_context_window": K3_CONTEXT_WINDOW,
         "auto_compact_token_limit": None,
         "comp_hash": None,
         "effective_context_window_percent": 95,

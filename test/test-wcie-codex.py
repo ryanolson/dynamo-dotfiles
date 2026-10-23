@@ -31,7 +31,8 @@ def live_entry(slug, priority):
 LIVE_CATALOG = {'models': [live_entry('gpt-6.1-sol', 0), live_entry('gpt-6-astra', 2), live_entry('gpt-6-luna', 4)]}
 
 # The metadata codex gives a model it does not know (models-manager model_info_from_slug), which
-# is what K3 ran on before it had a catalog entry. The reasoning fields differ and have their own test.
+# is what K3 ran on before it had a catalog entry. The reasoning fields and the context window
+# differ and have their own tests.
 FALLBACK_FIELDS = {
     'description': None,
     'shell_type': 'unified_exec', 'supported_in_api': True, 'additional_speed_tiers': [], 'service_tiers': [],
@@ -41,7 +42,7 @@ FALLBACK_FIELDS = {
     'default_reasoning_summary': 'auto', 'support_verbosity': False, 'default_verbosity': None,
     'apply_patch_tool_type': None, 'web_search_tool_type': 'text',
     'truncation_policy': {'mode': 'bytes', 'limit': 10000}, 'supports_image_detail_original': False,
-    'context_window': 272000, 'max_context_window': 272000, 'auto_compact_token_limit': None, 'comp_hash': None,
+    'auto_compact_token_limit': None, 'comp_hash': None,
     'effective_context_window_percent': 95, 'experimental_supported_tools': [], 'input_modalities': ['text', 'image'],
     'supports_search_tool': False, 'supports_experimental_context': False, 'use_responses_lite': False,
     'guardian': None, 'node_repl_auto_review_required': False,
@@ -142,6 +143,13 @@ class WcieCodex(unittest.TestCase):
         k3 = json.loads(self.cache().read_text())['models'][0]
         self.assertEqual({k: k3.get(k, 'MISSING') for k in FALLBACK_FIELDS}, FALLBACK_FIELDS)
         self.assertEqual(k3['model_messages'], {'instructions_template': 'gpt-6-astra instructions'})
+
+    def test_k3_has_its_own_context_window(self):
+        # Codex's unknown-model window is 272,000 tokens; K3 serves 1,048,576 on every OpenRouter
+        # endpoint, and codex compacts against this window.
+        self.assertEqual(self.run_wcie().returncode, 0)
+        k3 = json.loads(self.cache().read_text())['models'][0]
+        self.assertEqual((k3['context_window'], k3['max_context_window']), (1048576, 1048576))
 
     def test_k3_offers_the_openrouter_efforts_and_defaults_to_max(self):
         self.assertEqual(self.run_wcie().returncode, 0)
