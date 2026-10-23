@@ -512,7 +512,9 @@ subprocess.run(["bb", "plugin", "config", "provider-acp", "set", "customAgents",
 
 The `sh -c` wrapper takes `PATH` from the login shell, for the reason given for WCIE: the `PATH` of the bb host daemon does not have `~/.local/bin`.
 
-The server reuses the sign-in of `agy`. Sign in with `agy` once on each machine. The server also reads `~/.gemini/config/mcp_config.json`. It does not open a session when one of the servers in that file fails to start. The entries that the Antigravity IDE writes there need the IDE to run, so remove them on a machine without the IDE.
+Run `agy-acp login` once on each machine to sign the server in with Google. The server prints a link and waits about five minutes. Open the link and sign in with the Google account that has the Antigravity plan. On a machine without a browser, open the link on another computer. The browser then goes to a `http://127.0.0.1:<port>/?code=...` page that fails to load. Copy that full URL and run `curl -s '<URL>'` on the machine that waits, for example `ssh spark-p "curl -s '<URL>'"`. If `agy` is already signed in on the machine, the server uses that sign-in and needs no link (checked on macOS). The sign-in of the server does not sign in `agy` (checked on spark-p and spark-d): start `agy` to sign in the CLI.
+
+The server also reads `~/.gemini/config/mcp_config.json`. It does not open a session when one of the servers in that file fails to start. The entries that the Antigravity IDE writes there need the IDE to run, so remove them on a machine without the IDE.
 
 Verification:
 

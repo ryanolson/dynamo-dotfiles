@@ -12,16 +12,23 @@ chooses later overrides the default. Every other line passes through byte for by
 The server and its arguments come from <AGY_ACP_SERVER_DIR>/launch.json, which iou_antigravity_acp
 writes from the ACP registry (Linux needs `--uid=`). Arguments on the command line follow those.
 
+`agy-acp login` signs the server in with Google (the oauth-personal method) and exits. The server
+prints a link. On a machine without a browser, open the link on another computer. The browser then
+goes to a `http://127.0.0.1:<port>/?code=...` page that fails to load: run `curl` on that full URL
+on this machine to hand the code to the waiting server. The server gives up after about five minutes.
+
 Environment:
   AGY_ACP_SERVER_DIR          server directory (default ~/.local/share/agy-acp-server/current)
   AGY_ACP_DEFAULT_MODEL       model id for new sessions (default gemini-4-argon-high); empty turns it off
   AGY_ACP_SET_MODEL_TIMEOUT   seconds to wait for the server to accept the model (default 10)
+  AGY_ACP_LOGIN_TIMEOUT       seconds that `login` waits for the sign-in (default 330)
 
 If the server rejects the model or does not answer in time, bb gets the server's own reply
 unchanged and the session runs on the server default.
 """
 import json
 import os
+import queue
 import signal
 import subprocess
 import sys
@@ -30,6 +37,8 @@ from pathlib import Path
 
 DEFAULT_MODEL = "gemini-4-argon-high"
 SET_MODEL_TIMEOUT_S = 10.0
+# The server ends the sign-in itself after about five minutes.
+LOGIN_TIMEOUT_S = 330.0
 # The server gets this long to exit after bb closes stdin before it is terminated.
 EXIT_GRACE_S = 5.0
 REQUEST_PREFIX = "agy-acp-default-"
@@ -200,9 +209,60 @@ class Proxy:
             self.write_client(raw)
 
 
+def login(executable, arguments):
+    """Sign the server in with Google. The server prints the link on stderr, which this process shares."""
+    try:
+        timeout = float(os.environ.get("AGY_ACP_LOGIN_TIMEOUT", LOGIN_TIMEOUT_S))
+    except ValueError:
+        die("AGY_ACP_LOGIN_TIMEOUT must be a number of seconds.")
+    try:
+        child = subprocess.Popen([str(executable), *arguments], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    except OSError as error:
+        die(f"cannot start {executable}: {error}")
+    lines = queue.Queue()
+
+    def read_replies():
+        for raw in child.stdout:
+            lines.put(raw)
+
+    threading.Thread(target=read_replies, daemon=True).start()
+
+    def call(ident, method, params, wait):
+        child.stdin.write((json.dumps({"jsonrpc": "2.0", "id": ident, "method": method, "params": params}) + "\n").encode())
+        child.stdin.flush()
+        while True:
+            try:
+                message = json.loads(lines.get(timeout=wait))
+            except queue.Empty:
+                return None
+            except ValueError:
+                continue
+            if isinstance(message, dict) and message.get("id") == ident and "method" not in message:
+                return message
+
+    try:
+        call(1, "initialize", {"protocolVersion": 1, "clientCapabilities": {}, "clientInfo": {"name": "agy-acp", "version": "0"}},
+             SET_MODEL_TIMEOUT_S * 3)
+        print("agy-acp: waiting for the sign-in. Open the link that the server prints.", file=sys.stderr, flush=True)
+        answer = call(2, "authenticate", {"methodId": "oauth-personal"}, timeout)
+    finally:
+        child.terminate()
+    if answer is None:
+        warn(f"no answer from the server within {timeout:g} s")
+        return 1
+    if "error" in answer:
+        warn(f"sign-in failed: {answer['error'].get('message')}")
+        return 1
+    tier = (((answer.get("result") or {}).get("_meta") or {}).get("antigravity") or {}).get("tier") or {}
+    print(f"Signed in ({tier['name']})." if tier.get("name") else "Signed in.")
+    return 0
+
+
 def main():
     server_dir = Path(os.environ.get("AGY_ACP_SERVER_DIR") or Path.home() / ".local/share/agy-acp-server/current")
     executable, arguments = load_launch(server_dir)
+    if sys.argv[1:2] == ["login"]:
+        sys.exit(login(executable, arguments))
     model = os.environ.get("AGY_ACP_DEFAULT_MODEL", DEFAULT_MODEL)
     try:
         timeout = float(os.environ.get("AGY_ACP_SET_MODEL_TIMEOUT", SET_MODEL_TIMEOUT_S))

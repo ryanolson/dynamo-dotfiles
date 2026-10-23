@@ -49,6 +49,17 @@ STUB = textwrap.dedent('''\
                      'options': [{'value': 'low'}, {'value': 'high'}]},
                     {'id': 'mode', 'category': 'mode', 'currentValue': 'default',
                      'options': [{'value': 'default'}]}]}
+        elif method == 'authenticate':
+            if os.environ.get('STUB_HANG_AUTH'):
+                continue
+            if os.environ.get('STUB_FAIL_AUTH'):
+                print(json.dumps({'jsonrpc': '2.0', 'id': ident, 'error': {
+                    'code': -32000, 'message': 'Onboarding failed: Timed out waiting for the authentication flow'}}),
+                      flush=True)
+                continue
+            print('Open the following link to authenticate the ACP server: https://example.test/auth', file=sys.stderr,
+                  flush=True)
+            result = {'_meta': {'antigravity': {'tier': {'name': 'Google AI Pro'}}}}
         elif method == 'session/set_model':
             if os.environ.get('STUB_HANG_SET_MODEL'):
                 continue
@@ -230,6 +241,34 @@ class AgyAcp(unittest.TestCase):
                              capture_output=True, text=True)
         self.assertEqual(out.stdout.strip(), '')
 
+
+    def login(self, env=None, argv=('login',)):
+        environment = dict(os.environ, AGY_ACP_SERVER_DIR=str(self.server), STUB_LOG=str(self.log))
+        environment.update(env or {})
+        return subprocess.run([PYTHON, str(AGY_ACP), *argv], capture_output=True, text=True, timeout=60,
+                              env=environment, stdin=subprocess.DEVNULL)
+
+    def test_login_signs_in_with_google_and_shows_the_link_and_the_plan(self):
+        result = self.login()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Signed in (Google AI Pro)', result.stdout)
+        self.assertIn('https://example.test/auth', result.stderr)
+        authenticate = [m for m in self.received() if m.get('method') == 'authenticate']
+        self.assertEqual([m['params'] for m in authenticate], [{'methodId': 'oauth-personal'}])
+
+    def test_login_does_not_pass_its_name_to_the_server(self):
+        self.login()
+        self.assertEqual(json.loads((self.root / ARGUMENT_LOG).read_text()), ['--uid='])
+
+    def test_login_reports_the_error_that_the_server_gives(self):
+        result = self.login(env={'STUB_FAIL_AUTH': '1'})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('Timed out waiting for the authentication flow', result.stderr)
+
+    def test_login_stops_when_the_server_does_not_answer(self):
+        result = self.login(env={'STUB_HANG_AUTH': '1', 'AGY_ACP_LOGIN_TIMEOUT': '0.5'})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('no answer', result.stderr)
 
 if __name__ == '__main__':
     unittest.main()
