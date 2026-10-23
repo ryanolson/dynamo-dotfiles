@@ -13,4 +13,6 @@ mkdir -p "$staging/home"
 HOME="$staging/home" bash "$staging/install.sh" --dir "$staging"
 test -x "$staging/agy"
 mv -f "$staging/agy" "$install_dir/agy"
-"$install_dir/agy" install --dir "$install_dir"
+# Without these flags `agy install` appends a PATH line to ~/.profile and the fish config, which
+# chezmoi manages. chezmoi already puts ~/.local/bin on PATH.
+"$install_dir/agy" install --dir "$install_dir" --skip-path --skip-aliases
