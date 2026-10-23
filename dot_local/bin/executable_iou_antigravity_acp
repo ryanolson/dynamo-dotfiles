@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""Install or update the Antigravity ACP server that bb runs through agy-acp.
+
+Google publishes the server in the ACP registry as one archive per platform. This command reads the
+antigravity-acp entry, downloads the archive for this platform, and installs it as
+<root>/<version>/ with a launch.json that holds the command and arguments from the registry
+(Linux needs `--uid=`). Then it points <root>/current at that version and removes the other
+versions. agy-acp reads <root>/current/launch.json. A run that finds the version already installed
+downloads nothing.
+
+The server needs a Google login before it opens a session. This command does not log in.
+
+Environment:
+  AGY_ACP_REGISTRY_URL   registry file (default the ACP registry on cdn.agentclientprotocol.com)
+  AGY_ACP_SERVER_ROOT    install root (default ~/.local/share/agy-acp-server)
+  AGY_ACP_PLATFORM       platform key to install, such as linux-aarch64 (default: this machine)
+"""
+import json
+import os
+import platform
+import shutil
+import stat
+import sys
+import tempfile
+import urllib.request
+import zipfile
+from pathlib import Path
+
+REGISTRY_URL = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json"
+AGENT_ID = "antigravity-acp"
+TIMEOUT_S = 120
+SYSTEMS = {"Darwin": "darwin", "Linux": "linux"}
+MACHINES = {"arm64": "aarch64", "aarch64": "aarch64", "x86_64": "x86_64", "AMD64": "x86_64"}
+
+
+def die(message):
+    print(f"iou_antigravity_acp: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def fetch(url, destination=None):
+    # The registry CDN and dl.google.com answer 403 to the default Python-urllib user agent.
+    request = urllib.request.Request(url, headers={"User-Agent": "iou_antigravity_acp"})
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT_S) as response:
+            if destination is None:
+                return response.read()
+            with open(destination, "wb") as out:
+                shutil.copyfileobj(response, out)
+    except (OSError, ValueError) as error:
+        die(f"cannot download {url}: {error}")
+
+
+def detect_platform():
+    system, machine = SYSTEMS.get(platform.system()), MACHINES.get(platform.machine())
+    if system is None or machine is None:
+        die(f"unsupported platform {platform.system()} {platform.machine()}")
+    return f"{system}-{machine}"
+
+
+def registry_entry(platform_key):
+    url = os.environ.get("AGY_ACP_REGISTRY_URL", REGISTRY_URL)
+    try:
+        registry = json.loads(fetch(url))
+    except ValueError as error:
+        die(f"{url} is not valid JSON: {error}")
+    agent = next((a for a in registry.get("agents", []) if a.get("id") == AGENT_ID), None)
+    if agent is None:
+        die(f"the registry at {url} has no {AGENT_ID} entry")
+    binaries = agent.get("distribution", {}).get("binary", {})
+    if platform_key not in binaries:
+        die(f"the {AGENT_ID} entry has no build for {platform_key}. Builds: {', '.join(sorted(binaries)) or 'none'}")
+    return agent["version"], binaries[platform_key]
+
+
+def extract(archive_path, destination):
+    with zipfile.ZipFile(archive_path) as archive:
+        for info in archive.infolist():
+            target = Path(os.path.normpath(destination / info.filename))
+            mode = info.external_attr >> 16
+            if (destination not in target.parents and target != destination) or stat.S_ISLNK(mode):
+                die(f"the archive has an unsafe entry: {info.filename}")
+        archive.extractall(destination)
+        for info in archive.infolist():
+            if not info.is_dir():
+                # zipfile drops the permission bits; the server and its helper binary need the execute bit.
+                mode = info.external_attr >> 16
+                os.chmod(destination / info.filename, 0o755 if mode & 0o100 else 0o644)
+
+
+def point_current_at(root, version):
+    link = root / ".current.tmp"
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(version)
+    os.replace(link, root / "current")
+
+
+def main():
+    root = Path(os.environ.get("AGY_ACP_SERVER_ROOT") or Path.home() / ".local/share/agy-acp-server")
+    version, entry = registry_entry(os.environ.get("AGY_ACP_PLATFORM") or detect_platform())
+    command = entry["cmd"]
+    installed = root / version
+
+    if (installed / "launch.json").exists():
+        print(f"agy_acp_server {version} is already installed in {installed}")
+    else:
+        root.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=".staging.", dir=root))
+        try:
+            fetch(entry["archive"], staging / "archive.zip")
+            unpacked = staging / version
+            unpacked.mkdir()
+            extract(staging / "archive.zip", unpacked)
+            if not (unpacked / command).is_file():
+                die(f"the archive has no {command}")
+            (unpacked / "launch.json").write_text(
+                json.dumps({"version": version, "cmd": command, "args": entry.get("args", [])}, indent=2) + "\n")
+            if installed.exists():
+                shutil.rmtree(installed)  # an earlier run stopped before it wrote launch.json
+            os.rename(unpacked, installed)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+        print(f"Installed agy_acp_server {version} in {installed}")
+
+    point_current_at(root, version)
+    for other in root.iterdir():
+        if other.is_dir() and not other.is_symlink() and not other.name.startswith(".") and other.name != version:
+            shutil.rmtree(other)
+
+
+if __name__ == "__main__":
+    main()

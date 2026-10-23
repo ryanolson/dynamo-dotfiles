@@ -491,6 +491,36 @@ Verification:
 timeout 300 python3 test/bb-server-url.py
 ```
 
+### Antigravity in bb
+
+`iou_antigravity_acp` installs the Antigravity ACP server from the ACP registry. Google publishes one archive for each platform. The command installs the archive for this machine in `~/.local/share/agy-acp-server/<version>`. It writes `launch.json` there with the command and arguments from the registry (Linux needs `--uid=`). Then it points `current` at that version and removes the other versions. A run that finds the version installed downloads nothing. The command does not sign in.
+
+`agy-acp` runs the server for bb. The server chooses the starting model of a session and has no setting for it. After each `session/new`, `agy-acp` sends `session/set_model`, so a new session starts on `gemini-4-argon-high`. bb can still choose another model. If the server rejects the model or does not answer in 10 seconds, the session keeps the server default. All other messages pass through unchanged. `AGY_ACP_DEFAULT_MODEL` selects another model, and an empty value turns the default off.
+
+bb shows the agent as "Antigravity" (provider `acp-antigravity`). As with WCIE, the entry is bb server state, not a file in this repository. The `customAgents` setting holds every custom agent, and `set` replaces the whole list. This command adds or replaces the `antigravity` entry and keeps the other entries:
+
+```bash
+bb plugin config provider-acp --json | python3 -c '
+import json, subprocess, sys
+current = json.load(sys.stdin)["values"]["customAgents"]
+agents = [a for a in json.loads(current or "[]") if a["id"] != "antigravity"]
+script = """p=$("${SHELL:-/bin/sh}" -lc env 2>/dev/null | sed -n '"'"'s/^PATH=//p'"'"' | head -n 1); export PATH="${p:+$p:}$PATH"; exec agy-acp"""
+agents.append({"id": "antigravity", "displayName": "Antigravity", "command": "sh", "args": ["-c", script]})
+subprocess.run(["bb", "plugin", "config", "provider-acp", "set", "customAgents", json.dumps(agents)], check=True)
+'
+```
+
+The `sh -c` wrapper takes `PATH` from the login shell, for the reason given for WCIE: the `PATH` of the bb host daemon does not have `~/.local/bin`.
+
+The server reuses the sign-in of `agy`. Sign in with `agy` once on each machine. The server also reads `~/.gemini/config/mcp_config.json`. It does not open a session when one of the servers in that file fails to start. The entries that the Antigravity IDE writes there need the IDE to run, so remove them on a machine without the IDE.
+
+Verification:
+
+```bash
+timeout 300 python3 test/test-agy-acp.py
+timeout 300 python3 test/test-iou-antigravity-acp.py
+```
+
 ### Fleet door
 
 `fleet door` puts a public mutual-TLS listener in front of a local TCP service, for example the bb server on brev. Only fleet machines get through: a client must show a current fleet certificate that permits client use. Clients connect with `fleet tunnel add NAME --mode client --to HOST:8461 --peer NAME`, where `--peer` is the door machine's fleet name. A client checks the door's name and CA. A tunnel server (`fleet tunnel --mode server`) must not face the internet, because socat cannot limit how long a TLS handshake takes. The door uses nginx's stream module instead, as a root system service.
@@ -700,6 +730,7 @@ broot               # interactive tree view
 iou_claude
 iou_codex
 iou_antigravity
+iou_antigravity_acp
 iou_cursor
 iou_devin
 iou_pi
@@ -708,6 +739,8 @@ iou_q
 ```
 
 Claude, Cursor, and Devin use their native installers and update commands. `iou_devin` installs the Devin CLI when `devin` is missing, then runs `devin update`. Antigravity uses its native installer and replaces `agy` after installation succeeds. Codex and Pi use npm and preserve `NPM_CONFIG_PREFIX`, with `~/.npm-global` as the default. On sudo machines, `~/.npmrc` also sets `prefix` to `~/.npm-global`, so a service that runs npm without the shell environment, such as the bb host daemon, updates the same copy. chezmoi changes only the `prefix` line. Pi requires Node.js 22.19 or newer. Cursor refers to Cursor Agent CLI. Pi refers to the coding agent from [pi.dev](https://pi.dev).
+
+`iou_antigravity_acp` installs the Antigravity server that bb runs. See [Antigravity in bb](#antigravity-in-bb).
 
 `iou_relay` queries GitHub's latest stable release for `NVIDIA/NeMo-Relay` through `gh`. It downloads the current platform's binary and SHA-256 file from the same resolved tag. It verifies the checksum before replacing `~/.local/bin/nemo-relay`. Downloads and verification failures leave the existing binary intact. It requires authenticated `gh` access and `shasum`. Linux uses the musl release assets; macOS uses the Darwin assets. A missing platform asset produces an error.
 

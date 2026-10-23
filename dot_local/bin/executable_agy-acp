@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""Run the Antigravity ACP server so that new sessions start on Gemini 4 Argon (High).
+
+The server chooses the starting model of a session and has no setting for it: neither a `model`
+key in ~/.gemini/antigravity-acp/settings.json nor CASCADE_DEFAULT_MODEL_OVERRIDE changes it. Its
+choice has differed between checks (Gemini 3.8 Flash, later Gemini 4 Argon Medium). bb lists only
+"Agent default" for a custom ACP agent, so bb never picks a model on its own. This wrapper sits on
+stdio between bb and the server. After each successful `session/new` it sends
+`session/set_model` and then passes the reply to bb with the new model filled in. A model that bb
+chooses later overrides the default. Every other line passes through byte for byte.
+
+The server and its arguments come from <AGY_ACP_SERVER_DIR>/launch.json, which iou_antigravity_acp
+writes from the ACP registry (Linux needs `--uid=`). Arguments on the command line follow those.
+
+Environment:
+  AGY_ACP_SERVER_DIR          server directory (default ~/.local/share/agy-acp-server/current)
+  AGY_ACP_DEFAULT_MODEL       model id for new sessions (default gemini-4-argon-high); empty turns it off
+  AGY_ACP_SET_MODEL_TIMEOUT   seconds to wait for the server to accept the model (default 10)
+
+If the server rejects the model or does not answer in time, bb gets the server's own reply
+unchanged and the session runs on the server default.
+"""
+import json
+import os
+import signal
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+DEFAULT_MODEL = "gemini-4-argon-high"
+SET_MODEL_TIMEOUT_S = 10.0
+# The server gets this long to exit after bb closes stdin before it is terminated.
+EXIT_GRACE_S = 5.0
+REQUEST_PREFIX = "agy-acp-default-"
+
+
+def die(message):
+    print(f"agy-acp: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def warn(message):
+    print(f"agy-acp: {message}", file=sys.stderr, flush=True)
+
+
+def load_launch(server_dir):
+    path = server_dir / "launch.json"
+    try:
+        launch = json.loads(path.read_text())
+    except FileNotFoundError:
+        die(f"{path} not found. Run iou_antigravity_acp to install the server.")
+    except ValueError as error:
+        die(f"{path} is not valid JSON: {error}")
+    command = launch.get("cmd") if isinstance(launch, dict) else None
+    arguments = launch.get("args", []) if isinstance(launch, dict) else None
+    if not isinstance(command, str) or not command:
+        die(f"{path} has no 'cmd' string.")
+    if not isinstance(arguments, list) or not all(isinstance(a, str) for a in arguments):
+        die(f"{path}: 'args' must be a list of strings.")
+    return (server_dir / command).resolve(), arguments
+
+
+def apply_model(result, model_id):
+    """Make the reply to session/new report model_id as the current model."""
+    models = result.get("models")
+    if isinstance(models, dict):
+        models["currentModelId"] = model_id
+    # The server splits a model id into a model option and a thinking-level option: the id
+    # gemini-4-argon-high is the model gemini-4-argon at level high.
+    options = [o for o in result.get("configOptions") or [] if isinstance(o, dict)]
+    for option in options:
+        if option.get("category") != "model":
+            continue
+        values = [v.get("value") for v in option.get("options") or [] if isinstance(v, dict)]
+        family = max((v for v in values if isinstance(v, str) and (model_id == v or model_id.startswith(v + "-"))),
+                     key=len, default=None)
+        if family is None:
+            continue
+        option["currentValue"] = family
+        level = model_id[len(family) + 1:]
+        for other in options:
+            if other.get("category") == "thought_level" and level in [
+                    v.get("value") for v in other.get("options") or [] if isinstance(v, dict)]:
+                other["currentValue"] = level
+
+
+class Proxy:
+    def __init__(self, child, model, timeout):
+        self.child = child
+        self.model = model
+        self.timeout = timeout
+        self.state = threading.Lock()
+        self.to_child = threading.Lock()
+        self.to_client = threading.Lock()
+        self.new_sessions = set()  # ids of session/new requests that the server has not answered
+        self.held = {}  # id of our set_model request -> (raw reply, parsed reply) of its session/new
+        self.counter = 0
+
+    def write_child(self, raw):
+        with self.to_child:
+            try:
+                self.child.stdin.write(raw)
+                self.child.stdin.flush()
+            except (BrokenPipeError, ValueError):
+                pass  # the server has exited; the main thread reports its status
+
+    def write_client(self, raw):
+        with self.to_client:
+            sys.stdout.buffer.write(raw)
+            sys.stdout.buffer.flush()
+
+    def pump_client(self):
+        for raw in sys.stdin.buffer:
+            if self.model and b'"session/new"' in raw:
+                try:
+                    message = json.loads(raw)
+                except ValueError:
+                    message = None
+                if isinstance(message, dict) and message.get("method") == "session/new" and "id" in message:
+                    with self.state:
+                        self.new_sessions.add(json.dumps(message["id"]))
+            self.write_child(raw)
+        try:
+            self.child.stdin.close()
+        except (BrokenPipeError, ValueError):
+            pass
+        try:
+            self.child.wait(EXIT_GRACE_S)
+        except subprocess.TimeoutExpired:
+            self.child.terminate()
+
+    def pump_server(self):
+        for raw in self.child.stdout:
+            self.handle_server_line(raw)
+        self.release_all("the server exited")
+
+    def handle_server_line(self, raw):
+        with self.state:
+            watching = bool(self.new_sessions or self.held)
+        message = None
+        if watching:
+            try:
+                message = json.loads(raw)
+            except ValueError:
+                message = None
+        if not isinstance(message, dict) or "id" not in message or "method" in message:
+            self.write_client(raw)
+            return
+        key = json.dumps(message["id"])
+        with self.state:
+            held = self.held.pop(message["id"], None) if isinstance(message["id"], str) else None
+            is_new = held is None and key in self.new_sessions
+            if is_new:
+                self.new_sessions.discard(key)
+        if held is not None:
+            self.finish(held, message)
+        elif is_new:
+            result = message.get("result")
+            if isinstance(result, dict) and isinstance(result.get("sessionId"), str):
+                self.ask_for_model(raw, message, result["sessionId"])
+            else:
+                self.write_client(raw)
+        else:
+            self.write_client(raw)
+
+    def ask_for_model(self, raw, message, session_id):
+        with self.state:
+            self.counter += 1
+            request_id = f"{REQUEST_PREFIX}{self.counter}"
+            self.held[request_id] = (raw, message)
+        timer = threading.Timer(self.timeout, self.expire, [request_id])
+        timer.daemon = True
+        timer.start()
+        request = {"jsonrpc": "2.0", "id": request_id, "method": "session/set_model",
+                   "params": {"sessionId": session_id, "modelId": self.model}}
+        self.write_child((json.dumps(request) + "\n").encode())
+
+    def finish(self, held, answer):
+        raw, message = held
+        if "result" in answer:
+            apply_model(message["result"], self.model)
+            self.write_client((json.dumps(message) + "\n").encode())
+            return
+        warn(f"the server rejected session/set_model for {self.model}: {json.dumps(answer.get('error'))}")
+        self.write_client(raw)
+
+    def expire(self, request_id):
+        with self.state:
+            held = self.held.pop(request_id, None)
+        if held is not None:
+            warn(f"the server did not answer session/set_model within {self.timeout:g} s")
+            self.write_client(held[0])
+
+    def release_all(self, reason):
+        with self.state:
+            pending, self.held = list(self.held.values()), {}
+        for raw, _ in pending:
+            warn(f"{reason} before it answered session/set_model")
+            self.write_client(raw)
+
+
+def main():
+    server_dir = Path(os.environ.get("AGY_ACP_SERVER_DIR") or Path.home() / ".local/share/agy-acp-server/current")
+    executable, arguments = load_launch(server_dir)
+    model = os.environ.get("AGY_ACP_DEFAULT_MODEL", DEFAULT_MODEL)
+    try:
+        timeout = float(os.environ.get("AGY_ACP_SET_MODEL_TIMEOUT", SET_MODEL_TIMEOUT_S))
+    except ValueError:
+        die("AGY_ACP_SET_MODEL_TIMEOUT must be a number of seconds.")
+    try:
+        child = subprocess.Popen([str(executable), *arguments, *sys.argv[1:]],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    except OSError as error:
+        die(f"cannot start {executable}: {error}")
+
+    def stop(signum, _frame):
+        child.terminate()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    proxy = Proxy(child, model, timeout)
+    reader = threading.Thread(target=proxy.pump_server)
+    reader.start()
+    threading.Thread(target=proxy.pump_client, daemon=True).start()
+    status = child.wait()
+    reader.join(EXIT_GRACE_S)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # The thread that reads bb's stdin is still blocked in read(). A normal exit makes Python 3.9
+    # abort (SIGABRT) while it shuts down around that thread.
+    os._exit(status if status >= 0 else 128 - status)
+
+
+if __name__ == "__main__":
+    main()
