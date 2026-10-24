@@ -1,0 +1,9 @@
+# Cargo settings for every build on this machine.
+#
+# Debug builds keep line tables only: backtraces still name the file and line,
+# but variables and types are not in the debug info. This makes `target/`
+# 2 to 3 times smaller; full debug info filled 1.5 TB of disk on 2026-10-24.
+# Settings here take precedence over a workspace's Cargo.toml. For full debug
+# info in one build, set CARGO_PROFILE_DEV_DEBUG=true.
+[profile.dev]
+debug = "line-tables-only"
