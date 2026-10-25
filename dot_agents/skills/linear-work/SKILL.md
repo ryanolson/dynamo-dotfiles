@@ -49,7 +49,9 @@ Durable knowledge does not stay in Linear. Once the work is built, how it works 
 | Done | Merged to `main`. The closing comment links the commit or PR. |
 | Cancelled / Duplicate | Not done. The comment says why, or links the duplicate. |
 
-Every ticket an agent creates goes to **Triage**. Only the owner moves a ticket to Todo.
+Every ticket an agent creates goes to **Triage**, with two exceptions: an item the owner already deferred, or a bare idea with no plan to build it, goes to **Backlog** with the `idea` label. Only the owner moves a ticket to Todo.
+
+A ticket that waits on something outside the ticket gets the `Blocked` label: an owner decision (the body adds an `## Open question` section with the options), outside hardware, or a release of another project. A ticket that waits on another ticket uses Linear's blocked-by relation instead, without the label. Remove the label when the wait ends.
 
 ## Issue body
 
