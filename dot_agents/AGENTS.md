@@ -106,19 +106,50 @@ done, check the README and module docs, doc comments, examples, file trees, and 
 against what you actually changed. Remove orphaned references to symbols you deleted or renamed
 rather than leaving them. A symbol used in docs must be defined before first use.
 
-Separately and periodically, run the `docs-sweep` skill across `agent-docs/`, code comments, and
+Separately and periodically, run the `docs-sweep` skill across the book, code comments, and
 user-facing documentation. That sweep is the only thing that catches drift no single PR owned.
 
 Comments explain *why* a decision was made and what the alternative would have cost. A comment that
 restates the code is noise; a comment that records the failure mode a design avoids is why the next
 person does not undo it. History belongs in `git`, not in comments.
 
-## `agent-docs/`
+### The book
 
-Plans, design rulings, and deep-dive evidence go in `agent-docs/`, not at the repository root.
-README and module docs describe the code as it is; `agent-docs/` records where it is going and why.
-Supersede a ruling with a dated addendum rather than a silent rewrite — the reasoning that was
-overtaken is often the most useful part.
+Every Rust project past its first weeks has an mdBook in `docs/` (`docs/book.toml`, chapters in
+`docs/src/`). `../velo/docs` is the model: its sections (Introduction, Getting started, Concepts,
+Guides, Operations, Development, Appendix), its `book.toml` (`create-missing = false`, mermaid,
+linkcheck), `scripts/build-book.sh`, and its `development/documentation.md`, which each book copies
+and adapts.
+
+| Text | Place |
+|---|---|
+| How a subsystem works, and why, with the rejected alternative | A chapter in the book |
+| Measured numbers, with the command and setup that produced them | A chapter under Operations |
+| Rejected designs and negative results | A chapter under Development |
+| The reason for a line of code | A short code comment |
+| A hard lesson ("X breaks when Y") | A test; its doc comment can be long |
+| Plans, remaining work, follow-ups, reports about the work | Linear (`linear-work` skill) |
+| Notes while work is in progress | `agent-docs/` on a work branch |
+
+- **The book keeps only what lasts**: how it works, why, numbers with their setup, negative
+  results. No plans, phase or milestone labels, ruling numbers, PR numbers, ticket identifiers, or
+  handoff notes. History belongs in `git`.
+- **Each PR that changes behavior updates the chapters that describe it** and the top-level README.
+  The README stays short and points into the book.
+- Write the book, READMEs, and comments with the `simple-english` skill.
+
+### `agent-docs/`
+
+`agent-docs/` is scratch space on a work branch, and **it never merges to `main`**. Before the
+branch merges, move the lasting parts into the book, file the remaining work in Linear, and delete
+the directory from the branch. A new project may keep `agent-docs/` on `main` for its first weeks,
+before it has a book; distill it into the book and Linear as soon as the design settles.
+
+A design ruling that is not built yet goes, verbatim, into the body of the Linear ticket that builds
+it. Once it is built, its reason and the alternative it rejected go into the book chapter, without
+its number. Supersede a ruling in progress with a dated addendum rather than a silent rewrite — the
+reasoning that was overtaken is often the most useful part, and the book's Development section is
+where it lands.
 
 ## Subagents and workflows
 
@@ -140,6 +171,14 @@ Two rules matter more than the table:
 
 Carry design rulings in the stage brief. An implementation agent re-litigating a settled decision
 mid-stage is the failure mode briefs exist to prevent.
+
+## Work tracking
+
+Work items live in Linear: plans, remaining work, PR and review follow-ups, and the queue for agent
+swarms. Follow the `linear-work` skill for every ticket you create, claim, or close. I set each
+project's and ticket's priority and its token budget (the estimate, in millions of tokens); agents
+work inside them and stop at the budget. Never write the tracker's team name, ticket identifiers,
+or Linear URLs into a repository, commit, or PR.
 
 ## Git and GitHub
 

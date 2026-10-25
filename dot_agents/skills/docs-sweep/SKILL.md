@@ -1,6 +1,6 @@
 ---
 name: docs-sweep
-description: Sweep agent-docs, code comments, and user-facing documentation for drift against the code, and return a ledger of findings before changing anything. Use for a documentation rehash, doc drift audit, comment sweep, or stale-docs check across a repository.
+description: Sweep the book, code comments, and user-facing documentation for drift against the code, and return a ledger of findings before changing anything. Use for a documentation rehash, doc drift audit, comment sweep, or stale-docs check across a repository.
 user-invocable: true
 ---
 
@@ -30,19 +30,22 @@ Before reading prose, build the ground truth to compare against:
 
 Never assert drift from prose alone. Every finding names the code that contradicts it.
 
-## Surface 1 — `agent-docs/`
+## Surface 1 — the book and `agent-docs/`
 
-Plans, design rulings, and deep-dive evidence. These describe where the code is going, so they are
-allowed to differ from the code — but only in the forward direction.
+The book (`docs/src/`) describes the code as it is, so it must match the code exactly.
 
-- **Overtaken plans.** A plan whose milestones have shipped, or whose approach was abandoned. It
-  needs a dated addendum saying so, not a silent rewrite and not deletion.
-- **Superseded rulings.** A ruling contradicted by a later ruling or by the code. Both documents
-  stay; the earlier one gets the addendum pointing forward.
-- **Stale pinned-source claims.** A ruling derived from a dependency at a specific revision is
+- **Contradicted chapters.** A chapter that describes behavior, numbers, or structure the code no
+  longer has. Measured numbers need the command that produced them; a number without one is
+  `missing` evidence.
+- **Plan residue.** Phase or milestone labels, ruling numbers, PR numbers, ticket identifiers, or
+  handoff notes in the book. History belongs in `git`, plans in Linear.
+- **Stale pinned-source claims.** A claim derived from a dependency at a specific revision is
   stale the day that pin moves. Check each such claim against the current pin.
-- **Misplaced documents.** A plan or deep dive sitting at the repo root instead of `agent-docs/`.
-- **Orphans.** A document nothing references and no current work depends on.
+- **Orphans.** A chapter not listed in `SUMMARY.md`, or a link to a chapter that does not exist.
+
+`agent-docs/` must not exist on `main`. If it does, report it as one row: move the lasting parts
+into the book, file the remaining work in Linear (`linear-work` skill), and delete it. A plan or
+deep dive at the repo root gets the same row.
 
 ## Surface 2 — comments and doc comments
 
@@ -76,7 +79,7 @@ Return this table before any edit:
 
 | # | Surface | Where | Finding | Contradicting evidence | Class | Proposed change | Confidence |
 |---|---|---|---|---|---|---|---|
-| 1 | agent-docs / comment / docs | `path:line` | One sentence. | `path:line` of the code that disproves it, or the command whose output does. | `stale`, `contradicted`, `orphaned`, `restates-code`, `missing` | The smallest edit that makes it true, or `delete`. | high / medium / low |
+| 1 | book / comment / docs | `path:line` | One sentence. | `path:line` of the code that disproves it, or the command whose output does. | `stale`, `contradicted`, `orphaned`, `restates-code`, `missing` | The smallest edit that makes it true, or `delete`. | high / medium / low |
 
 Rules:
 
@@ -97,7 +100,7 @@ For selected rows only:
 1. Apply the edits.
 2. Re-read each modified file for internal consistency — fixing one claim often falsifies a
    neighbouring one.
-3. In `agent-docs/`, add dated addenda; never silently rewrite a ruling out of existence.
+3. In the book, keep a superseded design's reasoning under Development rather than deleting it.
 4. Return an updated mini-ledger marking each row `fixed`, `deferred`, or `not actionable`.
 
 Documentation-only changes belong in their own small PR, separate from the code they describe.

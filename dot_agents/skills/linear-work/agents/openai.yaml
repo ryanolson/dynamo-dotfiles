@@ -1,0 +1,4 @@
+interface:
+  display_name: "Linear Work"
+  short_description: "File, claim, and close work items in Linear the same way every time."
+  default_prompt: "Use $linear-work to file these follow-ups as Linear tickets."
