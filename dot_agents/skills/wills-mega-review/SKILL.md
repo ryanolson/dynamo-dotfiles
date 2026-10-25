@@ -11,8 +11,8 @@ Run this only once the feature mostly works and relevant tests pass.
 
 ## Setup
 
-- **Range.** Pin the head commit and name the review range (`<base>..<head>`) before the first pass. Every reviewer gets the same range.
-- **Reviewer.** The user may name the reviewer family: "fable mega review" means Fable, "codex mega review" means a Codex bb thread. Otherwise use a different model family from the author's: a Codex bb thread for Claude-authored work, Fable or Opus for Codex-authored work. Never the model that wrote the code.
+- **Range.** Pin the base commit before the first pass. Each pass reviews `<base>..<current head>`, so it sees the fixes from the passes before it, and gets the earlier rulings.
+- **Reviewer.** A reviewer the user names wins: "fable mega review" means Fable, "codex mega review" means a Codex bb thread. Otherwise use a different model family from the author's: a Codex bb thread for Claude-authored work, Fable or Opus for Codex-authored work. Never the model that wrote the code.
 - **Rubric.** Use the repository's own review skill when its agent file names one; otherwise the global `thermo-nuclear-code-quality-review`.
 
 ## Loop
@@ -25,7 +25,7 @@ Run this only once the feature mostly works and relevant tests pass.
 
 **Stop** at the earliest of:
 
-- the pass budget: three passes for code, two for a design doc;
+- the pass budget: three passes for code, two for a design doc, counted per milestone or document across every run of this skill (read the earlier records). Starting the skill again does not reset the count;
 - a pass with no new valid blocker or major finding;
 - a pass whose only findings repeat earlier rulings.
 
@@ -34,8 +34,8 @@ If a serious finding is still open at the budget, stop and report it with your r
 ## Finish
 
 1. Check that the documentation the change touches still matches the code.
-2. Write one record per pass: reviewer, range, each finding with its ruling and fix commit, and what was deferred. Put it in bb thread storage or on the work branch, never in `agent-docs/` on `main`. Give its path in the report.
-3. Deliver by the repository's merge rule:
+2. Write one record per pass: reviewer, range, each finding with its ruling and fix commit, and what was deferred. Put it in bb thread storage, on the work branch, or, outside bb in a repository that commits to `main`, in `~/.local/state/agent-reviews/<repo>/`. Never in `agent-docs/` on `main`. Give its path in the report.
+3. If a valid blocker or major finding is still open, stop here: report it and do not push to `main` or add the label until the user decides. Otherwise deliver by the repository's merge rule:
    - Commit to `main`: commit and push.
    - Pull request: push the branch, add the `human-review` label, and ask for human review. Never add the label earlier.
 4. End with the `AGENTS.md` status block, including the number of passes and the open findings.

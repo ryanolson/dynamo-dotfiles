@@ -296,7 +296,6 @@ The bar for approval is:
 - no obviously hacky or magical abstraction that makes the code harder to reason about
 - no unnecessary wrapper/cast/optionality churn obscuring the real design
 - no clear architecture-boundary leak or avoidable canonical-helper duplication
-- no missed opportunity for an obvious decomposition that would materially improve maintainability
 - no documentation the change has left describing behavior that no longer exists
 
 Treat these as presumptive blockers unless the author can justify them clearly:
