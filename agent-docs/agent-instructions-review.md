@@ -20,6 +20,10 @@ We want the global agent file (`dot_agents/AGENTS.md`) and the shared skills to 
 | `c09a3d6` | Plan store chosen per project (`Plans: agent-docs` by default, or `Plans: Linear`), with lifecycle rules for each. Commit to `main` by default. Test timeouts sized to the measured run. Review budget. Status block. A "Running under bb" section. A documentation pass each release, and short doc comments for public items. The file overrides memory. Fleet and secrets moved to `ENVIRONMENT.md`. Hard wraps removed. |
 | `fc0dcf4` | `simple-english`: budgets, a report structure (problem, why, method, then TL;DR), a padding checklist, and the STE catalog moved to `references/rules.md`. |
 | `27e14c0` | Review skills: a bounded loop with a ruling on each finding, one-pass reviewers, advisory simplification, and models sized to the task. |
+| `9b7821e` | Session start detects bb first; under bb, delegate code work to child threads. Draft PRs for repositories other people commit to. Book appendices. |
+| `277cada` | `attribution` set to empty in `~/.claude/settings.json` through a modify script. |
+| `d5f0927` | Loop gaps a Codex review found: moving review range, budget across runs, no push with an open blocker. |
+| `f0a2b77` | Model tiers in `AGENTS.md` with a dated routing table in `ENVIRONMENT.md`. Review table ordered by when. Test-backed findings in `wills-mega-review`. |
 
 ## Evidence
 
@@ -40,7 +44,7 @@ We want the global agent file (`dot_agents/AGENTS.md`) and the shared skills to 
 
 ## Open decisions
 
-1. **Attribution setting.** Set `"attribution": {"commit": "", "pr": ""}` in `~/.claude/settings.json`. That file is not managed by chezmoi. A `modify_` script, like `modify_dot_npmrc`, could set only this key. The docs do not say that Claude reads `~/.claude/settings.local.json` at user level, so the permissions chezmoi deploys there may have no effect. Test this.
+1. **Attribution setting.** Done in `277cada`. Was: set `"attribution": {"commit": "", "pr": ""}` in `~/.claude/settings.json`. That file is not managed by chezmoi. A `modify_` script, like `modify_dot_npmrc`, could set only this key. The docs do not say that Claude reads `~/.claude/settings.local.json` at user level, so the permissions chezmoi deploys there may have no effect. Test this.
 2. **bb-wide instructions.** Deploy the global file to the bb server's data directory, so ACP providers get it. That would let briefs stop pasting rules.
 3. **`~/.claude/CLAUDE.md` as an import, not a symlink.** Cowork skips a symlinked user file, and Claude cannot edit through one. An `@~/.agents/AGENTS.md` import avoids both.
 4. **Review skill set.** Merge `general-review`, `rust-code-review`, and `full-code-review` into one `review` skill with references. Cut thermo to about 80 lines. Rename velo's `thermonuclear-review` so it stops taking the global trigger.
@@ -55,4 +59,6 @@ We want the global agent file (`dot_agents/AGENTS.md`) and the shared skills to 
 - `agent-instructions-review/claude-transcripts.py <out-dir>` and `codex-transcripts.py <out-dir>` extract the typed user messages and per-session statistics. Run them with `python3 -I`.
 - Look for corrections typed more than once, rules a repository overrides, memories that contradict the file, and boilerplate that briefs paste.
 - Check vendor guidance again, and run `/doctor prompt-audit`.
+- Refresh the "Model routing" table in `ENVIRONMENT.md`: new models, release notes, and a small bake-off for a new candidate.
+- Read the test-backed review numbers recorded by `wills-mega-review` (reproduced, accepted, tokens) and decide whether to keep the mode.
 - Measure the file in words and bytes, not lines.
