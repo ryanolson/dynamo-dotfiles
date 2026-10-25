@@ -149,7 +149,7 @@ Installed skills:
 | `gh-pr-description` | Managed-block PR bodies that never clobber existing content |
 | `pr-babysitter` | Drives CI green and adjudicates AI reviewers adversarially |
 | `docs-sweep` | Repo-wide documentation drift ledger across `agent-docs/`, comments, and docs |
-| `simple-english` | ASD-STE100 Simplified Technical English plus authorship rules for docs, PR bodies, commit messages |
+| `simple-english` | Short, plain text for commits, PRs, docs, reports, and comments: budgets, answer first, padding checklist, STE rules on demand |
 
 Sources: [`ai-dynamo/rhino`](https://github.com/ai-dynamo/rhino),
 [`ishandhanani/dotfiles`](https://github.com/ishandhanani/dotfiles), plus practice distilled from

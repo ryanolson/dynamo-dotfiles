@@ -11,7 +11,7 @@ Search the draft for each pattern. Every hit outside code blocks and quoted text
 | `'ll`, `'re`, `'ve`, `n't`, `it's` | Contraction (Rule 4.2) | Expand it. |
 | `has been`, `have been`, `had been` | Present/past perfect (Rule 3.4) | Simple past or simple present. |
 | `has` / `have` + past participle | Present perfect (Rule 3.4) | Simple past. |
-| `should`, `would`, `may`, `might`, `could` | Unapproved modal (Rule 3.2) | See the modal ladder in SKILL.md. |
+| `should`, `would`, `may`, `might`, `could` | Unapproved modal (Rule 3.2) | See the modal ladder in `rules.md`. |
 | `is being`, `are being`, `was being` | Progressive passive (Rules 3.4, 3.5) | Active, simple tense. |
 | `, making`, `, allowing`, `, enabling`, `, ensuring` | "-ing" clause as verb (Rule 3.5) | New sentence with a real subject. |
 | `;` | Semicolon (Rule 8.1) | Two sentences. |
@@ -36,12 +36,12 @@ Search the draft for each pattern. Every hit outside code blocks and quoted text
 9. **Warnings.** Command or condition first, risk second (Rules 7.2, 7.3).
 10. **Completeness.** Articles present, "that" present after "make sure", no telegraph style (Rule 4.2).
 11. **Untouchables intact.** Code, identifiers, quoted errors, and proper nouns are unchanged.
-12. **Every sentence has a source.** Each fact comes from the diff, the code, the conversation, or a source that you read. Delete the rest (Rules A.1, A.6).
-13. **No growth.** The text contains no more ideas than the input (Rule A.5).
-14. **Minimal edits.** On text from the user, each change fixes a rule violation (Rule A.7).
-15. **Inferred facts named.** Your reply names each sentence that you inferred, and keeps your own suggestions out of the draft (Rules A.2, A.3).
+12. **Every sentence has a source.** Each fact comes from the diff, the code, the conversation, or a source that you read. Delete the rest (Authorship, in `SKILL.md`).
+13. **No growth.** The text contains no more ideas than the input (Authorship, in `SKILL.md`).
+14. **Minimal edits.** On text from the user, each change fixes a rule violation (Authorship, in `SKILL.md`).
+15. **Inferred facts named.** Your reply names each sentence that you inferred, and keeps your own suggestions out of the draft (Authorship, in `SKILL.md`).
 
 ## When reporting violations (check mode)
 
-For each violation give: the rule number, the offending text, and a compliant rewrite. Cite only rule numbers that appear in SKILL.md.
+For each violation give: the rule number, the offending text, and a compliant rewrite. Cite only rule numbers that appear in `rules.md`; cite the authorship rules by name.
 End the report with this statement when the user asked for STE compliance: "No tool can guarantee ASD-STE100 compliance. Final approval rests with the writer. The official standard is a free download at asd-ste100.org."
