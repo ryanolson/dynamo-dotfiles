@@ -30,8 +30,8 @@ performance pass, and independent-verification step from `ishandhanani/dotfiles@
 3. Use subagents when distinct review surfaces benefit from parallel inspection. Keep each pass
    scoped and independently verify its findings. An adversarial stage must not run the model that
    produced the claim.
-4. Optionally, get one independent read-only verification pass from a different model family: a
-   Codex bb thread when Claude wrote the code, or `phone-a-friend`. Give it the raw artifact and the
+4. Optionally, get one independent read-only verification pass from a different model family, for
+   example Codex when Claude wrote the code. Give it the raw artifact and the
    constraints **without your conclusions**, then verify material claims locally before including
    them.
 5. Make one pass. This skill does not loop; `wills-mega-review` owns the loop and its budget.
@@ -73,7 +73,7 @@ claim confirmed by reading code is an opinion, a claim confirmed by a failing te
 
 ## Performance Pass
 
-Trace each changed hot path end to end and compare the work before and after the change:
+When the repository keeps a hot-path register (`hot-paths` skill), every change to a registered path needs its guard benchmark run before and after, with the result against the entry's noise band. Then trace each changed hot path end to end and compare the work before and after the change:
 
 - Check allocations, cloning, boxing, dynamic dispatch, collection materialization, formatting,
   serialization, and copies.

@@ -150,6 +150,8 @@ Installed skills:
 | `pr-babysitter` | Drives CI green and adjudicates AI reviewers adversarially |
 | `docs-sweep` | Repo-wide documentation drift ledger across `agent-docs/`, comments, and docs |
 | `simple-english` | Short, plain text for commits, PRs, docs, reports, and comments: budgets, answer first, padding checklist, STE rules on demand |
+| `hot-paths` | Profile-backed register of hot code paths: a guard benchmark and noise band per path, markers in the code, speedups from the register |
+| `repo-skills` | Copies personal skills into public `ai-dynamo` repos and reports drift both ways; skips `ryanolson` and `NVIDIA-dev` repos |
 
 Sources: [`ai-dynamo/rhino`](https://github.com/ai-dynamo/rhino),
 [`ishandhanani/dotfiles`](https://github.com/ishandhanani/dotfiles), plus practice distilled from

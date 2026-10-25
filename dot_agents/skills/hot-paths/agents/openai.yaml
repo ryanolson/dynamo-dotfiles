@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hot Paths"
+  short_description: "Profile-backed register of hot code paths, with guards and speedups."
+  default_prompt: "Use $hot-paths to check whether this change touches a registered hot path."

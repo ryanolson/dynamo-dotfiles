@@ -1,0 +1,4 @@
+interface:
+  display_name: "Repo Skills"
+  short_description: "Sync personal skills into a public team repo and find drift."
+  default_prompt: "Use $repo-skills to check this repository's skills against my personal skills."

@@ -27,7 +27,7 @@ Rust and Python systems engineer. Datacenter-scale distributed inference serving
 - **Direct path first.** Make the smallest change that satisfies the request. Do not refactor working code in passing, and do not add abstraction for a second caller that does not exist yet.
 - **Reproduce before you theorize.** No long explanations of what might be wrong. Get the failure in front of you first.
 - **Show numbers.** Logs, metrics, benchmarks. "It is faster" is not a result.
-- **Profile before guessing** when the question is performance.
+- **Profile before guessing** when the question is performance. Hot paths found by profiling go in a register with a guard benchmark (`hot-paths` skill); a change to one reports before and after numbers.
 - **Amend a design on evidence.** When a measurement or a failing test contradicts a design, change the design; do not defend it.
 
 ## Validating a claim
@@ -159,7 +159,7 @@ No review is mandatory. When a unit of work is complete, suggest a review if the
 | Before building: a plan or design doc | `general-review` | Cross-family | Up to two rounds |
 | Before a commit: a small, local, tested change (a fix, a doc change, a mechanical refactor) | None, or `code-review` at low effort | Any | One |
 | A feature or behavior change in one area | `general-review`, with `rust-code-review` rules for Rust | Top tier or cross-family | One |
-| Concurrency, `unsafe`, hot paths, public interfaces, or a lifecycle across modules | `thermo-nuclear-code-quality-review` (`full-code-review` adds the general pass) | Cross-family | One per run, inside the budget |
+| Concurrency, `unsafe`, registered hot paths, public interfaces, or a lifecycle across modules | `thermo-nuclear-code-quality-review` (`full-code-review` adds the general pass) | Cross-family | One per run, inside the budget |
 | A milestone is done, before merge or human review | Offer `wills-mega-review` | Cross-family, test-backed | Up to three |
 | PR feedback arrives | `gh-comment-ledger`, then `pr-babysitter` to drive CI and the AI reviewers | — | Until CI passes; rule on each comment |
 | Each release | `docs-sweep`, fixing all actionable rows | — | One |

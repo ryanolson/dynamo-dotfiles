@@ -62,3 +62,4 @@ We want the global agent file (`dot_agents/AGENTS.md`) and the shared skills to 
 - Refresh the "Model routing" table in `ENVIRONMENT.md`: new models, release notes, and a small bake-off for a new candidate.
 - Read the test-backed review numbers recorded by `wills-mega-review` (reproduced, accepted, tokens) and decide whether to keep the mode.
 - Measure the file in words and bytes, not lines.
+- Run `repo-skills` status on each public team repository (velo, rhino) and resolve drift with the owner.

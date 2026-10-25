@@ -47,7 +47,7 @@ Check `agent-docs/` against the project's plan store, declared in its agent file
 `Plans: agent-docs` (the default) or `Plans: Linear`:
 
 - **`Plans: Linear`.** `agent-docs/` must not exist on `main`. If it does, report it as one row:
-  move the lasting parts into the book, file the remaining work in Linear (`linear-work` skill),
+  move the lasting parts into the book, file the remaining work in Linear,
   and delete it.
 - **`Plans: agent-docs`.** Report a note whose `Status:` or `Updated:` line no longer matches the
   code or its addenda, a note missing from `agent-docs/README.md`, a note whose current design
@@ -82,6 +82,7 @@ Compare claim by claim against the implementation, not against filenames or comm
 - **Orphaned references** to symbols, modules, flags, or endpoints that were removed or renamed.
 - **Undefined-before-use.** A symbol used in prose before the document defines it.
 - **Missing documentation** for a public surface that has none, where its siblings all do.
+- **Hot-path register.** When the repository keeps one (`hot-paths` skill), every `hot path:` marker in the code has a register entry and every entry has a marker, each entry points at code that exists, and no entry's profile is older than the last release.
 
 ## Ledger
 

@@ -16,9 +16,11 @@ agent_skills:
   - general-review
   - gh-comment-ledger
   - gh-pr-description
+  - hot-paths
   - linear-work
   - phone-a-friend
   - pr-babysitter
+  - repo-skills
   - rust-code-review
   - simple-english
   - thermo-nuclear-code-quality-review
