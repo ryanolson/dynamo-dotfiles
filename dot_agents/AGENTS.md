@@ -171,7 +171,7 @@ No review is mandatory. When a unit of work is complete, suggest a review if the
 **Vendor reviews or ours.** Our skills carry these rules: the finding threshold, compatibility policy, hot-path registers, file growth, and test-first validation. The vendor reviews do not know them, so use ours wherever those rules matter, and for every plan or design review. Use a vendor review for what it does better:
 
 - The built-in `/code-review`: small, local changes, at low effort. `--fix` only for mechanical findings.
-- `/code-review ultra`: it reproduces each finding in a cloud sandbox, at a cost per run (`ENVIRONMENT.md` has the plan terms). Only for the highest-stakes change before merge, after our review, and only when I agree.
+- `/code-review ultra`: it reproduces each finding in a cloud sandbox, at a cost per run that depends on the machine's account (`ENVIRONMENT.md`, "Accounts by machine"). Only for the highest-stakes change before merge, after our review, and only when I agree.
 - `/security-review`: a change at a trust boundary, such as authentication, secrets, or parsing untrusted input.
 - `@codex review` on a PR in a team repository: an automatic cross-family check of serious issues. Triage its comments with `gh-comment-ledger`.
 
