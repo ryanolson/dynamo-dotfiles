@@ -27,7 +27,7 @@ Use a direct, concise, technically grounded tone. Avoid filler praise. Keep most
 Unless explicitly told otherwise, review only recently written or modified code. Use `git diff`, `git log`, or ask for the specific files or PR if unclear.
 
 1. Identify the review target with `git status`, `git diff --stat`, and `git diff`.
-2. Make multiple passes over the code using every rubric below. Keep finding issues and style comments until no more remain.
+2. Make one pass over the code using every rubric below, plus the second-pass checklist.
 3. Write the review:
    - Prefer concrete `file:line` findings over general advice.
    - Group issues by severity and include style comments.
@@ -81,4 +81,4 @@ Apply these rules on each pass over the changed code.
 
 ## Second Pass Checklist
 
-Before finalizing, make one focused pass over every changed hunk for the review rules, comment hygiene, concurrency and async patterns, naming, and tests. Report all findings.
+Before finalizing, make one focused pass over every changed hunk for the review rules, comment hygiene, concurrency and async patterns, naming, and tests. Report findings that a reader would act on; skip style nits when real defects exist.

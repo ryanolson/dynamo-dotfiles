@@ -113,4 +113,4 @@ For selected rows only:
 3. In the book, keep a superseded design's reasoning under Development rather than deleting it.
 4. Return an updated mini-ledger marking each row `fixed`, `deferred`, or `not actionable`.
 
-Documentation-only changes belong in their own small PR, separate from the code they describe.
+Documentation-only changes go in their own commit, or their own PR where the repository uses PRs, separate from the code they describe.

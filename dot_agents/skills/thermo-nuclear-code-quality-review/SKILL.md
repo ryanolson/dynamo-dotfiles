@@ -30,11 +30,15 @@ performance pass, and independent-verification step from `ishandhanani/dotfiles@
 3. Use subagents when distinct review surfaces benefit from parallel inspection. Keep each pass
    scoped and independently verify its findings. An adversarial stage must not run the model that
    produced the claim.
-4. Load and use `phone-a-friend` for at least one independent, read-only verification pass. Give it
-   the raw artifact and the constraints **without your conclusions**, then verify material claims
-   locally before including them. If it is unavailable, say so and continue.
-5. Report findings first, ordered by severity, with `file_path:line_number` references.
-6. Skip cosmetic nits when structural issues exist. Prefer a small number of high-conviction
+4. Optionally, get one independent read-only verification pass from a different model family: a
+   Codex bb thread when Claude wrote the code, or `phone-a-friend`. Give it the raw artifact and the
+   constraints **without your conclusions**, then verify material claims locally before including
+   them.
+5. Make one pass. This skill does not loop; `wills-mega-review` owns the loop and its budget.
+6. Report findings first, ordered by severity, with `file_path:line_number` references. Each
+   finding names the precondition, the code path, and the outcome, plus a test that would fail.
+   Zero findings is a pass.
+7. Skip cosmetic nits when structural issues exist. Prefer a small number of high-conviction
    findings over a long list of minor comments.
 
 ## Core Prompt
@@ -287,8 +291,6 @@ The bar for approval is:
 - no unjustified hot-path allocation, copying, synchronization, serialization, or resource growth
 - no performance-sensitive change left unmeasured when a targeted benchmark is practical
 - no clear structural regression
-- no obvious missed opportunity to make the implementation dramatically simpler when such a path is
-  visible
 - no unjustified file-size explosion
 - no obvious spaghetti-growth from special-case branching
 - no obviously hacky or magical abstraction that makes the code harder to reason about
@@ -301,8 +303,6 @@ Treat these as presumptive blockers unless the author can justify them clearly:
 
 - the change is locally correct but breaks a caller, consumer, rollout, or recovery path
 - the change adds hot-path cost with no measurement and no causal argument
-- the PR preserves a lot of incidental complexity when there is a plausible code-judo move that
-  would delete it
 - the PR pushes a file from below 1000 lines to above 1000 lines
 - the PR adds ad-hoc branching that makes an existing flow more tangled
 - the PR solves a local problem by scattering feature checks across shared code
@@ -313,3 +313,7 @@ Treat these as presumptive blockers unless the author can justify them clearly:
 
 If those conditions are not met, leave explicit, actionable feedback and push for a cleaner
 decomposition.
+
+A code-judo simplification is advisory: list it separately from the findings, and never let it
+block approval. A reviewer can always find one more, and treating it as a blocker is how a review
+loop never ends.

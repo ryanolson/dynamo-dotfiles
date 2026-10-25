@@ -140,7 +140,7 @@ Installed skills:
 | Skill | What it does |
 |---|---|
 | `thermo-nuclear-code-quality-review` | Strict adversarial review: correctness, hot-path performance, abstraction quality, file-size and spaghetti growth |
-| `wills-mega-review` | Optional. Iterates the above in fresh read-only subagents until clean, then tags the PR `human-review` |
+| `wills-mega-review` | Optional. Bounded loop of fresh read-only reviews from another model family, with judged fixes; at most three passes, then commit or tag the PR `human-review` |
 | `full-code-review` | One consolidated general + thermo-nuclear pass |
 | `general-review` | Plans, designs, and documents rather than diffs |
 | `rust-code-review` | Rust systems and concurrency rules |

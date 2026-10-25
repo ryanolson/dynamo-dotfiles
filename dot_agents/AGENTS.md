@@ -151,9 +151,9 @@ No review is mandatory. When a unit of work is complete, suggest a review if the
 | Small, local, and covered by tests: a fix, a doc change, a mechanical refactor | None, or `code-review` at low effort |
 | A feature or a behavior change in one area | `general-review`; `rust-code-review` for Rust systems and concurrency rules |
 | Concurrency, `unsafe`, hot paths, public interfaces, or a lifecycle across modules | `full-code-review` or `thermo-nuclear-code-quality-review` |
-| Significant new work that is ready for a human reviewer | Offer `wills-mega-review` as an option. It runs `thermo-nuclear-code-quality-review` in fresh read-only subagents, applies the findings, and repeats within the review budget below. |
+| Significant new work that is ready for a human reviewer | Offer `wills-mega-review` as an option. It runs fresh read-only reviews from another model family, rules on each finding before fixing it, and stops at the review budget below. |
 
-**Review budget.** A design doc gets at most two review rounds; a milestone gets at most three code-review passes. After the last pass, fix what is real, fold the remaining minor findings into the next milestone's plan, and stop. Report a run that still finds serious problems instead of starting another pass: repeated passes over-engineer the code more often than they find defects.
+**Review budget.** A design doc gets at most two review rounds; a milestone gets at most three code-review passes. `wills-mega-review` carries the stop rule; single-pass review skills do not loop. After the last pass, fix what is real, fold the remaining minor findings into the next milestone's plan, and stop. Report a run that still finds serious problems instead of starting another pass: repeated passes over-engineer the code more often than they find defects.
 
 Treat AI review comments as adversarial claims, never as presumptions of correctness. Adjudicate each against the actual contract and code path before changing anything, and do not add guards, validation, or fallback behavior merely to satisfy a reviewer.
 
