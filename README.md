@@ -139,11 +139,9 @@ Installed skills:
 
 | Skill | What it does |
 |---|---|
-| `thermo-nuclear-code-quality-review` | Strict adversarial review: correctness, hot-path performance, abstraction quality, file-size and spaghetti growth |
-| `wills-mega-review` | Optional. Bounded loop of cross-family reviews that commit a failing test per finding for the implementer to cherry-pick; judged fixes; at most three passes, then commit or tag the PR `human-review` |
-| `full-code-review` | One consolidated general + thermo-nuclear pass |
-| `general-review` | Plans, designs, and documents rather than diffs |
-| `rust-code-review` | Rust systems and concurrency rules |
+| `review` | One pass over a plan, design, document, or code change; only findings with a concrete failure case; Rust rules and review areas as references |
+| `strict-review` | One strict pass for risky changes: correctness, hot-path cost, structure, file growth |
+| `review-loop` | Optional "mega review". Bounded loop of cross-family reviews that commit a failing test per finding for the implementer to cherry-pick; judged fixes; at most three passes, then commit or tag the PR `human-review` |
 | `phone-a-friend` | Independent second opinion from Claude / Cursor / Devin over ACP |
 | `gh-comment-ledger` | Triages PR feedback into an actionable table before editing |
 | `gh-pr-description` | Managed-block PR bodies that never clobber existing content |

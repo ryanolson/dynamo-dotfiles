@@ -50,6 +50,8 @@ Updated: 2026-10-25. `AGENTS.md` names tiers; this table maps them to models. A 
 - `phone-a-friend` has no Codex backend. Reach Codex through a bb thread, or the Codex plugin outside bb.
 - Read-only Codex runs fail on hosts where bubblewrap cannot create a network namespace (`bwrap: loopback: Failed RTM_NEWADDR`). Pass the files in the prompt, or run Codex with full access in a disposable worktree.
 
+Review plan terms (individual Claude Max, checked 2026-10-25): the built-in `/code-review` uses normal plan usage. `/code-review ultra` has 3 free runs per account that do not refresh, then about $5 to $25 per run in usage credits, which must be turned on. The managed Claude GitHub Code Review is Team and Enterprise only, so it is not available.
+
 To refresh a row: list the models each provider offers (`bb provider models <provider>`, Claude's model list, the Codex models cache), read the vendor release notes, and, for a new candidate, run a small bake-off on the owner's own tasks with fixed briefs and a blinded cross-family reviewer. Record the result and the date in the row.
 
 ## Fleet and secrets

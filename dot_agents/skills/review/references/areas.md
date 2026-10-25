@@ -1,77 +1,8 @@
----
-name: general-review
-description: Review a design, document, or code change for material correctness, scope, and performance issues.
----
+# Review areas
 
-# General Review
+The adversarial pass, the five areas, and how to dispatch them. `SKILL.md` says when to load this file.
 
-Adapted from `ishandhanani/dotfiles@7b54a8c` (`agents/skills/general-review`).
-
-Review the target artifact for material concerns, likely regressions, ambiguous behavior, unnecessary complexity, and performance overhead. Be especially skeptical of refactors and changes that may add hidden cost in hot paths.
-
-Use subagents by default for reviews: each active review bucket should get its own focused pass when subagents are available. Skip subagents only when the user asks not to use them, when subagents are unavailable, or when the target is clearly very small.
-
-## Scope
-
-Treat the review target as the artifact that is either:
-- currently opened or referred to in plan mode, or
-- contained in the user message immediately before invoking this skill.
-
-Do not do a deep conversation-history dig to reconstruct intent. Do not broaden scope unless the target itself forces it for validation. If the target is ambiguous, prefer the most recent explicit artifact.
-
-Do not treat the target as a git diff, branch diff, or diff review by default. Use diff-review mode only when the user explicitly asks for a patch/diff/PR/branch review, provides an actual diff or patch, or the artifact is obviously a diff. Otherwise, review the conversation, plan, code sketch, document, or scoped code surface as-is. Do not collect git metadata or compare against the working tree unless diff review is explicitly or obviously the task.
-
-Evaluate the target primarily as a delta against the base plan or patch itself.
-- Focus on concerns introduced by the proposed change.
-- Do not turn the review into a hunt for pre-existing overheads or problems in the surrounding system.
-- Only surface pre-existing concerns when they are very severe, or when the proposed change would interact with them poorly, amplify them, or make them harder to fix.
-- When mentioning an inherited issue, make clear that it is pre-existing and explain why it matters for this delta.
-
-## Applicable Targets
-
-This skill applies to:
-- general conversation where the user wants a concern pass
-- informal plans or design sketches
-- concrete implementation plans
-- documents and proposals
-- quick patch snippets or diffs when explicitly requested, supplied, or obvious
-- scoped reviews of a subsystem or invariant surface, such as CRTC, JetStream recovery, or local indexer recovery
-
-## What To Review
-
-The target is usually one of:
-- a conversation or informal proposal
-- a plan
-- a document
-- a patch or diff when explicitly requested, supplied, or obvious
-- a code sketch
-- a refactor proposal
-- a scoped code surface or subsystem invariant
-
-Review for material issues in these categories:
-
-- Correctness and semantic regression
-- Atomicity, transactionality, and partial-commit risk
-- In-process concurrency risk
-- Distributed consistency, recovery, and invariant guarantees
-- Ambiguity, unstated assumptions, and underspecified behavior
-- Overhead, especially in hot paths
-- Refactor hazards and abstraction cost
-- API or contract drift
-- Testability and observability gaps
-
-## Priority
-
-Bias toward finding issues that are:
-- likely to cause incorrect behavior
-- likely to cause logical regression
-- likely to add cost on hot paths
-- likely to make future changes harder without real benefit
-- likely to hide behavior behind abstraction in ways that reduce clarity or performance
-
-Ignore very minor issues unless the user explicitly wants a deep or exhaustive pass.
-
-## High-Level Adversarial Pass
+## Adversarial pass
 
 Challenge the target as a whole before dispatching detailed buckets:
 - question whether the problem is framed correctly and the proposed direction addresses the actual outcome
@@ -83,7 +14,7 @@ Challenge the target as a whole before dispatching detailed buckets:
 
 For non-trivial targets, assign a separate subagent to this adversarial pass. Give it the full target and ask it to attack the premise, integration boundaries, and validation strategy rather than repeat the detailed bucket checklists. Evaluate small targets inline.
 
-## Review Buckets
+## Areas
 
 Select buckets by their primary failure mode:
 
@@ -177,7 +108,7 @@ out, subagents are unavailable, or the target is clearly very small.
 - avoidable CPU, memory, latency, throughput, file-descriptor, or network overhead
 - resource growth that is bounded but operationally excessive under expected load
 
-## Subagent Workflow
+## Dispatch
 
 When subagents are available, dispatch one subagent per active bucket by default, on a model tier sized to the bucket (`AGENTS.md` tiers, `ENVIRONMENT.md` routing): the fast tier for checkable finding work, the top tier or a different family for judging whether a finding is real. Pass each subagent only the necessary context: the target artifact, the code or files to inspect, a concise conversation summary if needed, exactly one bucket checklist, and the main agent's concise relevance/risk guidance. Ask for concrete candidate issues with file:line references or precise plan references when available. Tell each subagent not to ponder unrelated possibilities: if the target has no meaningful surface for its bucket, it should say so in one line and return immediately.
 
@@ -196,18 +127,3 @@ After subagents report back, the main agent must consolidate and independently e
 
 The main agent owns the final judgment. Subagent output is input to review, not final output.
 
-## Filtering
-
-Filtering is done by the main agent after bucket reviews return. Subagents should not make final inclusion decisions or shape the final report; they should return candidate findings for their assigned bucket.
-
-The main agent should be aggressive about filtering false positives, but must report every material concern that survives verification.
-
-Do not report:
-- cosmetic nits
-- style-only preferences
-- speculative concerns without evidence
-- tradeoffs that are explicitly intended and clearly acceptable
-- tiny overhead in code that is obviously cold
-- generic "consider adding tests" comments unless the missing test is tied to a concrete risk
-
-Surface every concern that is plausible, consequential, and worth the user's attention.

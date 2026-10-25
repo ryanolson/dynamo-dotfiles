@@ -12,8 +12,6 @@
 #   3. chezmoi apply
 agent_skills:
   - docs-sweep
-  - full-code-review
-  - general-review
   - gh-comment-ledger
   - gh-pr-description
   - hot-paths
@@ -21,7 +19,7 @@ agent_skills:
   - phone-a-friend
   - pr-babysitter
   - repo-skills
-  - rust-code-review
+  - review
+  - review-loop
   - simple-english
-  - thermo-nuclear-code-quality-review
-  - wills-mega-review
+  - strict-review

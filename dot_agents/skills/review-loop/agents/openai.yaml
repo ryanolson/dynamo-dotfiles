@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Loop"
+  short_description: "Bounded cross-family review, test-backed findings, judged fixes."
+  default_prompt: "Use $review-loop to bring this work to merge."

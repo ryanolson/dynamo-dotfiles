@@ -48,3 +48,12 @@
 # .local/bin/broken-*
 # provision-keys copied 1Password keys to ~/.ssh/provisioned. Fleet certificates replaced it on 2026-10-15.
 .local/bin/provision-keys
+
+# Review skills renamed or merged on 2026-10-25: general-review, rust-code-review, and
+# full-code-review became review; thermo-nuclear-code-quality-review became strict-review;
+# wills-mega-review became review-loop. chezmoi does not delete a removed source directory.
+.agents/skills/general-review
+.agents/skills/rust-code-review
+.agents/skills/full-code-review
+.agents/skills/thermo-nuclear-code-quality-review
+.agents/skills/wills-mega-review

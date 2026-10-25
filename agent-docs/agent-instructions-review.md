@@ -47,7 +47,7 @@ We want the global agent file (`dot_agents/AGENTS.md`) and the shared skills to 
 1. **Attribution setting.** Done in `277cada`. Was: set `"attribution": {"commit": "", "pr": ""}` in `~/.claude/settings.json`. That file is not managed by chezmoi. A `modify_` script, like `modify_dot_npmrc`, could set only this key. The docs do not say that Claude reads `~/.claude/settings.local.json` at user level, so the permissions chezmoi deploys there may have no effect. Test this.
 2. **bb-wide instructions.** Deploy the global file to the bb server's data directory, so ACP providers get it. That would let briefs stop pasting rules.
 3. **`~/.claude/CLAUDE.md` as an import, not a symlink.** Cowork skips a symlinked user file, and Claude cannot edit through one. An `@~/.agents/AGENTS.md` import avoids both.
-4. **Review skill set.** Merge `general-review`, `rust-code-review`, and `full-code-review` into one `review` skill with references. Cut thermo to about 80 lines. Rename velo's `thermonuclear-review` so it stops taking the global trigger.
+4. **Review skill set.** Done on 2026-10-25: `review`, `strict-review`, and `review-loop`. Was: merge `general-review`, `rust-code-review`, and `full-code-review` into one `review` skill with references. Cut thermo to about 80 lines. Rename velo's `thermonuclear-review` so it stops taking the global trigger.
 5. **Repository files.** dynamo-gdl and agentic-control need a `Plans:` line and a consolidation pass. velo needs `Plans: Linear`, and the repositories without one need an `AGENTS.md` (velo, kvbm) or a `CLAUDE.md` (rhino, agentic-control). agentic-control calls mega review required. kvbm keeps `ACTIVE_PLAN.md` at the root. dynamo uses `agent-docs/` for something else.
 6. **Public mirrors.** A repository with a public mirror publishes its `agent-docs/`. Check what each mirror filter publishes before the next push.
 7. **Memory cleanup.** Delete memories that repeat the global file or are stale (listed in the session report), and move project state out of memory.
@@ -60,6 +60,6 @@ We want the global agent file (`dot_agents/AGENTS.md`) and the shared skills to 
 - Look for corrections typed more than once, rules a repository overrides, memories that contradict the file, and boilerplate that briefs paste.
 - Check vendor guidance again, and run `/doctor prompt-audit`.
 - Refresh the "Model routing" table in `ENVIRONMENT.md`: new models, release notes, and a small bake-off for a new candidate.
-- Read the test-backed review numbers recorded by `wills-mega-review` (reproduced, accepted, tokens) and decide whether to keep the mode.
+- Read the test-backed review numbers recorded by `review-loop` (reproduced, accepted, tokens) and decide whether to keep the mode.
 - Measure the file in words and bytes, not lines.
 - Run `repo-skills` status on each public team repository (velo, rhino) and resolve drift with the owner.

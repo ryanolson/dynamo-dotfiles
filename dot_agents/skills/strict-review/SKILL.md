@@ -1,9 +1,9 @@
 ---
-name: thermo-nuclear-code-quality-review
-description: Run an extremely strict adversarial review for correctness, hot-path performance, abstraction quality, giant files, and spaghetti-condition growth. Use for a thermo-nuclear code quality review, thermonuclear review, deep code quality audit, or especially harsh maintainability review.
+name: strict-review
+description: Run one strict review pass for correctness, hot-path cost, structure, and file growth. Use for risky changes, or when asked for a thermo or thermonuclear review. Not a loop.
 ---
 
-# Thermo-Nuclear Code Quality Review
+# Strict Review
 
 Use this skill for an unusually strict review focused on correctness, performance, implementation
 quality, maintainability, abstraction quality, and codebase health.
@@ -34,7 +34,7 @@ performance pass, and independent-verification step from `ishandhanani/dotfiles@
    example Codex when Claude wrote the code. Give it the raw artifact and the
    constraints **without your conclusions**, then verify material claims locally before including
    them.
-5. Make one pass. This skill does not loop; `wills-mega-review` owns the loop and its budget.
+5. Make one pass. This skill does not loop; `review-loop` owns the loop and its budget.
 6. Report findings first, ordered by severity, with `file_path:line_number` references. Each
    finding names the precondition, the code path, and the outcome, plus a test that would fail.
    Zero findings is a pass.

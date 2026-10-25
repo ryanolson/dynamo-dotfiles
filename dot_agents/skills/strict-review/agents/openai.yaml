@@ -1,0 +1,4 @@
+interface:
+  display_name: "Strict Review"
+  short_description: "One strict pass: correctness, hot-path cost, structure, file growth."
+  default_prompt: "Use $strict-review on the current branch diff."

@@ -1,13 +1,6 @@
----
-name: rust-code-review
-description: Review Rust changes for correctness, performance, concurrency, and maintainability.
----
+# Rust rules
 
-# Rust Code Review
-
-Adapted from `ishandhanani/dotfiles@7b54a8c` (`agents/skills/rust-code-review`).
-
-Review recently modified Rust code with strict systems and performance standards. Apply the rules below rigorously.
+Apply these on a Rust change, in addition to the areas. Adapted from `ishandhanani/dotfiles@7b54a8c` (`agents/skills/rust-code-review`).
 
 ## Core Review Philosophy
 
@@ -21,16 +14,6 @@ Review recently modified Rust code with strict systems and performance standards
 - **Logging and observability**: Ensure `tracing` spans and events are meaningful, not noisy.
 
 Use a direct, concise, technically grounded tone. Avoid filler praise. Keep most review comments to one or two lines.
-
-## How to Review
-
-Unless explicitly told otherwise, review only recently written or modified code. Use `git diff`, `git log`, or ask for the specific files or PR if unclear.
-
-1. Identify the review target with `git status`, `git diff --stat`, and `git diff`.
-2. Make one pass over the code using every rubric below, plus the second-pass checklist.
-3. Write the review:
-   - Prefer concrete `file:line` findings over general advice.
-   - Group issues by severity and include style comments.
 
 ## Review Rules
 

@@ -1,9 +1,9 @@
 ---
-name: wills-mega-review
-description: Prepare mostly working, tested work for merge or human review with a bounded loop of independent cross-family reviews that prove findings with failing tests, judged fixes, and regression tests. Use when the user asks for a mega review (wills, fable, or codex). It is optional; offer it, do not run it unasked.
+name: review-loop
+description: Bring finished work to merge with a bounded loop of cross-family reviews, test-backed findings, and judged fixes. Use when asked for a mega review (wills, fable, codex). Offer it; never run unasked.
 ---
 
-# Will's Mega Review
+# Review Loop
 
 Adapted from `ai-dynamo/rhino@a63a717` (`.agents/skills/wills-mega-review`).
 
@@ -13,7 +13,7 @@ Run this only once the feature mostly works and relevant tests pass.
 
 - **Range.** Pin the base commit before the first pass. Each pass reviews `<base>..<current head>`, so it sees the fixes from the passes before it, and gets the earlier rulings.
 - **Reviewer.** A reviewer the user names wins: "fable mega review" means Fable, "codex mega review" means a Codex bb thread. Otherwise use the cross-family row of the "Model routing" table in `ENVIRONMENT.md` for the author's family. Never the model that wrote the code.
-- **Rubric.** Use the repository's own review skill when its agent file names one; otherwise the global `thermo-nuclear-code-quality-review`.
+- **Rubric.** Use the repository's own review skill when its agent file names one; otherwise the global `strict-review`.
 
 ## Loop
 

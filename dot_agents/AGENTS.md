@@ -156,17 +156,24 @@ No review is mandatory. When a unit of work is complete, suggest a review if the
 
 | When | Review | Reviewer | Passes |
 |---|---|---|---|
-| Before building: a plan or design doc | `general-review` | Cross-family | Up to two rounds |
-| Before a commit: a small, local, tested change (a fix, a doc change, a mechanical refactor) | None, or `code-review` at low effort | Any | One |
-| A feature or behavior change in one area | `general-review`, with `rust-code-review` rules for Rust | Top tier or cross-family | One |
-| Concurrency, `unsafe`, registered hot paths, public interfaces, or a lifecycle across modules | `thermo-nuclear-code-quality-review` (`full-code-review` adds the general pass) | Cross-family | One per run, inside the budget |
-| A milestone is done, before merge or human review | Offer `wills-mega-review` | Cross-family, test-backed | Up to three |
+| Before building: a plan or design doc | `review` | Cross-family | Up to two rounds |
+| Before a commit: a small, local, tested change (a fix, a doc change, a mechanical refactor) | None, or the built-in `/code-review` at low effort | Any | One |
+| A feature or behavior change in one area | `review` | Top tier or cross-family | One |
+| Concurrency, `unsafe`, registered hot paths, public interfaces, or a lifecycle across modules | `strict-review` | Cross-family | One per run, inside the budget |
+| A milestone is done, before merge or human review | Offer `review-loop` ("mega review") | Cross-family, test-backed | Up to three |
 | PR feedback arrives | `gh-comment-ledger`, then `pr-babysitter` to drive CI and the AI reviewers | — | Until CI passes; rule on each comment |
 | Each release | `docs-sweep`, fixing all actionable rows | — | One |
 
-**Reviewers prove findings with tests.** A reviewer that can build and run the code commits a failing test for each finding it reproduces, on its own review branch, one commit per finding, so the implementer can cherry-pick it. A suggested fix is optional and only for small, local findings. A finding it cannot reproduce is reported as unreproduced, not dropped. `wills-mega-review` ("Test-backed findings") has the protocol.
+**Reviewers prove findings with tests.** A reviewer that can build and run the code commits a failing test for each finding it reproduces, on its own review branch, one commit per finding, so the implementer can cherry-pick it. A suggested fix is optional and only for small, local findings. A finding it cannot reproduce is reported as unreproduced, not dropped. `review-loop` ("Test-backed findings") has the protocol.
 
-**Review budget.** A design doc gets at most two review rounds; a milestone gets at most three code-review passes. `wills-mega-review` carries the stop rule; single-pass review skills do not loop. After the last pass, fix what is real, fold the remaining minor findings into the next milestone's plan, and stop. Report a run that still finds serious problems instead of starting another pass: repeated passes over-engineer the code more often than they find defects.
+**Review budget.** A design doc gets at most two review rounds; a milestone gets at most three code-review passes. `review-loop` carries the stop rule; single-pass review skills do not loop. After the last pass, fix what is real, fold the remaining minor findings into the next milestone's plan, and stop. Report a run that still finds serious problems instead of starting another pass: repeated passes over-engineer the code more often than they find defects.
+
+**Vendor reviews or ours.** Our skills carry these rules: the finding threshold, compatibility policy, hot-path registers, file growth, and test-first validation. The vendor reviews do not know them, so use ours wherever those rules matter, and for every plan or design review. Use a vendor review for what it does better:
+
+- The built-in `/code-review`: small, local changes, at low effort. `--fix` only for mechanical findings.
+- `/code-review ultra`: it reproduces each finding in a cloud sandbox, at a cost per run (`ENVIRONMENT.md` has the plan terms). Only for the highest-stakes change before merge, after our review, and only when I agree.
+- `/security-review`: a change at a trust boundary, such as authentication, secrets, or parsing untrusted input.
+- `@codex review` on a PR in a team repository: an automatic cross-family check of serious issues. Triage its comments with `gh-comment-ledger`.
 
 Treat AI review comments as adversarial claims, never as presumptions of correctness. Adjudicate each against the actual contract and code path before changing anything, and do not add guards, validation, or fallback behavior merely to satisfy a reviewer.
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review"
+  short_description: "One review pass of a plan, design, document, or code change."
+  default_prompt: "Use $review on this change."
