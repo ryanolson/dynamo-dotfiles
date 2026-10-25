@@ -1,6 +1,6 @@
 ---
 name: wills-mega-review
-description: Prepare mostly working, tested work for human review with a bounded loop of independent read-only thermonuclear reviews, judged fixes, and regression tests. Use when the user asks for a mega review (wills, fable, or codex). It is optional; offer it, do not run it unasked.
+description: Prepare mostly working, tested work for merge or human review with a bounded loop of independent cross-family reviews that prove findings with failing tests, judged fixes, and regression tests. Use when the user asks for a mega review (wills, fable, or codex). It is optional; offer it, do not run it unasked.
 ---
 
 # Will's Mega Review
@@ -12,12 +12,12 @@ Run this only once the feature mostly works and relevant tests pass.
 ## Setup
 
 - **Range.** Pin the base commit before the first pass. Each pass reviews `<base>..<current head>`, so it sees the fixes from the passes before it, and gets the earlier rulings.
-- **Reviewer.** A reviewer the user names wins: "fable mega review" means Fable, "codex mega review" means a Codex bb thread. Otherwise use a different model family from the author's: a Codex bb thread for Claude-authored work, Fable or Opus for Codex-authored work. Never the model that wrote the code.
+- **Reviewer.** A reviewer the user names wins: "fable mega review" means Fable, "codex mega review" means a Codex bb thread. Otherwise use the cross-family row of the "Model routing" table in `ENVIRONMENT.md` for the author's family. Never the model that wrote the code.
 - **Rubric.** Use the repository's own review skill when its agent file names one; otherwise the global `thermo-nuclear-code-quality-review`.
 
 ## Loop
 
-1. Launch a fresh **read-only** reviewer on the range. It reports findings in the rubric's format and makes no edits, commits, labels, or other changes.
+1. Launch a fresh reviewer on the range, in test-backed mode (below) when it can build and run the tests, otherwise read-only. It reports findings in the rubric's format. It never edits implementation files on the implementer's branch, and adds no labels.
 2. Rule on each finding before touching code, as `AGENTS.md` "Validating a claim" says: valid, partially valid, or invalid. A finding that repeats an earlier ruling without new evidence stays ruled.
 3. Fix the valid blocker and major findings that are in scope, each with a test that failed first. Record minor findings and out-of-scope suggestions for the next milestone's plan; do not fix them now. Simplification ideas are advisory.
 4. Run the relevant tests under a sized `timeout`.
@@ -30,6 +30,24 @@ Run this only once the feature mostly works and relevant tests pass.
 - a pass whose only findings repeat earlier rulings.
 
 If a serious finding is still open at the budget, stop and report it with your ruling. Do not start another pass.
+
+## Test-backed findings
+
+The reviewer has the context of each discovery; a failing test carries that context to the implementer, where a prose report must be re-derived. Use this mode whenever the reviewer can build and run the tests. A reviewer that writes a fix becomes its author, so fixes stay optional and never merge unreviewed.
+
+**Reviewer**
+
+- Work in your own worktree on `review/<branch>/p<pass>`, branched from the current head. Under bb, a child thread has one; outside bb, use `git worktree add`.
+- For each finding you reproduce, make one commit, `review: F<n> <summary>`, that adds only a failing test, marked as skipped with the reason (`#[ignore = "F<n>: <why it fails>"]` in Rust) so the branch stays green. Run it with the skip removed, and put the failure output in the commit body.
+- Optionally, add a second commit, `review: F<n> suggested fix`, on top, only for a small, local fix. Never for a design finding.
+- Spend only a small budget on each reproduction. Report a finding you cannot reproduce, such as a design concern or one that needs GPUs or a cluster, as `unreproduced`; do not drop it.
+- Report each finding with its severity, its commit SHAs, and whether it was reproduced.
+
+**Implementer**
+
+- For each test commit: cherry-pick it, remove the skip, and run it. A failure for the stated reason makes the finding valid; fix it and keep the test. A pass means the finding or the test is wrong; rule invalid or partially valid and say why.
+- Take a suggested-fix commit only after reviewing it as your own code. The next pass's reviewer checks it like any other change.
+- Record, for each finding: reproduced or not, the ruling, accepted or not, and the reviewer's token use when the provider reports it. These numbers decide whether this mode is worth its cost.
 
 ## Finish
 

@@ -105,19 +105,20 @@ I set each project's priority and any token budget; stop at the budget.
 
 ## Subagents, workflows, and model choice
 
-Match the model to the *kind of thinking* the step needs, not to how important the overall task feels. A workflow that runs every stage on the largest model is not more correct, only slower. Use model aliases (`opus`, `sonnet`, `fable`) rather than version IDs here; the agent's own model list is the current source for IDs.
+Match the model tier to the *kind of thinking* the step needs, not to how important the overall task feels. A workflow that runs every stage on the top tier is not more correct, only slower. This file names tiers, not models, because the best model changes with each release.
 
-| Use | For |
+| Tier | For |
 |---|---|
-| **Opus** | Load-bearing reasoning and implementation: judging whether an invariant holds, designing a type that makes an invalid state unrepresentable, tracing a lifecycle across modules, deciding whether a finding is real. |
-| **Sonnet** | Bounded work with a checkable answer: does anything call this function, does this parse, mechanical refactors, running a suite and reporting failures, writing a test for a behavior already characterized. Also deep research and web surveys. |
-| **Fable** | Orchestration and review: planning milestones, authoring workflow scripts and the design rulings their stage briefs carry, synthesizing reports, running the review cadence, gating and committing. |
-| **Codex** (a bb thread on the `codex` provider) | The cross-family reviewer for Claude-authored work, and the fallback implementer when Claude capacity runs out. `phone-a-friend` has no Codex backend; use bb. |
+| **Top** | Load-bearing reasoning and hard implementation: judging whether an invariant holds, designing a type that makes an invalid state unrepresentable, tracing a lifecycle across modules, deciding whether a finding is real, orchestrating a milestone. |
+| **Fast** | Bounded work with a checkable answer: does anything call this function, does this parse, mechanical refactors, running a suite and reporting failures, writing a test for a behavior already characterized. Also deep research and web surveys. |
+| **Cross-family** | Adversarial review and second opinions: a model from a different vendor than the author's. |
+
+The "Model routing" table in `~/.agents/ENVIRONMENT.md` maps each tier to the current model, provider, and effort. A model I name wins. When a row is more than four weeks old, say so when you use it.
 
 Two rules matter more than the table:
 
 - **An adversarial stage must not run the model that produced the claim.** A verifier sharing the author's blind spots agrees for the same wrong reason. The disagreement is the signal.
-- **Escalate on ambiguity, not on stakes.** A step with one checkable answer is answered correctly and faster by a smaller model. Reach for Opus when the judgment could reasonably go either way.
+- **Escalate on ambiguity, not on stakes.** A step with one checkable answer is answered correctly and faster by a smaller model. Reach for the top tier when the judgment could reasonably go either way.
 
 **How to delegate depends on bb.**
 
@@ -153,12 +154,17 @@ Most of my agent work runs as bb threads (`BB_THREAD_ID`, `BB_PROJECT_ID` set). 
 
 No review is mandatory. When a unit of work is complete, suggest a review if the change needs one, and name the level and the reason. Run it when I accept, or when the brief or plan already calls for it. Match the level to the risk of the change, not to its size.
 
-| Change | Suggested review |
-|---|---|
-| Small, local, and covered by tests: a fix, a doc change, a mechanical refactor | None, or `code-review` at low effort |
-| A feature or a behavior change in one area | `general-review`; `rust-code-review` for Rust systems and concurrency rules |
-| Concurrency, `unsafe`, hot paths, public interfaces, or a lifecycle across modules | `full-code-review` or `thermo-nuclear-code-quality-review` |
-| Significant new work that is ready for a human reviewer | Offer `wills-mega-review` as an option. It runs fresh read-only reviews from another model family, rules on each finding before fixing it, and stops at the review budget below. |
+| When | Review | Reviewer | Passes |
+|---|---|---|---|
+| Before building: a plan or design doc | `general-review` | Cross-family | Up to two rounds |
+| Before a commit: a small, local, tested change (a fix, a doc change, a mechanical refactor) | None, or `code-review` at low effort | Any | One |
+| A feature or behavior change in one area | `general-review`, with `rust-code-review` rules for Rust | Top tier or cross-family | One |
+| Concurrency, `unsafe`, hot paths, public interfaces, or a lifecycle across modules | `thermo-nuclear-code-quality-review` (`full-code-review` adds the general pass) | Cross-family | One per run, inside the budget |
+| A milestone is done, before merge or human review | Offer `wills-mega-review` | Cross-family, test-backed | Up to three |
+| PR feedback arrives | `gh-comment-ledger`, then `pr-babysitter` to drive CI and the AI reviewers | — | Until CI passes; rule on each comment |
+| Each release | `docs-sweep`, fixing all actionable rows | — | One |
+
+**Reviewers prove findings with tests.** A reviewer that can build and run the code commits a failing test for each finding it reproduces, on its own review branch, one commit per finding, so the implementer can cherry-pick it. A suggested fix is optional and only for small, local findings. A finding it cannot reproduce is reported as unreproduced, not dropped. `wills-mega-review` ("Test-backed findings") has the protocol.
 
 **Review budget.** A design doc gets at most two review rounds; a milestone gets at most three code-review passes. `wills-mega-review` carries the stop rule; single-pass review skills do not loop. After the last pass, fix what is real, fold the remaining minor findings into the next milestone's plan, and stop. Report a run that still finds serious problems instead of starting another pass: repeated passes over-engineer the code more often than they find defects.
 

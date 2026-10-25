@@ -33,6 +33,24 @@ Fish provides convenience functions such as `cc`, `cx`, `ws`, `wnew`, `wrm`, `wc
 
 The `nosudo` machine class excludes `wt`, `agent-spawn`, `agent-status`, and the related Fish shortcuts. Shared instructions and skills still deploy. No-sudo installations can use architecture-specific directories under `~/.local/<arch>/`; do not hardcode one machine's PATH into another.
 
+## Model routing
+
+Updated: 2026-10-25. `AGENTS.md` names tiers; this table maps them to models. A model the user names wins. A row more than four weeks old is stale: say so when you use it. The recurring agent instructions review in the source repository (`agent-docs/agent-instructions-review.md`) refreshes this table.
+
+| Tier | Model | Provider | Effort | Evidence |
+|---|---|---|---|---|
+| Top | Opus 5.5 | claude-code | max | Owner, 2026-10-25: more capable than Fable 5.1. |
+| Fast | Sonnet 5.5 | claude-code | default | Owner, 2026-10-22: Sonnet, not Opus, for deep research. |
+| Cross-family, for Claude-authored work | Codex `gpt-6.1-sol` | codex, as a bb thread | max, full access | Owner's reviewer choice, 2026-10-23. |
+| Cross-family, for Codex-authored work | Opus 5.5 | claude-code | max | Follows the top tier. |
+| Implementer when Claude capacity runs out | Codex | codex, as a bb thread | high | Owner, 2026-10-18. |
+
+- Implementer choice for concurrency-heavy Rust follows the owner's private bake-off of 2026-10-24. Ask before routing that work to a model the table does not name.
+- `phone-a-friend` has no Codex backend. Reach Codex through a bb thread, or the Codex plugin outside bb.
+- Read-only Codex runs fail on hosts where bubblewrap cannot create a network namespace (`bwrap: loopback: Failed RTM_NEWADDR`). Pass the files in the prompt, or run Codex with full access in a disposable worktree.
+
+To refresh a row: list the models each provider offers (`bb provider models <provider>`, Claude's model list, the Codex models cache), read the vendor release notes, and, for a new candidate, run a small bake-off on the owner's own tasks with fixed briefs and a blinded cross-family reviewer. Record the result and the date in the row.
+
 ## Fleet and secrets
 
 `fleet` enrolls my machines with my own CA. On an enrolled machine (`fleet status` succeeds), a broker serves secrets, SSH signing, and tunnels without 1Password. Read `fleet --help` before use.
