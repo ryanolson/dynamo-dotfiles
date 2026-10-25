@@ -34,7 +34,7 @@ Durable knowledge does not stay in Linear. Once the work is built, how it works 
 
 - **Priority**: set by the owner on projects and issues. Urgent, High, Medium, Low. An agent that creates an issue leaves priority empty.
 - **Estimate**: the token budget, in millions of tokens, on the exponential scale: 1, 2, 4, 8, 16, 32, 64. It covers the whole ticket: implementation, tests, review rounds, and fixes. The owner sets it. An agent that creates an issue writes a suggested budget in the body (`Suggested budget: 8M`) and leaves the field empty. For calibration: one Opus implementation of a change of about 500 lines, with two or three adversarial review rounds, cost about 4M to 8M tokens.
-- **Labels**: team-scoped only. Use `area:<crate or component>` for where the change lands (create the team label if it is missing). Use the existing `Bug`, `Feature`, `Improvement`, `Test`, and `idea` labels for the kind of work. Do not create a label at workspace level.
+- **Labels**: team-scoped only. The team's `area` label group (multi-select) has one child per crate or component, named exactly like it (`gdl-runtime`, `docs`, `velo`); use it for where the change lands, and add a missing child to the group with the team's id. Use the existing `Bug`, `Feature`, `Improvement`, `Test`, and `idea` labels for the kind of work. Do not create a label at workspace level.
 - **Assignee**: the owner. An agent working a ticket says so in a comment. It does not reassign the ticket.
 
 ## Status
