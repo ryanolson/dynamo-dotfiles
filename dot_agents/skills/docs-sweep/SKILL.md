@@ -38,14 +38,24 @@ The book (`docs/src/`) describes the code as it is, so it must match the code ex
   longer has. Measured numbers need the command that produced them; a number without one is
   `missing` evidence.
 - **Plan residue.** Phase or milestone labels, ruling numbers, PR numbers, ticket identifiers, or
-  handoff notes in the book. History belongs in `git`, plans in Linear.
+  handoff notes in the book. History belongs in `git`, plans in the project's plan store.
 - **Stale pinned-source claims.** A claim derived from a dependency at a specific revision is
   stale the day that pin moves. Check each such claim against the current pin.
 - **Orphans.** A chapter not listed in `SUMMARY.md`, or a link to a chapter that does not exist.
 
-`agent-docs/` must not exist on `main`. If it does, report it as one row: move the lasting parts
-into the book, file the remaining work in Linear (`linear-work` skill), and delete it. A plan or
-deep dive at the repo root gets the same row.
+Check `agent-docs/` against the project's plan store, declared in its agent file as
+`Plans: agent-docs` (the default) or `Plans: Linear`:
+
+- **`Plans: Linear`.** `agent-docs/` must not exist on `main`. If it does, report it as one row:
+  move the lasting parts into the book, file the remaining work in Linear (`linear-work` skill),
+  and delete it.
+- **`Plans: agent-docs`.** Report a note whose `Status:` or `Updated:` line no longer matches the
+  code or its addenda, a note missing from `agent-docs/README.md`, a note whose current design
+  can only be learned by replaying addenda or that passes about 500 lines (consolidate), a note
+  whose work has shipped (move the lasting parts into the book and delete it), and review records
+  or session notes on `main`.
+- **Either mode.** A reference to `agent-docs/` from a code comment or the book, and a plan or
+  deep dive at the repo root.
 
 ## Surface 2 — comments and doc comments
 

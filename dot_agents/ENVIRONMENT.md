@@ -1,6 +1,6 @@
 # Workstation environment
 
-This guide serves Claude, Codex, and q. It describes capabilities provided by the dotfiles and separately installed tooling. Availability depends on the host and execution shell.
+This guide serves Claude, Codex, and q. It describes capabilities provided by the dotfiles and separately installed tooling, and how to handle secrets. Availability depends on the host and execution shell.
 
 ## Discover before use
 
@@ -32,6 +32,21 @@ Shell aliases and Fish functions are not portable commands. Prefer the executabl
 Fish provides convenience functions such as `cc`, `cx`, `ws`, `wnew`, `wrm`, `wcd`, `as`, and `ast`. `wt cd` is also a Fish function. In other shells, use the executable or change directory to the result of `wt path <name>`.
 
 The `nosudo` machine class excludes `wt`, `agent-spawn`, `agent-status`, and the related Fish shortcuts. Shared instructions and skills still deploy. No-sudo installations can use architecture-specific directories under `~/.local/<arch>/`; do not hardcode one machine's PATH into another.
+
+## Fleet and secrets
+
+`fleet` enrolls my machines with my own CA. On an enrolled machine (`fleet status` succeeds), a broker serves secrets, SSH signing, and tunnels without 1Password. Read `fleet --help` before use.
+
+Secrets live in 1Password and are injected on demand: `openv <cmd>` runs a command with the variables in `~/.config/dynamo/dev.env.fleet`, from the fleet broker first and from `op run --env-file` when the broker fails. Never inline a secret, never echo one into a transcript or a log, and never write one to disk except as below. If a command needs a credential, wrap it in `openv` rather than exporting the value into the shell.
+
+**A command that prints a secret.** When a doc says to pipe in a token (for example `<command that prints your token> | tool login --stdin`), pipe `fleet secret get "<op ref>"`. If fleet returns 404 and `op` is installed, pipe `op read "<op ref>"`. Take the reference from the known items below. If none fits, find candidates with `op item list` and ask me which one to use.
+
+**The one on-disk exception: a rendered `.env`.** A tool that must run without prompts (an MCP server, a daemon) may read a `.env` that is gitignored, mode 600, and generated from a mapping of `op://` references kept outside the repo, at the path the repo names (else `~/.config/<repo>/<name>.env.tpl`; wcep-experiments uses `~/.config/wcep/mcp.env.tpl`): the repo's `.env.example` with each secret value replaced by `{{ op://<vault>/<item>/<field> }}`. Render with the repo's render script if it has one, else `op inject -i <mapping> -o <.env>` and `chmod 600`. Because 1Password is my store, build and maintain the mapping yourself rather than asking me for values: find items by title (`op item list`) and fields by label (`op item get <item> --format json`), never print a value, and ask only when the right item is ambiguous. Known items:
+
+- NGC personal key, NIM Operations (`goirlvsxnepa`): `op://Development/NGC NIM Operations PAT/credential`. An `nvapi-` key; works for the API gateway and the `ngc` CLI in that org. The `Fleet` vault has a copy: `op://Fleet/NGC NIM Operations PAT/credential`.
+- GitLab PAT for `gitlab-master.nvidia.com`: `op://Fleet/NV Gitlab PAT/credential`. Log in with `<command that prints the secret> | glab auth login --hostname gitlab-master.nvidia.com --git-protocol ssh --stdin`.
+- Every fleet machine can read any `op://Fleet/...` reference through `fleet secret get`, with no broker policy entry (fleet-config `ae76cc5`, deployed 2026-10-21).
+- `Development/NGC` and `Corp/NGC` are legacy NGC keys: the API gateway rejects them (401).
 
 ## q environment context
 
@@ -87,7 +102,7 @@ Codex can discover user skills directly under `~/.agents/skills`. The scaffold a
 2. Inspect target drift with scoped `chezmoi status <target>`. Preserve user edits. Do not run a broad apply to clear unrelated differences.
 3. Edit source files. Keep `.tmpl`, `executable_`, and other chezmoi attributes in source names. For behavior changes, write the failing test before the fix.
 4. Update this capability guide when the user-facing workflow changes. Keep skill references, metadata, and source README consistent.
-5. Run relevant checks under `timeout 300` for targeted suites. For scripts, use test fixtures rather than real credentials or services where possible.
+5. Run relevant checks under `timeout`, sized as the Bounded test runs section of `AGENTS.md` says. For scripts, use test fixtures rather than real credentials or services where possible.
 6. Preview with `chezmoi diff --recursive <target>...` and `chezmoi apply --dry-run <target>...`. Inspect any scheduled scripts. If using a separate worktree, pass `--source <worktree>` to every chezmoi preview and apply command.
 7. Apply the same explicit targets. Check scoped status, deployed contents, executable modes, and relevant links. For templates, compare against rendered output rather than raw source.
 8. Check discovery and use in fresh Claude and Codex sessions. Distinguish startup context, on-demand file reads, successful commands, and service access.
