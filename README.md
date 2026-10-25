@@ -181,6 +181,8 @@ timeout 300 python3 test/test-linear-mcp.py
 timeout 300 python3 test/agent-mcp.py
 ```
 
+chezmoi sets one key in `~/.claude/settings.json`: an empty `attribution`, so Claude Code adds no `Co-Authored-By` trailer or PR attribution line. Claude Code owns the rest of that file.
+
 Both agents are instructed to read [the environment guide](dot_agents/ENVIRONMENT.md) once per session. It maps tasks to tools, separates source ownership, and requires validation, scoped apply, commit, and push. Shared changes must work in both agents. See [the evaluation protocol](agent-docs/environment-evaluation.md) for behavioral checks.
 
 Verify a machine after the intended scoped apply:

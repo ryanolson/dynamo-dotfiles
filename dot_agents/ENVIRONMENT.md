@@ -80,6 +80,7 @@ Discover the active dotfiles source with `chezmoi source-path`. Resolve symlinks
 | `~/.agents/AGENTS.md`, `~/.agents/ENVIRONMENT.md` | `dot_agents/AGENTS.md`, `dot_agents/ENVIRONMENT.md` in the chezmoi repository |
 | Rostered `~/.agents/skills/<name>/` | `dot_agents/skills/<name>/`; roster in `.chezmoidata/agent_skills.yaml` |
 | `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, rostered agent-home skill links | `run_onchange_after_link-agent-scaffold.sh.tmpl` creates links to the deployed `~/.agents` tree |
+| The `attribution` key in `~/.claude/settings.json` | `dot_claude/modify_private_settings.json`; Claude Code owns every other key |
 | Managed `~/.local/bin` commands | `dot_local/bin/executable_<name>` or its `.tmpl` form; confirm with `chezmoi source-path` |
 | Managed shell configuration | `dot_config/fish/` and `dot_profile.tmpl`; confirm each target's mapping |
 | BB launcher and `bb-cli` skill | BB project and installer; see the BB section |

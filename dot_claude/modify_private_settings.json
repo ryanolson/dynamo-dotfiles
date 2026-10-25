@@ -1,0 +1,13 @@
+#!/bin/bash
+# Claude Code adds a Co-Authored-By trailer and a PR attribution line unless this
+# setting is empty, and a rule in AGENTS.md cannot stop it. Claude Code owns the
+# rest of this file (model, plugins, permissions), so set only this key.
+set -euo pipefail
+exec python3 -I -c '
+import json, sys
+text = sys.stdin.read()
+settings = json.loads(text) if text.strip() else {}
+settings["attribution"] = {"commit": "", "pr": ""}
+json.dump(settings, sys.stdout, indent=2)
+sys.stdout.write("\n")
+'
