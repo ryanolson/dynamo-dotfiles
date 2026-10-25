@@ -98,6 +98,8 @@ Omit inapplicable headings, not applicable information. Refresh the walkthrough 
 
 ## Anti-Slop Rules
 
+- Follow the `simple-english` PR budget: under 150 words plus a test line. Add the "How This Was Implemented" walkthrough only for a change to a lifecycle, protocol, or ordering rule that a reviewer cannot follow from the diff.
+- Write a `CLOSES:` line only for a GitHub issue. Never write a Linear identifier or URL.
 - Do not delete content outside the managed block.
 - Do not paste long logs, benchmark dumps, or generated artifacts into the body; link or summarize them.
 - Do not list every changed file; group boring mechanical changes.

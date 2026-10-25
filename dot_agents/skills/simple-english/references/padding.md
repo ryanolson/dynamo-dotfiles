@@ -19,20 +19,20 @@ The slop-to-plain word table is in `rules.md`, under "Slop-to-simple substitutio
 
 ## Report rewrite
 
-A bake-off report opened like this, and put its recommendation in section 8 of 8:
+A model comparison report opened like this, and put its recommendation in the last of eight sections:
 
-> Private report. Source of every number: the scoreboard `bakeoff.md` in bb thread storage of the coordinator thread `thr_…` (`~/.bb-machines/…/thread-storage/thr_…/`, cited as `:line`), and the review files beside it (cited by name). Where the scoreboard prose and a review file disagree, this report uses the review file and says so. Run: 2026-10-22 to 2026-10-24, cells tasks T1 to T11a in dynamo-gdl.
+> Private report. Source of every number: the scoreboard in the coordinator thread's storage (path, cited as `:line`), and the review files beside it (cited by name). Where the scoreboard prose and a review file disagree, this report uses the review file and says so. Run: three days, tasks T1 to T11.
 
 Then a model table, then a "Summary" of five dense bullets of ratios and score vectors. A reader who stops after the first screen learns where the data lives, not what was asked or what to do.
 
-The same facts, in order:
+The same structure, in order (numbers are placeholders):
 
-> We want to know whether Kimi K3 can implement concurrency-heavy Rust features as well as Opus 5.5, so that agent swarms can route that work to it. Both models got the same ten cells tasks in dynamo-gdl, each in its own worktree on the same base. A blinded Codex reviewer scored every round until it approved.
+> We want to know whether model X can implement our concurrency-heavy Rust features as well as model Y, so that agent swarms can route that work to it. Both models got the same N tasks, each in its own worktree on the same base. A blinded reviewer from a third model family scored every round until it approved.
 >
 > **TL;DR**
-> - Opus won all 10 tasks. It reached a clean review on all 10; K3 reached one on 2.
-> - K3 took about 2x as long to a first implementation, and had about 4 major findings per first review against Opus's 1.
-> - Keep Opus as the implementer for this work. Do not route it to K3 in the current setup.
+> - Y won N of N tasks, and reached a clean review on all of them; X reached one on K.
+> - X took about Rx as long to a first implementation, and had about M major findings per first review against Y's 1.
+> - Keep Y as the implementer for this work. Do not route it to X in the current setup.
 > - A clean verdict missed real defects on both sides. Keep a cross-family reviewer, and cross-read when two implementations exist.
 
-Method, per-task tables, confounders, and lessons follow. The source paths and thread IDs go in a closing "Sources" section.
+Method, per-task tables, confounders, and lessons follow. Source paths and thread IDs go in a closing "Sources" section.

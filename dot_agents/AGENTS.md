@@ -10,10 +10,11 @@ Rust and Python systems engineer. Datacenter-scale distributed inference serving
 
 ## Session start
 
-1. Read the repository's own agent file and treat it as authoritative over this one.
-2. `git worktree list` — know the checkout layout before touching a build directory or a venv. A bb thread works in its own worktree, not under `~/repos`.
-3. Before selecting workstation tools or changing the environment, read `~/.agents/ENVIRONMENT.md`. It maps capabilities, secrets, command discovery, and source ownership.
-4. Only when the task changes agent configuration, resolve the agent and its home: `CLAUDECODE` means Claude Code (`${CLAUDE_HOME:-~/.claude}`), `CODEX_*` means Codex (`${CODEX_HOME:-~/.codex}`). Under bb (`BB_THREAD_ID` set), `bb thread show "$BB_THREAD_ID" --json` names the provider. Other tasks do not need this step.
+1. Check whether you run under bb: `BB_THREAD_ID` set means you are a bb thread. It changes how you delegate (see "Subagents, workflows, and model choice") and where you work (see "Running under bb").
+2. Read the repository's own agent file and treat it as authoritative over this one.
+3. `git worktree list` — know the checkout layout before touching a build directory or a venv. A bb thread works in its own worktree, not under `~/repos`.
+4. Before selecting workstation tools or changing the environment, read `~/.agents/ENVIRONMENT.md`. It maps capabilities, secrets, command discovery, and source ownership.
+5. Only when the task changes agent configuration, resolve the agent and its home: `CLAUDECODE` means Claude Code (`${CLAUDE_HOME:-~/.claude}`), `CODEX_*` means Codex (`${CODEX_HOME:-~/.codex}`). Under bb, `bb thread show "$BB_THREAD_ID" --json` names the provider.
 
 ## Environment ownership and updates
 
@@ -83,7 +84,7 @@ Every Rust project past its first weeks has an mdBook in `docs/`, modelled on `.
 | Roadmap, plans, rulings not yet built | The project's plan store (below) |
 | Work-in-progress notes, review ledgers, handoffs | The work branch or bb thread storage |
 
-The book keeps only what lasts. No plans, phase or milestone labels, ruling numbers, PR numbers, ticket identifiers, or handoff notes. Each behavior change updates the chapters that describe it and the top-level README, which stays short and points into the book. Code comments and the book never cite `agent-docs/`: its notes are deleted when their work ships.
+The book keeps only what lasts, and its main chapters stay lean: detail worth keeping that the main prose does not need goes in an appendix. No plans, phase or milestone labels, ruling numbers, PR numbers, ticket identifiers, or handoff notes. Each behavior change updates the chapters that describe it and the top-level README, which stays short and points into the book. Code comments and the book never cite `agent-docs/`: its notes are deleted when their work ships.
 
 ### Plans: per-project store
 
@@ -118,6 +119,11 @@ Two rules matter more than the table:
 - **An adversarial stage must not run the model that produced the claim.** A verifier sharing the author's blind spots agrees for the same wrong reason. The disagreement is the signal.
 - **Escalate on ambiguity, not on stakes.** A step with one checkable answer is answered correctly and faster by a smaller model. Reach for Opus when the judgment could reasonably go either way.
 
+**How to delegate depends on bb.**
+
+- **Under bb:** work that edits code, runs long, needs its own worktree, or needs another model family (a Codex reviewer, a Kimi or Gemini implementer) goes to a child thread (`bb thread spawn`; read the `bb-cli` skill). The owner can see, steer, and resume a child; they cannot see an in-process subagent. Keep in-process subagents for short read-only lookups and searches whose result you need in this turn.
+- **Outside bb:** use in-process subagents and workflows. Get another model family through `phone-a-friend` or the Codex plugin.
+
 Carry design rulings in the stage brief. An implementation agent re-litigating a settled decision mid-stage is the failure mode briefs exist to prevent. A brief points to the repository's agent file rather than pasting it, and adds only what the file does not say: the settled rulings, the scope, and whether to push.
 
 ## Running under bb
@@ -134,7 +140,8 @@ Most of my agent work runs as bb threads (`BB_THREAD_ID`, `BB_PROJECT_ID` set). 
 
 **`gh` is the only GitHub credential.** Never set, read, export, or suggest `GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_PAT`, or any personal access token, and never write one into a file, an env file, a CI variable, or a shell profile. If `gh auth status` fails, stop and ask me to run `gh auth login` — do not work around it. Git reaches GitHub over SSH through the 1Password agent, or through `gh`'s own credential helper; there is no third option.
 
-- **Commit to `main` and push**, unless the repository's agent file or branch protection requires a pull request. Open a PR only when I ask or when the repository requires one; where it does, follow the repository's merge rules (squash, DCO sign-off, required checks).
+- **In my own repositories, commit to `main` and push**, unless the repository's agent file or branch protection requires a pull request. Open a PR only when I ask or when the repository requires one; where it does, follow its merge rules (squash, DCO sign-off, required checks).
+- **In a repository other people commit to** (for example `ai-dynamo/dynamo`), never push to `main`: work on a branch and open a draft PR, unless its agent file says otherwise. When unsure which kind a repository is, ask.
 - In a parent/child thread tree, children commit on their own branch and do not push; the parent integrates and pushes. A brief that says otherwise wins.
 - One logical change per commit, after validation. Keep documentation-only and mechanical refactors in their own commits.
 - Tests land with the code they cover. Write them first. Do not merge untested code or defer tests. A scaffold or interface change still tests its invariants — constructor guards, compile-fail seams, fail-closed contracts.

@@ -32,7 +32,7 @@ We want the global agent file (`dot_agents/AGENTS.md`) and the shared skills to 
 - Review: "why are we doing a 3rd thermo review?" and "do not get stuck in review death spirals… 2-3 passes". One milestone got 8 to 20 thermo runs on 2026-10-15.
 - Memory: a memory said "don't commit" and contradicted the global file. The owner said to follow the global file.
 
-**Documentation.** velo's rules work: `agent-docs/` never reaches `main`, and 38 of 51 commits since its book landed updated `docs/`. rhino has no written rule. Its code cites `agent-docs/` files that do not exist on `main`, and its book carries PR numbers. dynamo-gdl and agentic-control keep `agent-docs/` on `main` as their roadmap. It grew without a limit (gdl `plan.md` 275 KB with 102 addenda, one agentic-control task card 1.29 MB), because the old addendum rule had no point of consolidation. The new `Plans: agent-docs` rules add a status line, an index, a size trigger, and deletion when work ships.
+**Documentation.** velo's rules work: `agent-docs/` never reaches `main`, and 38 of 51 commits since its book landed updated `docs/`. rhino has no written rule. Its code cites `agent-docs/` files that do not exist on `main`, and its book carries PR numbers. dynamo-gdl and agentic-control keep `agent-docs/` on `main` as their roadmap. It grew without a limit (one plan reached 275 KB with 102 addenda, one task card 1.29 MB), because the old addendum rule had no point of consolidation. The new `Plans: agent-docs` rules add a status line, an index, a size trigger, and deletion when work ships.
 
 **bb boilerplate.** 70 of 98 child briefs pasted the same 12 KB block of repository rules, because parents could not count on children reading the agent files. ACP providers such as Antigravity do not read `~/.claude/CLAUDE.md` or `~/.codex/AGENTS.md`.
 
@@ -45,7 +45,7 @@ We want the global agent file (`dot_agents/AGENTS.md`) and the shared skills to 
 3. **`~/.claude/CLAUDE.md` as an import, not a symlink.** Cowork skips a symlinked user file, and Claude cannot edit through one. An `@~/.agents/AGENTS.md` import avoids both.
 4. **Review skill set.** Merge `general-review`, `rust-code-review`, and `full-code-review` into one `review` skill with references. Cut thermo to about 80 lines. Rename velo's `thermonuclear-review` so it stops taking the global trigger.
 5. **Repository files.** dynamo-gdl and agentic-control need a `Plans:` line and a consolidation pass. velo needs `Plans: Linear`, and the repositories without one need an `AGENTS.md` (velo, kvbm) or a `CLAUDE.md` (rhino, agentic-control). agentic-control calls mega review required. kvbm keeps `ACTIVE_PLAN.md` at the root. dynamo uses `agent-docs/` for something else.
-6. **Public mirror.** Private dynamo-gdl `main` has headshots under `agent-docs/video/assets/` for 8 people. The public `ryanolson/gdl` has 215 `agent-docs/` files and no headshots yet. Check the mirror filter before the next push.
+6. **Public mirrors.** A repository with a public mirror publishes its `agent-docs/`. Check what each mirror filter publishes before the next push.
 7. **Memory cleanup.** Delete memories that repeat the global file or are stale (listed in the session report), and move project state out of memory.
 8. **Stale model names** in `pr-babysitter` (`gpt-5.6-*`).
 

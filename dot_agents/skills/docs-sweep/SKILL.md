@@ -11,7 +11,7 @@ the other half — a periodic, repository-wide sweep that finds the drift no sin
 responsible for.
 
 Read-only by default. Produce the ledger, present it, and change only the rows the user selects.
-The one exception is a run the user explicitly opens with "fix all actionable rows".
+The exceptions are a run the user explicitly opens with "fix all actionable rows", and the release pass that `AGENTS.md` requires, which fixes all actionable rows.
 
 Sweep the three surfaces **independently**. They rot for different reasons and a finding in one is
 not evidence for another.
