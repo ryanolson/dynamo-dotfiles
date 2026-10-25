@@ -52,11 +52,11 @@ Updated: 2026-10-25. `AGENTS.md` names tiers; this table maps them to models. A 
 
 ### Accounts by machine
 
-Each machine signs in to different accounts, so plan features differ by host. The owner listed these on 2026-10-25:
+Each machine signs in to different accounts, so plan features differ by host. The owner confirmed these on 2026-10-25:
 
 | Machines | Claude | Codex |
 |---|---|---|
-| spark-d, mba15, mac-mini-m6 (personal) | Max | Pro |
+| spark-d (hostname `spark-e504`), mba15, mac-mini-m6 (personal) | Max | Pro |
 | spark-p, gb300 (enterprise) | Enterprise | Enterprise |
 
 Check the host you run on rather than trusting the list: `hostname`, the `organizationType` field of `oauthAccount` in `~/.claude.json` (for example `claude_max`), and `codex login status`. Read only that field; the file holds account details, and `~/.codex/auth.json` holds credentials.
