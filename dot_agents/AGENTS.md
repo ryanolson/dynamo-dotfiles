@@ -160,13 +160,13 @@ No review is mandatory. When a unit of work is complete, suggest a review if the
 | Before a commit: a small, local, tested change (a fix, a doc change, a mechanical refactor) | None, or the built-in `/code-review` at low effort | Any | One |
 | A feature or behavior change in one area | `review` | Top tier or cross-family | One |
 | Concurrency, `unsafe`, registered hot paths, public interfaces, or a lifecycle across modules | `strict-review` | Cross-family | One per run, inside the budget |
-| A milestone is done, before merge or human review | Offer `review-loop` ("mega review") | Cross-family, test-backed | Up to three |
+| A milestone is done, before merge or human review | Offer `review-loop` ("mega review") | Cross-family, test-backed | Up to 10, by size of change |
 | PR feedback arrives | `gh-comment-ledger`, then `pr-babysitter` to drive CI and the AI reviewers | — | Until CI passes; rule on each comment |
 | Each release | `docs-sweep`, fixing all actionable rows | — | One |
 
 **Reviewers prove findings with tests.** A reviewer that can build and run the code commits a failing test for each finding it reproduces, on its own review branch, one commit per finding, so the implementer can cherry-pick it. A suggested fix is optional and only for small, local findings. A finding it cannot reproduce is reported as unreproduced, not dropped. `review-loop` ("Test-backed findings") has the protocol.
 
-**Review budget.** A design doc gets at most two review rounds; a milestone gets at most three code-review passes. `review-loop` carries the stop rule; single-pass review skills do not loop. After the last pass, fix what is real, fold the remaining minor findings into the next milestone's plan, and stop. Report a run that still finds serious problems instead of starting another pass: repeated passes over-engineer the code more often than they find defects.
+**Review budget.** A design doc gets at most two review rounds. A milestone gets more code-review passes as its change grows, up to 10. At pass 6, check that the findings converge before you start another pass. `review-loop` carries the stop rule; single-pass review skills do not loop. After the last pass, fix what is real and give that fix a pass of its own. Then fold the remaining minor findings into the next milestone's plan, and stop. Report a run that still finds serious problems instead of starting another pass: repeated passes over-engineer the code more often than they find defects.
 
 **Vendor reviews or ours.** Our skills carry these rules: the finding threshold, compatibility policy, hot-path registers, file growth, and test-first validation. The vendor reviews do not know them, so use ours wherever those rules matter, and for every plan or design review. Use a vendor review for what it does better:
 

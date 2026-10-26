@@ -36,14 +36,14 @@ The `nosudo` machine class excludes `wt`, `agent-spawn`, `agent-status`, and the
 
 ## Model routing
 
-Updated: 2026-10-25. `AGENTS.md` names tiers; this table maps them to models. A model the user names wins. A row more than four weeks old is stale: say so when you use it. The recurring agent instructions review in the source repository (`agent-docs/agent-instructions-review.md`) refreshes this table.
+Updated: 2026-10-26. `AGENTS.md` names tiers; this table maps them to models. A model the user names wins. A row more than four weeks old is stale: say so when you use it. The recurring agent instructions review in the source repository (`agent-docs/agent-instructions-review.md`) refreshes this table.
 
 | Tier | Model | Provider | Effort | Evidence |
 |---|---|---|---|---|
 | Top | Opus 5.5 | claude-code | max | Owner, 2026-10-25: more capable than Fable 5.1. |
 | Fast | Sonnet 5.5 | claude-code | default | Owner, 2026-10-22: Sonnet, not Opus, for deep research. |
-| Cross-family, for Claude-authored work | Codex `gpt-6.1-sol` | codex, as a bb thread | max, full access | Owner's reviewer choice, 2026-10-23. |
-| Cross-family, for Codex-authored work | Opus 5.5 | claude-code | max | Follows the top tier. |
+| Cross-family, for Claude-authored work | Codex `gpt-6.1-sol` | codex, as a bb thread | max, full access | Owner's reviewer choice, 2026-10-23. Owner, 2026-10-25: Sol reviews at max. |
+| Cross-family, for Codex-authored work | Opus 5.5 | claude-code | high | Owner, 2026-10-25: Opus 5.5 reviews at high. |
 | Implementer when Claude capacity runs out | Codex | codex, as a bb thread | high | Owner, 2026-10-18. |
 
 - Implementer choice for concurrency-heavy Rust follows the owner's private bake-off of 2026-10-24. Ask before routing that work to a model the table does not name.

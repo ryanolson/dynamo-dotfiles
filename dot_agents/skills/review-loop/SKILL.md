@@ -25,9 +25,11 @@ Run this only once the feature mostly works and relevant tests pass.
 
 **Stop** at the earliest of:
 
-- the pass budget: three passes for code, two for a design doc, counted per milestone or document across every run of this skill (read the earlier records). Starting the skill again does not reset the count;
+- the pass budget: up to 10 passes for code, scaled to the size of the change, and two for a design doc, counted per milestone or document across every run of this skill (read the earlier records). Starting the skill again does not reset the count;
 - a pass with no new valid blocker or major finding;
 - a pass whose only findings repeat earlier rulings.
+
+At pass 6, check that the findings converge before you start pass 7. A fix made after the last pass gets a pass of its own.
 
 If a serious finding is still open at the budget, stop and report it with your ruling. Do not start another pass.
 
