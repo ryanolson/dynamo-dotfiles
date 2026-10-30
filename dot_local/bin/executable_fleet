@@ -760,7 +760,7 @@ onboard_bb() {
     [[ "$rc" == 0 ]] || { bb_abandon "" "$id"; fail "bb machine create failed (exit $rc); the pending bb host $id is removed"; }
     bb machine rename "$id" "$node" >/dev/null 2>&1 || true
     printf '%s is a bb machine (%s)\n' "$node" "$id" >&2
-    bb machine provider-cli status "$node" || true
+    bb machine provider-cli status "$node" --json 2>/dev/null | fpy bb-provider-summary >&2 || true
 }
 
 # Laptop: put HOST in the fleet. Each step converges, so a failed run is repaired by running the same
@@ -2061,6 +2061,10 @@ elif cmd == 'bb-host-status':
         if h.get('name') == a[1]:
             print(h.get('status', 'unknown'))
             break
+elif cmd == 'bb-provider-summary':
+    # One line for each agent CLI from `bb machine provider-cli status --json` on standard input.
+    for name, v in json.load(sys.stdin).items():
+        print(f"{name}: installed {v.get('currentVersion') or '?'}" if v.get('installed') else f'{name}: not installed')
 elif cmd == 'workers-has':
     # One page of `actl --json workers`: print "found", or the cursor of the next page, or nothing.
     data = load(a[0])

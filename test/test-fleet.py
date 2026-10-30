@@ -798,7 +798,8 @@ case "$1 $2" in
         printf 'On macOS or Linux, run:\\ncurl -sSL --fail-with-body -H '"'"'X-BB-Enrollment: SECRETBBTOKEN'"'"' '"'"'http://127.0.0.1:38900/install.sh'"'"' | sh\\nThis command expires at 1:08:49 PM.\\nFollowing machine host_test1\\n' >&2
         [ -e "$HOME/bb-create-fails" ] && exit 1
         sleep 1; exit 0 ;;
-    "machine rename"|"machine remove"|"machine show"|"machine provider-cli") exit 0 ;;
+    "machine provider-cli") echo '{"claude-code": {"installed": true, "currentVersion": "2.1.0", "installAction": {"command": "x"}}, "pi": {"installed": false, "currentVersion": null}}' ;;
+    "machine rename"|"machine remove"|"machine show") exit 0 ;;
     *) echo "unexpected bb $*" >&2; exit 99 ;;
 esac
 """
@@ -987,6 +988,10 @@ echo "gh: no clone" >&2; exit 1
         self.assertIn('machine rename host_test1 box', bb)
         self.assertEqual(bb.index('machine create --provider manual') < bb.index('machine rename host_test1 box'), True)
         self.assertFalse([c for c in bb if c.startswith('machine remove')])
+        # One line for each agent CLI, not bb's whole status document.
+        self.assertIn('claude-code: installed 2.1.0', result.stderr)
+        self.assertIn('pi: not installed', result.stderr)
+        self.assertNotIn('installAction', result.stdout + result.stderr)
 
     def test_onboard_does_not_create_a_bb_machine_when_the_tunnel_does_not_answer(self):
         self.onboard_setup()
