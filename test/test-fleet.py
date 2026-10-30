@@ -978,6 +978,8 @@ echo "gh: no clone" >&2; exit 1
         enroll = [stdin for _, stdin in calls if 'X-BB-Enrollment' in stdin]
         self.assertEqual(len(enroll), 1)
         self.assertIn('SECRETBBTOKEN', enroll[0])
+        # bb's installer needs node, which pixi puts in ~/.pixi/bin: not on the PATH of a bare `bash -s`.
+        self.assertIn('.pixi/bin', enroll[0].split('SECRETBBTOKEN')[0])
         # The enrollment token goes on standard input only, and never to the terminal.
         self.assertFalse([args for args, _ in calls if 'SECRETBBTOKEN' in ' '.join(args)])
         self.assertNotIn('SECRETBBTOKEN', result.stdout + result.stderr)

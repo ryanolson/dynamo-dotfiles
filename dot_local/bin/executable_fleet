@@ -746,7 +746,8 @@ onboard_bb() {
     grep -m 1 '^curl ' "$work/create.err" > "$work/enroll"
     # Name it first: a rerun that finds the name does not make a second host.
     bb machine rename "$id" "$node" >/dev/null 2>&1 || true
-    "${ssh_cmd[@]}" -- "$host" bash -s < "$work/enroll" ||
+    { printf '%s\n' 'export PATH="$HOME/.local/bin:$HOME/.pixi/bin:$PATH"'; cat "$work/enroll"; } |
+        "${ssh_cmd[@]}" -- "$host" bash -s ||
         { bb_abandon "$bbpid" "$id"; fail "the bb enrollment command failed on $host; the pending bb host $id is removed"; }
 
     local rc=0
