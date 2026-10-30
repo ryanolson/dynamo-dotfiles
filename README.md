@@ -343,7 +343,7 @@ The token is on the command line of the new machine for the duration of `join.sh
 To put a machine that you reach with SSH into the fleet in one command, use `fleet onboard` on the laptop:
 
 ```bash
-fleet onboard [USER@]HOST NAME [--jump ALIAS] [--fleet-config PATH] [--no-alias]
+fleet onboard [USER@]HOST NAME [--jump ALIAS] [--fleet-config PATH] [--no-alias] [--no-bb]
 ```
 
 It runs these steps. Each step checks first, so a failed run is repaired by running the same command again.
@@ -351,10 +351,11 @@ It runs these steps. Each step checks first, so a failed run is repaired by runn
 1. `ssh HOST true`, with `--jump` as an SSH jump host.
 2. Unless the machine is already enrolled, it sends the `fleet invite NAME --dotfiles` command to the machine on standard input. That installs the dotfiles, installs `fleet`, enrolls, and installs the renew timer. `bootstrap.sh` has no terminal there, so `fleet onboard` sends your name and email from chezmoi (or `DOTFILES_NAME` and `DOTFILES_EMAIL`).
 3. `fleet agent install` on the machine.
-4. It adds `NAME` to `broker/ssh-hosts.json` in a fleet-config checkout (`--fleet-config`, or `FLEET_CONFIG_REPO`, default `~/repos/fleet-config`), with the host name and user that `ssh -G` reports. It does not commit or deploy: commit the file, then copy `broker/` to the CA host and run `sudo broker/install.sh`. Other machines get the short name on their next renew. `--no-alias` skips this step, and it also skips when the checkout is missing. `NAME` must then be lowercase letters, digits, and hyphens, and `--jump` must be a short SSH name.
-5. `fleet status` on the machine must show `NAME`.
+4. The short SSH name. It updates the fleet-config checkout (`--fleet-config`, or `FLEET_CONFIG_REPO`, default `~/repos/fleet-config`; it clones `fleet-config` from the same GitHub account as the dotfiles when the folder is missing), adds `NAME` to `broker/ssh-hosts.json` with the host name and user that `ssh -G` reports, commits that file, and pushes. Then deploy the broker: copy `broker/` to the CA host and run `sudo broker/install.sh`. The broker reads the file only when it starts, and it refuses to start when a `jump` names an alias that is not listed earlier, so `fleet onboard` checks that. Other machines get the name on their next renew. `--no-alias` skips this step. `NAME` must then be lowercase letters, digits, and hyphens, and `--jump` must be a short SSH name. The entry holds the address that `ssh -G` reports, so an EC2 public DNS name changes when the instance stops and starts.
+5. The bb machine. It copies the laptop's own `bb` fleet tunnel to the machine (`fleet tunnel add bb`, a client tunnel on `127.0.0.1:38900`), and checks that the tunnel reaches the door. That address is the one bb gives to machines (`machineServerUrl`), so the enrollment command from `bb machine create --provider manual` works as printed. The command goes to the machine on standard input and is never shown. The bb machine takes the name `NAME`. If anything fails after bb made the host, `fleet onboard` removes that pending host. It reports `bb machine provider-cli status`, and it installs no agent CLI. It skips when the laptop has no `bb` tunnel or no `bb` command, or with `--no-bb`, and it does nothing when a bb machine named `NAME` exists.
+6. `fleet status` on the machine must show `NAME`.
 
-The token and the invite command go to the machine on standard input. The first SSH connection to a new host accepts its host key without asking, so check the fingerprint against the provider's console when the address is public. `fleet onboard` does not join Tailscale. The machine reaches the bb server through the fleet door (see Fleet door).
+The enrollment token and the invite command go to the machine on standard input. The first SSH connection to a new host accepts its host key without asking, so check the fingerprint against the provider's console when the address is public. `fleet onboard` does not join Tailscale.
 
 
 `fleet login` mints its own token through 1Password with the admin provisioner, and it does not add login trust. A laptop that sleeps longer than 24 hours has an expired certificate. Run `fleet login` again.

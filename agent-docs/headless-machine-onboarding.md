@@ -1,6 +1,6 @@
 # Headless machine onboarding: `fleet onboard`
 
-Status: in progress. Steps 1 to 5 are built (`fleet onboard`, with tests). The brev-up change and the bb phase are not.
+Status: in progress. `fleet onboard` is built with tests: enrollment, dotfiles, agent, short SSH name (commit and push), and the bb machine. Not built: the broker deploy, and the `brev-up` change.
 Updated: 2026-10-30
 
 ## Goal
@@ -29,9 +29,10 @@ Each step converges, so a failed run is repaired by running the same command aga
 
 1. Check that `ssh HOST true` works. `--jump` adds a `ProxyJump`.
 2. Send `fleet invite NAME --dotfiles` to the machine on stdin, as `brev-up` does. This installs the dotfiles, installs `fleet`, enrolls, and runs `fleet timer install`.
-3. Run `fleet agent install` and `fleet install-pylon` on the machine.
-4. Add the machine to `broker/ssh-hosts.json` in a fleet-config checkout (`--fleet-config`, default `~/repos/fleet-config`). Do not commit or deploy. Print the next step, as `fleet worker enroll` does.
-5. Check: `fleet list` shows the name, and `ssh NAME true` works once the broker has the new list.
+3. Run `fleet agent install` on the machine. `fleet install-pylon` is not part of it, as in `brev-up`.
+4. Add the machine to `broker/ssh-hosts.json` in a fleet-config checkout (`--fleet-config`, default `~/repos/fleet-config`, cloned from the dotfiles' GitHub account when missing), then commit and push that file. A jump host must name an alias that the file lists earlier, or the broker does not start. Print the deploy step.
+5. The bb machine (see below), unless `--no-bb`.
+6. Check: `fleet status` on the machine shows the name.
 
 Tailscale is not part of `fleet onboard`. The owner ruled on 2026-10-30 that joining the tailnet is a manual step and not needed by default. The fleet door and a fleet tunnel give a machine a path to the server without it. `brev-up` keeps its own optional join until it calls `fleet onboard`.
 
@@ -48,26 +49,25 @@ An entry has an alias, a hostname, a user, an optional jump host, and a host key
 ## Hazards
 
 - **First contact.** The fleet SSH settings trust new hosts on first use only inside the tailnet, where WireGuard authenticates the peer. A raw public address has no such protection. `fleet onboard` should print the host key fingerprint it accepted, so it can be compared with the provider's console. A stricter option is a `--host-key-fingerprint` flag that refuses any other key. This is a decision for the owner.
-- **Token exposure.** The enrollment token and any Tailscale key travel on SSH standard input only.
+- **Token exposure.** The fleet enrollment token and the bb enrollment command travel on SSH standard input only. The bb command stays in a scratch folder on the laptop that is removed on exit.
 - **No sudo.** The no-sudo class installs into `$HOME`, and `fleet door` needs sudo. A machine that is only a door client needs no sudo, because `fleet tunnel` runs as a user service.
 - **Revocation.** `fleet revoke` takes up to 24 hours to end access. This is the existing rule.
 
-## bb phase (gated)
+## bb phase
 
-The phase adds the machine as a bb execution machine over the fleet door. It does not start until the experiment below has an answer.
+Built. The experiment is answered: bb's `machineServerUrl` is already `http://127.0.0.1:38900`, the local end of the fleet `bb` tunnel. Any machine with that tunnel can run the stock enrollment command, so no per-machine URL is needed.
 
-1. `fleet tunnel add bb --mode client --listen 127.0.0.1:38900 --to DOOR:8461 --peer DOOR_NAME` on the machine.
-2. Make a manual-provider bundle (`bb machine create --provider manual`), put it in a private file on the machine, and run `bb machine enroll --bootstrap-file`.
-3. `bb machine provider-cli status` and `install`, then `bb machine list`.
+`fleet onboard` copies the laptop's own `bb` tunnel to the machine, proves that the tunnel reaches the door, runs `bb machine create --provider manual`, sends the printed command to the machine on standard input, and renames the host to NAME. A failure after the host exists removes the pending host. The step does nothing when a bb machine with that name exists.
 
-The experiment: bb has one server-wide setting, `machineServerUrl`, that the bundle uses. A machine behind the tunnel must reach the server at the tunnel's loopback address, which no other machine uses. Find out whether the bundle's URL can be set per machine. If it cannot, decide between a second bb access path and changing the server setting. Do not change `machineServerUrl` on the live server to find out, because every machine uses it.
+`bb-server-service install` from `brev-up` is not part of this. That installs a server.
 
-Do not copy `bb-server-service install` from `brev-up`. That installs a server.
+## Broker deploy (not built)
+
+The broker reads `ssh-hosts.json` once, at start, so a new alias works for other machines only after `broker/install.sh` runs on the CA host. `fleet onboard` commits and pushes the file and prints the deploy step. Running the deploy from `fleet onboard` restarts the shared broker, so it needs the owner's ruling first.
 
 ## Open questions
 
 - Which machine runs the fleet door, and where it forwards. Read `/etc/fleet-door/nginx.conf` on the door machine. The alias `bb` in `ssh-hosts.json` and the tunnel peer on the laptop name different machines, so do not assume they are the same.
-- Whether the broker reloads `ssh-hosts.json` without a restart.
 - Whether `brev-up` sets `DOTFILES_NAME` and `DOTFILES_EMAIL`, or the invite command carries them.
 - The host key decision above.
 
@@ -85,9 +85,9 @@ Tests land with the code, written first, in `test/test-fleet.py` with a fake `ss
 
 ## Order of work
 
-1. `fleet onboard` steps 1 to 5, and `brev-up` changed to call it. Tests first.
-2. README section for the command, and the removal of the `brev-up` steps that moved.
-3. The bb experiment, then the bb phase.
+1. Done: `fleet onboard` with tests, the README section, and the bb step.
+2. `brev-up` changed to call `fleet onboard`, and its moved steps removed.
+3. The broker deploy, after the owner's ruling.
 
 ## Review
 

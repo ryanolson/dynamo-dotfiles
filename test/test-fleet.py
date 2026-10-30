@@ -784,14 +784,34 @@ cat > "$HOME/ssh-$n.stdin"
 case "$(cat "$HOME/ssh-$n.stdin")" in
     *node.crt*) [ -e "$HOME/enrolled" ] ;;
     *"fleet status"*) printf 'name: box\\nexpires: tomorrow\\n' ;;
+    *http_code*) cat "$HOME/probe-code" 2>/dev/null || printf 200 ;;
+    *X-BB-Enrollment*) [ ! -e "$HOME/bb-enroll-fails" ] ;;
     *) exit 0 ;;
 esac
 """
 
+    FAKE_BB = """#!/bin/sh
+echo "$*" >> "$HOME/bb.log"
+case "$1 $2" in
+    "machine list") cat "$HOME/bb-hosts.json" 2>/dev/null || echo '[]' ;;
+    "machine create")
+        printf 'On macOS or Linux, run:\\ncurl -sSL --fail-with-body -H '"'"'X-BB-Enrollment: SECRETBBTOKEN'"'"' '"'"'http://127.0.0.1:38900/install.sh'"'"' | sh\\nThis command expires at 1:08:49 PM.\\nFollowing machine host_test1\\n' >&2
+        [ -e "$HOME/bb-create-fails" ] && exit 1
+        sleep 1; exit 0 ;;
+    "machine rename"|"machine remove"|"machine show"|"machine provider-cli") exit 0 ;;
+    *) echo "unexpected bb $*" >&2; exit 99 ;;
+esac
+"""
+    FAKE_GH = """#!/bin/sh
+echo "$*" >> "$HOME/gh.log"
+if [ "$1 $2" = "repo clone" ] && [ -d "$HOME/fleet-config.git" ]; then git clone -q "$HOME/fleet-config.git" "$4"; exit 0; fi
+echo "gh: no clone" >&2; exit 1
+"""
+
     def onboard_setup(self, hosts='{\n  "hosts": [\n    {"alias": "old", "hostname": "198.51.100.1", "user": "ubuntu"}\n  ]\n}\n'):
-        ssh = self.home / 'bin/ssh'
-        ssh.write_text(self.FAKE_SSH)
-        ssh.chmod(0o700)
+        for name, body in [('ssh', self.FAKE_SSH), ('bb', self.FAKE_BB), ('gh', self.FAKE_GH)]:
+            (self.home / 'bin' / name).write_text(body)
+            (self.home / 'bin' / name).chmod(0o700)
         self.init()
         repo, sha = self.source_repo()
         config = self.home / 'fleet-config'
@@ -799,7 +819,9 @@ esac
         self.hosts_file = config / 'broker/ssh-hosts.json'
         self.hosts_file.write_text(hosts)
         self.onboard_env = dict(FLEET_SOURCE=str(repo), FLEET_CONFIG_REPO=str(config), DOTFILES_NAME='Test User',
-                                DOTFILES_EMAIL='t@example.com')
+                                DOTFILES_EMAIL='t@example.com',
+                                GIT_AUTHOR_NAME='T', GIT_AUTHOR_EMAIL='t@example.com',
+                                GIT_COMMITTER_NAME='T', GIT_COMMITTER_EMAIL='t@example.com')
         return sha
 
     def ssh_calls(self):
@@ -869,8 +891,8 @@ esac
 
     def test_onboard_writes_a_jump_host_into_the_name(self):
         self.onboard_setup()
-        self.assertEqual(self.fleet('onboard', 'ubuntu@box.example', 'box', '--jump', 'spark-p', **self.onboard_env).returncode, 0)
-        self.assertEqual(json.loads(self.hosts_file.read_text())['hosts'][-1]['jump'], 'spark-p')
+        self.assertEqual(self.fleet('onboard', 'ubuntu@box.example', 'box', '--jump', 'old', **self.onboard_env).returncode, 0)
+        self.assertEqual(json.loads(self.hosts_file.read_text())['hosts'][-1]['jump'], 'old')
 
     def test_onboard_refuses_bad_input_before_it_does_anything(self):
         self.onboard_setup()
@@ -889,6 +911,117 @@ esac
         self.onboard_setup()
         self.assertEqual(self.fleet('onboard', 'ubuntu@box.example', 'box', **self.onboard_env).returncode, 0)
         self.assertFalse([1 for _, stdin in self.ssh_calls() if 'tailscale' in stdin])
+
+    def bb_calls(self):
+        log = self.home / 'bb.log'
+        return log.read_text().splitlines() if log.exists() else []
+
+    def bb_tunnel(self):
+        tunnels = self.home / '.config/fleet/tunnels'
+        tunnels.mkdir(parents=True)
+        (tunnels / 'bb').write_text('mode=client\nlisten=127.0.0.1:38900\nto=203.0.113.9:8461\npeer=fleet-command\nallow=\nvia=\nvia_peer=\n')
+
+    def fleet_config_repo(self):
+        """The fleet-config checkout as a git repository with its own bare origin."""
+        git = lambda *a, cwd=self.home: subprocess.run(['git', *a], cwd=cwd, check=True, capture_output=True, text=True).stdout
+        origin = self.home / 'fleet-config.git'
+        git('init', '-q', '--bare', '-b', 'main', str(origin))
+        config = self.home / 'fleet-config'
+        git('-c', 'user.name=T', '-c', 'user.email=t@example.com', '-C', str(config), 'init', '-q', '-b', 'main', cwd=self.home)
+        for cmd in (['add', '-A'], ['commit', '-q', '-m', 'seed'], ['remote', 'add', 'origin', str(origin)], ['push', '-q', 'origin', 'main']):
+            git('-c', 'user.name=T', '-c', 'user.email=t@example.com', *cmd, cwd=config)
+        return config, origin, git
+
+    def test_onboard_commits_and_pushes_the_ssh_name(self):
+        self.onboard_setup()
+        config, origin, git = self.fleet_config_repo()
+        result = self.fleet('onboard', 'ubuntu@box.example', 'box', '--no-bb', **self.onboard_env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(git('log', '-1', '--format=%s', cwd=config).strip(), 'Add box to the ssh host list')
+        self.assertEqual(git('show', '--stat', '--format=', 'HEAD', cwd=config).split()[0], 'broker/ssh-hosts.json')
+        self.assertEqual(git('rev-parse', 'main', cwd=origin).strip(), git('rev-parse', 'HEAD', cwd=config).strip())
+        self.assertIn('broker/install.sh', result.stdout)
+
+    def test_onboard_clones_fleet_config_when_it_is_missing(self):
+        self.onboard_setup()
+        config, _, _ = self.fleet_config_repo()
+        shutil.rmtree(config)
+        result = self.fleet('onboard', 'ubuntu@box.example', 'box', '--no-bb', **self.onboard_env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.home / 'gh.log').read_text().strip(), f'repo clone owner/fleet-config {config}')
+        self.assertEqual(json.loads((config / 'broker/ssh-hosts.json').read_text())['hosts'][-1]['alias'], 'box')
+
+    def test_onboard_skips_the_name_when_fleet_config_cannot_be_cloned(self):
+        self.onboard_setup()
+        shutil.rmtree(self.hosts_file.parent.parent)
+        result = self.fleet('onboard', 'ubuntu@box.example', 'box', '--no-bb', **self.onboard_env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('skipped', result.stderr)
+
+    def test_onboard_refuses_a_jump_host_that_the_broker_would_reject(self):
+        self.onboard_setup()
+        before = self.hosts_file.read_text()
+        result = self.fleet('onboard', 'ubuntu@box.example', 'box', '--jump', 'nowhere', '--no-bb', **self.onboard_env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('nowhere', result.stderr)
+        self.assertEqual(self.hosts_file.read_text(), before)
+
+    def test_onboard_adds_the_machine_to_bb_through_the_tunnel(self):
+        self.onboard_setup()
+        self.bb_tunnel()
+        result = self.fleet('onboard', 'ubuntu@box.example', 'box', **self.onboard_env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.ssh_calls()
+        tunnel = [stdin for _, stdin in calls if 'tunnel add bb' in stdin]
+        self.assertEqual(len(tunnel), 1)
+        self.assertIn('fleet tunnel add bb --mode client --listen 127.0.0.1:38900 --to 203.0.113.9:8461 --peer fleet-command', tunnel[0])
+        enroll = [stdin for _, stdin in calls if 'X-BB-Enrollment' in stdin]
+        self.assertEqual(len(enroll), 1)
+        self.assertIn('SECRETBBTOKEN', enroll[0])
+        # The enrollment token goes on standard input only, and never to the terminal.
+        self.assertFalse([args for args, _ in calls if 'SECRETBBTOKEN' in ' '.join(args)])
+        self.assertNotIn('SECRETBBTOKEN', result.stdout + result.stderr)
+        bb = self.bb_calls()
+        self.assertIn('machine rename host_test1 box', bb)
+        self.assertEqual(bb.index('machine create --provider manual') < bb.index('machine rename host_test1 box'), True)
+        self.assertFalse([c for c in bb if c.startswith('machine remove')])
+
+    def test_onboard_does_not_create_a_bb_machine_when_the_tunnel_does_not_answer(self):
+        self.onboard_setup()
+        self.bb_tunnel()
+        (self.home / 'probe-code').write_text('000')
+        result = self.fleet('onboard', 'ubuntu@box.example', 'box', **self.onboard_env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('tunnel', result.stderr)
+        self.assertFalse([c for c in self.bb_calls() if c.startswith('machine create')])
+
+    def test_onboard_removes_the_pending_bb_machine_when_enrollment_fails(self):
+        self.onboard_setup()
+        self.bb_tunnel()
+        (self.home / 'bb-enroll-fails').write_text('')
+        result = self.fleet('onboard', 'ubuntu@box.example', 'box', **self.onboard_env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('machine remove host_test1 --yes', self.bb_calls())
+        self.assertNotIn('SECRETBBTOKEN', result.stdout + result.stderr)
+
+    def test_onboard_leaves_a_bb_machine_that_exists_alone(self):
+        self.onboard_setup()
+        self.bb_tunnel()
+        (self.home / 'bb-hosts.json').write_text(json.dumps([{'id': 'host_x', 'name': 'box', 'status': 'connected'}]))
+        result = self.fleet('onboard', 'ubuntu@box.example', 'box', **self.onboard_env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.bb_calls(), ['machine list --json'])
+        self.assertFalse([1 for _, stdin in self.ssh_calls() if 'tunnel add bb' in stdin])
+
+    def test_onboard_skips_bb_without_a_tunnel_to_copy_and_with_no_bb(self):
+        self.onboard_setup()
+        result = self.fleet('onboard', 'ubuntu@box.example', 'box', **self.onboard_env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('bb', result.stderr)
+        self.bb_tunnel()
+        result = self.fleet('onboard', 'ubuntu@box.example', 'box', '--no-bb', **self.onboard_env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.bb_calls(), [])
 
     def test_login_uses_the_admin_provisioner_without_trust(self):
         self.init('--admin-item', 'op://Vault/Admin')

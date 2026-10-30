@@ -73,11 +73,12 @@ Laptop (has 1Password):
                                         Mint a token and enroll HOST over SSH.
   invite NAME [--san NAME]... [--dotfiles] [--ephemeral] [--no-trust] [--principal NAME]
                                         Print a curl command that enrolls a new machine.
-  onboard [USER@]HOST NAME [--jump ALIAS] [--fleet-config PATH] [--no-alias]
+  onboard [USER@]HOST NAME [--jump ALIAS] [--fleet-config PATH] [--no-alias] [--no-bb]
                                         Over SSH: install the dotfiles, fleet, and the renew timer, enroll
-                                        HOST as NAME, install the fleet agent, and add NAME to the broker's
-                                        ssh-hosts.json in a fleet-config checkout (not committed or deployed).
-                                        Safe to run again after a failure.
+                                        HOST as NAME, install the fleet agent, add NAME to the broker's
+                                        ssh-hosts.json in a fleet-config checkout (commit and push, no
+                                        deploy), and add HOST to bb through a fleet tunnel. Safe to run
+                                        again after a failure.
   login [NAME]                          Enroll this laptop as an admin, without login trust, and
                                         schedule renewal. Without fleet init, read the settings
                                         from op://Personal/Fleet config. Run it again after the
@@ -580,6 +581,19 @@ cmd_login() {
     printf 'logged in as %s (admin). Renewal runs every hour.\n' "$node"
 }
 
+# owner/repo of a GitHub remote URL. Fails for any other remote.
+github_slug() {
+    local slug
+    case "$1" in
+        git@github.com:*) slug="${1#git@github.com:}" ;;
+        https://github.com/*) slug="${1#https://github.com/}" ;;
+        *) return 1 ;;
+    esac
+    slug="${slug%.git}"
+    [[ "$slug" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
+    printf '%s\n' "$slug"
+}
+
 cmd_invite() {
     [[ $# -ge 1 ]] || fail 'usage: fleet invite NAME [--san NAME]... [--dotfiles] [--ephemeral] [--no-trust] [--principal NAME] [--ref COMMIT]'
     valid_name "$1" || fail 'invalid NAME'
@@ -599,13 +613,7 @@ cmd_invite() {
     src="${FLEET_SOURCE:-$(chezmoi source-path 2>/dev/null || true)}"
     [[ -n "$src" && -d "$src/.git" ]] || fail 'cannot find the dotfiles source; set FLEET_SOURCE'
     origin=$(git -C "$src" remote get-url origin)
-    case "$origin" in
-        git@github.com:*) repo="${origin#git@github.com:}" ;;
-        https://github.com/*) repo="${origin#https://github.com/}" ;;
-        *) fail "origin is not a GitHub repository: $origin" ;;
-    esac
-    repo="${repo%.git}"
-    [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "cannot parse the GitHub repository from $origin"
+    repo=$(github_slug "$origin") || fail "origin is not a GitHub repository: $origin"
     # The join script and fleet come from this commit, so it must be on GitHub.
     if [[ -z "$ref" ]]; then
         ref=$(git -C "$src" rev-parse HEAD)
@@ -686,19 +694,88 @@ cmd_enroll_remote() {
     ssh -- "$host" < "$out/token" "~/.local/bin/fleet enroll $node --ca-url $ca_url --fingerprint $fingerprint ${remote_args[*]-}"
 }
 
+# Stop the waiting `bb machine create` (PID) and remove the host it made (ID), so a failed run leaves
+# no pending host.
+bb_abandon() {
+    [[ -z "$1" ]] || { kill -INT "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
+    [[ -z "$2" ]] || bb machine remove "$2" --yes >/dev/null 2>&1 || true
+}
+
+# Laptop: make HOST a bb execution machine over the fleet tunnel. The laptop's own "bb" tunnel says where
+# the door is. bb's server URL for machines is already that tunnel's loopback address, so the enrollment
+# command that bb prints works unchanged on HOST. The command holds a one-time token: it goes to HOST on
+# standard input and nowhere else. Uses host, node, and ssh_cmd of cmd_onboard.
+onboard_bb() {
+    local tfile="$TUNNELS/bb" key value mode="" listen="" to="" peer=""
+    if [[ ! -f "$tfile" ]]; then
+        printf 'skipped: this laptop has no "bb" tunnel to copy (see fleet tunnel list)\n' >&2
+        return 0
+    fi
+    command -v bb >/dev/null 2>&1 || { printf 'skipped: bb is not installed on this laptop\n' >&2; return 0; }
+    while IFS='=' read -r key value; do
+        case "$key" in mode) mode="$value" ;; listen) listen="$value" ;; to) to="$value" ;; peer) peer="$value" ;; esac
+    done < "$tfile"
+    [[ "$mode" == client && "$listen" == 127.0.0.1:38900 ]] && valid_addr "$to" && valid_name "$peer" ||
+        fail 'the bb tunnel on this laptop is not a client tunnel on 127.0.0.1:38900, the address bb gives to machines'
+    need_python
+    local work state code
+    scratch; work="$SCRATCH"
+    bb machine list --json > "$work/hosts.json" || fail 'bb machine list failed'
+    state=$(fpy bb-host-status "$work/hosts.json" "$node") || fail 'could not read the bb machine list'
+    if [[ -n "$state" ]]; then
+        printf '%s is already a bb machine (%s)\n' "$node" "$state" >&2
+        return 0
+    fi
+
+    # Prove the path before creating a host: a tunnel that does not answer leaves a pending host behind.
+    code=$(printf '%s\n' 'export PATH="$HOME/.local/bin:$PATH"' \
+        "fleet tunnel add bb --mode client --listen $listen --to $to --peer $peer </dev/null >&2" \
+        'c=000; for i in 1 2 3 4 5 6 7 8 9 10; do c=$(curl -s -o /dev/null -m 10 -w "%{http_code}" http://'"$listen"'/ </dev/null || true); [ "$c" != 000 ] && break; sleep 1; done; echo "$c"' |
+        "${ssh_cmd[@]}" -- "$host" bash -s | tail -n 1) || fail "could not set up the bb tunnel on $host"
+    [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] || fail "the bb tunnel on $host does not reach the door (HTTP $code)"
+
+    bb machine create --provider manual > "$work/create.out" 2> "$work/create.err" &
+    local bbpid=$! id="" deadline=$((SECONDS + 60))
+    until grep -q '^curl ' "$work/create.err" 2>/dev/null && grep -q '^Following machine host_' "$work/create.err" 2>/dev/null; do
+        kill -0 "$bbpid" 2>/dev/null || fail 'bb machine create stopped before it printed the enrollment command'
+        (( SECONDS < deadline )) || { bb_abandon "$bbpid" ""; fail 'bb machine create printed no enrollment command within 60 seconds'; }
+        sleep 0.2
+    done
+    id=$(sed -n 's/^Following machine \(host_[A-Za-z0-9]*\).*/\1/p' "$work/create.err" | head -n 1)
+    [[ -n "$id" ]] || { bb_abandon "$bbpid" ""; fail 'bb machine create did not name the machine'; }
+    grep -m 1 '^curl ' "$work/create.err" > "$work/enroll"
+    # Name it first: a rerun that finds the name does not make a second host.
+    bb machine rename "$id" "$node" >/dev/null 2>&1 || true
+    "${ssh_cmd[@]}" -- "$host" bash -s < "$work/enroll" ||
+        { bb_abandon "$bbpid" "$id"; fail "the bb enrollment command failed on $host; the pending bb host $id is removed"; }
+
+    local rc=0
+    deadline=$((SECONDS + 300))
+    while kill -0 "$bbpid" 2>/dev/null; do
+        (( SECONDS < deadline )) || { bb_abandon "$bbpid" "$id"; fail "$node did not connect to bb within 5 minutes; the pending bb host $id is removed"; }
+        sleep 1
+    done
+    wait "$bbpid" || rc=$?
+    [[ "$rc" == 0 ]] || { bb_abandon "" "$id"; fail "bb machine create failed (exit $rc); the pending bb host $id is removed"; }
+    bb machine rename "$id" "$node" >/dev/null 2>&1 || true
+    printf '%s is a bb machine (%s)\n' "$node" "$id" >&2
+    bb machine provider-cli status "$node" || true
+}
+
 # Laptop: put HOST in the fleet. Each step converges, so a failed run is repaired by running the same
 # command again. The remote steps run as `bash -s` scripts on stdin: the login shell there can be fish.
 cmd_onboard() {
-    [[ $# -ge 2 ]] || fail 'usage: fleet onboard [USER@]HOST NAME [--jump ALIAS] [--fleet-config PATH] [--no-alias]'
+    [[ $# -ge 2 ]] || fail 'usage: fleet onboard [USER@]HOST NAME [--jump ALIAS] [--fleet-config PATH] [--no-alias] [--no-bb]'
     local host="$1" node="$2"; shift 2
     valid_ssh_host "$host" || fail 'invalid HOST'
     valid_name "$node" || fail 'invalid NAME'
-    local jump="" fleet_config="${FLEET_CONFIG_REPO:-$HOME/repos/fleet-config}" alias=1
+    local jump="" fleet_config="${FLEET_CONFIG_REPO:-$HOME/repos/fleet-config}" alias=1 bb=1
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --jump) valid_ssh_host "${2:-}" || fail 'invalid --jump'; jump="$2"; shift 2 ;;
             --fleet-config) fleet_config="${2:-}"; shift 2 ;;
             --no-alias) alias=0; shift ;;
+            --no-bb) bb=0; shift ;;
             *) fail "unknown option $1" ;;
         esac
     done
@@ -743,9 +820,25 @@ cmd_onboard() {
     local hosts_file="$fleet_config/broker/ssh-hosts.json" added="" target_host target_user cfg
     if [[ "$alias" == 1 ]]; then
         printf '== short ssh name\n' >&2
+        if [[ ! -d "$fleet_config" ]]; then
+            # fleet-config is in the same GitHub account as the dotfiles.
+            local src slug
+            src="${FLEET_SOURCE:-$(chezmoi source-path 2>/dev/null || true)}"
+            slug=$(github_slug "$(git -C "$src" remote get-url origin 2>/dev/null || true)" || true)
+            if [[ -n "$slug" ]]; then
+                mkdir -p "$(dirname "$fleet_config")"
+                gh repo clone "${slug%%/*}/fleet-config" "$fleet_config" >&2 || true
+            fi
+        fi
         if [[ ! -f "$hosts_file" ]]; then
-            printf 'skipped: %s is missing. Clone fleet-config, or pass --fleet-config PATH, and run this again.\n' "$hosts_file" >&2
+            printf 'skipped: %s is missing and fleet-config could not be cloned. Clone it, or pass --fleet-config PATH, and run this again.\n' "$hosts_file" >&2
         else
+            if [[ -d "$fleet_config/.git" ]]; then
+                [[ -z "$(git -C "$fleet_config" status --porcelain -- broker/ssh-hosts.json)" ]] ||
+                    fail "$hosts_file has uncommitted changes; commit or discard them first"
+                git -C "$fleet_config" pull --ff-only -q origin "$(git -C "$fleet_config" branch --show-current)" ||
+                    fail "could not update $fleet_config"
+            fi
             cfg=$("${ssh_cmd[@]}" -G -- "$host" </dev/null) || fail "ssh -G $host failed"
             target_host=$(awk '$1 == "hostname" { print $2; exit }' <<<"$cfg")
             target_user=$(awk '$1 == "user" { print $2; exit }' <<<"$cfg")
@@ -755,7 +848,19 @@ cmd_onboard() {
             added=$(fpy ssh-hosts-add "$hosts_file" "$node" "$target_host" "$target_user" "${jump:--}") ||
                 fail "could not add $node to $hosts_file"
             printf '%s %s in %s\n' "$node" "$added" "$hosts_file" >&2
+            if [[ "$added" == added && -d "$fleet_config/.git" ]]; then
+                git -C "$fleet_config" add broker/ssh-hosts.json
+                git -C "$fleet_config" commit -q -m "Add $node to the ssh host list" -- broker/ssh-hosts.json ||
+                    fail "could not commit $hosts_file"
+                git -C "$fleet_config" push -q origin HEAD ||
+                    fail "committed $node in $fleet_config but could not push it; push it, then deploy the broker"
+            fi
         fi
+    fi
+
+    if [[ "$bb" == 1 ]]; then
+        printf '== bb\n' >&2
+        onboard_bb
     fi
 
     printf '== check\n' >&2
@@ -766,7 +871,7 @@ cmd_onboard() {
     printf '%s\n' "$status"
     printf '%s is in the fleet as %s.\n' "$host" "$node"
     if [[ "$added" == added ]]; then
-        printf 'next: commit broker/ssh-hosts.json in %s, then copy broker/ to ca-1 and run sudo broker/install.sh there. Other machines get the name on their next renew.\n' "$fleet_config"
+        printf 'next: deploy the broker so other machines get the name on their next renew: copy broker/ from %s to ca-1 and run sudo broker/install.sh there. The broker reads ssh-hosts.json when it starts.\n' "$fleet_config"
     fi
 }
 
@@ -1933,6 +2038,9 @@ elif cmd == 'ssh-hosts-add':
     if jump != '-':
         entry['jump'] = jump
     entry['host_key_alias'] = alias
+    # The broker refuses to start when a jump names an alias that is not listed earlier.
+    if jump != '-' and jump not in [h.get('alias') for h in hosts]:
+        sys.exit(f'{jump} is not in {path}, and the broker would not start; add it first')
     for h in hosts:
         if h.get('alias') == alias:
             if all(h.get(k) == v for k, v in entry.items()):
@@ -1946,6 +2054,12 @@ elif cmd == 'ssh-hosts-add':
     json.loads(new)
     atomic(path, new, os.stat(path).st_mode & 0o777)
     print('added')
+elif cmd == 'bb-host-status':
+    # The status of the host named a[1] in the JSON of `bb machine list --json`, or nothing.
+    for h in load(a[0]):
+        if h.get('name') == a[1]:
+            print(h.get('status', 'unknown'))
+            break
 elif cmd == 'workers-has':
     # One page of `actl --json workers`: print "found", or the cursor of the next page, or nothing.
     data = load(a[0])
