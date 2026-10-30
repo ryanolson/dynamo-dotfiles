@@ -73,6 +73,11 @@ Laptop (has 1Password):
                                         Mint a token and enroll HOST over SSH.
   invite NAME [--san NAME]... [--dotfiles] [--ephemeral] [--no-trust] [--principal NAME]
                                         Print a curl command that enrolls a new machine.
+  onboard [USER@]HOST NAME [--jump ALIAS] [--fleet-config PATH] [--no-alias]
+                                        Over SSH: install the dotfiles, fleet, and the renew timer, enroll
+                                        HOST as NAME, install the fleet agent, and add NAME to the broker's
+                                        ssh-hosts.json in a fleet-config checkout (not committed or deployed).
+                                        Safe to run again after a failure.
   login [NAME]                          Enroll this laptop as an admin, without login trust, and
                                         schedule renewal. Without fleet init, read the settings
                                         from op://Personal/Fleet config. Run it again after the
@@ -611,7 +616,7 @@ cmd_invite() {
     local out
     scratch; out="$SCRATCH"
     mint_token "$node" "${token_args[@]+"${token_args[@]}"}" > "$out/token"
-    printf 'Run this on the new machine within 15 minutes. The token works once.\n\n' >&2
+    [[ -n "${INVITE_QUIET:-}" ]] || printf 'Run this on the new machine within 15 minutes. The token works once.\n\n' >&2
     printf "bash -c 'exec bash <(curl -fsSL \"\$0\") \"\$@\"' %s --repo %s --ref %s --name %s --ca-url %s --fingerprint %s --token %s%s\n" \
         "https://raw.githubusercontent.com/$repo/$ref/join.sh" "$repo" "$ref" "$node" "$ca_url" "$fingerprint" \
         "$(<"$out/token")" "${join_args[*]+ ${join_args[*]}}"
@@ -679,6 +684,90 @@ cmd_enroll_remote() {
     scratch; out="$SCRATCH"
     mint_token "$node" "${token_args[@]+"${token_args[@]}"}" > "$out/token"
     ssh -- "$host" < "$out/token" "~/.local/bin/fleet enroll $node --ca-url $ca_url --fingerprint $fingerprint ${remote_args[*]-}"
+}
+
+# Laptop: put HOST in the fleet. Each step converges, so a failed run is repaired by running the same
+# command again. The remote steps run as `bash -s` scripts on stdin: the login shell there can be fish.
+cmd_onboard() {
+    [[ $# -ge 2 ]] || fail 'usage: fleet onboard [USER@]HOST NAME [--jump ALIAS] [--fleet-config PATH] [--no-alias]'
+    local host="$1" node="$2"; shift 2
+    valid_ssh_host "$host" || fail 'invalid HOST'
+    valid_name "$node" || fail 'invalid NAME'
+    local jump="" fleet_config="${FLEET_CONFIG_REPO:-$HOME/repos/fleet-config}" alias=1
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --jump) valid_ssh_host "${2:-}" || fail 'invalid --jump'; jump="$2"; shift 2 ;;
+            --fleet-config) fleet_config="${2:-}"; shift 2 ;;
+            --no-alias) alias=0; shift ;;
+            *) fail "unknown option $1" ;;
+        esac
+    done
+    if [[ "$alias" == 1 ]]; then
+        [[ "$node" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || fail 'NAME cannot be a short SSH name (lowercase letters, digits, hyphens); pass --no-alias'
+        [[ -z "$jump" || "$jump" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || fail '--jump must be a short SSH name (lowercase letters, digits, hyphens) for the ssh-hosts entry; pass --no-alias'
+    fi
+    # bootstrap.sh cannot ask for these without a terminal.
+    local dotfiles_name="${DOTFILES_NAME:-}" dotfiles_email="${DOTFILES_EMAIL:-}"
+    [[ -n "$dotfiles_name" ]] || dotfiles_name=$(chezmoi execute-template '{{ .name }}' 2>/dev/null || true)
+    [[ -n "$dotfiles_email" ]] || dotfiles_email=$(chezmoi execute-template '{{ .email }}' 2>/dev/null || true)
+    [[ "$dotfiles_name" =~ ^[A-Za-z0-9][A-Za-z0-9\ ._+-]*$ ]] || fail 'cannot read your name for the dotfiles; set DOTFILES_NAME (letters, digits, space, . _ + -)'
+    [[ "$dotfiles_email" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]] || fail 'cannot read your email for the dotfiles; set DOTFILES_EMAIL'
+    load_config
+    local ssh_cmd=(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
+    [[ -z "$jump" ]] || ssh_cmd+=(-J "$jump")
+
+    printf '== ssh %s\n' "$host" >&2
+    "${ssh_cmd[@]}" -- "$host" true </dev/null || fail "ssh $host does not answer"
+
+    printf '== fleet enrollment\n' >&2
+    local rc=0
+    printf '%s\n' 'test -s "${XDG_STATE_HOME:-$HOME/.local/state}/fleet/node.crt"' |
+        "${ssh_cmd[@]}" -- "$host" bash -s || rc=$?
+    case "$rc" in
+        0) printf '%s is already enrolled\n' "$host" >&2 ;;
+        1)
+            # Not $(...): a subshell would lose the cleanup entry of the token's key file.
+            local work
+            scratch; work="$SCRATCH"
+            INVITE_QUIET=1 cmd_invite "$node" --dotfiles > "$work/join"
+            "${ssh_cmd[@]}" -- "$host" "env DOTFILES_NAME='$dotfiles_name' DOTFILES_EMAIL='$dotfiles_email' bash -s" < "$work/join" ||
+                fail "the join command failed on $host. Run the same fleet onboard again; each step is safe to repeat."
+            ;;
+        *) fail "could not check the enrollment on $host" ;;
+    esac
+
+    printf '== agent\n' >&2
+    printf '%s\n' 'export PATH="$HOME/.local/bin:$HOME/.pixi/bin:$PATH"' 'fleet agent install </dev/null' |
+        "${ssh_cmd[@]}" -- "$host" bash -s || fail "fleet agent install failed on $host"
+
+    local hosts_file="$fleet_config/broker/ssh-hosts.json" added="" target_host target_user cfg
+    if [[ "$alias" == 1 ]]; then
+        printf '== short ssh name\n' >&2
+        if [[ ! -f "$hosts_file" ]]; then
+            printf 'skipped: %s is missing. Clone fleet-config, or pass --fleet-config PATH, and run this again.\n' "$hosts_file" >&2
+        else
+            cfg=$("${ssh_cmd[@]}" -G -- "$host" </dev/null) || fail "ssh -G $host failed"
+            target_host=$(awk '$1 == "hostname" { print $2; exit }' <<<"$cfg")
+            target_user=$(awk '$1 == "user" { print $2; exit }' <<<"$cfg")
+            [[ "$target_host" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ && "$target_user" =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]] ||
+                fail "ssh resolves $host to a host or user that an ssh-hosts entry cannot hold; pass --no-alias"
+            need_python
+            added=$(fpy ssh-hosts-add "$hosts_file" "$node" "$target_host" "$target_user" "${jump:--}") ||
+                fail "could not add $node to $hosts_file"
+            printf '%s %s in %s\n' "$node" "$added" "$hosts_file" >&2
+        fi
+    fi
+
+    printf '== check\n' >&2
+    local status
+    status=$(printf '%s\n' 'export PATH="$HOME/.local/bin:$PATH"' 'fleet status </dev/null' | "${ssh_cmd[@]}" -- "$host" bash -s) ||
+        fail "fleet status failed on $host"
+    grep -qF -- "$node" <<<"$status" || fail "fleet status on $host does not show $node"
+    printf '%s\n' "$status"
+    printf '%s is in the fleet as %s.\n' "$host" "$node"
+    if [[ "$added" == added ]]; then
+        printf 'next: commit broker/ssh-hosts.json in %s, then copy broker/ to ca-1 and run sudo broker/install.sh there. Other machines get the name on their next renew.\n' "$fleet_config"
+    fi
 }
 
 cmd_renew() {
@@ -1831,6 +1920,32 @@ elif cmd == 'roster-add':
     workers.append({'id': wid, 'os': wos})
     atomic(path, json.dumps(data, indent=2) + '\n', os.stat(path).st_mode & 0o777)
     print('added')
+elif cmd == 'ssh-hosts-add':
+    # Add one machine to the broker's ssh-hosts.json as one more line, so the diff stays one line.
+    path, alias, hostname, user, jump = a
+    with open(path) as f:
+        text = f.read()
+    data = json.loads(text)
+    hosts = data.get('hosts') if isinstance(data, dict) else None
+    if not isinstance(hosts, list):
+        sys.exit(f'{path} has no "hosts" list')
+    entry = {'alias': alias, 'hostname': hostname, 'user': user}
+    if jump != '-':
+        entry['jump'] = jump
+    entry['host_key_alias'] = alias
+    for h in hosts:
+        if h.get('alias') == alias:
+            if all(h.get(k) == v for k, v in entry.items()):
+                print('present')
+                sys.exit(0)
+            sys.exit(f'{alias} is already in {path} as {h.get("hostname")}; fix it by hand')
+    end = text.rindex(']')
+    head = text[:end].rstrip()
+    line = '    ' + json.dumps(entry)
+    new = (head + '\n' + line + '\n  ' if head.endswith('[') else head + ',\n' + line + '\n  ') + text[end:]
+    json.loads(new)
+    atomic(path, new, os.stat(path).st_mode & 0o777)
+    print('added')
 elif cmd == 'workers-has':
     # One page of `actl --json workers`: print "found", or the cursor of the next page, or nothing.
     data = load(a[0])
@@ -2946,6 +3061,7 @@ case "$command" in
     token) cmd_token "$@" ;;
     enroll) cmd_enroll "$@" ;;
     enroll-remote) cmd_enroll_remote "$@" ;;
+    onboard) cmd_onboard "$@" ;;
     invite) cmd_invite "$@" ;;
     login) cmd_login "$@" ;;
     ephemeral) cmd_ephemeral "$@" ;;

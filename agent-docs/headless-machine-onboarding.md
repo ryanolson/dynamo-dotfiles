@@ -1,6 +1,6 @@
 # Headless machine onboarding: `fleet onboard`
 
-Status: planned
+Status: in progress. Steps 1 to 5 are built (`fleet onboard`, with tests). The brev-up change and the bb phase are not.
 Updated: 2026-10-30
 
 ## Goal
@@ -8,7 +8,7 @@ Updated: 2026-10-30
 One command on the admin laptop takes a machine that only has SSH and puts it in the fleet, with the dotfiles installed. Today it takes several commands, and some steps are not written down. The optional last phase also adds the machine to bb as an execution machine, over the fleet door.
 
 ```
-fleet onboard [USER@]HOST NAME [--jump HOST] [--tailscale-key-item op://...] [--bb]
+fleet onboard [USER@]HOST NAME [--jump ALIAS] [--fleet-config PATH] [--no-alias]
 ```
 
 ## What exists now
@@ -32,9 +32,8 @@ Each step converges, so a failed run is repaired by running the same command aga
 3. Run `fleet agent install` and `fleet install-pylon` on the machine.
 4. Add the machine to `broker/ssh-hosts.json` in a fleet-config checkout (`--fleet-config`, default `~/repos/fleet-config`). Do not commit or deploy. Print the next step, as `fleet worker enroll` does.
 5. Check: `fleet list` shows the name, and `ssh NAME true` works once the broker has the new list.
-6. With `--bb`: the bb phase below.
 
-Tailscale is not part of the default flow. The fleet door and a fleet tunnel give a machine a path to the server without it. `--tailscale-key-item` keeps the optional join step from `brev-up`. The key goes over SSH standard input and never into a command line or a startup script.
+Tailscale is not part of `fleet onboard`. The owner ruled on 2026-10-30 that joining the tailnet is a manual step and not needed by default. The fleet door and a fleet tunnel give a machine a path to the server without it. `brev-up` keeps its own optional join until it calls `fleet onboard`.
 
 ## Dotfiles on the machine
 
@@ -81,7 +80,8 @@ Tests land with the code, written first, in `test/test-fleet.py` with a fake `ss
 - The `ssh-hosts.json` change is added once and is not added twice.
 - A host name with `user@` and with `--jump` passes validation. A name with a space or a leading dash is refused.
 - `DOTFILES_NAME` and `DOTFILES_EMAIL` are in the script that the machine receives.
-- With no `--tailscale-key-item`, no Tailscale command is sent.
+- No Tailscale command is sent.
+- The token's key file on the laptop is removed (a first version leaked it, because `$(...)` loses the cleanup entry).
 
 ## Order of work
 

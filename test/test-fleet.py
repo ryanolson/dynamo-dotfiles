@@ -774,6 +774,122 @@ class FleetLaptop(FleetBase):
         self.assertIn('push', result.stderr)
         self.assertFalse([c for c in self.calls() if c[:2] == ['ca', 'token']])
 
+    FAKE_SSH = """#!/bin/sh
+# Records each call, answers `ssh -G`, and runs no remote command. The script on stdin decides the answer.
+n=$(cat "$HOME/ssh-count" 2>/dev/null || echo 0)
+echo $((n + 1)) > "$HOME/ssh-count"
+printf '%s\\n' "$@" > "$HOME/ssh-$n.args"
+for a in "$@"; do [ "$a" = -G ] && { printf 'hostname 203.0.113.7\\nuser ubuntu\\n'; exit 0; }; done
+cat > "$HOME/ssh-$n.stdin"
+case "$(cat "$HOME/ssh-$n.stdin")" in
+    *node.crt*) [ -e "$HOME/enrolled" ] ;;
+    *"fleet status"*) printf 'name: box\\nexpires: tomorrow\\n' ;;
+    *) exit 0 ;;
+esac
+"""
+
+    def onboard_setup(self, hosts='{\n  "hosts": [\n    {"alias": "old", "hostname": "198.51.100.1", "user": "ubuntu"}\n  ]\n}\n'):
+        ssh = self.home / 'bin/ssh'
+        ssh.write_text(self.FAKE_SSH)
+        ssh.chmod(0o700)
+        self.init()
+        repo, sha = self.source_repo()
+        config = self.home / 'fleet-config'
+        (config / 'broker').mkdir(parents=True)
+        self.hosts_file = config / 'broker/ssh-hosts.json'
+        self.hosts_file.write_text(hosts)
+        self.onboard_env = dict(FLEET_SOURCE=str(repo), FLEET_CONFIG_REPO=str(config), DOTFILES_NAME='Test User',
+                                DOTFILES_EMAIL='t@example.com')
+        return sha
+
+    def ssh_calls(self):
+        count = int((self.home / 'ssh-count').read_text()) if (self.home / 'ssh-count').exists() else 0
+        return [((self.home / f'ssh-{i}.args').read_text().splitlines(),
+                 (self.home / f'ssh-{i}.stdin').read_text() if (self.home / f'ssh-{i}.stdin').exists() else '')
+                for i in range(count)]
+
+    def test_onboard_enrolls_installs_the_agent_and_adds_the_ssh_name(self):
+        sha = self.onboard_setup()
+        result = self.fleet('onboard', 'ubuntu@box.example', 'box', **self.onboard_env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.ssh_calls()
+        join = [stdin for args, stdin in calls if '--token' in stdin]
+        self.assertEqual(len(join), 1)
+        for part in [f'--ref {sha}', '--name box', '--dotfiles', f'--token {TOKEN}']:
+            self.assertIn(part, join[0])
+        # The token travels on standard input only. The environment for the dotfiles is not secret.
+        self.assertFalse([args for args, _ in calls if TOKEN in ' '.join(args)])
+        joined = [args for args, stdin in calls if '--token' in stdin][0]
+        self.assertIn("DOTFILES_NAME='Test User'", ' '.join(joined))
+        self.assertIn("DOTFILES_EMAIL='t@example.com'", ' '.join(joined))
+        self.assertTrue([1 for _, stdin in calls if 'fleet agent install' in stdin])
+        hosts = json.loads(self.hosts_file.read_text())['hosts']
+        self.assertEqual(hosts[-1], {'alias': 'box', 'hostname': '203.0.113.7', 'user': 'ubuntu', 'host_key_alias': 'box'})
+        self.assertEqual([h['alias'] for h in hosts], ['old', 'box'])
+        self.assertIn('broker/install.sh', result.stdout)
+        seen = json.loads((self.home / 'token-seen.json').read_text())
+        self.assertFalse(Path(seen['key_path']).exists())
+
+    def test_onboard_twice_does_not_enroll_or_add_the_name_again(self):
+        self.onboard_setup()
+        self.assertEqual(self.fleet('onboard', 'ubuntu@box.example', 'box', **self.onboard_env).returncode, 0)
+        (self.home / 'enrolled').write_text('')
+        tokens = len([c for c in self.calls() if c[:2] == ['ca', 'token']])
+        before = self.hosts_file.read_text()
+        result = self.fleet('onboard', 'ubuntu@box.example', 'box', **self.onboard_env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len([c for c in self.calls() if c[:2] == ['ca', 'token']]), tokens)
+        self.assertEqual(self.hosts_file.read_text(), before)
+        self.assertEqual(len(json.loads(before)['hosts']), 2)
+
+    def test_onboard_keeps_the_file_layout_when_it_adds_a_name(self):
+        self.onboard_setup()
+        self.assertEqual(self.fleet('onboard', 'ubuntu@box.example', 'box', **self.onboard_env).returncode, 0)
+        lines = self.hosts_file.read_text().splitlines()
+        self.assertEqual(lines[:2], ['{', '  "hosts": ['])
+        self.assertEqual(lines[2], '    {"alias": "old", "hostname": "198.51.100.1", "user": "ubuntu"},')
+        self.assertTrue(lines[3].startswith('    {"alias": "box", '))
+        self.assertEqual(lines[-2:], ['  ]', '}'])
+
+    def test_onboard_refuses_a_name_that_clashes_with_another_machine(self):
+        self.onboard_setup(hosts='{\n  "hosts": [\n    {"alias": "box", "hostname": "198.51.100.1", "user": "ubuntu"}\n  ]\n}\n')
+        before = self.hosts_file.read_text()
+        result = self.fleet('onboard', 'ubuntu@box.example', 'box', **self.onboard_env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('box', result.stderr)
+        self.assertEqual(self.hosts_file.read_text(), before)
+
+    def test_onboard_with_a_jump_host_and_no_alias(self):
+        self.onboard_setup()
+        before = self.hosts_file.read_text()
+        result = self.fleet('onboard', 'ubuntu@box.example', 'box', '--jump', 'spark-p', '--no-alias', **self.onboard_env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.hosts_file.read_text(), before)
+        self.assertTrue(all('-J' in args and 'spark-p' in args for args, _ in self.ssh_calls() if args[0] != '-G'))
+
+    def test_onboard_writes_a_jump_host_into_the_name(self):
+        self.onboard_setup()
+        self.assertEqual(self.fleet('onboard', 'ubuntu@box.example', 'box', '--jump', 'spark-p', **self.onboard_env).returncode, 0)
+        self.assertEqual(json.loads(self.hosts_file.read_text())['hosts'][-1]['jump'], 'spark-p')
+
+    def test_onboard_refuses_bad_input_before_it_does_anything(self):
+        self.onboard_setup()
+        for args, message in [(['-oProxyCommand=x', 'box'], 'invalid HOST'), (['ubuntu@box.example', 'bad name'], 'invalid NAME'),
+                              (['ubuntu@box.example', 'Box'], '--no-alias'),
+                              (['ubuntu@box.example', 'box', '--jump', '-oX'], '--jump')]:
+            result = self.fleet('onboard', *args, **self.onboard_env)
+            self.assertNotEqual(result.returncode, 0, args)
+            self.assertIn(message, result.stderr, args)
+        result = self.fleet('onboard', 'ubuntu@box.example', 'box', **dict(self.onboard_env, DOTFILES_NAME='a,b'))
+        self.assertIn('DOTFILES_NAME', result.stderr)
+        self.assertFalse((self.home / 'ssh-count').exists())
+        self.assertFalse([c for c in self.calls() if c[:2] == ['ca', 'token']])
+
+    def test_onboard_sends_no_tailscale_command(self):
+        self.onboard_setup()
+        self.assertEqual(self.fleet('onboard', 'ubuntu@box.example', 'box', **self.onboard_env).returncode, 0)
+        self.assertFalse([1 for _, stdin in self.ssh_calls() if 'tailscale' in stdin])
+
     def test_login_uses_the_admin_provisioner_without_trust(self):
         self.init('--admin-item', 'op://Vault/Admin')
         result = self.fleet('login', 'laptop-1')

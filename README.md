@@ -338,7 +338,24 @@ Run the printed command on the new machine within 15 minutes. It works in bash, 
 - `--dotfiles` first runs `bootstrap.sh`, which installs these dotfiles from `main`.
 - `--ephemeral` runs `fleet ephemeral` in the foreground, for example in a Zellij pane. The keys are in memory-backed storage (`$XDG_RUNTIME_DIR` or `/dev/shm`), and renewal runs every hour. On exit or Ctrl-C, the command revokes its certificate and removes its keys, `~/.ssh/fleet`, and its `authorized_keys` block. It refuses to run on a machine with a persistent enrollment.
 
-The token is on the command line of the new machine for the duration of `join.sh`. To keep it off the command line, use `fleet enroll-remote HOST NAME` for a machine that you can reach with SSH. That command sends the token on stdin. If the laptop cannot reach the machine, run `fleet token NAME` on the laptop. Then run `fleet enroll NAME --ca-url https://CA --fingerprint ROOT_SHA256` on the machine and paste the token. After `enroll-remote` or a manual `enroll`, run `fleet timer install` on the machine. A plan for a single `fleet onboard` command that also installs the dotfiles and adds the short SSH name is in `agent-docs/headless-machine-onboarding.md`.
+The token is on the command line of the new machine for the duration of `join.sh`. To keep it off the command line, use `fleet enroll-remote HOST NAME` for a machine that you can reach with SSH. That command sends the token on stdin. If the laptop cannot reach the machine, run `fleet token NAME` on the laptop. Then run `fleet enroll NAME --ca-url https://CA --fingerprint ROOT_SHA256` on the machine and paste the token. After `enroll-remote` or a manual `enroll`, run `fleet timer install` on the machine.
+
+To put a machine that you reach with SSH into the fleet in one command, use `fleet onboard` on the laptop:
+
+```bash
+fleet onboard [USER@]HOST NAME [--jump ALIAS] [--fleet-config PATH] [--no-alias]
+```
+
+It runs these steps. Each step checks first, so a failed run is repaired by running the same command again.
+
+1. `ssh HOST true`, with `--jump` as an SSH jump host.
+2. Unless the machine is already enrolled, it sends the `fleet invite NAME --dotfiles` command to the machine on standard input. That installs the dotfiles, installs `fleet`, enrolls, and installs the renew timer. `bootstrap.sh` has no terminal there, so `fleet onboard` sends your name and email from chezmoi (or `DOTFILES_NAME` and `DOTFILES_EMAIL`).
+3. `fleet agent install` on the machine.
+4. It adds `NAME` to `broker/ssh-hosts.json` in a fleet-config checkout (`--fleet-config`, or `FLEET_CONFIG_REPO`, default `~/repos/fleet-config`), with the host name and user that `ssh -G` reports. It does not commit or deploy: commit the file, then copy `broker/` to the CA host and run `sudo broker/install.sh`. Other machines get the short name on their next renew. `--no-alias` skips this step, and it also skips when the checkout is missing. `NAME` must then be lowercase letters, digits, and hyphens, and `--jump` must be a short SSH name.
+5. `fleet status` on the machine must show `NAME`.
+
+The token and the invite command go to the machine on standard input. The first SSH connection to a new host accepts its host key without asking, so check the fingerprint against the provider's console when the address is public. `fleet onboard` does not join Tailscale. The machine reaches the bb server through the fleet door (see Fleet door).
+
 
 `fleet login` mints its own token through 1Password with the admin provisioner, and it does not add login trust. A laptop that sleeps longer than 24 hours has an expired certificate. Run `fleet login` again.
 
