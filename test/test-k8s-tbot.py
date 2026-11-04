@@ -149,6 +149,25 @@ class K8sTbot(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('tbot-k8s-agent.service:', result.stderr)
 
+    @unittest.skipUnless(shutil.which('systemd-analyze'), 'systemd-analyze not installed')
+    def test_key_condition_checks_the_configured_directory(self):
+        for name in ('tenant-a', 'tenant%H'):
+            with self.subTest(name=name):
+                data = block('host-a', name=name)
+                cfg = yaml.safe_load(self.render(CONFIG_SRC, data).stdout)
+                key = Path(cfg['storage']['path']) / 'id_bkp'
+                key.parent.mkdir(parents=True)
+                key.write_text('placeholder')
+                unit = self.render(UNIT_SRC, data).stdout
+                [condition] = [line for line in unit.splitlines()
+                               if line.startswith('ConditionPathExists=')]
+                # Resolve the home specifier into the fixture, keeping every lookup there.
+                condition = condition.replace('%h', str(self.home))
+                result = subprocess.run(['systemd-analyze', '--user', 'condition', condition],
+                                        capture_output=True, text=True, env=self.env,
+                                        stdin=subprocess.DEVNULL, timeout=60)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_only_hosts_with_the_block_get_the_files(self):
         self.assertFalse({CONFIG_TARGET, UNIT_TARGET} & self.managed(''))
         self.assertLessEqual({CONFIG_TARGET, UNIT_TARGET}, self.managed(block('host-a')))
