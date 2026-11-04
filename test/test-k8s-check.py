@@ -437,6 +437,14 @@ class K8sCheck(unittest.TestCase):
                     self.log.unlink()
                 self.invalid(text, needle)
 
+    def test_schema_version_requires_an_integer(self):
+        self.profiles.write_text(EXAMPLE.read_text().replace('schema_version = 1', 'schema_version = 1.0'))
+        rc, out = self.run_check('--list')
+        self.assertEqual(rc, 1)
+        self.assertIn('profiles_invalid', self.codes(out))
+        self.assertIn('schema_version', ' '.join(f['message'] for f in out['failures']))
+        self.assertEqual(self.calls(), [])
+
     def test_never_profile_needs_only_context_allowed_source(self):
         rc, out = self.run_check('--list')
         self.assertEqual(rc, 0, out)
