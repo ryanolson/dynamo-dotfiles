@@ -412,6 +412,15 @@ class K8sCheck(unittest.TestCase):
         self.assertEqual(out['clusters']['lab-arm-a']['gpu_taint'], GPU_TAINT)
         self.assertEqual(self.calls(), [])
 
+    def test_schema_documented_profile_listing_command(self):
+        documentation = (SKILL / 'references/profiles.md').read_text()
+        args = documentation.split('`k8s-check ', 1)[1].split('`', 1)[0].split()
+        rc, out = self.run_check(*args)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out['schema_version'], 1)
+        self.assertEqual(sorted(out['clusters']), ['lab-arm-a', 'lab-ci', 'lab-x86-qa'])
+        self.assertEqual(self.calls(), [])
+
     def invalid(self, text, needle):
         self.profiles.write_text(text)
         rc, out = self.run_check('lab-arm-a')
