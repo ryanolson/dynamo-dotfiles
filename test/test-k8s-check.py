@@ -415,6 +415,17 @@ class K8sCheck(unittest.TestCase):
         self.assertEqual(out['failures'], [])
         self.assert_read_only()
 
+    def test_can_i_evaluation_error_is_not_a_confirmed_denial(self):
+        # kubectl appends SubjectAccessReviewStatus.evaluationError after "no - ".
+        self.scenario['auth can-i create dynamographdeployments.nvidia.com -n default'] = can_i(
+            'no - Internal error occurred: failed calling webhook "authorization.example.test": '
+            'Post "https://authorization.example.test/authorize": context deadline exceeded')
+        rc, out = self.run_check('lab-arm-a')
+        self.assert_read_only()
+        self.assertEqual(rc, 1, out)
+        self.assertFalse(out['ok'], out)
+        self.assertIn('kubectl_error', self.codes(out))
+
     def test_unexpected_cluster_error_fails(self):
         self.scenario['get nodes -l nvidia.com/gpu.present=true -o json'] = {
             'stderr': 'Unable to connect to the server: timeout\n', 'exit': 1}
