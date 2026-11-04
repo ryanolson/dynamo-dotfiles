@@ -361,6 +361,20 @@ class K8sCheck(unittest.TestCase):
 
     # --- drift between the profile and the cluster is a warning ---
 
+    def test_gpu_taint_without_value_matches_exists_toleration(self):
+        self.profiles.write_text(EXAMPLE.read_text().replace(
+            'gpu_taint = { key = "nvidia.com/gpu", value = "true", effect = "NoSchedule" }',
+            'gpu_taint = { key = "nvidia.com/gpu", effect = "NoSchedule" }'))
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out['gpus']['free'], 1)
+        self.assertEqual(out['gpus']['free_untainted'], 1)
+        self.assertNotIn('gpu_taint_missing', self.codes(out, 'warnings'))
+        nodes = {n['name']: n for n in out['gpu_nodes']}
+        self.assertEqual(nodes['node-a']['taints'], ['nvidia.com/gpu=true:NoSchedule'])
+        self.assertEqual(nodes['node-a']['extra_taints'], [])
+        self.assertEqual(nodes['node-b']['extra_taints'], ['example.test/reserved=team-b:NoSchedule'])
+
     def test_profile_drift_warns(self):
         s = self.scenario
         nodes = json.loads(s['get nodes -l nvidia.com/gpu.present=true -o json']['stdout'])
