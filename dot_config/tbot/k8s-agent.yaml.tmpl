@@ -1,0 +1,38 @@
+{{- /* tbot config for the agents' own Kubernetes identity (a Teleport bot).
+       Every internal value comes from the host's uncommitted k8s_tbot block in
+       ~/.config/chezmoi/chezmoi.yaml; .chezmoiignore skips this file without it.
+       The key in the storage directory is made once by hand and never managed. */ -}}
+{{- $t := .k8s_tbot -}}
+{{- range list "name" "proxy_server" "token" -}}
+{{-   if not (get $t .) -}}{{ fail (printf "k8s_tbot.%s must be set" .) }}{{- end -}}
+{{- end -}}
+{{- /* The unit puts the name in a systemd path, where % is a specifier, so allow only plain characters. */ -}}
+{{- if not (regexMatch "^[A-Za-z0-9_-][A-Za-z0-9._-]*$" $t.name) -}}
+{{-   fail "k8s_tbot.name must be one directory name of letters, digits, '.', '_' or '-'" -}}
+{{- end -}}
+{{- /* An empty selector matches every cluster the bot can see, CI and production included. */ -}}
+{{- if not $t.selector_labels -}}{{ fail "k8s_tbot.selector_labels must name at least one label" }}{{- end -}}
+{{- $dir := joinPath .chezmoi.homeDir ".local/share/tbot" $t.name -}}
+# Managed by chezmoi (dot_config/tbot/k8s-agent.yaml.tmpl). Values come from k8s_tbot in the chezmoi config.
+version: v2
+proxy_server: {{ $t.proxy_server | quote }}
+onboarding:
+  join_method: bound_keypair
+  token: {{ $t.token | quote }}
+storage:
+  type: directory
+  path: {{ joinPath $dir "storage" | quote }}
+credential_ttl: 1h
+renewal_interval: 20m
+services:
+  - type: kubernetes/v2
+    destination:
+      type: directory
+      path: {{ joinPath $dir "kube" | quote }}
+    # With true, DGD creates through the Python Kubernetes client fail with 403.
+    disable_exec_plugin: false
+    selectors:
+      - labels:
+{{- range $k, $v := $t.selector_labels }}
+          {{ $k | quote }}: {{ $v | quote }}
+{{- end }}

@@ -64,3 +64,9 @@ data:
     vault: {{ dig "onepassword" "vault" "Development" . | quote }}
     # secrets: override in ~/.config/chezmoi/chezmoi.yaml
     # defaults from .chezmoidata/team.yaml
+{{- /* Opt-in for the agents' Teleport bot, added by hand on each host. Init rewrites
+       this file, so carry the block over. See "Kubernetes bot for agents" in README.md. */}}
+{{- with dig "k8s_tbot" nil . }}
+  k8s_tbot:
+{{ toYaml . | trim | indent 4 }}
+{{- end }}

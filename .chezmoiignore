@@ -41,6 +41,14 @@ test/**
 **/__pycache__
 **/__pycache__/**
 
+# The agents' Teleport bot (tbot) config and unit deploy only on hosts whose
+# chezmoi config has a k8s_tbot block. Its key directory is never managed.
+{{- if not (hasKey . "k8s_tbot") }}
+.config/tbot
+.config/tbot/**
+.config/systemd/user/tbot-k8s-agent.service
+{{- end }}
+
 # Local development files
 node_modules/
 .env

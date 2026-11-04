@@ -1,0 +1,27 @@
+{{- /* User unit for tbot with ~/.config/tbot/k8s-agent.yaml. Deployed only with the
+       k8s_tbot block (see .chezmoiignore); never enabled or started by chezmoi. */ -}}
+{{- $name := .k8s_tbot.name -}}
+{{- /* % is a systemd specifier; the config template refuses the same names. */ -}}
+{{- if not (regexMatch "^[A-Za-z0-9_-][A-Za-z0-9._-]*$" ($name | toString)) -}}
+{{-   fail "k8s_tbot.name must be one directory name of letters, digits, '.', '_' or '-'" -}}
+{{- end -}}
+# Managed by chezmoi (dot_config/systemd/user/tbot-k8s-agent.service.tmpl).
+[Unit]
+Description=tbot: Teleport bot identity for agent Kubernetes access
+# The key is made once by hand. Without it, tbot would make a new key that the bot does not know.
+ConditionPathExists=%h/.local/share/tbot/{{ $name }}/storage/id_bkp
+# Failed joins back off instead of hammering the proxy.
+StartLimitIntervalSec=1h
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# tbot lives in ~/.local/bin on some hosts and in /usr/local/bin on others.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=TELEPORT_ANONYMOUS_TELEMETRY=0
+ExecStart=/usr/bin/env tbot start --config %h/.config/tbot/k8s-agent.yaml
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=default.target

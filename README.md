@@ -511,6 +511,45 @@ Verification:
 timeout 300 python3 test/bb-server-url.py
 ```
 
+### Kubernetes bot for agents (tbot)
+
+Agents reach Kubernetes clusters through their own Teleport bot identity, never through your `tsh` login. `tbot` holds the bot's key and keeps a short-lived kubeconfig fresh. This repository manages two files for it:
+
+- `~/.config/tbot/k8s-agent.yaml`: the tbot config. It joins with `bound_keypair`, renews 1-hour certificates every 20 minutes, and writes a kubeconfig for clusters that match the selector labels. It sets `disable_exec_plugin: false`, because with `true` DGD creates through the Python Kubernetes client fail with 403.
+- `~/.config/systemd/user/tbot-k8s-agent.service`: a user unit that runs `tbot start --config ~/.config/tbot/k8s-agent.yaml`. It finds `tbot` in `~/.local/bin` or `/usr/local/bin`, and it does not start until the key exists.
+
+The repository is public, so it holds no internal names. Both files deploy only on a host whose `~/.config/chezmoi/chezmoi.yaml` has a `k8s_tbot` block, and every internal value comes from that block. `chezmoi init` keeps the block:
+
+```yaml
+data:
+  k8s_tbot:
+    name: <directory under ~/.local/share/tbot>
+    proxy_server: <teleport proxy host>:443
+    token: <bot join token name>
+    selector_labels:        # required; an empty selector matches every cluster
+      <label>: <value>
+```
+
+Prerequisites:
+
+- `tbot` v18.7.6, the same version on every host. Install it from the official Teleport tarball and check its SHA-256. A system install puts it in `/usr/local/bin`; a user install puts it in `~/.local/bin`.
+- Lingering, so the unit runs without a login session: `loginctl enable-linger $USER`.
+- A key, made once by hand on each host. Run `tbot keypair create --storage=file://$HOME/.local/share/tbot/<name>/storage --proxy-server=<proxy>` with that directory at mode 700, and give only the public key to the bot's owner. Never use `--overwrite` on a working key.
+
+The key directory `~/.local/share/tbot/<name>` is never managed by chezmoi. Never copy it to another host, and never run two `tbot` on one directory: a renewal race can lock the bot's join token. `chezmoi apply` does not enable or start the unit. After the bot is registered:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now tbot-k8s-agent.service
+export KUBECONFIG="$HOME/.local/share/tbot/<name>/kube/kubeconfig.yaml"
+```
+
+Verification:
+
+```bash
+timeout 300 python3 test/test-k8s-tbot.py
+```
+
 ### Antigravity in bb
 
 `iou_antigravity_acp` installs the Antigravity ACP server from the ACP registry. Google publishes one archive for each platform. The command installs the archive for this machine in `~/.local/share/agy-acp-server/<version>`. It writes `launch.json` there with the command and arguments from the registry (Linux needs `--uid=`). Then it points `current` at that version and removes the other versions. A run that finds the version installed downloads nothing. The command does not sign in.
