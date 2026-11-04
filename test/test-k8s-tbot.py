@@ -81,6 +81,25 @@ class K8sTbot(unittest.TestCase):
                 self.assertEqual(svc['selectors'], [{'labels': {'resource-group': ['example-group'],
                                                                 'environment': ['dev']}}])
 
+    @unittest.skipUnless(shutil.which('tbot'), 'tbot not installed')
+    def test_selector_labels_match_tbot_v18_schema(self):
+        rendered = yaml.safe_load(self.render(CONFIG_SRC, block('host-a')).stdout)
+        env = {key: value for key, value in self.env.items()
+               if not key.startswith(('TBOT_', 'TELEPORT_'))}
+        # Use tbot's own generator as the control for the selector schema.
+        result = subprocess.run(['tbot', 'configure', 'kubernetes/v2',
+                                 '--proxy-server=proxy.example.test:443', '--token=bot-a-join',
+                                 '--join-method=bound_keypair',
+                                 f'--storage=file://{self.home}/storage',
+                                 f'--destination=file://{self.home}/kube',
+                                 '--label-selector=' + ','.join(f'{k}={v}' for k, v in LABELS.items())],
+                                capture_output=True, text=True, env=env,
+                                stdin=subprocess.DEVNULL, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = yaml.safe_load(result.stdout)['services'][0]['selectors']
+        self.assertEqual(expected, [{'labels': LABELS}])
+        self.assertEqual(rendered['services'][0]['selectors'], expected)
+
     def test_rendered_files_hold_no_key_material_and_no_overwrite(self):
         for host in HOSTS:
             for src in (CONFIG_SRC, UNIT_SRC):
