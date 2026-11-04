@@ -230,6 +230,22 @@ class K8sCheck(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertEqual(out['crd']['want'], 'v1beta1')
 
+    def test_restartable_init_container_reserves_gpus_alongside_main(self):
+        workload = pod('team-x', 'with-sidecar', 'node-a', 2, init_gpus=1)
+        workload['spec']['initContainers'][0]['restartPolicy'] = 'Always'
+        for container in workload['spec']['containers'] + workload['spec']['initContainers']:
+            resources = container['resources']
+            resources['limits'] = dict(resources['requests'])
+        self.scenario['get nodes -l nvidia.com/gpu.present=true -o json'] = j({
+            'items': [node('node-a', 4, [GPU_TAINT])]})
+        self.scenario['get pods -A --field-selector=status.phase!=Succeeded,status.phase!=Failed -o json'] = j({
+            'items': [workload]})
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assert_read_only()
+        self.assertEqual(out['gpu_nodes'][0]['free'], 1)
+        self.assertEqual(out['gpus'], {'allocatable': 4, 'free': 1, 'free_untainted': 1})
+
     def test_symlink_to_bot_kubeconfig_is_the_bot_file(self):
         link = self.tmp / 'kc-link.yaml'
         link.symlink_to(self.bot_kubeconfig)
