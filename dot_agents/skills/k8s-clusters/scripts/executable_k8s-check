@@ -73,9 +73,9 @@ class Kubectl:
         except json.JSONDecodeError:
             raise KubectlError(args, 0, 'output is not JSON')
 
-    def can_i(self, verb, resource, namespace):
+    def can_i(self, verb, resource, namespace=None):
         # can-i exits 0 for "yes" and 1 for "no"; anything else is an error, not an answer.
-        args = ('auth', 'can-i', verb, resource, '-n', namespace)
+        args = ('auth', 'can-i', verb, resource) + (('-n', namespace) if namespace else ())
         rc, out, err = self.run(*args)
         answer = out.strip()
         if (rc, answer) in ((0, 'yes'), (1, 'no')):
@@ -155,11 +155,13 @@ def run_check(report, profiles, cluster, want_crd):
     outside = {ns: kc.can_i('create', DGD_RESOURCE, ns) for ns in ('default', prof['operator_namespace'])}
     inside = {n['name']: kc.can_i('create', DGD_RESOURCE, n['name'])
               for n in ours if n['name'].startswith(bot['namespace_prefix'])}
-    admission = bot['admission_namespace']
-    report['can_i'] = {'outside': outside, 'inside': inside, 'admission': {
-        'namespace': admission,
-        'leases': kc.can_i('create', 'leases.coordination.k8s.io', admission),
-        'configmaps': kc.can_i('create', 'configmaps', admission)}}
+    # k8s-guard assumes the bot cannot patch a namespace object under our prefix, and can create a
+    # ConfigMap inside one. The probe name need not exist; the answers come from RBAC alone.
+    probe = bot['namespace_prefix'] + 'probe'
+    report['can_i'] = {'outside': outside, 'inside': inside, 'probe': {
+        'namespace': probe,
+        'patch_namespace': kc.can_i('patch', f'namespaces/{probe}'),
+        'create_configmaps': kc.can_i('create', 'configmaps', probe)}}
     for ns, answer in outside.items():
         if answer == 'yes':
             report['failures'].append({'code': 'can_i_outside',

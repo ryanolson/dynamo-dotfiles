@@ -95,8 +95,8 @@ def happy_scenario():
         'auth can-i create dynamographdeployments.nvidia.com -n default': can_i('no'),
         'auth can-i create dynamographdeployments.nvidia.com -n dynamo-system': can_i('no'),
         f'auth can-i create dynamographdeployments.nvidia.com -n {OUR_NS}': can_i('yes'),
-        'auth can-i create leases.coordination.k8s.io -n dyntest-alice-admission': can_i('yes'),
-        'auth can-i create configmaps -n dyntest-alice-admission': can_i('yes'),
+        'auth can-i patch namespaces/dyntest-alice-probe': can_i('no'),
+        'auth can-i create configmaps -n dyntest-alice-probe': can_i('yes'),
         f'get crd dynamographdeployments.nvidia.com -o jsonpath={CRD_JSONPATH}': {'stdout': 'v1alpha1 v1beta1 '},
         'get deploy -n dynamo-system -o json': j({'items': [{
             'metadata': {'name': 'dynamo-operator-controller-manager'},
@@ -191,7 +191,8 @@ class K8sCheck(unittest.TestCase):
             if not call['key'].startswith('config '):
                 self.assertEqual(call['flags'].get('--context'), CTX, call['argv'])
             if call['key'].startswith('auth can-i'):
-                self.assertIn('-n', call['key'].split(), call['argv'])
+                # Every can-i names a namespace, or a namespace object by name.
+                self.assertTrue('-n' in call['key'].split() or ' namespaces/' in call['key'], call['argv'])
 
     # --- the happy path ---
 
@@ -205,8 +206,8 @@ class K8sCheck(unittest.TestCase):
         self.assertEqual(out['identity']['username'], BOT)
         self.assertEqual(out['can_i']['outside'], {'default': 'no', 'dynamo-system': 'no'})
         self.assertEqual(out['can_i']['inside'], {OUR_NS: 'yes'})
-        self.assertEqual(out['can_i']['admission'], {'namespace': 'dyntest-alice-admission',
-                                                     'leases': 'yes', 'configmaps': 'yes'})
+        self.assertEqual(out['can_i']['probe'], {'namespace': 'dyntest-alice-probe',
+                                                 'patch_namespace': 'no', 'create_configmaps': 'yes'})
         self.assertEqual(out['crd']['served'], ['v1alpha1', 'v1beta1'])
         self.assertEqual(out['operator'], [{'name': 'dynamo-operator-controller-manager',
                                             'images': ['registry.example.test/dynamo-operator:main.abc1234']}])
@@ -293,6 +294,22 @@ class K8sCheck(unittest.TestCase):
         self.assertEqual(out['can_i']['outside']['default'], 'yes')
         self.assert_read_only()
 
+    def test_probe_reports_answers_as_given(self):
+        # The guard assumes "no" and "yes"; the check reports what the cluster says and leaves the ruling to the run.
+        self.scenario['auth can-i patch namespaces/dyntest-alice-probe'] = can_i('yes')
+        self.scenario['auth can-i create configmaps -n dyntest-alice-probe'] = can_i('no')
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out['can_i']['probe'], {'namespace': 'dyntest-alice-probe',
+                                                 'patch_namespace': 'yes', 'create_configmaps': 'no'})
+        self.assert_read_only()
+
+    def test_probe_error_fails(self):
+        self.scenario['auth can-i patch namespaces/dyntest-alice-probe'] = {'stderr': 'error: forbidden\n', 'exit': 1}
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 1, out)
+        self.assertIn('kubectl_error', self.codes(out))
+
     def test_crd_version_not_served(self):
         self.scenario[f'get crd dynamographdeployments.nvidia.com -o jsonpath={CRD_JSONPATH}'] = {'stdout': 'v1alpha1 '}
         rc, out = self.run_check('lab-arm-a', '--want-crd', 'v1beta1')
@@ -369,8 +386,7 @@ class K8sCheck(unittest.TestCase):
             'unknown key': (base.replace('reaper = true', 'reaper = true\nreapr = true'), 'reapr'),
             'missing key': (base.replace('storage_class = "example-rwx"\n', ''), 'storage_class'),
             'schema version': (base.replace('schema_version = 1', 'schema_version = 2'), 'schema_version'),
-            'admission outside prefix': (base.replace('"dyntest-alice-admission"', '"other-admission"'),
-                                         'admission_namespace'),
+            'prefix without dash': (base.replace('"dyntest-alice-"', '"dyntest-alice"'), 'namespace_prefix'),
             'bad arch': (base.replace('arch = "arm64"', 'arch = "arm"'), 'arch'),
             'bad taint effect': (base.replace('effect = "NoSchedule"', 'effect = "Never"'), 'effect'),
             'never without source': (base.replace('source = ["ops shared cluster guide"]\n', ''), 'source'),

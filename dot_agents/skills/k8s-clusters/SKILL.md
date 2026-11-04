@@ -28,7 +28,7 @@ export KUBECONFIG=<bot.kubeconfig from the profiles>
 ~/.agents/skills/k8s-clusters/scripts/k8s-check <cluster> [--want-crd v1beta1]
 ```
 
-It runs the runbook's section 5 and prints JSON: the identity, `can-i` inside and outside our namespaces and for the admission lock, the DGD CRD versions served, the operator images, the GPU nodes with their taints and free GPUs, our namespaces, and whether the GPU reaper runs.
+It runs the runbook's section 5 and prints JSON: the identity, `can-i` inside and outside our namespaces, two probes on a namespace name under our prefix (patch the namespace object; create a ConfigMap in it), the DGD CRD versions served, the operator images, the GPU nodes with their taints and free GPUs, our namespaces, and whether the GPU reaper runs.
 
 It exits 1, with a `failures` list of stable codes, when:
 

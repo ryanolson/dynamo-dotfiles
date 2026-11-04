@@ -13,7 +13,7 @@ ALLOWED = ('first-choice', 'qa-idle', 'never')
 ARCHES = ('amd64', 'arm64')
 EFFECTS = ('NoSchedule', 'PreferNoSchedule', 'NoExecute')
 
-BOT_KEYS = {'user': str, 'kubeconfig': str, 'developer': str, 'namespace_prefix': str, 'admission_namespace': str}
+BOT_KEYS = {'user': str, 'kubeconfig': str, 'developer': str, 'namespace_prefix': str}
 # Keys every profile needs, then the ones every profile but a "never" one needs.
 BASE_KEYS = {'context': str, 'allowed': str, 'source': list}
 USE_KEYS = {'bot_can_write': bool, 'arch': str, 'gpu_product': str, 'gpu_type': str, 'gpus_per_node': int,
@@ -114,11 +114,9 @@ def load_profiles():
             errors.append(f'bot.{key} is required')
         else:
             check_type('bot', key, bot[key], kind, errors)
-    prefix, admission = bot.get('namespace_prefix'), bot.get('admission_namespace')
+    prefix = bot.get('namespace_prefix')
     if isinstance(prefix, str) and prefix and not prefix.endswith('-'):
         errors.append('bot.namespace_prefix must end in "-"')
-    if isinstance(prefix, str) and isinstance(admission, str) and admission and not admission.startswith(prefix):
-        errors.append('bot.admission_namespace must start with bot.namespace_prefix')
     clusters = data.get('clusters')
     if not isinstance(clusters, dict) or not clusters:
         errors.append('[clusters.<name>] needs at least one cluster')

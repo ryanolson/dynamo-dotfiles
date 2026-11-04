@@ -7,7 +7,6 @@ user = "bot-example-agent"
 kubeconfig = "~/.local/share/tbot/example/kube/kubeconfig.yaml"
 developer = "alice"
 namespace_prefix = "dyntest-alice-"
-admission_namespace = "dyntest-alice-admission"
 
 [clusters.lab-arm-a]
 context = "proxy.example.test-lab-arm-a"

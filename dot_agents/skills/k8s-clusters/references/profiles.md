@@ -22,7 +22,6 @@ One TOML file per host says which clusters agents may use and how to reach them.
 | `kubeconfig` | string | The bot's kubeconfig, written by `tbot`. `~` is expanded. `KUBECONFIG` must name exactly this file. |
 | `developer` | string | The value of the `dynamo.nvidia.com/developer` label on our namespaces. |
 | `namespace_prefix` | string | The prefix of every namespace we may write in, ending in `-`. |
-| `admission_namespace` | string | The namespace `k8s-guard` uses for its admission lock. Must start with `namespace_prefix`. |
 
 ## `[clusters.<name>]`
 
