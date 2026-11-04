@@ -269,6 +269,19 @@ class K8sCheck(unittest.TestCase):
         self.assert_refused_without_contact(out, rc, 'kubeconfig_not_bot')
         self.assertEqual(self.calls(), [])
 
+    def test_profile_cannot_designate_owner_kubeconfig_as_bot_file(self):
+        self.profiles.write_text(EXAMPLE.read_text().replace(
+            'kubeconfig = "~/.local/share/tbot/example/kube/kubeconfig.yaml"',
+            'kubeconfig = "~/.kube/config"'))
+        self.env['KUBECONFIG'] = str(self.human_kubeconfig)
+        self.scenario['auth whoami -o json'] = j({'status': {'userInfo': {'username': 'alice@example.test'}}})
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 1, out)
+        self.assertFalse(out['ok'])
+        cluster_calls = [c for c in self.calls() if not c['key'].startswith('config ')]
+        self.assertEqual(cluster_calls, [], 'the owner kubeconfig must be refused before contacting the cluster')
+        self.assertTrue({'profiles_invalid', 'kubeconfig_not_bot'}.intersection(self.codes(out)), out)
+
     def test_kubeconfig_unset(self):
         # kubectl would fall back to ~/.kube/config, the owner's login.
         del self.env['KUBECONFIG']
