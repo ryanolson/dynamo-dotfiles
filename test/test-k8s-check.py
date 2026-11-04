@@ -282,6 +282,30 @@ class K8sCheck(unittest.TestCase):
         self.assertEqual(cluster_calls, [], 'the owner kubeconfig must be refused before contacting the cluster')
         self.assertTrue({'profiles_invalid', 'kubeconfig_not_bot'}.intersection(self.codes(out)), out)
 
+    def test_symlinked_owner_directories_are_refused_before_contact(self):
+        for directory in ('.kube', '.tsh'):
+            with self.subTest(directory=directory):
+                if self.log.exists():
+                    self.log.unlink()
+                owner_directory = self.home / directory
+                owner_directory.mkdir(exist_ok=True)
+                (owner_directory / 'config').write_text('apiVersion: v1\nkind: Config\n')
+                stored_directory = self.tmp / (directory[1:] + '-owner-credentials')
+                owner_directory.rename(stored_directory)
+                owner_directory.symlink_to(stored_directory, target_is_directory=True)
+                self.profiles.write_text(EXAMPLE.read_text().replace(
+                    'kubeconfig = "~/.local/share/tbot/example/kube/kubeconfig.yaml"',
+                    f'kubeconfig = "~/{directory}/config"'))
+                self.env['KUBECONFIG'] = str(owner_directory / 'config')
+                self.scenario['auth whoami -o json'] = j({
+                    'status': {'userInfo': {'username': 'alice@example.test'}}})
+                rc, out = self.run_check('lab-arm-a')
+                self.assertEqual(rc, 1, out)
+                cluster_calls = [c for c in self.calls() if not c['key'].startswith('config ')]
+                self.assertEqual(cluster_calls, [],
+                                 'a symlinked owner directory must be refused before contacting the cluster')
+                self.assertIn('profiles_invalid', self.codes(out))
+
     def test_kubeconfig_unset(self):
         # kubectl would fall back to ~/.kube/config, the owner's login.
         del self.env['KUBECONFIG']
