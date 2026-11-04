@@ -150,6 +150,7 @@ Installed skills:
 | `simple-english` | Short, plain text for commits, PRs, docs, reports, and comments: budgets, answer first, padding checklist, STE rules on demand |
 | `hot-paths` | Profile-backed register of hot code paths: a guard benchmark and noise band per path, markers in the code, speedups from the register |
 | `repo-skills` | Copies personal skills into public `ai-dynamo` repos and reports drift both ways; skips `ryanolson` and `NVIDIA-dev` repos |
+| `k8s-clusters` | Points to the Linear cluster runbook; cluster profiles in an uncommitted `~/.config/k8s-clusters/profiles.toml`; `k8s-check`, a read-only access check as the agents' bot that prints JSON |
 
 Sources: [`ai-dynamo/rhino`](https://github.com/ai-dynamo/rhino),
 [`ishandhanani/dotfiles`](https://github.com/ishandhanani/dotfiles), plus practice distilled from
@@ -548,6 +549,12 @@ Verification:
 
 ```bash
 timeout 300 python3 test/test-k8s-tbot.py
+```
+
+The `k8s-clusters` skill builds on the bot. Its cluster profiles live in an uncommitted `~/.config/k8s-clusters/profiles.toml`, written from the Linear runbook; the schema is `dot_agents/skills/k8s-clusters/references/profiles.md`. Its `k8s-check <cluster>` is read only: it refuses an unknown or `never` cluster, any `KUBECONFIG` but the bot's, and any identity but the bot, then prints what the bot can do on the cluster as JSON. The tests replay made-up `kubectl` output and never contact a cluster:
+
+```bash
+timeout 60 python3 test/test-k8s-check.py </dev/null
 ```
 
 ### Antigravity in bb

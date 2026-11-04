@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""Read-only access check for one Kubernetes cluster, as the agents' bot.
+
+Usage:
+  k8s-check <cluster> [--want-crd VERSION]   check one cluster, print JSON
+  k8s-check --list                           validate the profiles, print them as JSON
+
+The profiles file (references/profiles.md) is ~/.config/k8s-clusters/profiles.toml,
+or the path in K8S_CLUSTERS_PROFILES. Exit status: 0 when every check passes,
+1 when one fails, 2 for a usage error. A check's JSON on stdout always has "ok",
+"failures" and "warnings"; each item has a stable "code" and a "message".
+
+The checks that need no cluster call come first, so a refused cluster, a missing
+profile or the wrong kubeconfig never reach a cluster. Every kubectl call is a
+read, and carries the bot's kubeconfig and the profile's context explicitly.
+"""
+import argparse
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+# -I drops the script directory from sys.path; the shared parser lives next to this script.
+sys.dont_write_bytecode = True  # keep the deployed skill directory clean
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from k8s_profiles import ProfileError, load_profiles  # noqa: E402
+
+DGD_CRD = 'dynamographdeployments.nvidia.com'
+DGD_RESOURCE = 'dynamographdeployments.nvidia.com'
+GPU = 'nvidia.com/gpu'
+GPU_NODES = 'nvidia.com/gpu.present=true'
+GPU_PRODUCT = 'nvidia.com/gpu.product'
+DEVELOPER_LABEL = 'dynamo.nvidia.com/developer'
+KUBECTL_TIMEOUT = 60
+# The ops team's GPU reaper runs its pods in this namespace on every cluster that has it.
+REAPER_NAMESPACE = 'gpu-reaper'
+
+
+class Refusal(ProfileError):
+    """A check that fails before or instead of a cluster call; same shape as ProfileError."""
+
+
+# --- kubectl ----------------------------------------------------------------
+
+class Kubectl:
+    def __init__(self, kubeconfig, context):
+        self.base = ['kubectl', '--kubeconfig', kubeconfig]
+        self.context = context
+
+    def run(self, *args, local=False):
+        cmd = self.base + ([] if local else ['--context', self.context]) + list(args)
+        try:
+            p = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                               timeout=KUBECTL_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return 124, '', f'timed out after {KUBECTL_TIMEOUT}s'
+        except FileNotFoundError:
+            return 127, '', 'kubectl not found on PATH'
+        return p.returncode, p.stdout, p.stderr
+
+    def read(self, *args, local=False):
+        rc, out, err = self.run(*args, local=local)
+        if rc != 0:
+            raise KubectlError(args, rc, err)
+        return out
+
+    def json(self, *args):
+        out = self.read(*args)
+        try:
+            return json.loads(out)
+        except json.JSONDecodeError:
+            raise KubectlError(args, 0, 'output is not JSON')
+
+    def can_i(self, verb, resource, namespace):
+        # can-i exits 0 for "yes" and 1 for "no"; anything else is an error, not an answer.
+        args = ('auth', 'can-i', verb, resource, '-n', namespace)
+        rc, out, err = self.run(*args)
+        answer = out.strip()
+        if (rc, answer) in ((0, 'yes'), (1, 'no')):
+            return answer
+        raise KubectlError(args, rc, err or out)
+
+
+class KubectlError(Exception):
+    def __init__(self, args, rc, err):
+        super().__init__(f'kubectl {" ".join(args)} exited {rc}: {err.strip()[:400]}')
+
+
+# --- the check --------------------------------------------------------------
+
+def taint_str(t):
+    value = t.get('value')
+    return f'{t.get("key")}={value}:{t.get("effect")}' if value else f'{t.get("key")}:{t.get("effect")}'
+
+
+def quantity(q):
+    try:
+        return int(str(q))
+    except ValueError:
+        return 0
+
+
+def pod_gpus(spec):
+    def req(c):
+        return quantity(((c.get('resources') or {}).get('requests') or {}).get(GPU, 0))
+    main = sum(req(c) for c in spec.get('containers') or [])
+    init = max([req(c) for c in spec.get('initContainers') or []] or [0])
+    return max(main, init)
+
+
+def check_kubeconfig(bot):
+    value = os.environ.get('KUBECONFIG')
+    if not value:
+        raise Refusal('kubeconfig_not_bot',
+                      'KUBECONFIG is unset, so kubectl would use ~/.kube/config; export the bot kubeconfig')
+    if os.pathsep in value:
+        raise Refusal('kubeconfig_not_bot', 'KUBECONFIG lists more than one file; name only the bot kubeconfig')
+    if os.path.realpath(os.path.expanduser(value)) != os.path.realpath(bot['kubeconfig']):
+        raise Refusal('kubeconfig_not_bot', f'KUBECONFIG is {value}, not the bot kubeconfig {bot["kubeconfig"]}')
+
+
+def run_check(report, profiles, cluster, want_crd):
+    if cluster not in profiles['clusters']:
+        raise Refusal('unknown_cluster', f'{cluster} has no profile; known: {", ".join(sorted(profiles["clusters"]))}')
+    prof = profiles['clusters'][cluster]
+    report['context'] = prof['context']
+    report['allowed'] = prof['allowed']
+    if prof['allowed'] == 'never':
+        raise Refusal('cluster_never', f'{cluster} is marked never: agents must not touch it')
+    bot = profiles['bot']
+    check_kubeconfig(bot)
+    kc = Kubectl(bot['kubeconfig'], prof['context'])
+
+    contexts = kc.read('config', 'get-contexts', '-o', 'name', local=True).split()
+    if prof['context'] not in contexts:
+        raise Refusal('context_missing', f'context {prof["context"]} is not in the bot kubeconfig')
+
+    who = kc.json('auth', 'whoami', '-o', 'json')
+    user = ((who.get('status') or {}).get('userInfo') or {})
+    report['identity'] = {'username': user.get('username'), 'groups': user.get('groups', [])}
+    if user.get('username') != bot['user']:
+        raise Refusal('not_bot', f'identity is {user.get("username")!r}, not the bot {bot["user"]!r}; stop')
+
+    ns_list = kc.json('get', 'ns', '-l', f'{DEVELOPER_LABEL}={bot["developer"]}', '-o', 'json')
+    ours = []
+    for item in ns_list.get('items', []):
+        meta = item.get('metadata', {})
+        ours.append({'name': meta.get('name'),
+                     'thread': (meta.get('labels') or {}).get('wcep.agent/thread'),
+                     'expires_at': (meta.get('annotations') or {}).get('wcep.agent/expires-at')})
+    report['namespaces'] = ours
+
+    outside = {ns: kc.can_i('create', DGD_RESOURCE, ns) for ns in ('default', prof['operator_namespace'])}
+    inside = {n['name']: kc.can_i('create', DGD_RESOURCE, n['name'])
+              for n in ours if n['name'].startswith(bot['namespace_prefix'])}
+    admission = bot['admission_namespace']
+    report['can_i'] = {'outside': outside, 'inside': inside, 'admission': {
+        'namespace': admission,
+        'leases': kc.can_i('create', 'leases.coordination.k8s.io', admission),
+        'configmaps': kc.can_i('create', 'configmaps', admission)}}
+    for ns, answer in outside.items():
+        if answer == 'yes':
+            report['failures'].append({'code': 'can_i_outside',
+                                       'message': f'the bot can create DGDs in {ns}, outside our namespaces; stop'})
+
+    rc, out, err = kc.run('get', 'crd', DGD_CRD, '-o',
+                          'jsonpath={range .spec.versions[?(@.served==true)]}{.name}{" "}{end}')
+    if rc != 0 and 'NotFound' not in err:
+        raise KubectlError(('get', 'crd', DGD_CRD), rc, err)
+    served = out.split() if rc == 0 else []
+    report['crd'] = {'served': served, 'want': want_crd}
+    if rc != 0:
+        report['warnings'].append({'code': 'crd_missing', 'message': f'{DGD_CRD} is not installed'})
+    if want_crd and want_crd not in served:
+        report['failures'].append({'code': 'crd_version_not_served',
+                                   'message': f'the DGD CRD serves {served or "nothing"}, not {want_crd}'})
+
+    deploys = kc.json('get', 'deploy', '-n', prof['operator_namespace'], '-o', 'json')
+    report['operator'] = [{'name': d['metadata']['name'],
+                           'images': [c.get('image') for c in d['spec']['template']['spec'].get('containers', [])]}
+                          for d in deploys.get('items', [])]
+
+    nodes = kc.json('get', 'nodes', '-l', GPU_NODES, '-o', 'json')
+    pods = kc.json('get', 'pods', '-A', '--field-selector=status.phase!=Succeeded,status.phase!=Failed', '-o', 'json')
+    used, reaper_pods = {}, 0
+    for p in pods.get('items', []):
+        spec = p.get('spec') or {}
+        if (p.get('metadata') or {}).get('namespace') == REAPER_NAMESPACE and \
+                (p.get('status') or {}).get('phase') == 'Running':
+            reaper_pods += 1
+        if spec.get('nodeName'):
+            used[spec['nodeName']] = used.get(spec['nodeName'], 0) + pod_gpus(spec)
+    want_taint = prof.get('gpu_taint')
+    gpu_nodes, products, untainted_nodes = [], set(), []
+    for n in nodes.get('items', []):
+        name = n['metadata']['name']
+        taints = (n.get('spec') or {}).get('taints') or []
+        alloc = quantity(((n.get('status') or {}).get('allocatable') or {}).get(GPU, 0))
+        is_gpu_taint = [want_taint is not None and t.get('key') == want_taint['key']
+                        and t.get('effect') == want_taint['effect']
+                        and (t.get('value') or '') == (want_taint.get('value') or '') for t in taints]
+        if want_taint is not None and not any(is_gpu_taint):
+            untainted_nodes.append(name)
+        product = (n['metadata'].get('labels') or {}).get(GPU_PRODUCT)
+        products.add(product)
+        gpu_nodes.append({'name': name, 'product': product, 'allocatable': alloc,
+                          'free': max(alloc - used.get(name, 0), 0),
+                          'taints': [taint_str(t) for t, g in zip(taints, is_gpu_taint) if g],
+                          'extra_taints': [taint_str(t) for t, g in zip(taints, is_gpu_taint) if not g]})
+    report['gpu_nodes'] = gpu_nodes
+    report['gpus'] = {'allocatable': sum(n['allocatable'] for n in gpu_nodes),
+                      'free': sum(n['free'] for n in gpu_nodes),
+                      'free_untainted': sum(n['free'] for n in gpu_nodes if not n['extra_taints'])}
+    if products - {prof['gpu_product']}:
+        report['warnings'].append({'code': 'gpu_product_mismatch',
+                                   'message': f'GPU nodes report {sorted(map(str, products))}, '
+                                              f'the profile says {prof["gpu_product"]}'})
+    if untainted_nodes:
+        report['warnings'].append({'code': 'gpu_taint_missing',
+                                   'message': f'{len(untainted_nodes)} GPU nodes lack the profile taint '
+                                              f'{taint_str(want_taint)}: {", ".join(untainted_nodes[:5])}'})
+
+    classes = {line.split('/', 1)[-1] for line in kc.read('get', 'storageclass', '-o', 'name').split()}
+    if prof['storage_class'] not in classes:
+        report['warnings'].append({'code': 'storage_class_missing',
+                                   'message': f'storage class {prof["storage_class"]} not found; '
+                                              f'the cluster has {", ".join(sorted(classes))}'})
+    report['reaper'] = {'profile': prof['reaper'], 'running_pods': reaper_pods}
+    if prof['reaper'] != (reaper_pods > 0):
+        report['warnings'].append({'code': 'reaper_mismatch',
+                                   'message': f'the profile says reaper = {str(prof["reaper"]).lower()}, '
+                                              f'and {reaper_pods} pods run in {REAPER_NAMESPACE}'})
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog='k8s-check', description='Read-only access check, as the agents\' bot.')
+    parser.add_argument('cluster', nargs='?', help='cluster name, as in the profiles file')
+    parser.add_argument('--want-crd', metavar='VERSION', help='fail unless the DGD CRD serves this version')
+    parser.add_argument('--list', action='store_true', help='validate the profiles and print them as JSON')
+    args = parser.parse_args(argv)
+    if bool(args.list) == bool(args.cluster):
+        parser.error('give a cluster, or --list')
+
+    report = {'ok': False, 'cluster': args.cluster, 'checked_at':
+              datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'), 'failures': [], 'warnings': []}
+    try:
+        profiles = load_profiles()
+        if args.list:
+            print(json.dumps(profiles, indent=2))
+            return 0
+        run_check(report, profiles, args.cluster, args.want_crd)
+    except ProfileError as e:  # Refusal included
+        report['failures'].append({'code': e.code, 'message': str(e)})
+    except KubectlError as e:
+        report['failures'].append({'code': 'kubectl_error', 'message': str(e)})
+    report['ok'] = not report['failures']
+    print(json.dumps(report, indent=2))
+    return 0 if report['ok'] else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
