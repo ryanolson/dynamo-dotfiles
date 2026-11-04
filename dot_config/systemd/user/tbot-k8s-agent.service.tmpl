@@ -1,8 +1,9 @@
 {{- /* User unit for tbot with ~/.config/tbot/k8s-agent.yaml. Deployed only with the
        k8s_tbot block (see .chezmoiignore); never enabled or started by chezmoi. */ -}}
 {{- $name := .k8s_tbot.name -}}
-{{- if or (not $name) (contains "/" $name) (hasPrefix "." $name) -}}
-{{-   fail "k8s_tbot.name must be one directory name" -}}
+{{- /* % is a systemd specifier; the config template refuses the same names. */ -}}
+{{- if not (regexMatch "^[A-Za-z0-9_-][A-Za-z0-9._-]*$" ($name | toString)) -}}
+{{-   fail "k8s_tbot.name must be one directory name of letters, digits, '.', '_' or '-'" -}}
 {{- end -}}
 # Managed by chezmoi (dot_config/systemd/user/tbot-k8s-agent.service.tmpl).
 [Unit]

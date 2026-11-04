@@ -78,8 +78,8 @@ class K8sTbot(unittest.TestCase):
                 self.assertEqual(svc['destination'], {'type': 'directory', 'path': str(share / 'kube')})
                 # `true` makes DGD creates through the Python Kubernetes client fail with 403.
                 self.assertIs(svc['disable_exec_plugin'], False)
-                self.assertEqual(svc['selectors'], [{'labels': {'resource-group': ['example-group'],
-                                                                'environment': ['dev']}}])
+                # tbot v18 decodes labels as map[string]string; a list value fails at startup.
+                self.assertEqual(svc['selectors'], [{'labels': LABELS}])
 
     @unittest.skipUnless(shutil.which('tbot'), 'tbot not installed')
     def test_selector_labels_match_tbot_v18_schema(self):
@@ -119,7 +119,8 @@ class K8sTbot(unittest.TestCase):
 
     def test_missing_or_unsafe_values_are_refused(self):
         for key, value in (('token', None), ('proxy_server', None), ('name', None), ('name', '../x'),
-                           ('name', 'a/b'), ('name', '')):
+                           ('name', 'a/b'), ('name', ''), ('name', 'tenant%H'),
+                           ('name', '.hidden'), ('name', 'a b')):
             with self.subTest(key=key, value=value):
                 result = self.render(CONFIG_SRC, block('host-a', **{key: value}), check=False)
                 self.assertNotEqual(result.returncode, 0)
@@ -151,7 +152,9 @@ class K8sTbot(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('systemd-analyze'), 'systemd-analyze not installed')
     def test_key_condition_checks_the_configured_directory(self):
-        for name in ('tenant-a', 'tenant%H'):
+        # A name with % would be expanded by systemd but not by tbot; the templates refuse it
+        # (test_missing_or_unsafe_values_are_refused), so check the names they accept.
+        for name in ('tenant-a', 'tenant.a_1'):
             with self.subTest(name=name):
                 data = block('host-a', name=name)
                 cfg = yaml.safe_load(self.render(CONFIG_SRC, data).stdout)
@@ -179,6 +182,12 @@ class K8sTbot(unittest.TestCase):
         self.assertEqual(regenerated['data']['name'], 'N')
         self.assertEqual(regenerated['data'].get('k8s_tbot'),
                          {**HOSTS['host-a'], 'selector_labels': LABELS})
+
+    def test_reinitializing_without_the_block_adds_none(self):
+        self.chezmoi('', 'init', '--promptDefaults')
+        regenerated = yaml.safe_load(self.config.read_text())
+        self.assertNotIn('k8s_tbot', regenerated['data'])
+        self.assertFalse({CONFIG_TARGET, UNIT_TARGET} & self.managed(''))
 
     def test_key_storage_is_never_managed(self):
         for data in ('', block('host-a')):

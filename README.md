@@ -518,7 +518,7 @@ Agents reach Kubernetes clusters through their own Teleport bot identity, never 
 - `~/.config/tbot/k8s-agent.yaml`: the tbot config. It joins with `bound_keypair`, renews 1-hour certificates every 20 minutes, and writes a kubeconfig for clusters that match the selector labels. It sets `disable_exec_plugin: false`, because with `true` DGD creates through the Python Kubernetes client fail with 403.
 - `~/.config/systemd/user/tbot-k8s-agent.service`: a user unit that runs `tbot start --config ~/.config/tbot/k8s-agent.yaml`. It finds `tbot` in `~/.local/bin` or `/usr/local/bin`, and it does not start until the key exists.
 
-The repository is public, so it holds no internal names. Both files deploy only on a host whose `~/.config/chezmoi/chezmoi.yaml` has a `k8s_tbot` block, and every internal value comes from that block:
+The repository is public, so it holds no internal names. Both files deploy only on a host whose `~/.config/chezmoi/chezmoi.yaml` has a `k8s_tbot` block, and every internal value comes from that block. `chezmoi init` keeps the block:
 
 ```yaml
 data:

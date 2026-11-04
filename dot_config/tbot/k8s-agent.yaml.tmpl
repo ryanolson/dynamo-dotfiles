@@ -6,8 +6,9 @@
 {{- range list "name" "proxy_server" "token" -}}
 {{-   if not (get $t .) -}}{{ fail (printf "k8s_tbot.%s must be set" .) }}{{- end -}}
 {{- end -}}
-{{- if or (contains "/" $t.name) (hasPrefix "." $t.name) -}}
-{{-   fail "k8s_tbot.name must be one directory name" -}}
+{{- /* The unit puts the name in a systemd path, where % is a specifier, so allow only plain characters. */ -}}
+{{- if not (regexMatch "^[A-Za-z0-9_-][A-Za-z0-9._-]*$" $t.name) -}}
+{{-   fail "k8s_tbot.name must be one directory name of letters, digits, '.', '_' or '-'" -}}
 {{- end -}}
 {{- /* An empty selector matches every cluster the bot can see, CI and production included. */ -}}
 {{- if not $t.selector_labels -}}{{ fail "k8s_tbot.selector_labels must name at least one label" }}{{- end -}}
@@ -33,5 +34,5 @@ services:
     selectors:
       - labels:
 {{- range $k, $v := $t.selector_labels }}
-          {{ $k | quote }}: [{{ $v | quote }}]
+          {{ $k | quote }}: {{ $v | quote }}
 {{- end }}
