@@ -2,7 +2,7 @@
 
 One TOML file per host says which clusters agents may use and how to reach them. It holds internal names, so it is never committed. It lives at `~/.config/k8s-clusters/profiles.toml`, or at the path in `K8S_CLUSTERS_PROFILES`. Write it from section 3 of the Linear runbook "Runbook: build and run on our Dynamo k8s clusters", and keep it current with the runbook.
 
-`k8s-check`, `k8s-guard` and the `k8s-leases` bb plugin all read this file. `k8s-check profiles` validates it and prints it as JSON, for a reader without a TOML parser.
+`k8s-check`, `k8s-guard` and the `k8s-leases` bb plugin all read this file. `k8s-check --list` validates it and prints it as JSON, for a reader without a TOML parser.
 
 `profiles.example.toml` next to this file is a complete example with made-up names.
 
@@ -19,7 +19,7 @@ One TOML file per host says which clusters agents may use and how to reach them.
 | Key | Type | Meaning |
 |---|---|---|
 | `user` | string | The username `kubectl auth whoami` must print for the bot. Any other identity is refused. |
-| `kubeconfig` | string | The bot's kubeconfig, written by `tbot`. `~` is expanded. `KUBECONFIG` must name exactly this file. |
+| `kubeconfig` | string | The bot's kubeconfig, written by `tbot`. `~` is expanded. `KUBECONFIG` must name exactly this file. A path under `~/.kube` or `~/.tsh` is refused: those hold the owner's own login. |
 | `developer` | string | The value of the `dynamo.nvidia.com/developer` label on our namespaces. |
 | `namespace_prefix` | string | The prefix of every namespace we may write in, ending in `-`. |
 

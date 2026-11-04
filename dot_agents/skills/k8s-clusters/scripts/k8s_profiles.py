@@ -30,6 +30,13 @@ class ProfileError(Exception):
         self.code = code
 
 
+def owner_login(path):
+    """True when path is under ~/.kube or ~/.tsh, where the owner's own credentials live."""
+    real = Path(os.path.realpath(os.path.expanduser(path)))
+    home = Path(os.path.realpath(os.path.expanduser('~')))
+    return any(real == home / d or home / d in real.parents for d in ('.kube', '.tsh'))
+
+
 def profiles_path():
     return Path(os.path.expanduser(os.environ.get('K8S_CLUSTERS_PROFILES') or DEFAULT_PROFILES))
 
@@ -100,7 +107,8 @@ def load_profiles():
     for key in data:
         if key not in ('schema_version', 'bot', 'clusters'):
             errors.append(f'{key} is not a known top-level key')
-    if data.get('schema_version') != SCHEMA_VERSION or isinstance(data.get('schema_version'), bool):
+    # type() and not isinstance(): TOML 1.0 is a float and true is a bool, and both compare equal to 1.
+    if type(data.get('schema_version')) is not int or data['schema_version'] != SCHEMA_VERSION:
         errors.append(f'schema_version must be {SCHEMA_VERSION}')
     bot = data.get('bot')
     if not isinstance(bot, dict):
@@ -117,6 +125,9 @@ def load_profiles():
     prefix = bot.get('namespace_prefix')
     if isinstance(prefix, str) and prefix and not prefix.endswith('-'):
         errors.append('bot.namespace_prefix must end in "-"')
+    kubeconfig = bot.get('kubeconfig')
+    if isinstance(kubeconfig, str) and kubeconfig and owner_login(kubeconfig):
+        errors.append(f'bot.kubeconfig {kubeconfig} is the owner\'s login (~/.kube or ~/.tsh), not the bot\'s')
     clusters = data.get('clusters')
     if not isinstance(clusters, dict) or not clusters:
         errors.append('[clusters.<name>] needs at least one cluster')

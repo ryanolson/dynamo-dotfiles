@@ -77,7 +77,9 @@ class Kubectl:
         # can-i exits 0 for "yes" and 1 for "no"; anything else is an error, not an answer.
         args = ('auth', 'can-i', verb, resource) + (('-n', namespace) if namespace else ())
         rc, out, err = self.run(*args)
-        answer = out.strip()
+        # The answer may carry a reason from the authorizer: "no - <reason>".
+        words = out.split()
+        answer = words[0] if words else ''
         if (rc, answer) in ((0, 'yes'), (1, 'no')):
             return answer
         raise KubectlError(args, rc, err or out)
@@ -105,9 +107,17 @@ def quantity(q):
 def pod_gpus(spec):
     def req(c):
         return quantity(((c.get('resources') or {}).get('requests') or {}).get(GPU, 0))
+    # The scheduler's rule: a restartable init container (a sidecar) runs alongside every later
+    # init container and the main containers; a plain init container runs alone with the sidecars before it.
     main = sum(req(c) for c in spec.get('containers') or [])
-    init = max([req(c) for c in spec.get('initContainers') or []] or [0])
-    return max(main, init)
+    sidecars = peak = 0
+    for c in spec.get('initContainers') or []:
+        if c.get('restartPolicy') == 'Always':
+            sidecars += req(c)
+            peak = max(peak, sidecars)
+        else:
+            peak = max(peak, req(c) + sidecars)
+    return max(main + sidecars, peak)
 
 
 def check_kubeconfig(bot):
@@ -202,7 +212,9 @@ def run_check(report, profiles, cluster, want_crd):
         alloc = quantity(((n.get('status') or {}).get('allocatable') or {}).get(GPU, 0))
         is_gpu_taint = [want_taint is not None and t.get('key') == want_taint['key']
                         and t.get('effect') == want_taint['effect']
-                        and (t.get('value') or '') == (want_taint.get('value') or '') for t in taints]
+                        # No value in the profile means an Exists toleration, which matches any value.
+                        and ('value' not in want_taint or (t.get('value') or '') == want_taint['value'])
+                        for t in taints]
         if want_taint is not None and not any(is_gpu_taint):
             untainted_nodes.append(name)
         product = (n['metadata'].get('labels') or {}).get(GPU_PRODUCT)
