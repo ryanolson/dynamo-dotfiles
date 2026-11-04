@@ -153,6 +153,14 @@ class K8sTbot(unittest.TestCase):
         self.assertFalse({CONFIG_TARGET, UNIT_TARGET} & self.managed(''))
         self.assertLessEqual({CONFIG_TARGET, UNIT_TARGET}, self.managed(block('host-a')))
 
+    def test_reinitializing_preserves_the_host_opt_in(self):
+        self.assertLessEqual({CONFIG_TARGET, UNIT_TARGET}, self.managed(block('host-a')))
+        self.chezmoi(block('host-a'), 'init', '--promptDefaults')
+        regenerated = yaml.safe_load(self.config.read_text())
+        self.assertEqual(regenerated['data']['name'], 'N')
+        self.assertEqual(regenerated['data'].get('k8s_tbot'),
+                         {**HOSTS['host-a'], 'selector_labels': LABELS})
+
     def test_key_storage_is_never_managed(self):
         for data in ('', block('host-a')):
             with self.subTest(opted_in=bool(data)):
