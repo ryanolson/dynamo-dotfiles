@@ -352,6 +352,15 @@ class K8sCheck(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn('kubectl_error', self.codes(out))
 
+    def test_can_i_denial_with_reason_is_no(self):
+        self.scenario['auth can-i create dynamographdeployments.nvidia.com -n default'] = can_i(
+            'no - namespace is outside the bot namespace prefix')
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out['can_i']['outside']['default'], 'no')
+        self.assertEqual(out['failures'], [])
+        self.assert_read_only()
+
     def test_unexpected_cluster_error_fails(self):
         self.scenario['get nodes -l nvidia.com/gpu.present=true -o json'] = {
             'stderr': 'Unable to connect to the server: timeout\n', 'exit': 1}
