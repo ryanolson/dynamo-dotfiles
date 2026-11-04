@@ -306,6 +306,23 @@ class K8sCheck(unittest.TestCase):
                                  'a symlinked owner directory must be refused before contacting the cluster')
                 self.assertIn('profiles_invalid', self.codes(out))
 
+    def test_home_override_cannot_hide_owner_kubeconfig(self):
+        self.profiles.write_text(EXAMPLE.read_text().replace(
+            'kubeconfig = "~/.local/share/tbot/example/kube/kubeconfig.yaml"',
+            f'kubeconfig = "{self.human_kubeconfig}"'))
+        self.env['KUBECONFIG'] = str(self.human_kubeconfig)
+        changed_home = self.tmp / 'scratch-home'
+        changed_home.mkdir()
+        self.env['HOME'] = str(changed_home)
+        self.scenario['auth whoami -o json'] = j({
+            'status': {'userInfo': {'username': 'alice@example.test'}}})
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 1, out)
+        cluster_calls = [c for c in self.calls() if not c['key'].startswith('config ')]
+        self.assertEqual(cluster_calls, [],
+                         'changing HOME must not allow the original owner kubeconfig to contact the cluster')
+        self.assertTrue({'profiles_invalid', 'kubeconfig_not_bot'}.intersection(self.codes(out)), out)
+
     def test_kubeconfig_unset(self):
         # kubectl would fall back to ~/.kube/config, the owner's login.
         del self.env['KUBECONFIG']
