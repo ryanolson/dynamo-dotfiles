@@ -118,7 +118,7 @@ symbol = "☸ "
 style = "cyan bold"
 disabled = false
 
-# nv-prd-dgxc.teleport.sh-dynamo-gcp-dev-02 -> dynamo-gcp-dev-02
+# <tenant>.teleport.sh-<cluster> -> <cluster>
 [[kubernetes.contexts]]
 context_pattern = '.*\.teleport\.sh-(?P<cluster>.+)'
 context_alias = '$cluster'
