@@ -1349,6 +1349,28 @@ class Expire(GuardCase):
         self.assertEqual(body.get('code'), 'lease_not_found')
         self.assertEqual(self.replicas(), [1, 2])
 
+    @unittest.skip("F4: released and torn-down replies incorrectly grant offline teardown authority")
+    def test_terminal_lease_reply_cannot_use_offline_teardown_authority(self):
+        for method in ('expire', 'down'):
+            for state in ('released', 'torn-down'):
+                with self.subTest(method=method, state=state):
+                    self.k8s = {'namespaces': {}, 'objects': {}, 'pods': {}}
+                    self.bb = {'leases': {}}
+                    self.kubectl_log.unlink(missing_ok=True)
+                    past = iso_ms(hours_from_now(-1))
+                    self.add_ns(thread=OTHER, expires_at=past)
+                    lid = self.add_lease(thread=OTHER, state=state, expires_at=past)
+                    self.add_obj(gpu_dgd('w', 2, lid))
+
+                    rc, body, _ = self.guard('--context', CTX, method, NS, '--uid', 'uid-ns-1',
+                                             '--lease', lid, host_entry=True)
+
+                    self.assertEqual(self.bb['leases'][lid]['state'], state)
+                    self.assertEqual(self.writes(), [], body)
+                    self.assertNotEqual(rc, 0, body)
+                    self.assertIn(NS, self.k8s['namespaces'])
+                    self.assertEqual(self.dgd_obj('w')['spec']['components'][1]['replicas'], 1)
+
     def test_owner_cannot_expire_own_active_lease(self):
         self.busy(state='active')
         self.assertEqual(self.expire(host_entry=False, thread=OTHER)[1].get('code'), 'lease_active')
