@@ -5,6 +5,7 @@ refuse the same bad file the same way. Standard library only.
 """
 import os
 from pathlib import Path
+import pwd
 import tomllib
 
 SCHEMA_VERSION = 1
@@ -30,11 +31,31 @@ class ProfileError(Exception):
         self.code = code
 
 
+OWNER_DIRS = ('.kube', '.tsh')
+
+
 def owner_login(path):
-    """True when path is under ~/.kube or ~/.tsh, where the owner's own credentials live."""
-    real = Path(os.path.realpath(os.path.expanduser(path)))
-    home = Path(os.path.realpath(os.path.expanduser('~')))
-    return any(real == home / d or home / d in real.parents for d in ('.kube', '.tsh'))
+    """True when path may be the owner's own login: a file in a .kube or .tsh directory.
+
+    Checks the path as written and as resolved, for any .kube or .tsh component, so
+    neither a symlink nor a changed HOME hides it. Also checks the resolved owner
+    directories of both $HOME and the account's home, for a link whose names say nothing.
+    """
+    given = Path(os.path.abspath(os.path.expanduser(path)))
+    real = Path(os.path.realpath(given))
+    if any(part in OWNER_DIRS for p in (given, real) for part in p.parts):
+        return True
+    homes = {os.path.expanduser('~')}
+    try:
+        homes.add(pwd.getpwuid(os.getuid()).pw_dir)
+    except KeyError:
+        pass
+    for home in homes:
+        for d in OWNER_DIRS:
+            owner = Path(os.path.realpath(os.path.join(home, d)))
+            if real == owner or owner in real.parents:
+                return True
+    return False
 
 
 def profiles_path():

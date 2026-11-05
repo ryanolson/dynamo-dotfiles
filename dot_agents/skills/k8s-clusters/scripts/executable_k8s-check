@@ -77,9 +77,13 @@ class Kubectl:
         # can-i exits 0 for "yes" and 1 for "no"; anything else is an error, not an answer.
         args = ('auth', 'can-i', verb, resource) + (('-n', namespace) if namespace else ())
         rc, out, err = self.run(*args)
-        # The answer may carry a reason from the authorizer: "no - <reason>".
+        # kubectl prints "no - <reason>" and "no - <evaluation error>" in the same form, so
+        # the two cannot be told apart for certain. Fail closed: text that names an error
+        # means the authorizer did not decide, and "no" would claim more than it knows.
         words = out.split()
         answer = words[0] if words else ''
+        if rc == 1 and answer == 'no' and 'error' in out.lower():
+            raise KubectlError(args, rc, out)
         if (rc, answer) in ((0, 'yes'), (1, 'no')):
             return answer
         raise KubectlError(args, rc, err or out)
