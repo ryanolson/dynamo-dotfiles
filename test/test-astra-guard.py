@@ -1486,6 +1486,15 @@ class AdversarialReview(GuardCase):
 
 class PassTwoReview(GuardCase):
 
+    def test_failed_check_after_merge_preserves_the_teardown_patch(self):
+        iid, qid = self.approved()
+        self.merge(iid, qid)
+        self.refused('mr_not_open', 'check', '--mr', str(iid), '--namespace', NS)
+        teardown = 'wcep/TEAM-910-teardown'
+        body = self.ok('teardown', '--deploy-mr', str(iid), '--branch', teardown)
+        self.assertEqual(body['base'], self.main())
+        self.assertEqual(self.gl.file_at(teardown, DEV), DEV_VALUES)
+
     def test_merge_config_refusal_is_logged_and_signed(self):
         iid, qid = self.approved()
         self.config.write_text('project_id = 0\n')
