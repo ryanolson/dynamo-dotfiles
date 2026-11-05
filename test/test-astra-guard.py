@@ -1549,6 +1549,17 @@ class PassTwoReview(GuardCase):
 
 class PassThreeReview(GuardCase):
 
+    def test_merge_refuses_before_writing_when_approval_log_is_unusable(self):
+        iid, qid = self.approved()
+        before = self.main()
+        log = self.state_home / 'astra-guard' / 'approvals.jsonl'
+        log.mkdir()
+        rc, body, err = self.guard('merge', '--mr', str(iid), '--answer', qid)
+        self.assertNotEqual(rc, 0, (body, err))
+        self.assertEqual(self.merges(), [], 'The guard merged before discovering that it cannot audit the merge')
+        self.assertEqual(self.main(), before)
+        self.assertEqual(self.gl.mrs[(PID, iid)]['state'], 'opened')
+
     def test_truncated_resource_header_cannot_hide_a_cluster_scoped_resource(self):
         iid = self.deployed_mr()
         head = self.gl.branch_sha(BRANCH)
