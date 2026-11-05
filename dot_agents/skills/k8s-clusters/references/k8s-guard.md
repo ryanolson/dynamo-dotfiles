@@ -26,8 +26,9 @@ The commands for the namespace's thread (`lease acquire`, `secret`, `apply`, `de
 ## Identity and cluster
 
 - `KUBECONFIG` must name exactly the bot's kubeconfig from the profiles, which the parser allows only under tbot's directory in the account's home. The guard never runs `tsh`.
-- It reads that file once into a memory file sealed against writes (`k8s_profiles.sealed_copy`), and passes it to every `kubectl` call as `/proc/self/fd/<n>`. Replacing or rewriting the file later changes nothing. `kubectl` gets no `KUBECONFIG`, no `KUBECTL_*` variable, and `KUBECTL_KUBERC=false`.
-- Before any cluster call, `kubectl config view` (local) must show that the context's user holds only a client certificate or exactly the exec plugin tbot writes: an installed tbot (`/usr/local/bin/tbot` or `~/.local/bin/tbot`) with `kube credentials --destination-dir=<the kubeconfig's directory>`. A token, an impersonation, or another exec command such as `tsh` is refused with `kubeconfig_credentials`.
+- Each run calls `k8s_profiles.prepare_bot_kubeconfig`. It finds the installed `kubectl` ELF binary whose sha256 is the profile's `[bot] kubectl_sha256`, never one found on `PATH`. It renders a kubeconfig for the one context from an allowlist of tbot's fields, with tbot's exec plugin replaced by a credential snapshot taken now (the certificate lives about an hour). The result sits in a memory file sealed against writes.
+- Every `kubectl` call uses that `kubectl`, the rendered file as `/proc/self/fd/<n>`, no `KUBECONFIG`, no `KUBECTL_*` variable, and `KUBECTL_KUBERC=false`.
+- The renderer's refusals keep their codes: `kubectl_not_found`, `kubectl_mismatch`, `kubeconfig_not_bot`, `kubectl_error`, `context_missing`, `kubeconfig_credentials`, `credentials_expired`. The rules are in `references/profiles.md` and `SKILL.md` ("Threat model").
 - `--context` must equal the `context` of one profile. A profile with `allowed = "never"` is refused. A profile with `bot_can_write = false` allows only `inspect`.
 - The guard calls the lease plugin with the profile name (the `[clusters.<name>]` key), and checks that a lease's `cluster` equals it.
 

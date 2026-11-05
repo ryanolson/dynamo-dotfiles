@@ -40,7 +40,7 @@ import time
 # -I drops the script directory from sys.path; the shared parser lives next to this script.
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from k8s_profiles import ProfileError, bot_credential_problem, kubectl_env, load_profiles, sealed_copy  # noqa: E402
+from k8s_profiles import ProfileError, kubectl_env, load_profiles, prepare_bot_kubeconfig  # noqa: E402
 from k8s_guard_rules import (  # noqa: E402
     DGD_KIND, HOSTNAME_TOPOLOGY, LEASE_LABEL, LEASE_RECORD, NS_UID_LABEL, Refusal, admit, allocation,
     budget_allocation, check_gpu_product, check_one_node, dgd_gpus, gpu_pod_summary, zero_patch)
@@ -133,21 +133,23 @@ def parse_time(value, what):
 # --- kubectl --------------------------------------------------------------------
 
 class Kubectl:
-    """kubectl on one sealed copy of the bot kubeconfig and one context, as k8s-check does it.
+    """The pinned kubectl on a kubeconfig rendered for one context, through k8s_profiles.
 
-    k8s_profiles.sealed_copy reads the file once into a memfd sealed against writes; every call,
-    the credential check's config view included, reads it through /proc/self/fd/<n>. Replacing or
-    rewriting the file on disk changes nothing. The environment has no KUBECONFIG, no KUBECTL_* and
-    kuberc off (k8s_profiles.kubectl_env), so nothing adds a --token.
+    prepare_bot_kubeconfig finds the installed kubectl ELF binary whose sha256 is the profile's pin,
+    keeps only tbot's fields of the bot kubeconfig, and replaces tbot's exec plugin with a credential
+    snapshot taken now, in a memfd sealed against writes. So each guard run takes a fresh snapshot
+    (the certificate lives about an hour). Every call uses that kubectl, /proc/self/fd/<n> of that
+    memfd, and kubectl_env(): no KUBECONFIG, no KUBECTL_*, kuberc off.
     """
 
-    def __init__(self, kubeconfig, context):
+    def __init__(self, bot, context):
         try:
-            self.fd = sealed_copy(kubeconfig)
+            kubectl, self.fd = prepare_bot_kubeconfig(bot['kubeconfig'], context, bot['kubectl_sha256'])
         except ProfileError as e:
+            # kubectl_not_found, kubectl_mismatch, kubeconfig_not_bot, kubectl_error, context_missing,
+            # kubeconfig_credentials or credentials_expired: the guard refuses with the same code.
             raise Refusal(e.code, str(e))
-        pinned = f'/proc/self/fd/{self.fd}'
-        self.base = ['kubectl', '--kubeconfig', pinned, '--context', context]
+        self.base = [kubectl, '--kubeconfig', f'/proc/self/fd/{self.fd}', '--context', context]
         self.env = kubectl_env()
 
     def run(self, *args, input=None, timeout=KUBECTL_TIMEOUT):
@@ -277,13 +279,7 @@ class Guard:
             raise Refusal('kubeconfig_not_bot', 'KUBECONFIG lists more than one file; name only the bot kubeconfig')
         if os.path.realpath(value) != bot_path:
             raise Refusal('kubeconfig_not_bot', f'KUBECONFIG is {value}, not the bot kubeconfig {bot_path}')
-        self.kc = Kubectl(bot_path, self.context)
-        # Local: config view reads the pinned file and runs no credential plugin. Only tbot's exec
-        # plugin or a client certificate may sign the context's requests.
-        view = self.kc.json('config', 'view', '-o', 'json')
-        problem = bot_credential_problem(view, self.context, self.bot["kubeconfig"])
-        if problem:
-            raise Refusal('kubeconfig_credentials', problem)
+        self.kc = Kubectl(self.bot, self.context)
 
     def require_writable(self):
         if not self.profile.get('bot_can_write'):

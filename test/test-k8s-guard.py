@@ -75,7 +75,7 @@ while i < len(argv):
     a = argv[i]
     if a.startswith('--') and '=' in a and a.split('=', 1)[0] in VALUED:
         k, v = a.split('=', 1); flags[k] = v; i += 1
-    elif a in VALUED:
+    elif a in VALUED and not (a == '--raw' and (i + 1 >= len(argv) or argv[i + 1].startswith('-'))):
         flags[a] = argv[i + 1]; i += 2
     else:
         pos.append(a); i += 1
@@ -452,8 +452,28 @@ class Entry:
     def __init__(self, entry):
         self.pw_name, self.pw_uid, self.pw_dir = entry.pw_name, entry.pw_uid, os.environ['FAKE_PW_DIR']
 pwd.getpwuid = lambda uid: Entry(real(uid))
+# The fake kubectl is a script; the real rule (an ELF binary at a fixed path) is unit-tested in
+# test-k8s-render.py. The pin (sha256) is still checked, against the fake.
+sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[1])))
+import k8s_profiles
+k8s_profiles.KUBECTL_INSTALLS = (os.environ['FAKE_KUBECTL'],)
+k8s_profiles.is_elf = lambda path: True
 sys.argv = sys.argv[1:]
 runpy.run_path(sys.argv[0], run_name='__main__')
+'''
+
+# tbot v18.7.6 `kube credentials`, as in test-k8s-check.py: prints an ExecCredential with a PEM
+# cert and key. Each run is logged, so a test can count the snapshots.
+FAKE_TBOT = r'''#!/usr/bin/env python3
+import json, os, sys
+from datetime import datetime, timedelta, timezone
+assert len(sys.argv) == 4 and sys.argv[1:3] == ['kube', 'credentials'], sys.argv
+open(os.environ['FAKE_TBOT_LOG'], 'a').write('snapshot\n')
+expiry = (datetime.now(timezone.utc) + timedelta(seconds=3600)).strftime('%Y-%m-%dT%H:%M:%SZ')
+print(json.dumps({'kind': 'ExecCredential', 'apiVersion': 'client.authentication.k8s.io/v1beta1', 'spec': {},
+                  'status': {'expirationTimestamp': expiry,
+                             'clientCertificateData': '-----BEGIN CERTIFICATE-----\nbot-example-agent\n-----END CERTIFICATE-----\n',
+                             'clientKeyData': '-----BEGIN PRIVATE KEY-----\nmade-up-key\n-----END PRIVATE KEY-----\n'}}))
 '''
 
 
@@ -464,7 +484,8 @@ def kubeconfig(tbot, user=None, contexts=(CTX, CTX_QA, CTX_B200), destination=No
         'args': ['kube', 'credentials', f'--destination-dir={destination}']}}
     return json.dumps({
         'apiVersion': 'v1', 'kind': 'Config',
-        'clusters': [{'name': 'example', 'cluster': {'server': 'https://proxy.example.test'}}],
+        'clusters': [{'name': 'example', 'cluster': {'server': 'https://proxy.example.test:443',
+                                                     'certificate-authority-data': 'Q0E='}}],
         'contexts': [{'name': c, 'context': {'cluster': 'example', 'user': 'bot'}} for c in contexts],
         'users': [{'name': 'bot', 'user': user}]})
 
@@ -556,7 +577,7 @@ class GuardCase(unittest.TestCase):
         # tbot as the dotfiles install it for one user, in the (fake) passwd home.
         self.tbot = self.home / '.local/bin/tbot'
         self.tbot.parent.mkdir(parents=True)
-        self.tbot.write_text('#!/bin/sh\nexit 0\n')
+        self.tbot.write_text(FAKE_TBOT)
         self.tbot.chmod(0o755)
         self.bot_kubeconfig.write_text(kubeconfig(str(self.tbot), destination=self.bot_kubeconfig.parent))
         self.runner = self.tmp / 'runner.py'
@@ -567,9 +588,14 @@ class GuardCase(unittest.TestCase):
             p.write_text('apiVersion: v1\nkind: Config\n')
         self.bin = self.tmp / 'bin'
         self.bin.mkdir()
-        for name, body in (('kubectl', FAKE_KUBECTL), ('bb', FAKE_BB), ('fleet', FAKE_FLEET), ('tsh', FAKE_TSH)):
+        for name, body in (('bb', FAKE_BB), ('fleet', FAKE_FLEET), ('tsh', FAKE_TSH)):
             (self.bin / name).write_text(body)
             (self.bin / name).chmod(0o755)
+        # The fake kubectl is NOT on PATH: only the pinned path from k8s_profiles can run it.
+        self.kubectl_path = self.tmp / 'pinned/kubectl'
+        self.kubectl_path.parent.mkdir()
+        self.kubectl_path.write_text(FAKE_KUBECTL)
+        self.kubectl_path.chmod(0o755)
         self.profiles = self.tmp / 'profiles.toml'
         self.profiles.write_text(EXAMPLE.read_text() + EXTRA_PROFILE)
         self.storage = self.tmp / 'thread-storage'
@@ -583,6 +609,8 @@ class GuardCase(unittest.TestCase):
         self.tsh_log = self.tmp / 'tsh.log'
         self.k8s = {'namespaces': {}, 'objects': {}, 'pods': {}}
         self.bb = {'leases': {}}
+        self.kubectl_pin = None
+        self.tbot_log = self.tmp / 'tbot.log'
         self.flush()
 
     def tearDown(self):
@@ -590,7 +618,8 @@ class GuardCase(unittest.TestCase):
         for call in self.kubectl_calls():
             # The pinned bot kubeconfig, a context, no KUBECONFIG and kuberc off on every call.
             self.assertTrue(call['flags'].get('--kubeconfig', '').startswith('/proc/self/fd/'), call)
-            self.assertIn('--context', call['flags'], call)
+            if call['pos'][:2] != ['config', 'view']:  # the renderer's local read takes no context
+                self.assertIn('--context', call['flags'], call)
             self.assertEqual(call['env'], {'KUBECONFIG': None, 'KUBECTL_KUBERC': 'false'}, call)
 
     # --- world -------------------------------------------------------------
@@ -641,7 +670,16 @@ class GuardCase(unittest.TestCase):
 
     # --- running ----------------------------------------------------------
 
+    def pin_kubectl(self):
+        """Write the fake kubectl's sha256 into the profiles, as the real pin is written per host."""
+        import hashlib
+        import re
+        pin = self.kubectl_pin or hashlib.sha256(self.kubectl_path.read_bytes()).hexdigest()
+        self.profiles.write_text(re.sub(r'kubectl_sha256 = "[0-9a-f]*"', f'kubectl_sha256 = "{pin}"',
+                                        self.profiles.read_text()))
+
     def env(self, thread=ME, host_entry=False, kubeconfig=None, storage=True):
+        self.pin_kubectl()
         env = {'PATH': f'{self.bin}:/usr/bin:/bin', 'HOME': str(self.home),
                'K8S_CLUSTERS_PROFILES': str(self.profiles),
                'KUBECONFIG': str(kubeconfig or self.bot_kubeconfig),
@@ -650,7 +688,8 @@ class GuardCase(unittest.TestCase):
                'FAKE_BB_STATE': str(self.bb_state), 'FAKE_BB_LOG': str(self.bb_log),
                'FAKE_FLEET_LOG': str(self.fleet_log), 'FAKE_TSH_LOG': str(self.tsh_log),
                'FAKE_SECRET': SECRET, 'K8S_GUARD_DOWN_WAIT_SECONDS': '0', 'K8S_GUARD_POLL_SECONDS': '0',
-               'FAKE_PW_DIR': str(self.home),
+               'FAKE_PW_DIR': str(self.home), 'FAKE_KUBECTL': str(self.kubectl_path),
+               'FAKE_TBOT_LOG': str(self.tbot_log),
                # The caller's kubectl settings must never reach kubectl.
                'KUBECTL_KUBERC': 'true', 'KUBECTL_EXPLAIN_OPENAPIV3': 'true'}
         if storage is False:
@@ -793,7 +832,7 @@ class Identity(GuardCase):
         if json.load(open(flags['--kubeconfig'])).get('rewritten'):
             fail('fake kubectl: read the rewritten kubeconfig', 96)""", 1)
         self.assertNotEqual(fake, FAKE_KUBECTL)
-        (self.bin / 'kubectl').write_text(fake)
+        self.kubectl_path.write_text(fake)
         env = self.env()
         env['FAKE_BOT_KUBECONFIG'] = str(self.bot_kubeconfig)
         p = subprocess.run(['python3', '-I', str(self.runner), str(GUARD), '--context', CTX, 'inspect', NS], env=env,
@@ -801,10 +840,31 @@ class Identity(GuardCase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn('rewritten', self.bot_kubeconfig.read_text())
 
+    def test_kubectl_pin_mismatch_refused_before_any_call(self):
+        self.add_ns()
+        self.kubectl_pin = 'f' * 64
+        self.refused('kubectl_mismatch', '--context', CTX, 'inspect', NS)
+        self.assertEqual(self.kubectl_calls(), [])
+
+    def test_each_run_takes_a_fresh_snapshot_and_kubectl_sees_no_exec_plugin(self):
+        self.add_ns()
+        hook = """if what == 'namespace':
+        cfg = json.load(open(flags['--kubeconfig']))
+        st.setdefault('users_seen', []).append(cfg['users'][0]['user'])
+        save()"""
+        fake = FAKE_KUBECTL.replace("if what == 'namespace':", hook, 1)
+        self.assertNotEqual(fake, FAKE_KUBECTL)
+        self.kubectl_path.write_text(fake)
+        self.ok('--context', CTX, 'inspect', NS)
+        self.ok('--context', CTX, 'inspect', NS)
+        self.assertEqual(self.tbot_log.read_text().split(), ['snapshot', 'snapshot'])
+        for user in self.k8s['users_seen']:
+            self.assertEqual(set(user), {'client-certificate-data', 'client-key-data'}, user)
+
     def test_context_missing_from_kubeconfig_refused(self):
         self.add_ns()
         self.bot_kubeconfig.write_text(kubeconfig(str(self.tbot), contexts=(CTX_QA,), destination=self.bot_kubeconfig.parent))
-        self.refused('kubeconfig_credentials', '--context', CTX, 'inspect', NS)
+        self.refused('context_missing', '--context', CTX, 'inspect', NS)
         self.assertEqual([c['pos'][:2] for c in self.kubectl_calls()], [['config', 'view']])
 
     def test_two_kubeconfigs_refused(self):
@@ -1272,7 +1332,7 @@ class Budget(GuardCase):
             fail('Error from server (InternalError): second apply request failed')"""
         fake = FAKE_KUBECTL.replace('for obj in docs(stdin):', hook)
         self.assertNotEqual(fake, FAKE_KUBECTL)
-        (self.bin / 'kubectl').write_text(fake)
+        self.kubectl_path.write_text(fake)
         running = gpu_dgd('w', 4, 'lse_none0001')
         stopped = gpu_dgd('w', 4, 'lse_none0001', replicas=0)
 
@@ -1440,7 +1500,7 @@ class Budget(GuardCase):
         save()"""
         fake = FAKE_KUBECTL.replace("if cmd == 'apply':", hook, 1)
         self.assertNotEqual(fake, FAKE_KUBECTL)
-        (self.bin / 'kubectl').write_text(fake.replace(hook, hook + "\n    st = json.load(open(STATE))", 1))
+        self.kubectl_path.write_text(fake.replace(hook, hook + "\n    st = json.load(open(STATE))", 1))
         rc, body, _ = self.apply(gpu_dgd('w', 1, lid))
         self.assertEqual(body.get('code'), 'uid_mismatch', body)
         self.assertEqual(self.writes(), [])
@@ -1891,7 +1951,7 @@ class DownClassificationRaces(GuardCase):
         foreign_pod = pod('shared', 2, name='foreign-running')
         hook = hook.replace('REPLACEMENT', repr(replacement)).replace('FOREIGN_POD', repr(foreign_pod))
         self.assertEqual(FAKE_KUBECTL.count(anchor), 1)
-        (self.bin / 'kubectl').write_text(FAKE_KUBECTL.replace(anchor, hook, 1))
+        self.kubectl_path.write_text(FAKE_KUBECTL.replace(anchor, hook, 1))
 
         rc, body = self.down_waiting(NS, '--uid', 'uid-ns-1', '--lease', lid, host_entry=True)
 
@@ -1921,7 +1981,7 @@ class DownClassificationRaces(GuardCase):
         st['pods'][ns] = [st['replacement_pod']]
 """ + anchor
         self.assertEqual(FAKE_KUBECTL.count(anchor), 1)
-        (self.bin / 'kubectl').write_text(FAKE_KUBECTL.replace(anchor, hook, 1))
+        self.kubectl_path.write_text(FAKE_KUBECTL.replace(anchor, hook, 1))
 
         rc, body = self.down_waiting(NS, '--uid', 'uid-ns-1', '--lease', lid, host_entry=True)
 
@@ -1952,7 +2012,7 @@ class DownClassificationRaces(GuardCase):
         st['owned_pods_after_dgd_delete'] = copy.deepcopy(st['pods'][ns])
 """
         self.assertEqual(FAKE_KUBECTL.count(anchor), 1)
-        (self.bin / 'kubectl').write_text(FAKE_KUBECTL.replace(anchor, hook, 1))
+        self.kubectl_path.write_text(FAKE_KUBECTL.replace(anchor, hook, 1))
 
         rc, body = self.down_waiting(NS, '--uid', 'uid-ns-1', '--lease', lid, host_entry=True)
 
@@ -2044,7 +2104,7 @@ class Extend(GuardCase):
         save()"""
         fake = FAKE_KUBECTL.replace("if what == 'configmap':", hook)
         self.assertNotEqual(fake, FAKE_KUBECTL)
-        (self.bin / 'kubectl').write_text(fake)
+        self.kubectl_path.write_text(fake)
 
         rc, body, _ = self.guard('--context', CTX, 'extend', NS, '--uid', 'uid-ns-1', '--lease', lid,
                                  host_entry=True)
@@ -2086,7 +2146,7 @@ class Extend(GuardCase):
         lid = self.add_lease(thread=OTHER, expires_at='2026-11-05T03:00:00.000Z')
         self.bb['leases'][lid]['expires_at'] = '2026-11-05T04:00:00.000Z'
         # Another writer changed the record after the guard read it: the fake's stored version moves on.
-        (self.bin / 'kubectl').write_text(FAKE_KUBECTL.replace(
+        self.kubectl_path.write_text(FAKE_KUBECTL.replace(
             "if cmd == 'replace':", "if cmd == 'replace':\n    st['objects'][ns_flag]['ConfigMap/' + "
                                     "'wcep-agent-lease']['metadata']['resourceVersion'] = 'moved'"))
         self.flush()
@@ -2217,7 +2277,7 @@ class Secrets(GuardCase):
         leaky = FAKE_KUBECTL.replace("fail(f'Error from server (Forbidden): fake forbids \"{needle}\"')",
                                      "fail('Error from server (Forbidden): ' + stdin)")
         self.assertNotEqual(leaky, FAKE_KUBECTL)
-        (self.bin / 'kubectl').write_text(leaky)
+        self.kubectl_path.write_text(leaky)
         rc, body, p = self.guard('--context', CTX, '-n', NS, 'secret', 'hf')
         self.assertNotEqual(rc, 0)
         self.assert_no_leak(p)
@@ -2231,7 +2291,7 @@ class Secrets(GuardCase):
             "fail(f'Error from server (Forbidden): fake forbids \"{needle}\"')",
             "fail('x' * 580 + stdin)")
         self.assertNotEqual(leaky, FAKE_KUBECTL)
-        (self.bin / 'kubectl').write_text(leaky)
+        self.kubectl_path.write_text(leaky)
 
         rc, body, p = self.guard('--context', CTX, '-n', NS, 'secret', 'hf')
 
@@ -2337,7 +2397,7 @@ class SlotWriteWindows(GuardCase):
         fake = fake.replace("if what == 'pods':", "if what == 'pods':\n"
                             "        st['elapsed_seconds'] = 75\n        save()", 1)
         self.assertNotEqual(fake, FAKE_KUBECTL)
-        (self.bin / 'kubectl').write_text(fake)
+        self.kubectl_path.write_text(fake)
         # Model bounded calls: dry run 45s, DGD read 15s, pod read 15s, final UID read 50s.
         launcher = self.tmp / 'slot-clock.py'
         launcher.write_text(RUNNER.split('sys.argv = sys.argv[1:]')[0] + """import json, os, runpy, sys
@@ -2397,7 +2457,7 @@ class PartialApplyFailures(GuardCase):
             fail('Error from server (InternalError): old shrink failed; later objects still applied')
     emit(out[0]""", 1)
         self.assertNotEqual(fake, FAKE_KUBECTL)
-        (self.bin / 'kubectl').write_text(fake)
+        self.kubectl_path.write_text(fake)
 
         rc, body, _ = self.apply(gpu_dgd('old', 4, lid, replicas=0), gpu_dgd('new', 4, lid))
 
@@ -2437,7 +2497,7 @@ class NamespaceWriteWindows(GuardCase):
             emit(reply)""".replace('REPLACEMENT', repr(replacement))
                 fake = FAKE_KUBECTL.replace("if what == 'namespace':", hook, 1)
                 self.assertNotEqual(fake, FAKE_KUBECTL)
-                (self.bin / 'kubectl').write_text(fake)
+                self.kubectl_path.write_text(fake)
 
                 rc, body, _ = self.guard('--context', CTX, method, NS, '--uid', 'uid-ns-1', '--lease', lid,
                                          host_entry=True)
@@ -2520,7 +2580,7 @@ def logical_now():
         fake = fake.replace("            st['objects'][ns_flag][key(merged)] = merged",
                             "            st['objects'][ns_flag][key(merged)] = merged\n            save()", 1)
         self.assertNotEqual(fake, FAKE_KUBECTL)
-        (self.bin / 'kubectl').write_text(fake)
+        self.kubectl_path.write_text(fake)
         manifest = self.manifest(*(gpu_dgd(name, 1, lid) for name in ('first', 'second', 'late')))
 
         p = subprocess.run(['python3', '-I', str(launcher), str(GUARD), '--context', CTX, '-n', NS,
@@ -2580,7 +2640,7 @@ class SelftestFences(GuardCase):
                     fake = fake.replace("if cmd == 'delete' and '--raw' in flags:", """if cmd == 'delete' and '--raw' in flags:
     fail('Error from server (UnsupportedMediaType): unsupported Content-Type for DeleteOptions')""", 1)
                     self.assertNotEqual(fake, FAKE_KUBECTL)
-                (self.bin / 'kubectl').write_text(fake)
+                self.kubectl_path.write_text(fake)
 
                 rc, body, _ = self.guard('--context', CTX, '-n', NS, 'selftest', 'fences')
 
@@ -2592,7 +2652,7 @@ class SelftestFences(GuardCase):
         fake = FAKE_KUBECTL.replace("        if o['metadata']['uid'] != want:\n            fail('Error from server (Conflict): Precondition failed')",
                                     "        pass", 1)
         self.assertNotEqual(fake, FAKE_KUBECTL)
-        (self.bin / 'kubectl').write_text(fake)
+        self.kubectl_path.write_text(fake)
         body = self.refused('fence_failed', '--context', CTX, '-n', NS, 'selftest', 'fences')
         self.assertFalse(body['all_held'])
         self.assertEqual([p['refused'] for p in body['probes']], [True, True, False, True, True])
