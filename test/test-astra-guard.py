@@ -1892,5 +1892,24 @@ class RedesignReview(GuardCase):
         self.assertEqual(self.gl.mrs[(PID, iid)]['state'], 'opened')
 
 
+class RoundTwoReview(GuardCase):
+
+    def test_json_exponent_cannot_change_to_a_string_outside_our_entries(self):
+        base = rules.load_values(DEV_VALUES)
+        base['itSetting'] = 1000.0
+        base_text = json.dumps(base).replace('1000.0', '1e3')
+        head = json.loads(base_text)
+        head['itSetting'] = '1e3'
+        head['mockerRepros'] = rules.load_values(dev_deploy())['mockerRepros']
+        head_text = json.dumps(head)
+        self.assertIsInstance(json.loads(base_text)['itSetting'], float)
+        self.assertIsInstance(json.loads(head_text)['itSetting'], str)
+        self.gl.commit(PID, 'main', {DEV: base_text})
+        self.gl.commit(PID, BRANCH, {DEV: head_text}, parent=self.main())
+        iid = self.open()
+
+        self.refused('outside_entries', 'check', '--mr', str(iid), '--namespace', NS)
+
+
 if __name__ == '__main__':
     unittest.main()
