@@ -323,6 +323,36 @@ class K8sCheck(unittest.TestCase):
                          'changing HOME must not allow the original owner kubeconfig to contact the cluster')
         self.assertTrue({'profiles_invalid', 'kubeconfig_not_bot'}.intersection(self.codes(out)), out)
 
+    def test_symlink_parent_path_cannot_hide_owner_kubeconfig(self):
+        changed_home = self.tmp / 'changed-home'
+        changed_home.mkdir()
+        for directory in ('.kube', '.tsh'):
+            owner_directory = self.home / directory
+            (owner_directory / 'nested').mkdir(parents=True)
+            owner_config = owner_directory / 'config'
+            owner_config.write_text('apiVersion: v1\nkind: Config\n')
+            link = self.home / (directory[1:] + '-alias')
+            link.symlink_to(owner_directory / 'nested', target_is_directory=True)
+            supplied = link / '..' / 'config'
+            self.assertTrue(supplied.samefile(owner_config))
+            self.profiles.write_text(EXAMPLE.read_text().replace(
+                'kubeconfig = "~/.local/share/tbot/example/kube/kubeconfig.yaml"',
+                f'kubeconfig = "{supplied}"'))
+            self.env['KUBECONFIG'] = str(supplied)
+            self.scenario['auth whoami -o json'] = j({
+                'status': {'userInfo': {'username': 'alice@example.test'}}})
+            for home in (self.home, changed_home):
+                with self.subTest(directory=directory, changed_home=home != self.home):
+                    if self.log.exists():
+                        self.log.unlink()
+                    self.env['HOME'] = str(home)
+                    rc, out = self.run_check('lab-arm-a')
+                    self.assertEqual(rc, 1, out)
+                    cluster_calls = [c['key'] for c in self.calls() if not c['key'].startswith('config ')]
+                    self.assertEqual(cluster_calls, [],
+                                     'resolving symlinks before .. reaches the owner kubeconfig')
+                    self.assertIn('profiles_invalid', self.codes(out))
+
     def test_kubeconfig_unset(self):
         # kubectl would fall back to ~/.kube/config, the owner's login.
         del self.env['KUBECONFIG']
