@@ -1383,6 +1383,16 @@ class PureRules(unittest.TestCase):
 
 class AdversarialReview(GuardCase):
 
+    def test_it_values_cannot_change_from_a_boolean_to_a_number(self):
+        base = DEV_VALUES + 'itFeature: true\n'
+        head = dev_deploy(base).replace('itFeature: true', 'itFeature: 1')
+        self.assertIs(rules.load_values(base)['itFeature'], True)
+        self.assertIs(type(rules.load_values(head)['itFeature']), int)
+        self.gl.commit(PID, 'main', {DEV: base})
+        self.gl.commit(PID, BRANCH, {DEV: head}, parent=self.main())
+        iid = self.open()
+        self.refused('outside_entries', 'check', '--mr', str(iid), '--namespace', NS)
+
     def test_dev_cannot_request_a_mig_gpu(self):
         entry = DEV_ENTRY.replace('requests: { cpu: "1", memory: "2Gi" }',
                                   'requests: { cpu: "1", memory: "2Gi" }\n'
