@@ -1142,6 +1142,19 @@ class Budget(GuardCase):
                 self.assertEqual(body.get('code'), 'one_node_required', body)
         self.assertEqual(self.writes(), [])
 
+    @unittest.skip("F3: nodeName bypasses the affinity check and permits two nodes on a single-node lease")
+    def test_node_name_cannot_bypass_single_node_lease(self):
+        lid = self.add_lease(gpus=2, multi_node=False)
+        first = component('first', gpus=1, lease_id=lid)
+        second = component('second', gpus=1, lease_id=lid)
+        first['podTemplate']['spec']['nodeName'] = 'gpu-node-a'
+        second['podTemplate']['spec']['nodeName'] = 'gpu-node-b'
+
+        rc, body, _ = self.apply(dgd('w', first, second))
+
+        self.assertEqual(self.writes(), [], body)
+        self.assertNotEqual(rc, 0, body)
+
     def test_larger_than_one_node_refused_without_multi_node(self):
         lid = self.add_lease(gpus=8)
         rc, body, _ = self.apply(gpu_dgd('big', 4, lid, replicas=2))  # 8 GPUs, 4 per node
