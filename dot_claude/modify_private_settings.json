@@ -1,13 +1,18 @@
 #!/bin/bash
 # Claude Code adds a Co-Authored-By trailer and a PR attribution line unless this
 # setting is empty, and a rule in AGENTS.md cannot stop it. Claude Code owns the
-# rest of this file (model, plugins, permissions), so set only this key.
+# rest of this file (model, plugins, permissions), so set only these keys.
+# The wce marketplace needs autoUpdate for its plugin to update itself; it is set only
+# when the entry exists, because the entry needs a source that Claude Code records.
 set -euo pipefail
 exec python3 -I -c '
 import json, sys
 text = sys.stdin.read()
 settings = json.loads(text) if text.strip() else {}
 settings["attribution"] = {"commit": "", "pr": ""}
+wce = settings.get("extraKnownMarketplaces", {}).get("wce")
+if wce is not None:
+    wce["autoUpdate"] = True
 json.dump(settings, sys.stdout, indent=2)
 sys.stdout.write("\n")
 '
