@@ -1,0 +1,48 @@
+# Example cluster profiles, schema 1 (see profiles.md). Every name here is made up.
+# The real file is ~/.config/k8s-clusters/profiles.toml, written from the Linear runbook.
+schema_version = 1
+
+[bot]
+user = "bot-example-agent"
+kubeconfig = "~/.local/share/tbot/example/kube/kubeconfig.yaml"
+developer = "alice"
+namespace_prefix = "dyntest-alice-"
+# sha256sum of the kubectl binary on this host (made up here); k8s-check refuses any other kubectl.
+kubectl_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[clusters.lab-arm-a]
+context = "proxy.example.test-lab-arm-a"
+allowed = "first-choice"
+source = ["ops inventory page, 2026-01-01", "ops config repo clusters/lab-arm-a/README.md"]
+bot_can_write = true
+arch = "arm64"
+gpu_product = "NVIDIA-GB300"
+gpu_type = "gb300"
+gpus_per_node = 4
+gpu_taint = { key = "nvidia.com/gpu", value = "true", effect = "NoSchedule" }
+storage_class = "example-rwx"
+model_cache = "shared-model-cache"
+pull_secret = "example-pull-secret"
+reaper = true
+operator_namespace = "dynamo-system"
+
+[clusters.lab-x86-qa]
+context = "proxy.example.test-lab-x86-qa"
+allowed = "qa-idle"
+source = ["ops inventory page, 2026-01-01"]
+bot_can_write = false
+arch = "amd64"
+gpu_product = "NVIDIA-H200"
+gpu_type = "h200"
+gpus_per_node = 8
+storage_class = "example-rwo"
+model_cache = ""
+pull_secret = ""
+reaper = false
+operator_namespace = "dynamo-system"
+notes = "Read only for the bot."
+
+[clusters.lab-ci]
+context = "proxy.example.test-lab-ci"
+allowed = "never"
+source = ["ops shared cluster guide"]

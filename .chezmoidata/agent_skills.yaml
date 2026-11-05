@@ -15,6 +15,7 @@ agent_skills:
   - gh-comment-ledger
   - gh-pr-description
   - hot-paths
+  - k8s-clusters
   - linear-work
   - phone-a-friend
   - pr-babysitter

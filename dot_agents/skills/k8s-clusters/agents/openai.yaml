@@ -1,0 +1,4 @@
+interface:
+  display_name: "Kubernetes clusters"
+  short_description: "Reach the shared GPU clusters as the agents' bot, and check access read only."
+  default_prompt: "Use $k8s-clusters to check read-only access to this cluster."
