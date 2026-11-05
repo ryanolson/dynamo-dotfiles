@@ -9,6 +9,7 @@ Every name here is made up. The real profiles file is never read: HOME,
 K8S_CLUSTERS_PROFILES and KUBECONFIG all point into a temporary directory.
 """
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -32,7 +33,7 @@ MUTATING = {'create', 'apply', 'delete', 'patch', 'label', 'annotate', 'scale', 
 READ_ONLY = {('config', 'view'), ('auth', 'whoami'), ('auth', 'can-i'), 'get'}
 
 FAKE_KUBECTL = r'''#!/usr/bin/env python3
-import json, os, sys
+import hashlib, json, os, sys
 argv = sys.argv[1:]
 flags, rest, i = {}, [], 0
 while i < len(argv):
@@ -46,7 +47,8 @@ while i < len(argv):
         flags[name] = a.split('=', 1)[1]; i += 1
 with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:
     log.write(json.dumps({'argv': argv, 'flags': flags, 'key': ' '.join(rest),
-                          'kubeconfig_real': os.path.realpath(flags.get('--kubeconfig', '')),
+                          'kubeconfig_sha': hashlib.sha256(open(flags['--kubeconfig'], 'rb').read()).hexdigest()
+                          if '--kubeconfig' in flags else None,
                           'env_kuberc': os.environ.get('KUBECTL_KUBERC'),
                           'env_kubeconfig': os.environ.get('KUBECONFIG')}) + '\n')
 if rest == ['config', 'view', '-o', 'json']:
@@ -103,10 +105,10 @@ def pod(ns, name, node_name, gpus, phase='Running', init_gpus=0):
     return {'metadata': {'namespace': ns, 'name': name}, 'spec': spec, 'status': {'phase': phase}}
 
 
-def kubeconfig(contexts=(CTX, 'proxy.example.test-lab-x86-qa'), user=None):
+def kubeconfig(tbot, contexts=(CTX, 'proxy.example.test-lab-x86-qa'), user=None):
     """A bot kubeconfig as tbot writes it with its exec plugin on, in JSON (also valid YAML)."""
     user = user if user is not None else {'exec': {
-        'apiVersion': 'client.authentication.k8s.io/v1beta1', 'command': '/usr/local/bin/tbot',
+        'apiVersion': 'client.authentication.k8s.io/v1beta1', 'command': tbot,
         'args': ['kube', 'credentials', '--destination-dir=/example/kube']}}
     return json.dumps({
         'apiVersion': 'v1', 'kind': 'Config',
@@ -162,7 +164,12 @@ class K8sCheck(unittest.TestCase):
         self.home = self.tmp / 'home'
         self.bot_kubeconfig = self.home / '.local/share/tbot/example/kube/kubeconfig.yaml'
         self.bot_kubeconfig.parent.mkdir(parents=True)
-        self.bot_kubeconfig.write_text(kubeconfig())
+        # tbot as the dotfiles install it for one user, in the (fake) passwd home.
+        self.tbot = self.home / '.local/bin/tbot'
+        self.tbot.parent.mkdir(parents=True)
+        self.tbot.write_text('#!/bin/sh\nexit 0\n')
+        self.tbot.chmod(0o755)
+        self.bot_kubeconfig.write_text(self.kc())
         self.human_kubeconfig = self.home / '.kube/config'
         self.human_kubeconfig.parent.mkdir(parents=True)
         self.human_kubeconfig.write_text('apiVersion: v1\nkind: Config\n')
@@ -189,6 +196,9 @@ class K8sCheck(unittest.TestCase):
             'FAKE_KUBECTL_SCENARIO': str(self.scenario_path),
             'FAKE_TSH_LOG': str(self.tsh_log),
         }
+
+    def kc(self, **kw):
+        return kubeconfig(str(self.tbot), **kw)
 
     def run_check(self, *args):
         self.scenario_path.write_text(json.dumps(self.scenario))
@@ -224,8 +234,9 @@ class K8sCheck(unittest.TestCase):
                           READ_ONLY, f'not a read: {call["argv"]}')
             if words[0] == 'get':
                 self.assertFalse(set(words) & MUTATING, call['argv'])
-            # kubectl gets the pinned file (/proc/self/fd/<n>), and that file is the bot's.
-            self.assertEqual(call['kubeconfig_real'], str(self.bot_kubeconfig), call['argv'])
+            # kubectl reads the sealed copy (/proc/self/fd/<n>); its bytes are the bot file's.
+            self.assertEqual(call['kubeconfig_sha'], hashlib.sha256(self.bot_kubeconfig.read_bytes()).hexdigest(),
+                             call['argv'])
             self.assertEqual(call['env_kuberc'], 'false', call['argv'])
             self.assertIsNone(call['env_kubeconfig'], call['argv'])
             if not call['key'].startswith('config '):
@@ -433,14 +444,14 @@ class K8sCheck(unittest.TestCase):
             with self.subTest(name):
                 if self.log.exists():
                     self.log.unlink()
-                self.bot_kubeconfig.write_text(kubeconfig(user=user))
+                self.bot_kubeconfig.write_text(self.kc(user=user))
                 rc, out = self.run_check('lab-arm-a')
                 self.assert_refused_without_contact(out, rc, 'kubeconfig_credentials')
                 self.assertIn(needle, ' '.join(f['message'] for f in out['failures']))
                 self.assertEqual([c['key'] for c in self.calls()], ['config view -o json'])
 
     def test_client_certificate_is_bot_credentials(self):
-        self.bot_kubeconfig.write_text(kubeconfig(user={'client-certificate': '/example/tls.crt',
+        self.bot_kubeconfig.write_text(self.kc(user={'client-certificate': '/example/tls.crt',
                                                         'client-key': '/example/tls.key'}))
         rc, out = self.run_check('lab-arm-a')
         self.assertEqual(rc, 0, out)
@@ -459,7 +470,7 @@ class K8sCheck(unittest.TestCase):
         self.assertEqual(self.calls(), [])
 
     def test_context_missing_from_bot_kubeconfig(self):
-        self.bot_kubeconfig.write_text(kubeconfig(contexts=('proxy.example.test-lab-x86-qa',)))
+        self.bot_kubeconfig.write_text(self.kc(contexts=('proxy.example.test-lab-x86-qa',)))
         rc, out = self.run_check('lab-arm-a')
         self.assert_refused_without_contact(out, rc, 'context_missing')
 
@@ -718,7 +729,7 @@ class K8sCheck(unittest.TestCase):
 
     def test_resolved_kubeconfig_cannot_switch_to_owner_after_whoami(self):
         # The bot file must pass the credential allowlist, or the check stops before the swap.
-        self.bot_kubeconfig.write_text(kubeconfig())
+        self.bot_kubeconfig.write_text(self.kc())
         self.human_kubeconfig.write_text(json.dumps({
             'apiVersion': 'v1', 'kind': 'Config',
             'clusters': [{'name': 'example', 'cluster': {'server': 'https://proxy.example.test'}}],
@@ -748,36 +759,35 @@ class K8sCheck(unittest.TestCase):
         self.assertEqual(owner_calls, [], f'owner path used after whoami: exit={rc}, identity={out.get("identity")}')
 
     def test_pinned_kubeconfig_cannot_be_rewritten_after_whoami(self):
-        inode = self.bot_kubeconfig.stat().st_ino
-        self.human_kubeconfig.write_text(kubeconfig(user={'token': 'made-up-owner-token'}))
+        self.human_kubeconfig.write_text(self.kc(user={'token': 'made-up-owner-token'}))
         self.env['FAKE_REWRITE_SOURCE'] = str(self.human_kubeconfig)
+        self.env['FAKE_REWRITE_TARGET'] = str(self.bot_kubeconfig)  # the bot file on disk, in place
         # Reopening /proc/self/fd pins the inode, but a writer can still change its bytes.
         rewrite_step = textwrap.dedent('''\
             if rest[:2] == ['auth', 'whoami']:
                 with open(os.environ['FAKE_REWRITE_SOURCE']) as source:
                     replacement = source.read()
-                with open(flags['--kubeconfig'], 'w') as target:
+                with open(os.environ['FAKE_REWRITE_TARGET'], 'r+') as target:
+                    target.truncate()
                     target.write(replacement)
             ''')
         kubectl = self.tmp / 'bin/kubectl'
         kubectl.write_text(FAKE_KUBECTL.replace(
             "'key': ' '.join(rest)",
-            "'key': ' '.join(rest), 'inode': os.stat(flags['--kubeconfig']).st_ino, "
+            "'key': ' '.join(rest), "
             "'credential_token': json.load(open(flags['--kubeconfig']))['users'][0]['user'].get('token')").replace(
                 "sys.stdout.write(reply.get('stdout', ''))",
                 rewrite_step + "sys.stdout.write(reply.get('stdout', ''))"))
         rc, out = self.run_check('lab-arm-a')
         self.assertEqual(rc, 0, out)
         self.assertGreater(len(self.calls()), 3, 'the rewrite after whoami must be exercised')
-        self.assertEqual({c['inode'] for c in self.calls()}, {inode})
-        self.assertEqual(self.bot_kubeconfig.stat().st_ino, inode)
         owner_calls = [c['key'] for c in self.calls() if c['credential_token'] == 'made-up-owner-token']
         self.assertEqual(owner_calls, [], f'owner credentials used after bot whoami: {owner_calls}')
 
     def test_tbot_named_symlink_cannot_run_tsh(self):
         plugin_path = self.tmp / 'bin/tbot'
         plugin_path.symlink_to(self.tmp / 'bin/tsh')
-        self.bot_kubeconfig.write_text(kubeconfig(user={'exec': {
+        self.bot_kubeconfig.write_text(self.kc(user={'exec': {
             'apiVersion': 'client.authentication.k8s.io/v1beta1',
             'command': str(plugin_path), 'args': ['kube', 'credentials']}}))
         # Execute only the fixture plugin, with the same symlink lookup as client-go.

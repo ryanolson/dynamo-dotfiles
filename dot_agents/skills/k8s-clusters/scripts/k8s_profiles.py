@@ -6,6 +6,7 @@ refuse the same bad file the same way. Standard library only.
 import os
 from pathlib import Path
 import pwd
+import shutil
 import tomllib
 
 SCHEMA_VERSION = 1
@@ -81,7 +82,20 @@ def resolve_bot_kubeconfig(path):
 # certificate tbot writes when its exec plugin is off. A token, an auth provider, an
 # impersonation or any other exec command (tsh above all) would act as someone else.
 BOT_USER_KEYS = {'exec', 'client-certificate', 'client-certificate-data', 'client-key', 'client-key-data'}
-BOT_EXEC_COMMAND = 'tbot'
+# Where tbot is installed (the tbot setup in the dotfiles README): an exec plugin may run only
+# the file one of these resolves to. A name alone is not enough: /tmp/tbot can link to tsh.
+TBOT_INSTALLS = ('/usr/local/bin/tbot', '~/.local/bin/tbot')
+
+
+def tbot_binaries():
+    """The resolved paths of the installed tbot binaries, with ~ as the account's home."""
+    home = account_home()
+    found = set()
+    for p in TBOT_INSTALLS:
+        real = os.path.realpath(home + p[1:] if p.startswith('~/') else p)
+        if os.path.isfile(real):
+            found.add(real)
+    return found
 
 
 def bot_credential_problem(view, context):
@@ -95,8 +109,13 @@ def bot_credential_problem(view, context):
     extra = sorted(set(user) - BOT_USER_KEYS)
     if extra:
         return f'the user of context {context} holds {", ".join(extra)}; only tbot credentials are allowed'
-    if 'exec' in user and os.path.basename(str((user['exec'] or {}).get('command', ''))) != BOT_EXEC_COMMAND:
-        return f'the user of context {context} runs {(user["exec"] or {}).get("command")!r}, not {BOT_EXEC_COMMAND}'
+    if 'exec' in user:
+        command = str((user['exec'] or {}).get('command') or '')
+        # client-go looks a bare name up on PATH; kubectl runs with the caller's PATH.
+        path = command if os.path.isabs(command) else (shutil.which(command) or '') if command else ''
+        if not path or os.path.realpath(path) not in tbot_binaries():
+            return (f'the user of context {context} runs {command!r}, which is not an installed tbot '
+                    f'({", ".join(TBOT_INSTALLS)})')
     if not user:
         return f'the user of context {context} holds no credentials'
     return None

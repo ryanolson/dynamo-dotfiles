@@ -15,10 +15,12 @@ profile or the wrong kubeconfig never reach a cluster. Every kubectl call is a
 read, and carries the bot's kubeconfig and the profile's context explicitly.
 """
 import argparse
+import fcntl
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 
@@ -44,23 +46,46 @@ class Refusal(ProfileError):
 
 # --- kubectl ----------------------------------------------------------------
 
-class Kubectl:
-    """kubectl pinned to one open kubeconfig file.
+KUBECONFIG_MAX = 1 << 20
 
-    The file is opened once, and every call reads it through /proc/self/fd/<n>, which
-    opens that same inode again. Replacing the path after the checks changes nothing:
-    the file whose credentials were checked is the file every call uses.
+
+def sealed_copy(path):
+    """Read path once into a memfd sealed against any change, and return its descriptor.
+
+    Every kubectl call reads the kubeconfig through /proc/self/fd/<n> of this memfd. The
+    bytes the credential check reads are the bytes every later call reads: neither
+    replacing nor rewriting the file on disk changes them, and the seals stop writes.
     """
+    try:
+        src = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as e:
+        raise Refusal('kubeconfig_not_bot', f'cannot open the bot kubeconfig {path}: {e.strerror}')
+    try:
+        if not stat.S_ISREG(os.fstat(src).st_mode):
+            raise Refusal('kubeconfig_not_bot', f'the bot kubeconfig {path} is not a regular file')
+        data = os.read(src, KUBECONFIG_MAX + 1)
+    finally:
+        os.close(src)
+    if len(data) > KUBECONFIG_MAX:
+        raise Refusal('kubeconfig_not_bot', f'the bot kubeconfig {path} is larger than {KUBECONFIG_MAX} bytes')
+    if not hasattr(os, 'memfd_create') or not os.path.isdir('/proc/self/fd'):
+        raise Refusal('kubeconfig_not_bot', 'this host has no memfd or /proc/self/fd; the check needs Linux')
+    fd = os.memfd_create('k8s-check-kubeconfig', os.MFD_ALLOW_SEALING)
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+    fcntl.fcntl(fd, fcntl.F_ADD_SEALS,
+                fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
+    os.set_inheritable(fd, True)
+    return fd
+
+
+class Kubectl:
+    """kubectl reading one sealed copy of the bot kubeconfig (see sealed_copy)."""
 
     def __init__(self, kubeconfig, context):
-        try:
-            self.fd = os.open(kubeconfig, os.O_RDONLY | os.O_NOFOLLOW)
-        except OSError as e:
-            raise Refusal('kubeconfig_not_bot', f'cannot open the bot kubeconfig {kubeconfig}: {e.strerror}')
-        os.set_inheritable(self.fd, True)
+        self.fd = sealed_copy(kubeconfig)
         pinned = f'/proc/self/fd/{self.fd}'
-        if not os.path.exists(pinned):
-            raise Refusal('kubeconfig_not_bot', 'this host has no /proc/self/fd, so the kubeconfig cannot be pinned')
         self.base = ['kubectl', '--kubeconfig', pinned]
         self.context = context
         self.env = kubectl_env()
