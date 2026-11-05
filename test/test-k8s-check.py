@@ -811,6 +811,53 @@ class K8sCheck(unittest.TestCase):
         rc, out = self.run_check('lab-arm-a')
         self.assert_refused_without_contact(out, rc, 'kubeconfig_credentials')
 
+    def test_path_parent_of_symlink_cannot_resolve_tbot_to_tsh(self):
+        self.bot_kubeconfig.write_text(self.kc(user={'exec': {
+            'apiVersion': 'client.authentication.k8s.io/v1beta1',
+            'command': 'tbot', 'args': ['kube', 'credentials']}}))
+        path_root = self.tmp / 'tool-path'
+        (path_root / 'bin').mkdir(parents=True)
+        library = self.home / '.local/lib'
+        library.mkdir()
+        (path_root / 'current').symlink_to(library, target_is_directory=True)
+        (path_root / 'bin/tbot').symlink_to(self.tmp / 'bin/tsh')
+        # Go's LookPath cleans each joined path before lookup. Python's which does not.
+        # https://github.com/golang/go/blob/go1.25.0/src/os/exec/lp_unix.go#L69
+        credential_step = textwrap.dedent('''\
+            if rest[:1] != ['config']:
+                import subprocess
+                config = json.load(open(flags['--kubeconfig']))
+                context = next(c['context'] for c in config['contexts'] if c['name'] == flags['--context'])
+                user = next(u['user'] for u in config['users'] if u['name'] == context['user'])
+                plugin = user['exec']
+                assert plugin['command'] == 'tbot'
+                command = next(candidate for directory in os.get_exec_path()
+                               if os.path.isfile(candidate := os.path.normpath(
+                                   os.path.join(directory, plugin['command'])))
+                               and os.access(candidate, os.X_OK))
+                fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
+                assert os.path.commonpath([os.path.realpath(command), fixture_root]) == fixture_root
+                result = subprocess.run([command, *plugin.get('args', [])],
+                                        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
+                if result.returncode:
+                    sys.stderr.write(result.stderr)
+                    sys.exit(result.returncode)
+            ''')
+        kubectl = self.tmp / 'bin/kubectl'
+        kubectl.write_text(FAKE_KUBECTL.replace(
+            "scenario = json.load(open(os.environ['FAKE_KUBECTL_SCENARIO']))",
+            credential_step + "scenario = json.load(open(os.environ['FAKE_KUBECTL_SCENARIO']))"))
+        # Control: a direct PATH entry runs the installed fixture and passes.
+        self.env['PATH'] = f'{self.tmp}/bin:{self.tbot.parent}:/usr/bin:/bin'
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assertGreater(len(self.calls()), 3)
+        self.log.unlink()
+        # A tool adds current/../bin to PATH while a stray tbot shim points to tsh.
+        self.env['PATH'] = f'{self.tmp}/bin:{path_root}/current/../bin:/usr/bin:/bin'
+        rc, out = self.run_check('lab-arm-a')
+        self.assert_refused_without_contact(out, rc, 'kubeconfig_credentials')
+
 
 if __name__ == '__main__':
     unittest.main()
