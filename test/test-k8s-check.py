@@ -456,6 +456,60 @@ class K8sCheck(unittest.TestCase):
         rc, out = self.run_check('lab-arm-a')
         self.assertEqual(rc, 0, out)
 
+    def test_external_client_certificates_cannot_change_identity(self):
+        cert = self.bot_kubeconfig.parent / 'tls.crt'
+        key = self.bot_kubeconfig.parent / 'tls.key'
+        cert.write_text(BOT)
+        key.write_text('made-up-bot-key')
+        self.bot_kubeconfig.write_text(self.kc(user={
+            'client-certificate': str(cert), 'client-key': str(key)}))
+        self.env['FAKE_CERT_FILE'] = str(cert)
+        self.env['FAKE_KEY_FILE'] = str(key)
+        # client-go reads certificate files for each new kubectl process.
+        # https://github.com/kubernetes/client-go/blob/v0.34.1/tools/clientcmd/client_config.go#L270
+        credential_step = textwrap.dedent('''\
+            credential_user = None
+            if rest[:1] != ['config']:
+                config = json.load(open(flags['--kubeconfig']))
+                context = next(c['context'] for c in config['contexts'] if c['name'] == flags['--context'])
+                user = next(u['user'] for u in config['users'] if u['name'] == context['user'])
+                with open(user['client-certificate']) as cert:
+                    credential_user = cert.read()
+                with open(user['client-key']) as key:
+                    assert key.read().startswith('made-up-')
+            ''')
+        response_step = textwrap.dedent('''\
+            if rest[:2] == ['auth', 'whoami']:
+                reply = {'stdout': json.dumps({'status': {'userInfo': {'username': credential_user}}})}
+                if os.environ.get('FAKE_REPLACE_CERT') == 'yes':
+                    with open(os.environ['FAKE_CERT_FILE'], 'w') as cert:
+                        cert.write('alice@example.test')
+                    with open(os.environ['FAKE_KEY_FILE'], 'w') as key:
+                        key.write('made-up-owner-key')
+            ''')
+        kubectl = self.tmp / 'bin/kubectl'
+        kubectl.write_text(FAKE_KUBECTL.replace(
+            "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:",
+            credential_step + "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:").replace(
+                "'key': ' '.join(rest)", "'key': ' '.join(rest), 'credential_user': credential_user").replace(
+                    "sys.stdout.write(reply.get('stdout', ''))",
+                    response_step + "sys.stdout.write(reply.get('stdout', ''))"))
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assertGreater(len(self.calls()), 3)
+        self.assertTrue(all(c['credential_user'] == BOT for c in self.calls()
+                            if not c['key'].startswith('config ')))
+        checked_sha = hashlib.sha256(self.bot_kubeconfig.read_bytes()).hexdigest()
+        self.log.unlink()
+        # A tool refreshes shared certificate files with the owner's credentials after whoami.
+        self.env['FAKE_REPLACE_CERT'] = 'yes'
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(out['identity']['username'], BOT, out)
+        self.assertGreater(len(self.calls()), 3)
+        self.assertTrue(all(c['kubeconfig_sha'] == checked_sha for c in self.calls()))
+        owner_calls = [c['key'] for c in self.calls() if c['credential_user'] == 'alice@example.test']
+        self.assertEqual(owner_calls, [], f'certificate files bypass the sealed kubeconfig: exit={rc}, {owner_calls}')
+
     def tbot_exec(self, **kw):
         plugin = {'apiVersion': 'client.authentication.k8s.io/v1beta1', 'command': str(self.tbot),
                   'args': ['kube', 'credentials', f'--destination-dir={self.bot_kubeconfig.parent}']}
