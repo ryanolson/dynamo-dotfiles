@@ -2138,6 +2138,88 @@ class NamespaceWriteWindows(GuardCase):
                 self.assertNotIn('ConfigMap/' + LEASE_CM, self.k8s['objects'][NS])
 
 
+class ApplySlotLifetime(GuardCase):
+    @unittest.skip("F12: a 42s apply outlives the slot's remaining 41s and overlaps another writer")
+    def test_multi_object_apply_cannot_outlive_its_slot_and_overallocate(self):
+        self.add_ns()
+        lid = self.add_lease(gpus=3)
+        # Advance a logical clock so each request takes 14s without slowing the suite.
+        launcher = self.tmp / 'slot-clock.py'
+        launcher.write_text(RUNNER.split('sys.argv = sys.argv[1:]')[0] + """import json, os, runpy, sys
+from datetime import timedelta
+from pathlib import Path
+scope = runpy.run_path(sys.argv[1])
+real_now = scope['now']
+def delayed_now():
+    state = json.loads(Path(os.environ['FAKE_K8S_STATE']).read_text())
+    return real_now() + timedelta(seconds=state.get('elapsed_seconds', 0))
+scope['main'].__globals__['now'] = delayed_now
+sys.exit(scope['main'](sys.argv[2:]))
+""")
+        concurrent = self.manifest(gpu_dgd('concurrent', 1, lid))
+        concurrent_argv = ['python3', '-I', str(launcher), str(GUARD), '--context', CTX, '-n', NS,
+                           'apply', '-f', concurrent]
+        bb_clock = """real_now = datetime.now
+def logical_now():
+    state = json.load(open(os.environ['FAKE_K8S_STATE']))
+    return real_now(timezone.utc) + timedelta(seconds=state.get('elapsed_seconds', 0))
+"""
+        fake_bb = FAKE_BB.replace("argv = sys.argv[1:]", bb_clock + "\nargv = sys.argv[1:]", 1)
+        fake_bb = fake_bb.replace('datetime.now(timezone.utc)', 'logical_now()')
+        fake_bb = fake_bb.replace("    if l.get('slot'):\n", """    if l.get('slot') and l.get('slot_deadline'):
+        if datetime.fromisoformat(l['slot_deadline'].replace('Z', '+00:00')) <= logical_now():
+            l['slot'] = None
+    if l.get('slot'):
+""", 1)
+        fake_bb = fake_bb.replace("    save(); out({'token': l['slot'], 'deadline': iso(dl)})",
+                                  "    l['slot_deadline'] = iso(dl)\n"
+                                  "    save(); out({'token': l['slot'], 'deadline': iso(dl)})", 1)
+        self.assertNotEqual(fake_bb, FAKE_BB)
+        (self.bin / 'bb').write_text(fake_bb)
+        fake = FAKE_KUBECTL.replace('import copy, json, os, sys, time',
+                                    'import copy, json, os, subprocess, sys, time', 1)
+        fake = fake.replace("if what == 'namespace':", """if what == 'namespace':
+        st['namespace_reads'] = st.get('namespace_reads', 0) + 1
+        if st['namespace_reads'] == 3:
+            st['elapsed_seconds'] = 79
+        save()""", 1)
+        # The first two writes land at 93s and 107s. Another guard gets the expired slot at 121s.
+        hook = """    for obj in docs(stdin):
+        if not dry and obj['metadata']['name'] in ('first', 'second', 'late'):
+            st['elapsed_seconds'] += 14
+            save()
+            if obj['metadata']['name'] == 'late':
+                other = subprocess.run(CONCURRENT_ARGV, env=dict(os.environ, KUBECONFIG=BOT_KUBECONFIG),
+                                       capture_output=True,
+                                       text=True, timeout=60, stdin=subprocess.DEVNULL)
+                st = json.load(open(STATE))
+                st['concurrent_rc'] = other.returncode
+                st['concurrent_result'] = json.loads(other.stdout)
+                save()
+""".replace('CONCURRENT_ARGV', repr(concurrent_argv)).replace('BOT_KUBECONFIG', repr(str(self.bot_kubeconfig)))
+        fake = fake.replace("    for obj in docs(stdin):\n        meta = obj.setdefault",
+                            hook + "        meta = obj.setdefault", 1)
+        fake = fake.replace("            st['objects'][ns_flag][key(merged)] = merged",
+                            "            st['objects'][ns_flag][key(merged)] = merged\n            save()", 1)
+        self.assertNotEqual(fake, FAKE_KUBECTL)
+        (self.bin / 'kubectl').write_text(fake)
+        manifest = self.manifest(*(gpu_dgd(name, 1, lid) for name in ('first', 'second', 'late')))
+
+        p = subprocess.run(['python3', '-I', str(launcher), str(GUARD), '--context', CTX, '-n', NS,
+                            'apply', '-f', manifest], env=self.env(), capture_output=True, text=True,
+                           timeout=60, stdin=subprocess.DEVNULL)
+        self.reload()
+
+        self.assertEqual(self.k8s.get('elapsed_seconds'), 121, p.stdout + p.stderr)
+        self.assertEqual(self.k8s.get('concurrent_rc'), 0, self.k8s.get('concurrent_result'))
+        self.assertEqual(self.k8s['concurrent_result']['allocation'], 3)
+        self.assertEqual(sum(c[:4] == ['k8s', 'lease', 'op', 'begin'] for c in self.bb_calls()), 2)
+        held = sum(int(c['podTemplate']['spec']['containers'][0]['resources']['limits'].get('nvidia.com/gpu', 0))
+                   * c['replicas'] for obj in self.k8s['objects'][NS].values()
+                   if obj['kind'] == 'DynamoGraphDeployment' for c in obj['spec']['components'])
+        self.assertLessEqual(held, 3, f'42s apply crosses the 120s slot and leaves {held} GPUs: {p.stdout}')
+
+
 class OwnerNamespaceWriteWindows(GuardCase):
     @unittest.skip("F11: owner writes have no server fence against namespace recreation")
     def test_owner_writes_cannot_land_in_a_recreated_namespace(self):
