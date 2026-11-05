@@ -7,6 +7,8 @@ user = "bot-example-agent"
 kubeconfig = "~/.local/share/tbot/example/kube/kubeconfig.yaml"
 developer = "alice"
 namespace_prefix = "dyntest-alice-"
+# sha256sum of the kubectl binary on this host (made up here); k8s-check refuses any other kubectl.
+kubectl_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 
 [clusters.lab-arm-a]
 context = "proxy.example.test-lab-arm-a"

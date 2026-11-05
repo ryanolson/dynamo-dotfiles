@@ -8,10 +8,12 @@ it has no recording for, so a new cluster call cannot slip in untested. A fake
 Every name here is made up. The real profiles file is never read: HOME,
 K8S_CLUSTERS_PROFILES and KUBECONFIG all point into a temporary directory.
 """
+import base64
 import copy
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -45,15 +47,40 @@ while i < len(argv):
         flags[name] = argv[i + 1]; i += 2
     else:
         flags[name] = a.split('=', 1)[1]; i += 1
+def pem_user(pem):
+    # The fake cert's body is the identity's name; plain text is taken as the name itself.
+    return next((line for line in pem.splitlines() if line and not line.startswith('-----')), None)
+def cert_user(user):
+    # The identity in embedded client cert data.
+    import base64
+    return pem_user(base64.b64decode(user['client-certificate-data']).decode())
+def kubeconfig_user():
+    # The user entry of the context kubectl would use, from the file it was given.
+    if '--kubeconfig' not in flags or '--context' not in flags:
+        return None
+    config = json.load(open(flags['--kubeconfig']))
+    ctx = next((c['context'] for c in config.get('contexts', []) if c['name'] == flags['--context']), {})
+    return next((u['user'] for u in config.get('users', []) if u['name'] == ctx.get('user')), None)
 with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:
     log.write(json.dumps({'argv': argv, 'flags': flags, 'key': ' '.join(rest),
                           'kubeconfig_sha': hashlib.sha256(open(flags['--kubeconfig'], 'rb').read()).hexdigest()
                           if '--kubeconfig' in flags else None,
+                          'kubeconfig_user': kubeconfig_user(),
                           'env_kuberc': os.environ.get('KUBECTL_KUBERC'),
                           'env_kubeconfig': os.environ.get('KUBECONFIG')}) + '\n')
-if rest == ['config', 'view', '-o', 'json']:
-    # Local, like kubectl: read the file it was given and print it. The fixtures are JSON.
-    print(json.dumps(json.load(open(flags['--kubeconfig']))))
+if rest in (['config', 'view', '-o', 'json'], ['config', 'view', '--raw', '--flatten', '-o', 'json']):
+    # Local, like kubectl: read the file it was given and print it (the fixtures are JSON).
+    # --flatten inlines files named by client-certificate, client-key and certificate-authority.
+    import base64
+    config = json.load(open(flags['--kubeconfig']))
+    if '--flatten' in rest:
+        for kind, key in (('users', 'user'), ('clusters', 'cluster')):
+            for entry in config.get(kind, []):
+                body = entry.get(key) or {}
+                for name in ('client-certificate', 'client-key', 'certificate-authority'):
+                    if name in body:
+                        body[name + '-data'] = base64.b64encode(open(body.pop(name), 'rb').read()).decode()
+    print(json.dumps(config))
     sys.exit(0)
 scenario = json.load(open(os.environ['FAKE_KUBECTL_SCENARIO']))
 reply = scenario.get(' '.join(rest))
@@ -75,6 +102,13 @@ class Entry:
         self.pw_name, self.pw_uid, self.pw_dir = entry.pw_name, entry.pw_uid, os.environ['FAKE_PW_DIR']
 pwd.getpwuid = lambda uid: Entry(real(uid))
 sys.argv = sys.argv[1:]
+if os.environ.get('FAKE_KUBECTL'):
+    # The fake kubectl is a script; the real rule (ELF only, fixed paths) is unit-tested in
+    # test-k8s-render.py. Older scripts (K8S_CHECK_SCRIPTS) ignore these attributes.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0])))
+    import k8s_profiles
+    k8s_profiles.KUBECTL_INSTALLS = (os.environ['FAKE_KUBECTL'],)
+    k8s_profiles.is_elf = lambda path: True
 runpy.run_path(sys.argv[0], run_name='__main__')
 '''
 
@@ -112,9 +146,43 @@ def kubeconfig(tbot, destination='/example/kube', contexts=(CTX, 'proxy.example.
         'args': ['kube', 'credentials', f'--destination-dir={destination}']}}
     return json.dumps({
         'apiVersion': 'v1', 'kind': 'Config',
-        'clusters': [{'name': 'example', 'cluster': {'server': 'https://proxy.example.test'}}],
+        'clusters': [{'name': 'example', 'cluster': {'server': 'https://proxy.example.test:443',
+                                                     'certificate-authority-data': 'Q0E='}}],
         'contexts': [{'name': c, 'context': {'cluster': 'example', 'user': 'bot'}} for c in contexts],
         'users': [{'name': 'bot', 'user': user}]})
+
+
+def cert_pem(identity):
+    return f'-----BEGIN CERTIFICATE-----\n{identity}\n-----END CERTIFICATE-----\n'
+
+
+KEY_PEM = '-----BEGIN PRIVATE KEY-----\nmade-up-key\n-----END PRIVATE KEY-----\n'
+
+# tbot v18.7.6 `kube credentials` (tool/tbot/kube.go): reads <destination>/identity and prints
+# an ExecCredential with the PEM cert and key. The fake's "cert" is the identity's name, read
+# from <destination>/identity when present. FAKE_TBOT_EXPIRES_IN sets the expiry in seconds;
+# FAKE_TBOT_FRESH_AFTER_FIRST makes only the first snapshot near expiry.
+FAKE_TBOT = r'''#!/usr/bin/env python3
+import json, os, sys
+from datetime import datetime, timedelta, timezone
+assert len(sys.argv) == 4 and sys.argv[1:3] == ['kube', 'credentials'], sys.argv
+destination = sys.argv[3].removeprefix('--destination-dir=')
+path = os.path.join(destination, 'identity')
+identity = open(path).read() if os.path.exists(path) else os.environ['FAKE_BOT_USER']
+seconds = int(os.environ.get('FAKE_TBOT_EXPIRES_IN', '3600'))
+counter = os.environ.get('FAKE_TBOT_FRESH_AFTER_FIRST')
+if counter:
+    if os.path.exists(counter):
+        seconds = 3600
+    open(counter, 'a').close()
+if os.environ.get('FAKE_TBOT_JUNK'):
+    print('{"status": {}}'); sys.exit(0)
+expiry = (datetime.now(timezone.utc) + timedelta(seconds=seconds)).strftime('%Y-%m-%dT%H:%M:%SZ')
+print(json.dumps({'kind': 'ExecCredential', 'apiVersion': 'client.authentication.k8s.io/v1beta1', 'spec': {},
+                  'status': {'expirationTimestamp': expiry,
+                             'clientCertificateData': '-----BEGIN CERTIFICATE-----\n' + identity + '\n-----END CERTIFICATE-----\n',
+                             'clientKeyData': '-----BEGIN PRIVATE KEY-----\nmade-up-key\n-----END PRIVATE KEY-----\n'}}))
+'''
 
 
 GPU_TAINT = {'key': 'nvidia.com/gpu', 'value': 'true', 'effect': 'NoSchedule'}
@@ -167,7 +235,7 @@ class K8sCheck(unittest.TestCase):
         # tbot as the dotfiles install it for one user, in the (fake) passwd home.
         self.tbot = self.home / '.local/bin/tbot'
         self.tbot.parent.mkdir(parents=True)
-        self.tbot.write_text('#!/bin/sh\nexit 0\n')
+        self.tbot.write_text(FAKE_TBOT)
         self.tbot.chmod(0o755)
         self.bot_kubeconfig.write_text(self.kc())
         self.human_kubeconfig = self.home / '.kube/config'
@@ -186,10 +254,13 @@ class K8sCheck(unittest.TestCase):
         self.tsh_log = self.tmp / 'tsh.log'
         self.scenario_path = self.tmp / 'scenario.json'
         self.scenario = happy_scenario()
+        self.kubectl_pin = None
         self.env = {
             'PATH': f'{bin_dir}:/usr/bin:/bin',
             'HOME': str(self.home),
             'FAKE_PW_DIR': str(self.home),
+            'FAKE_KUBECTL': str(bin_dir / 'kubectl'),
+            'FAKE_BOT_USER': BOT,
             'K8S_CLUSTERS_PROFILES': str(self.profiles),
             'KUBECONFIG': str(self.bot_kubeconfig),
             'FAKE_KUBECTL_LOG': str(self.log),
@@ -197,11 +268,28 @@ class K8sCheck(unittest.TestCase):
             'FAKE_TSH_LOG': str(self.tsh_log),
         }
 
+    def rendered_user(self):
+        user = next(u['user'] for u in json.loads(self.bot_kubeconfig.read_text())['users'] if u['name'] == 'bot')
+        if 'exec' in user:
+            # The snapshot: tbot's cert and key, embedded; the rendered file has no exec plugin.
+            identity_file = self.bot_kubeconfig.parent / 'identity'
+            identity = identity_file.read_text() if identity_file.exists() else BOT
+            return {'client-certificate-data': base64.b64encode(cert_pem(identity).encode()).decode(),
+                    'client-key-data': base64.b64encode(KEY_PEM.encode()).decode()}
+        return user
+
     def kc(self, **kw):
         return kubeconfig(str(self.tbot), str(self.bot_kubeconfig.parent), **kw)
 
     def run_check(self, *args):
         self.scenario_path.write_text(json.dumps(self.scenario))
+        if self.profiles.exists():
+            pin = self.kubectl_pin or hashlib.sha256((self.tmp / 'bin/kubectl').read_bytes()).hexdigest()
+            self.profiles.write_text(re.sub(r'kubectl_sha256 = "[0-9a-f]*"', f'kubectl_sha256 = "{pin}"',
+                                            self.profiles.read_text()))
+            if 'kubectl_sha256' not in (SCRIPT.parent / 'k8s_profiles.py').read_text():
+                # Older scripts (K8S_CHECK_SCRIPTS) predate the pin and refuse the key.
+                self.profiles.write_text(re.sub(r'.*kubectl_sha256.*\n', '', self.profiles.read_text()))
         proc = subprocess.run([sys.executable, '-I', str(self.runner), str(SCRIPT), *args], env=self.env, stdin=subprocess.DEVNULL,
                               capture_output=True, text=True, timeout=60)
         try:
@@ -234,9 +322,13 @@ class K8sCheck(unittest.TestCase):
                           READ_ONLY, f'not a read: {call["argv"]}')
             if words[0] == 'get':
                 self.assertFalse(set(words) & MUTATING, call['argv'])
-            # kubectl reads the sealed copy (/proc/self/fd/<n>); its bytes are the bot file's.
-            self.assertEqual(call['kubeconfig_sha'], hashlib.sha256(self.bot_kubeconfig.read_bytes()).hexdigest(),
-                             call['argv'])
+            if call['key'].startswith('config '):
+                # config view reads the sealed copy of the bot file itself.
+                self.assertEqual(call['kubeconfig_sha'], hashlib.sha256(self.bot_kubeconfig.read_bytes()).hexdigest(),
+                                 call['argv'])
+            else:
+                # Every cluster call reads the rendered copy: the bot file's user, tbot fields only.
+                self.assertEqual(call['kubeconfig_user'], self.rendered_user(), call['argv'])
             self.assertEqual(call['env_kuberc'], 'false', call['argv'])
             self.assertIsNone(call['env_kubeconfig'], call['argv'])
             if not call['key'].startswith('config '):
@@ -448,19 +540,178 @@ class K8sCheck(unittest.TestCase):
                 rc, out = self.run_check('lab-arm-a')
                 self.assert_refused_without_contact(out, rc, 'kubeconfig_credentials')
                 self.assertIn(needle, ' '.join(f['message'] for f in out['failures']))
-                self.assertEqual([c['key'] for c in self.calls()], ['config view -o json'])
+                self.assertEqual([c['key'] for c in self.calls()], ['config view --raw --flatten -o json'])
 
     def test_client_certificate_is_bot_credentials(self):
-        self.bot_kubeconfig.write_text(self.kc(user={'client-certificate': '/example/tls.crt',
-                                                        'client-key': '/example/tls.key'}))
+        self.bot_kubeconfig.write_text(self.kc(user={'client-certificate-data': 'Q0VSVA==',
+                                                        'client-key-data': 'S0VZ'}))
         rc, out = self.run_check('lab-arm-a')
         self.assertEqual(rc, 0, out)
+
+    def test_external_client_certificates_cannot_change_identity(self):
+        cert = self.bot_kubeconfig.parent / 'tls.crt'
+        key = self.bot_kubeconfig.parent / 'tls.key'
+        cert.write_text(BOT)
+        key.write_text('made-up-bot-key')
+        self.bot_kubeconfig.write_text(self.kc(user={
+            'client-certificate': str(cert), 'client-key': str(key)}))
+        self.env['FAKE_CERT_FILE'] = str(cert)
+        self.env['FAKE_KEY_FILE'] = str(key)
+        # client-go reads certificate files for each new kubectl process.
+        # https://github.com/kubernetes/client-go/blob/v0.34.1/tools/clientcmd/client_config.go#L270
+        credential_step = textwrap.dedent('''\
+            credential_user = None
+            if rest[:1] != ['config']:
+                config = json.load(open(flags['--kubeconfig']))
+                context = next(c['context'] for c in config['contexts'] if c['name'] == flags['--context'])
+                user = next(u['user'] for u in config['users'] if u['name'] == context['user'])
+                # client-go uses embedded data when present, and reads the file otherwise.
+                if 'client-certificate-data' in user:
+                    import base64
+                    credential_user = base64.b64decode(user['client-certificate-data']).decode()
+                    assert base64.b64decode(user['client-key-data']).decode().startswith('made-up-')
+                else:
+                    with open(user['client-certificate']) as cert:
+                        credential_user = cert.read()
+                    with open(user['client-key']) as key:
+                        assert key.read().startswith('made-up-')
+            ''')
+        response_step = textwrap.dedent('''\
+            if rest[:2] == ['auth', 'whoami']:
+                reply = {'stdout': json.dumps({'status': {'userInfo': {'username': credential_user}}})}
+                if os.environ.get('FAKE_REPLACE_CERT') == 'yes':
+                    with open(os.environ['FAKE_CERT_FILE'], 'w') as cert:
+                        cert.write('alice@example.test')
+                    with open(os.environ['FAKE_KEY_FILE'], 'w') as key:
+                        key.write('made-up-owner-key')
+            ''')
+        kubectl = self.tmp / 'bin/kubectl'
+        kubectl.write_text(FAKE_KUBECTL.replace(
+            "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:",
+            credential_step + "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:").replace(
+                "'key': ' '.join(rest)", "'key': ' '.join(rest), 'credential_user': credential_user").replace(
+                    "sys.stdout.write(reply.get('stdout', ''))",
+                    response_step + "sys.stdout.write(reply.get('stdout', ''))"))
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assertGreater(len(self.calls()), 3)
+        self.assertTrue(all(c['credential_user'] == BOT for c in self.calls()
+                            if not c['key'].startswith('config ')))
+        self.log.unlink()
+        # A tool refreshes shared certificate files with the owner's credentials after whoami.
+        self.env['FAKE_REPLACE_CERT'] = 'yes'
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(out['identity']['username'], BOT, out)
+        self.assertGreater(len(self.calls()), 3)
+        # Every cluster call reads the same sealed, rendered bytes.
+        self.assertEqual(len({c['kubeconfig_sha'] for c in self.calls() if not c['key'].startswith('config ')}), 1)
+        owner_calls = [c['key'] for c in self.calls() if c['credential_user'] == 'alice@example.test']
+        self.assertEqual(owner_calls, [], f'certificate files bypass the sealed kubeconfig: exit={rc}, {owner_calls}')
 
     def tbot_exec(self, **kw):
         plugin = {'apiVersion': 'client.authentication.k8s.io/v1beta1', 'command': str(self.tbot),
                   'args': ['kube', 'credentials', f'--destination-dir={self.bot_kubeconfig.parent}']}
         plugin.update(kw)
         return {'exec': plugin}
+
+    def test_tbot_identity_cannot_change_after_bot_whoami(self):
+        identity = self.bot_kubeconfig.parent / 'identity'
+        identity.write_text(BOT)
+        self.env['FAKE_TBOT_IDENTITY'] = str(identity)
+        # tbot reads destination/identity on every invocation, without checking the username.
+        # https://github.com/gravitational/teleport/blob/v18.7.6/tool/tbot/kube.go#L81
+        self.tbot.write_text(textwrap.dedent('''\
+            #!/usr/bin/env python3
+            import json, os, sys
+            assert len(sys.argv) == 4 and sys.argv[1:3] == ['kube', 'credentials']
+            destination = sys.argv[3].removeprefix('--destination-dir=')
+            identity = os.path.join(destination, 'identity')
+            assert identity == os.environ['FAKE_TBOT_IDENTITY']
+            with open(identity) as source:
+                credential_user = source.read()
+            print(json.dumps({'kind': 'ExecCredential', 'apiVersion': 'client.authentication.k8s.io/v1beta1',
+                              'status': {'expirationTimestamp': '2999-01-01T00:00:00Z',
+                                         'clientCertificateData': '-----BEGIN CERTIFICATE-----\\n' + credential_user
+                                                                  + '\\n-----END CERTIFICATE-----\\n',
+                                         'clientKeyData': '-----BEGIN PRIVATE KEY-----\\nmade-up-key\\n-----END PRIVATE KEY-----\\n'}}))
+            '''))
+        credential_step = textwrap.dedent('''\
+            credential_user = None
+            if rest[:1] != ['config']:
+                import subprocess
+                user = kubeconfig_user()
+                plugin = user.get('exec')
+                if plugin is None:  # a rendered snapshot: client-go uses the embedded cert
+                    credential_user = cert_user(user)
+                else:
+                    fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
+                    assert os.path.commonpath([os.path.realpath(plugin['command']), fixture_root]) == fixture_root
+                    result = subprocess.run([plugin['command'], *plugin['args']], stdin=subprocess.DEVNULL,
+                                            capture_output=True, text=True, timeout=5, check=True)
+                    credential_user = pem_user(json.loads(result.stdout)['status']['clientCertificateData'])
+            ''')
+        response_step = textwrap.dedent('''\
+            if rest[:2] == ['auth', 'whoami']:
+                reply = {'stdout': json.dumps({'status': {'userInfo': {'username': credential_user}}})}
+                if os.environ.get('FAKE_SWAP_TBOT_IDENTITY') == 'yes':
+                    with open(os.environ['FAKE_TBOT_IDENTITY'], 'w') as identity:
+                        identity.write('alice@example.test')
+            ''')
+        (self.tmp / 'bin/kubectl').write_text(FAKE_KUBECTL.replace(
+            "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:",
+            credential_step + "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:").replace(
+                "'key': ' '.join(rest)", "'key': ' '.join(rest), 'credential_user': credential_user").replace(
+                    "sys.stdout.write(reply.get('stdout', ''))",
+                    response_step + "sys.stdout.write(reply.get('stdout', ''))"))
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assertGreater(len(self.calls()), 3)
+        self.assertTrue(all(c['credential_user'] == BOT for c in self.calls()
+                            if not c['key'].startswith('config ')))
+        self.log.unlink()
+        # A credential repair tool copies the owner's identity into the bot destination after whoami.
+        self.env['FAKE_SWAP_TBOT_IDENTITY'] = 'yes'
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(out['identity']['username'], BOT, out)
+        cluster_calls = [c for c in self.calls() if not c['key'].startswith('config ')]
+        self.assertEqual(len({c['kubeconfig_sha'] for c in cluster_calls}), 1)
+        owner_calls = [c['key'] for c in cluster_calls if c['credential_user'] == 'alice@example.test']
+        self.assertEqual(owner_calls, [], f'the sealed exec plugin re-reads the replaced identity: exit={rc}, {owner_calls}')
+
+    def test_identity_fixture_uses_the_same_username_for_exec_and_snapshot(self):
+        class FixtureChecked(Exception):
+            pass
+
+        def check_fixture(*args):
+            self.scenario_path.write_text(json.dumps(self.scenario))
+            config = json.loads(self.bot_kubeconfig.read_text())
+            exec_user = config['users'][0]['user']
+            snapshot_user = {
+                'client-certificate-data': base64.b64encode(cert_pem(BOT).encode()).decode(),
+                'client-key-data': base64.b64encode(KEY_PEM.encode()).decode(),
+            }
+            for mode, user in (('snapshot', snapshot_user), ('exec', exec_user)):
+                with self.subTest(mode=mode):
+                    config['users'][0]['user'] = user
+                    self.bot_kubeconfig.write_text(json.dumps(config))
+                    result = subprocess.run(
+                        [sys.executable, str(self.tmp / 'bin/kubectl'),
+                         '--kubeconfig', str(self.bot_kubeconfig), '--context', CTX,
+                         'auth', 'whoami', '-o', 'json'],
+                        env=self.env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                        timeout=5, check=True)
+                    username = json.loads(result.stdout)['status']['userInfo']['username']
+                    self.assertEqual(username, BOT, f'{mode} must use the identity in the certificate')
+            raise FixtureChecked
+
+        # Inspect the regression's actual fake before its first checker call.
+        run_check = self.run_check
+        self.run_check = check_fixture
+        try:
+            with self.assertRaises(FixtureChecked):
+                self.test_tbot_identity_cannot_change_after_bot_whoami()
+        finally:
+            self.run_check = run_check
 
     def test_tbot_by_file_identity(self):
         # tbot may write the install path or the file it links to; both are the same file.
@@ -526,6 +777,194 @@ class K8sCheck(unittest.TestCase):
                 rc, out = self.run_check('lab-arm-a')
                 self.assert_refused_without_contact(out, rc, 'kubeconfig_credentials')
 
+    def test_tbot_destination_parent_of_symlink_cannot_select_another_identity(self):
+        (self.bot_kubeconfig.parent / 'identity').write_text(BOT)
+        nested = self.bot_kubeconfig.parent / 'nested'
+        nested.mkdir()
+        aliases = self.tmp / 'aliases'
+        aliases.mkdir()
+        (aliases / 'current').symlink_to(nested, target_is_directory=True)
+        (aliases / 'identity').write_text('alice@example.test')
+        supplied = str(aliases / 'current' / '..')
+        self.assertEqual(os.path.realpath(supplied), str(self.bot_kubeconfig.parent))
+        self.assertNotEqual(os.path.realpath(os.path.normpath(os.path.join(supplied, 'identity'))),
+                            str(self.bot_kubeconfig.parent / 'identity'))
+        # tbot joins the destination with "identity" before reading it. Go cleans away current/..
+        # before the kernel follows current. The checker instead follows current before "..".
+        # https://github.com/gravitational/teleport/blob/v18.7.6/lib/tbot/bot/destination/directory.go#L460
+        self.tbot.write_text(textwrap.dedent('''\
+            #!/usr/bin/env python3
+            import json, os, sys
+            from urllib.parse import urlsplit, unquote
+            assert sys.argv[1:3] == ['kube', 'credentials']
+            destination = unquote(urlsplit(sys.argv[3].split('=', 1)[1]).path)
+            identity = os.path.normpath(os.path.join(destination, 'identity'))
+            fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
+            assert os.path.commonpath([os.path.realpath(identity), fixture_root]) == fixture_root
+            with open(identity) as source:
+                credential_user = source.read()
+            print(json.dumps({'kind': 'ExecCredential', 'apiVersion': 'client.authentication.k8s.io/v1beta1',
+                              'status': {'expirationTimestamp': '2999-01-01T00:00:00Z',
+                                         'clientCertificateData': '-----BEGIN CERTIFICATE-----\\n' + credential_user
+                                                                  + '\\n-----END CERTIFICATE-----\\n',
+                                         'clientKeyData': '-----BEGIN PRIVATE KEY-----\\nmade-up-key\\n-----END PRIVATE KEY-----\\n'}}))
+            '''))
+        credential_step = textwrap.dedent('''\
+            credential_user = None
+            if rest[:1] != ['config']:
+                import subprocess
+                config = json.load(open(flags['--kubeconfig']))
+                context = next(c['context'] for c in config['contexts'] if c['name'] == flags['--context'])
+                user = next(u['user'] for u in config['users'] if u['name'] == context['user'])
+                plugin = user.get('exec')
+                if plugin is None:  # a rendered snapshot: client-go uses the embedded cert
+                    credential_user = cert_user(user)
+                else:
+                    fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
+                    assert os.path.commonpath([os.path.realpath(plugin['command']), fixture_root]) == fixture_root
+                    result = subprocess.run([plugin['command'], *plugin['args']], stdin=subprocess.DEVNULL,
+                                            capture_output=True, text=True, timeout=5, check=True)
+                    credential_user = pem_user(json.loads(result.stdout)['status']['clientCertificateData'])
+            ''')
+        response_step = textwrap.dedent('''\
+            if rest[:2] == ['auth', 'whoami']:
+                reply = {'stdout': json.dumps({'status': {'userInfo': {'username': credential_user}}})}
+            ''')
+        kubectl = self.tmp / 'bin/kubectl'
+        kubectl.write_text(FAKE_KUBECTL.replace(
+            "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:",
+            credential_step + "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:").replace(
+                "'key': ' '.join(rest)", "'key': ' '.join(rest), 'credential_user': credential_user").replace(
+                    "sys.stdout.write(reply.get('stdout', ''))",
+                    response_step + "sys.stdout.write(reply.get('stdout', ''))"))
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(all(c['credential_user'] == BOT for c in self.calls()
+                            if not c['key'].startswith('config ')))
+        self.log.unlink()
+        # A tool spells the destination through current/.. while editing the exec argument.
+        self.bot_kubeconfig.write_text(self.kc(user=self.tbot_exec(
+            args=['kube', 'credentials', f'--destination-dir={supplied}'])))
+        rc, out = self.run_check('lab-arm-a')
+        owner_calls = [c['key'] for c in self.calls() if c['credential_user'] == 'alice@example.test']
+        self.assertEqual(owner_calls, [], f'tbot reads a different identity than the checked destination: {out}')
+        self.assert_refused_without_contact(out, rc, 'kubeconfig_credentials')
+
+    def test_tbot_destination_uri_fragment_cannot_select_another_identity(self):
+        identity = self.bot_kubeconfig.parent / 'identity'
+        identity.write_text(BOT)
+        # DestinationFromURI uses url.Parse(...).Path, which omits a fragment.
+        # https://github.com/gravitational/teleport/blob/v18.7.6/lib/tbot/config/config.go#L517
+        self.tbot.write_text(textwrap.dedent('''\
+            #!/usr/bin/env python3
+            import json, os, sys
+            from urllib.parse import urlsplit, unquote
+            assert sys.argv[1:3] == ['kube', 'credentials'] and len(sys.argv) == 4
+            destination = unquote(urlsplit(sys.argv[3].removeprefix('--destination-dir=')).path)
+            identity = os.path.normpath(os.path.join(destination, 'identity'))
+            fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
+            assert os.path.commonpath([os.path.realpath(identity), fixture_root]) == fixture_root
+            with open(identity) as source:
+                credential_user = source.read()
+            print(json.dumps({'kind': 'ExecCredential', 'apiVersion': 'client.authentication.k8s.io/v1beta1',
+                              'status': {'expirationTimestamp': '2999-01-01T00:00:00Z',
+                                         'clientCertificateData': '-----BEGIN CERTIFICATE-----\\n' + credential_user
+                                                                  + '\\n-----END CERTIFICATE-----\\n',
+                                         'clientKeyData': '-----BEGIN PRIVATE KEY-----\\nmade-up-key\\n-----END PRIVATE KEY-----\\n'}}))
+            '''))
+        credential_step = textwrap.dedent('''\
+            credential_user = None
+            if rest[:1] != ['config']:
+                import subprocess
+                user = kubeconfig_user()
+                plugin = user.get('exec')
+                if plugin is None:  # a rendered snapshot: client-go uses the embedded cert
+                    credential_user = cert_user(user)
+                else:
+                    fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
+                    assert os.path.commonpath([os.path.realpath(plugin['command']), fixture_root]) == fixture_root
+                    result = subprocess.run([plugin['command'], *plugin['args']], stdin=subprocess.DEVNULL,
+                                            capture_output=True, text=True, timeout=5, check=True)
+                    credential_user = pem_user(json.loads(result.stdout)['status']['clientCertificateData'])
+            ''')
+        response_step = textwrap.dedent('''\
+            if rest[:2] == ['auth', 'whoami']:
+                reply = {'stdout': json.dumps({'status': {'userInfo': {'username': credential_user}}})}
+            ''')
+        (self.tmp / 'bin/kubectl').write_text(FAKE_KUBECTL.replace(
+            "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:",
+            credential_step + "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:").replace(
+                "'key': ' '.join(rest)", "'key': ' '.join(rest), 'credential_user': credential_user").replace(
+                    "sys.stdout.write(reply.get('stdout', ''))",
+                    response_step + "sys.stdout.write(reply.get('stdout', ''))"))
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(all(c['credential_user'] == BOT for c in self.calls()
+                            if not c['key'].startswith('config ')))
+        self.log.unlink()
+        # A tool names a new output directory kube#staging beside an output for another identity.
+        identity.write_text('alice@example.test')
+        staged = self.bot_kubeconfig.parent.with_name('kube#staging')
+        staged.mkdir()
+        (staged / 'identity').write_text(BOT)
+        self.bot_kubeconfig = staged / 'kubeconfig.yaml'
+        self.bot_kubeconfig.write_text(self.kc())
+        self.profiles.write_text(EXAMPLE.read_text().replace('/kube/kubeconfig.yaml', '/kube#staging/kubeconfig.yaml'))
+        self.env['KUBECONFIG'] = str(self.bot_kubeconfig)
+        rc, out = self.run_check('lab-arm-a')
+        owner_calls = [c['key'] for c in self.calls() if c['credential_user'] == 'alice@example.test']
+        self.assertEqual(owner_calls, [], f'tbot treats the accepted destination as a URI: exit={rc}, {out}')
+        self.assert_refused_without_contact(out, rc, 'kubeconfig_credentials')
+
+    def test_snapshot_near_expiry_is_retaken_once_then_refused(self):
+        # A credential within 5 minutes of expiry is taken once more; still near expiry is refused.
+        self.env['FAKE_TBOT_EXPIRES_IN'] = '60'
+        rc, out = self.run_check('lab-arm-a')
+        self.assert_refused_without_contact(out, rc, 'credentials_expired')
+        self.log.unlink()
+        self.env['FAKE_TBOT_FRESH_AFTER_FIRST'] = str(self.tmp / 'tbot-counter')
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assert_read_only()
+
+    def test_snapshot_must_be_an_exec_credential(self):
+        self.env['FAKE_TBOT_JUNK'] = 'yes'
+        rc, out = self.run_check('lab-arm-a')
+        self.assert_refused_without_contact(out, rc, 'kubeconfig_credentials')
+        self.assertIn('ExecCredential', ' '.join(f['message'] for f in out['failures']))
+
+    def test_rendered_kubeconfig_has_no_exec_plugin(self):
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        cluster_calls = [c for c in self.calls() if not c['key'].startswith('config ')]
+        self.assertTrue(cluster_calls)
+        for call in cluster_calls:
+            self.assertNotIn('exec', call['kubeconfig_user'], call['argv'])
+            self.assertEqual(set(call['kubeconfig_user']), {'client-certificate-data', 'client-key-data'})
+
+    def test_kubectl_pin_mismatch_refused_before_any_call(self):
+        self.kubectl_pin = 'f' * 64
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 1, out)
+        self.assertIn('kubectl_mismatch', self.codes(out))
+        self.assertEqual(self.calls(), [], 'a kubectl that is not the pinned one must not run at all')
+
+    def test_snapshot_destination_must_not_hold_uri_characters(self):
+        for name in ('kube:x', 'kube%41', 'kube?x', 'kube x'):
+            with self.subTest(name):
+                d = self.bot_kubeconfig.parent.with_name(name)
+                d.mkdir()
+                kc = d / 'kubeconfig.yaml'
+                kc.write_text(kubeconfig(str(self.tbot), str(d)))
+                self.profiles.write_text(EXAMPLE.read_text().replace('/kube/kubeconfig.yaml', f'/{name}/kubeconfig.yaml'))
+                self.env['KUBECONFIG'] = str(kc)
+                if self.log.exists():
+                    self.log.unlink()
+                rc, out = self.run_check('lab-arm-a')
+                # ':' is refused even earlier: it splits a KUBECONFIG list.
+                self.assert_refused_without_contact(out, rc, 'kubeconfig_not_bot' if ':' in name
+                                                    else 'kubeconfig_credentials')
+
     def test_kubeconfig_unset(self):
         # kubectl would fall back to ~/.kube/config, the owner's login.
         del self.env['KUBECONFIG']
@@ -538,6 +977,85 @@ class K8sCheck(unittest.TestCase):
         rc, out = self.run_check('lab-arm-a')
         self.assert_refused_without_contact(out, rc, 'kubeconfig_not_bot')
         self.assertEqual(self.calls(), [])
+
+    def test_cluster_server_url_cannot_supply_owner_basic_auth(self):
+        # Go's HTTP client adds Authorization from URL userinfo before its transport runs.
+        # https://github.com/golang/go/blob/go1.25.0/src/net/http/client.go#L246
+        authorization_step = textwrap.dedent('''\
+            authorization = None
+            if rest[:1] != ['config']:
+                import base64
+                from urllib.parse import urlsplit, unquote
+                config = json.load(open(flags['--kubeconfig']))
+                context = next(c['context'] for c in config['contexts'] if c['name'] == flags['--context'])
+                cluster = next(c['cluster'] for c in config['clusters'] if c['name'] == context['cluster'])
+                server = urlsplit(cluster['server'])
+                if server.username is not None:
+                    credentials = unquote(server.username) + ':' + unquote(server.password or '')
+                    authorization = 'Basic ' + base64.b64encode(credentials.encode()).decode()
+            ''')
+        kubectl = self.tmp / 'bin/kubectl'
+        kubectl.write_text(FAKE_KUBECTL.replace(
+            "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:",
+            authorization_step + "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:").replace(
+                "'key': ' '.join(rest)", "'key': ' '.join(rest), 'authorization': authorization"))
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(all(c['authorization'] is None for c in self.calls()))
+        self.log.unlink()
+        # An agent copies a URL with an owner's basic-auth credentials into the cluster stanza.
+        config = json.loads(self.kc())
+        config['clusters'][0]['cluster']['server'] = 'https://alice:made-up-password@proxy.example.test'
+        self.bot_kubeconfig.write_text(json.dumps(config))
+        rc, out = self.run_check('lab-arm-a')
+        owner_calls = [c['key'] for c in self.calls() if c['authorization'] is not None]
+        self.assertEqual(owner_calls, [], f'cluster URL supplies unchecked credentials: exit={rc}, {owner_calls}')
+        self.assert_refused_without_contact(out, rc, 'kubeconfig_credentials')
+
+    def test_http_endpoint_cannot_bypass_bot_credentials_through_owner_proxy(self):
+        self.env['FAKE_BOT_USER'] = BOT
+        self.env['FAKE_LOCAL_PROXY_USER'] = 'alice@example.test'
+        # client-go loads the user only for TLS. An HTTP kubectl proxy supplies its own identity.
+        # https://github.com/kubernetes/client-go/blob/v0.34.1/tools/clientcmd/client_config.go#L208
+        credential_step = textwrap.dedent('''\
+            client_identity = effective_identity = None
+            if rest[:1] != ['config']:
+                from urllib.parse import urlsplit
+                config = json.load(open(flags['--kubeconfig']))
+                context = next(c['context'] for c in config['contexts'] if c['name'] == flags['--context'])
+                cluster = next(c['cluster'] for c in config['clusters'] if c['name'] == context['cluster'])
+                server = urlsplit(cluster['server'])
+                if server.scheme == 'https':
+                    client_identity = effective_identity = os.environ['FAKE_BOT_USER']
+                else:
+                    assert (server.scheme, server.hostname, server.port) == ('http', '127.0.0.1', 8001)
+                    effective_identity = os.environ['FAKE_LOCAL_PROXY_USER']
+            ''')
+        response_step = textwrap.dedent('''\
+            if rest[:2] == ['auth', 'whoami']:
+                reply = {'stdout': json.dumps({'status': {'userInfo': {'username': effective_identity}}})}
+            ''')
+        kubectl = self.tmp / 'bin/kubectl'
+        kubectl.write_text(FAKE_KUBECTL.replace(
+            "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:",
+            credential_step + "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:").replace(
+                "'key': ' '.join(rest)",
+                "'key': ' '.join(rest), 'client_identity': client_identity, 'effective_identity': effective_identity").replace(
+                    "sys.stdout.write(reply.get('stdout', ''))",
+                    response_step + "sys.stdout.write(reply.get('stdout', ''))"))
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(all(c['client_identity'] == BOT for c in self.calls()
+                            if not c['key'].startswith('config ')))
+        self.log.unlink()
+        # An agent keeps a localhost server URL copied from a human's kubectl proxy session.
+        config = json.loads(self.kc())
+        config['clusters'][0]['cluster']['server'] = 'http://127.0.0.1:8001'
+        self.bot_kubeconfig.write_text(json.dumps(config))
+        rc, out = self.run_check('lab-arm-a')
+        owner_calls = [c['key'] for c in self.calls() if c['effective_identity'] == 'alice@example.test']
+        self.assertEqual(owner_calls, [], f'the checked user is not used for HTTP: exit={rc}, {out}')
+        self.assert_refused_without_contact(out, rc, 'kubeconfig_credentials')
 
     def test_context_missing_from_bot_kubeconfig(self):
         self.bot_kubeconfig.write_text(self.kc(contexts=('proxy.example.test-lab-x86-qa',)))
@@ -557,7 +1075,7 @@ class K8sCheck(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertEqual(self.codes(out), ['not_bot'])
         self.assertEqual(out['identity']['username'], 'alice@example.test')
-        self.assertEqual([c['key'] for c in self.calls()], ['config view -o json', 'auth whoami -o json'])
+        self.assertEqual([c['key'] for c in self.calls()], ['config view --raw --flatten -o json', 'auth whoami -o json'])
 
     def test_can_create_outside_our_namespaces(self):
         self.scenario['auth can-i create dynamographdeployments.nvidia.com -n default'] = can_i('yes')
@@ -731,6 +1249,31 @@ class K8sCheck(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertEqual(set(out['clusters']['lab-ci']), {'context', 'allowed', 'source'})
 
+    def test_kubectl_from_path_cannot_run_a_human_teleport_wrapper(self):
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assert_read_only()
+        self.log.unlink()
+        wrappers = self.tmp / 'human-tools'
+        wrappers.mkdir()
+        kubectl = wrappers / 'kubectl'
+        kubectl.write_text(textwrap.dedent('''\
+            #!/usr/bin/env python3
+            import os, subprocess, sys
+            fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
+            tsh = os.path.join(fixture_root, 'bin', 'tsh')
+            delegate = os.path.join(fixture_root, 'bin', 'kubectl')
+            assert os.path.commonpath([os.path.realpath(tsh), fixture_root]) == fixture_root
+            assert os.path.commonpath([os.path.realpath(delegate), fixture_root]) == fixture_root
+            subprocess.run([tsh, 'status'], stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=5)
+            os.execv(delegate, [delegate, *sys.argv[1:]])
+            '''))
+        kubectl.chmod(0o755)
+        # A tool prepends terminal helpers to PATH. Its kubectl checks the human's tsh session.
+        self.env['PATH'] = f'{wrappers}:{self.env["PATH"]}'
+        self.run_check('lab-arm-a')  # the harness fails if even its fake tsh is reached
+
     def test_bot_path_cannot_delegate_credentials_to_tsh(self):
         self.bot_kubeconfig.write_text(json.dumps({
             'apiVersion': 'v1', 'kind': 'Config',
@@ -750,14 +1293,15 @@ class K8sCheck(unittest.TestCase):
                 context = next(c['context'] for c in config['contexts'] if c['name'] == flags['--context'])
                 user = next(u['user'] for u in config['users'] if u['name'] == context['user'])
                 plugin = user.get('exec')
-                if plugin is not None:
-                    assert plugin['command'] == 'tsh'
-                    stub = os.path.join(os.path.dirname(os.environ['FAKE_TSH_LOG']), 'bin', 'tsh')
-                    result = subprocess.run([stub, *plugin.get('args', [])], stdin=subprocess.DEVNULL,
-                                            capture_output=True, text=True, timeout=5)
-                    sys.stdout.write(result.stdout)
-                    sys.stderr.write(result.stderr)
-                    sys.exit(result.returncode)
+                if plugin is not None:  # a rendered snapshot has no exec plugin to run
+                    if plugin is not None:
+                        assert plugin['command'] == 'tsh'
+                        stub = os.path.join(os.path.dirname(os.environ['FAKE_TSH_LOG']), 'bin', 'tsh')
+                        result = subprocess.run([stub, *plugin.get('args', [])], stdin=subprocess.DEVNULL,
+                                                capture_output=True, text=True, timeout=5)
+                        sys.stdout.write(result.stdout)
+                        sys.stderr.write(result.stderr)
+                        sys.exit(result.returncode)
             ''')
         kubectl = self.tmp / 'bin/kubectl'
         kubectl.write_text(FAKE_KUBECTL.replace(
@@ -867,12 +1411,13 @@ class K8sCheck(unittest.TestCase):
                 config = json.load(open(flags['--kubeconfig']))
                 context = next(c['context'] for c in config['contexts'] if c['name'] == flags['--context'])
                 user = next(u['user'] for u in config['users'] if u['name'] == context['user'])
-                plugin = user['exec']
-                result = subprocess.run([plugin['command'], *plugin.get('args', [])],
-                                        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
-                sys.stdout.write(result.stdout)
-                sys.stderr.write(result.stderr)
-                sys.exit(result.returncode)
+                plugin = user.get('exec')
+                if plugin is not None:  # a rendered snapshot has no exec plugin to run
+                    result = subprocess.run([plugin['command'], *plugin.get('args', [])],
+                                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
+                    sys.stdout.write(result.stdout)
+                    sys.stderr.write(result.stderr)
+                    sys.exit(result.returncode)
             ''')
         kubectl = self.tmp / 'bin/kubectl'
         kubectl.write_text(FAKE_KUBECTL.replace(
@@ -899,19 +1444,20 @@ class K8sCheck(unittest.TestCase):
                 config = json.load(open(flags['--kubeconfig']))
                 context = next(c['context'] for c in config['contexts'] if c['name'] == flags['--context'])
                 user = next(u['user'] for u in config['users'] if u['name'] == context['user'])
-                plugin = user['exec']
-                assert plugin['command'] == 'tbot'
-                command = next(candidate for directory in os.get_exec_path()
-                               if os.path.isfile(candidate := os.path.normpath(
-                                   os.path.join(directory, plugin['command'])))
-                               and os.access(candidate, os.X_OK))
-                fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
-                assert os.path.commonpath([os.path.realpath(command), fixture_root]) == fixture_root
-                result = subprocess.run([command, *plugin.get('args', [])],
-                                        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
-                if result.returncode:
-                    sys.stderr.write(result.stderr)
-                    sys.exit(result.returncode)
+                plugin = user.get('exec')
+                if plugin is not None:  # a rendered snapshot has no exec plugin to run
+                    assert plugin['command'] == 'tbot'
+                    command = next(candidate for directory in os.get_exec_path()
+                                   if os.path.isfile(candidate := os.path.normpath(
+                                       os.path.join(directory, plugin['command'])))
+                                   and os.access(candidate, os.X_OK))
+                    fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
+                    assert os.path.commonpath([os.path.realpath(command), fixture_root]) == fixture_root
+                    result = subprocess.run([command, *plugin.get('args', [])],
+                                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
+                    if result.returncode:
+                        sys.stderr.write(result.stderr)
+                        sys.exit(result.returncode)
             ''')
         kubectl = self.tmp / 'bin/kubectl'
         kubectl.write_text(FAKE_KUBECTL.replace(
@@ -933,8 +1479,12 @@ class K8sCheck(unittest.TestCase):
         # https://github.com/gravitational/teleport/blob/v18.7.6/tool/tbot/proxy.go#L88
         self.tbot.write_text(textwrap.dedent('''\
             #!/usr/bin/env python3
-            import os, shutil, sys
+            import json, os, shutil, sys
             if sys.argv[1:3] == ['kube', 'credentials']:
+                print(json.dumps({'kind': 'ExecCredential', 'apiVersion': 'client.authentication.k8s.io/v1beta1',
+                                  'status': {'expirationTimestamp': '2999-01-01T00:00:00Z',
+                                             'clientCertificateData': '-----BEGIN CERTIFICATE-----\\nx\\n-----END CERTIFICATE-----\\n',
+                                             'clientKeyData': '-----BEGIN PRIVATE KEY-----\\nx\\n-----END PRIVATE KEY-----\\n'}}))
                 sys.exit(0)
             assert sys.argv[1] == 'proxy'
             destination = next(a.split('=', 1)[1] for a in sys.argv if a.startswith('--destination-dir='))
@@ -954,16 +1504,17 @@ class K8sCheck(unittest.TestCase):
                 config = json.load(open(flags['--kubeconfig']))
                 context = next(c['context'] for c in config['contexts'] if c['name'] == flags['--context'])
                 user = next(u['user'] for u in config['users'] if u['name'] == context['user'])
-                plugin = user['exec']
-                fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
-                assert os.path.commonpath([os.path.realpath(plugin['command']), fixture_root]) == fixture_root
-                env = dict(os.environ)
-                env.update((item['name'], item['value']) for item in plugin.get('env', []))
-                result = subprocess.run([plugin['command'], *plugin.get('args', [])], env=env,
-                                        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
-                if result.returncode:
-                    sys.stderr.write(result.stderr)
-                    sys.exit(result.returncode)
+                plugin = user.get('exec')
+                if plugin is not None:  # a rendered snapshot has no exec plugin to run
+                    fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
+                    assert os.path.commonpath([os.path.realpath(plugin['command']), fixture_root]) == fixture_root
+                    env = dict(os.environ)
+                    env.update((item['name'], item['value']) for item in plugin.get('env', []))
+                    result = subprocess.run([plugin['command'], *plugin.get('args', [])], env=env,
+                                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
+                    if result.returncode:
+                        sys.stderr.write(result.stderr)
+                        sys.exit(result.returncode)
             ''')
         kubectl = self.tmp / 'bin/kubectl'
         kubectl.write_text(FAKE_KUBECTL.replace(

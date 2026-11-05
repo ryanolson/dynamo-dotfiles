@@ -19,9 +19,10 @@ One TOML file per host says which clusters agents may use and how to reach them.
 | Key | Type | Meaning |
 |---|---|---|
 | `user` | string | The username `kubectl auth whoami` must print for the bot. Any other identity is refused. |
-| `kubeconfig` | string | The bot's kubeconfig, written by `tbot`. A leading `~/` is the account's home from the password database, not `$HOME`. After symlinks are resolved, it must lie under `~/.local/share/tbot/` of that home, where the tbot config writes it. A path with a `.kube` or `.tsh` directory in it, as written or resolved, is refused: those hold the owner's own login. Readers get the resolved path, and pass that to kubectl. `KUBECONFIG` must name the same file. |
+| `kubeconfig` | string | The bot's kubeconfig, written by `tbot`. A leading `~/` is the account's home from the password database, not `$HOME`. After symlinks are resolved, it must lie under `~/.local/share/tbot/` of that home, where the tbot config writes it. A path with a `.kube` or `.tsh` directory in it, as written or resolved, is refused: those hold the owner's own login. Readers get the resolved path, and pass it to `prepare_bot_kubeconfig()` in `scripts/k8s_profiles.py`, which renders the only kubeconfig kubectl ever sees. `KUBECONFIG` must name the same file. |
 | `developer` | string | The value of the `dynamo.nvidia.com/developer` label on our namespaces. |
 | `namespace_prefix` | string | The prefix of every namespace we may write in, ending in `-`. |
+| `kubectl_sha256` | string | `sha256sum` of the kubectl binary on this host: 64 lower-case hex digits. Tools run kubectl only from `/usr/local/bin`, `/usr/bin` or `~/.local/bin`, only as an ELF binary, and only when its sha256 matches; a different binary at those paths, such as a wrapper, is refused (`kubectl_mismatch`). Update it when kubectl is upgraded. |
 
 ## `[clusters.<name>]`
 

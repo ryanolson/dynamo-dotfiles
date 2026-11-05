@@ -3,12 +3,19 @@
 The schema is references/profiles.md. Shared by k8s-check and k8s-guard, so both
 refuse the same bad file the same way. Standard library only.
 """
+import base64
+from datetime import datetime, timezone
 import fcntl
+import hashlib
+import json
 import os
 from pathlib import Path
 import pwd
+import re
 import stat
+import subprocess
 import tomllib
+import urllib.parse
 
 SCHEMA_VERSION = 1
 DEFAULT_PROFILES = '~/.config/k8s-clusters/profiles.toml'
@@ -16,7 +23,7 @@ ALLOWED = ('first-choice', 'qa-idle', 'never')
 ARCHES = ('amd64', 'arm64')
 EFFECTS = ('NoSchedule', 'PreferNoSchedule', 'NoExecute')
 
-BOT_KEYS = {'user': str, 'kubeconfig': str, 'developer': str, 'namespace_prefix': str}
+BOT_KEYS = {'user': str, 'kubeconfig': str, 'developer': str, 'namespace_prefix': str, 'kubectl_sha256': str}
 # Keys every profile needs, then the ones every profile but a "never" one needs.
 BASE_KEYS = {'context': str, 'allowed': str, 'source': list}
 USE_KEYS = {'bot_can_write': bool, 'arch': str, 'gpu_product': str, 'gpu_type': str, 'gpus_per_node': int,
@@ -79,12 +86,6 @@ def resolve_bot_kubeconfig(path):
     return str(real), None
 
 
-# The only credentials a bot kubeconfig user may hold: tbot's exec plugin, or the client
-# certificate tbot writes when its exec plugin is off. A token, an auth provider, an
-# impersonation or any other exec command (tsh above all) would act as someone else.
-BOT_USER_KEYS = {'exec', 'client-certificate', 'client-certificate-data', 'client-key', 'client-key-data'}
-# Where tbot is installed (the tbot setup in the dotfiles README): an exec plugin may run only
-# the file one of these resolves to. A name alone is not enough: /tmp/tbot can link to tsh.
 TBOT_INSTALLS = ('/usr/local/bin/tbot', '~/.local/bin/tbot')
 # The one exec shape tbot v18.7.6 writes (lib/tbot/services/k8s/output_v2.go,
 # generateKubeConfigV2WithPlugin), as `kubectl config view -o json` prints it: kubectl adds
@@ -148,32 +149,12 @@ def tbot_exec_problem(plugin, kubeconfig):
             not isinstance(args[2], str) or not args[2].startswith(TBOT_DESTINATION_FLAG):
         return f'exec args are {args!r}; only {shape} is allowed'
     destination = args[2][len(TBOT_DESTINATION_FLAG):]
-    if not os.path.isabs(destination) or \
-            os.path.realpath(destination) != os.path.dirname(os.path.realpath(kubeconfig)):
-        return f'exec args are {args!r}; only {shape} is allowed'
-    return None
-
-
-def bot_credential_problem(view, context, kubeconfig):
-    """Why the context in a `kubectl config view -o json` result does not use bot credentials, or None.
-
-    kubeconfig is the resolved path of the bot kubeconfig the view was read from.
-    """
-    ctx = next((c.get('context') or {} for c in view.get('contexts') or [] if c.get('name') == context), None)
-    if ctx is None:
-        return f'context {context} is not in the bot kubeconfig'
-    user = next((u.get('user') or {} for u in view.get('users') or [] if u.get('name') == ctx.get('user')), None)
-    if user is None:
-        return f'context {context} names user {ctx.get("user")!r}, which the bot kubeconfig does not define'
-    extra = sorted(set(user) - BOT_USER_KEYS)
-    if extra:
-        return f'the user of context {context} holds {", ".join(extra)}; only tbot credentials are allowed'
-    if 'exec' in user:
-        problem = tbot_exec_problem(user['exec'], kubeconfig)
-        if problem:
-            return f'the user of context {context}: {problem}'
-    if not user:
-        return f'the user of context {context} holds no credentials'
+    # tbot's Go joins and cleans the destination before the kernel follows symlinks, so
+    # current/.. may name another directory to tbot than to realpath. Allow no . or .. at all.
+    if not os.path.isabs(destination) or any(part in ('.', '..') for part in destination.split('/')):
+        return f'exec destination {destination!r} must be an absolute path without . or ..'
+    if os.path.realpath(destination) != os.path.dirname(os.path.realpath(kubeconfig)):
+        return f'exec destination {destination!r} is not the directory of the bot kubeconfig; only {shape} is allowed'
     return None
 
 
@@ -192,15 +173,29 @@ def kubectl_env(environ=None):
 KUBECONFIG_MAX = 1 << 20
 
 
-def sealed_copy(path):
-    """Read path once into a memfd sealed against any change, and return its descriptor.
+def sealed_bytes(data):
+    """Put data in a memfd sealed against any change, and return its inheritable descriptor.
 
-    Every kubectl call (k8s-check and k8s-guard) reads the kubeconfig through /proc/self/fd/<n> of this memfd. The
-    bytes the credential check reads are the bytes every later call reads: neither
-    replacing nor rewriting the file on disk changes them, and the seals stop writes.
+    kubectl reads it through /proc/self/fd/<n>. Nothing can change these bytes afterwards:
+    the seals stop writes, growth and shrinking, and further seals.
     """
+    if not hasattr(os, 'memfd_create') or not os.path.isdir('/proc/self/fd'):
+        raise ProfileError('kubeconfig_not_bot', 'this host has no memfd or /proc/self/fd; the check needs Linux')
+    fd = os.memfd_create('k8s-clusters-kubeconfig', os.MFD_ALLOW_SEALING)
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+    fcntl.fcntl(fd, fcntl.F_ADD_SEALS,
+                fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
+    os.set_inheritable(fd, True)
+    return fd
+
+
+def sealed_copy(path):
+    """Read the file at path once (no symlink as its last part) into a sealed memfd."""
     try:
-        src = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        # O_NONBLOCK: opening a FIFO with no writer would otherwise wait forever before fstat.
+        src = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as e:
         raise ProfileError('kubeconfig_not_bot', f'cannot open the bot kubeconfig {path}: {e.strerror}')
     try:
@@ -211,16 +206,227 @@ def sealed_copy(path):
         os.close(src)
     if len(data) > KUBECONFIG_MAX:
         raise ProfileError('kubeconfig_not_bot', f'the bot kubeconfig {path} is larger than {KUBECONFIG_MAX} bytes')
-    if not hasattr(os, 'memfd_create') or not os.path.isdir('/proc/self/fd'):
-        raise ProfileError('kubeconfig_not_bot', 'this host has no memfd or /proc/self/fd; the check needs Linux')
-    fd = os.memfd_create('k8s-check-kubeconfig', os.MFD_ALLOW_SEALING)
-    view = memoryview(data)
-    while view:
-        view = view[os.write(fd, view):]
-    fcntl.fcntl(fd, fcntl.F_ADD_SEALS,
-                fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
-    os.set_inheritable(fd, True)
-    return fd
+    return sealed_bytes(data)
+
+
+# kubectl runs only from these paths (~ is the passwd home), never from PATH, and only as an
+# ELF binary: a wrapper script earlier on PATH, or at one of these paths, may run tsh.
+KUBECTL_INSTALLS = ('/usr/local/bin/kubectl', '/usr/bin/kubectl', '~/.local/bin/kubectl')
+
+
+def is_elf(path):
+    try:
+        with open(path, 'rb') as f:
+            return f.read(4) == b'\x7fELF'
+    except OSError:
+        return False
+
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(1 << 20), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def kubectl_binary(pinned_sha256):
+    """The resolved path of the installed kubectl ELF binary whose sha256 is the pinned one.
+
+    The pin ([bot] kubectl_sha256, written per host) catches a different binary installed at
+    an allowlisted path later, such as a compiled wrapper that runs tsh.
+    """
+    home = account_home()
+    found = []
+    for p in KUBECTL_INSTALLS:
+        real = os.path.realpath(home + p[1:] if p.startswith('~/') else p)
+        if os.path.isfile(real) and os.access(real, os.X_OK) and is_elf(real):
+            digest = file_sha256(real)
+            if digest == pinned_sha256:
+                return real
+            found.append(f'{real} ({digest})')
+    if found:
+        raise ProfileError('kubectl_mismatch', f'no installed kubectl matches bot.kubectl_sha256 {pinned_sha256}; '
+                                               f'found {", ".join(found)}')
+    raise ProfileError('kubectl_not_found', f'no kubectl ELF binary at {", ".join(KUBECTL_INSTALLS)}')
+
+
+# What tbot v18.7.6 writes for one context (lib/tbot/services/k8s/output_v2.go). The renderer
+# copies only these fields into a fresh kubeconfig, so a field it does not copy cannot act.
+# A field outside them is refused by name, so a mistake is reported, not silently dropped.
+TBOT_CLUSTER_KEYS = {'server', 'tls-server-name', 'certificate-authority-data'}
+TBOT_CONTEXT_KEYS = {'cluster', 'user', 'namespace'}
+TBOT_CERT_KEYS = {'client-certificate-data', 'client-key-data'}
+
+
+def _one(view, kind, name):
+    entries = [e for e in view.get(kind) or [] if isinstance(e, dict) and e.get('name') == name]
+    if len(entries) != 1:
+        return None, f'{kind} names {name!r} {len(entries)} times; it must be exactly once'
+    body = entries[0].get(kind[:-1])
+    if not isinstance(body, dict):
+        return None, f'{kind[:-1]} {name!r} is not a table'
+    return body, None
+
+
+def render_bot_kubeconfig(view, context, kubeconfig):
+    """Render a fresh kubeconfig for one context from `kubectl config view --raw --flatten -o json`.
+
+    Returns (JSON bytes, None), or (None, why it is not the bot's). kubeconfig is the resolved
+    path of the bot kubeconfig the view was read from: tbot's exec plugin names its directory.
+    """
+    ctx, problem = _one(view, 'contexts', context)
+    if problem:
+        return None, problem
+    extra = sorted(set(ctx) - TBOT_CONTEXT_KEYS)
+    if extra:
+        return None, f'context {context} holds {", ".join(extra)}'
+    cluster, problem = _one(view, 'clusters', ctx.get('cluster'))
+    if problem:
+        return None, problem
+    extra = sorted(set(cluster) - TBOT_CLUSTER_KEYS)
+    if extra:
+        return None, f'cluster {ctx.get("cluster")!r} holds {", ".join(extra)}'
+    server = cluster.get('server')
+    try:
+        url = urllib.parse.urlsplit(server) if isinstance(server, str) else None
+        if url:
+            url.port  # raises ValueError for a port that is not a number
+    except ValueError:
+        url = None
+    if not url or url.scheme != 'https' or not url.hostname:
+        return None, f'cluster server {server!r} must be an https URL; http skips the bot\'s credentials'
+    if url.username is not None or url.password is not None or '@' in url.netloc:
+        return None, f'cluster server {server!r} holds userinfo, which would be sent as credentials'
+    if not isinstance(cluster.get('certificate-authority-data'), str) or not cluster['certificate-authority-data']:
+        return None, f'cluster {ctx.get("cluster")!r} has no certificate-authority-data'
+    if 'tls-server-name' in cluster and not isinstance(cluster['tls-server-name'], str):
+        return None, f'cluster {ctx.get("cluster")!r} tls-server-name is not a string'
+    user, problem = _one(view, 'users', ctx.get('user'))
+    if problem:
+        return None, problem
+    if not user:
+        return None, f'user {ctx.get("user")!r} holds no credentials'
+    if 'exec' in user:
+        extra = sorted(set(user) - {'exec'})
+        if extra:
+            return None, f'user {ctx.get("user")!r} holds {", ".join(extra)} beside tbot\'s exec plugin'
+        problem = tbot_exec_problem(user['exec'], kubeconfig)
+        if problem:
+            return None, f'user {ctx.get("user")!r}: {problem}'
+        rendered_user = {'exec': {k: user['exec'][k] for k in ('apiVersion', 'command', 'args')}}
+    elif set(user) == TBOT_CERT_KEYS and all(isinstance(user[k], str) and user[k] for k in TBOT_CERT_KEYS):
+        rendered_user = {k: user[k] for k in sorted(TBOT_CERT_KEYS)}
+    else:
+        return None, (f'user {ctx.get("user")!r} holds {", ".join(sorted(user))}; only tbot\'s exec plugin '
+                      f'or embedded client certificate data is allowed')
+    rendered_context = {'cluster': ctx['cluster'], 'user': ctx['user']}
+    if isinstance(ctx.get('namespace'), str) and ctx['namespace']:
+        rendered_context['namespace'] = ctx['namespace']
+    rendered = {
+        'apiVersion': 'v1', 'kind': 'Config',
+        'clusters': [{'name': ctx['cluster'], 'cluster': {k: cluster[k] for k in sorted(TBOT_CLUSTER_KEYS) if k in cluster}}],
+        'users': [{'name': ctx['user'], 'user': rendered_user}],
+        'contexts': [{'name': context, 'context': rendered_context}],
+        'current-context': context,
+    }
+    return json.dumps(rendered).encode(), None
+
+
+# A destination tbot reads as a plain path: tbot parses --destination-dir as a URI
+# (lib/tbot/config/config.go, DestinationFromURI), so # ? % : and the like would change it.
+SAFE_DESTINATION = re.compile(r'/[A-Za-z0-9._/+-]*')
+SNAPSHOT_MIN_SECONDS = 300
+EXEC_CREDENTIAL_API = 'client.authentication.k8s.io/v1beta1'
+
+
+def snapshot_tbot_credentials(tbot, destination, timeout=60):
+    """Run `tbot kube credentials` once and return (cert PEM, key PEM, expiry).
+
+    tbot v18.7.6 (tool/tbot/kube.go) reads <destination>/identity and prints an ExecCredential
+    whose status holds the PEM cert and key and an expirationTimestamp. Embedding these in the
+    rendered kubeconfig, with no exec plugin, makes the credential whoami checks the credential
+    every later call uses. A snapshot that expires within SNAPSHOT_MIN_SECONDS is taken once
+    more, then refused.
+    """
+    if not SAFE_DESTINATION.fullmatch(destination) or any(p in ('.', '..') for p in destination.split('/')):
+        raise ProfileError('kubeconfig_credentials',
+                           f'tbot destination {destination!r} must be an absolute path of letters, digits and . _ / + -, '
+                           f'without . or ..')
+    cmd = [tbot, 'kube', 'credentials', f'--destination-dir={destination}']
+    for _ in range(2):
+        try:
+            p = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout,
+                               env=kubectl_env())
+        except subprocess.TimeoutExpired:
+            raise ProfileError('kubeconfig_credentials', f'tbot kube credentials timed out after {timeout}s')
+        if p.returncode != 0:
+            raise ProfileError('kubeconfig_credentials',
+                               f'tbot kube credentials exited {p.returncode}: {p.stderr.strip()[:400]}')
+        try:
+            cred = json.loads(p.stdout)
+            status = cred['status']
+            cert, key, expiry = status['clientCertificateData'], status['clientKeyData'], status['expirationTimestamp']
+            ok = (cred.get('kind') == 'ExecCredential' and cred.get('apiVersion') == EXEC_CREDENTIAL_API
+                  and isinstance(cert, str) and cert.startswith('-----BEGIN CERTIFICATE-----')
+                  and isinstance(key, str) and key.startswith('-----BEGIN ') and 'PRIVATE KEY-----' in key)
+            expires = datetime.fromisoformat(expiry.replace('Z', '+00:00'))
+        except (ValueError, KeyError, TypeError, AttributeError):
+            ok = False
+        if not ok:
+            raise ProfileError('kubeconfig_credentials', 'tbot kube credentials did not print an ExecCredential '
+                                                         f'({EXEC_CREDENTIAL_API}) with a PEM cert, key and expiry')
+        if expires.tzinfo is None:
+            raise ProfileError('kubeconfig_credentials', f'tbot credential expiry {expiry!r} has no time zone')
+        if (expires - datetime.now(timezone.utc)).total_seconds() >= SNAPSHOT_MIN_SECONDS:
+            return cert, key, expires
+    raise ProfileError('credentials_expired',
+                       f'tbot credentials expire at {expiry}, within {SNAPSHOT_MIN_SECONDS}s; is tbot renewing?')
+
+
+def prepare_bot_kubeconfig(kubeconfig, context, kubectl_sha256, timeout=60):
+    """Return (kubectl path, sealed descriptor of the rendered kubeconfig) for one context.
+
+    kubeconfig is the resolved bot kubeconfig and kubectl_sha256 the pin, both from
+    load_profiles. The file is read once into a sealed copy; the pinned kubectl reads that copy
+    locally (config view runs no credential plugin); render_bot_kubeconfig keeps only tbot's
+    fields; a tbot exec plugin is replaced by a one-time credential snapshot, so the rendered
+    file holds fixed client cert data and no exec plugin. The result goes into a second sealed
+    copy. Every later kubectl call must use the returned kubectl path, the returned descriptor
+    through /proc/self/fd/<n>, and kubectl_env().
+    Raises ProfileError: kubectl_not_found, kubectl_mismatch, kubeconfig_not_bot, kubectl_error,
+    context_missing, kubeconfig_credentials, or credentials_expired.
+    """
+    kubectl = kubectl_binary(kubectl_sha256)
+    raw = sealed_copy(kubeconfig)
+    cmd = [kubectl, '--kubeconfig', f'/proc/self/fd/{raw}', 'config', 'view', '--raw', '--flatten', '-o', 'json']
+    try:
+        p = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout,
+                           env=kubectl_env(), pass_fds=(raw,))
+    except subprocess.TimeoutExpired:
+        raise ProfileError('kubectl_error', f'kubectl config view timed out after {timeout}s')
+    finally:
+        os.close(raw)
+    if p.returncode != 0:
+        raise ProfileError('kubectl_error', f'kubectl config view exited {p.returncode}: {p.stderr.strip()[:400]}')
+    try:
+        view = json.loads(p.stdout)
+    except json.JSONDecodeError:
+        raise ProfileError('kubectl_error', 'kubectl config view output is not JSON')
+    if context not in [c.get('name') for c in view.get('contexts') or [] if isinstance(c, dict)]:
+        raise ProfileError('context_missing', f'context {context} is not in the bot kubeconfig')
+    data, problem = render_bot_kubeconfig(view, context, kubeconfig)
+    if problem:
+        raise ProfileError('kubeconfig_credentials', problem)
+    rendered = json.loads(data)
+    user = rendered['users'][0]['user']
+    if 'exec' in user:
+        cert, key, _ = snapshot_tbot_credentials(user['exec']['command'],
+                                                 os.path.dirname(os.path.realpath(kubeconfig)), timeout)
+        rendered['users'][0]['user'] = {'client-certificate-data': base64.b64encode(cert.encode()).decode(),
+                                        'client-key-data': base64.b64encode(key.encode()).decode()}
+        data = json.dumps(rendered).encode()
+    return kubectl, sealed_bytes(data)
 
 
 def profiles_path():
@@ -309,6 +515,9 @@ def load_profiles():
         else:
             check_type('bot', key, bot[key], kind, errors)
     prefix = bot.get('namespace_prefix')
+    pin = bot.get('kubectl_sha256')
+    if isinstance(pin, str) and not re.fullmatch(r'[0-9a-f]{64}', pin):
+        errors.append('bot.kubectl_sha256 must be 64 lower-case hex digits (sha256sum of the kubectl binary)')
     if isinstance(prefix, str) and prefix and not prefix.endswith('-'):
         errors.append('bot.namespace_prefix must end in "-"')
     resolved = None
