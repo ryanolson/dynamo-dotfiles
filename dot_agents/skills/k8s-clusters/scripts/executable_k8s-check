@@ -15,19 +15,17 @@ profile or the wrong kubeconfig never reach a cluster. Every kubectl call is a
 read, and carries the bot's kubeconfig and the profile's context explicitly.
 """
 import argparse
-import fcntl
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
-import stat
 import subprocess
 import sys
 
 # -I drops the script directory from sys.path; the shared parser lives next to this script.
 sys.dont_write_bytecode = True  # keep the deployed skill directory clean
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from k8s_profiles import ProfileError, bot_credential_problem, kubectl_env, load_profiles  # noqa: E402
+from k8s_profiles import ProfileError, bot_credential_problem, kubectl_env, load_profiles, sealed_copy  # noqa: E402
 
 DGD_CRD = 'dynamographdeployments.nvidia.com'
 DGD_RESOURCE = 'dynamographdeployments.nvidia.com'
@@ -45,40 +43,6 @@ class Refusal(ProfileError):
 
 
 # --- kubectl ----------------------------------------------------------------
-
-KUBECONFIG_MAX = 1 << 20
-
-
-def sealed_copy(path):
-    """Read path once into a memfd sealed against any change, and return its descriptor.
-
-    Every kubectl call reads the kubeconfig through /proc/self/fd/<n> of this memfd. The
-    bytes the credential check reads are the bytes every later call reads: neither
-    replacing nor rewriting the file on disk changes them, and the seals stop writes.
-    """
-    try:
-        src = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    except OSError as e:
-        raise Refusal('kubeconfig_not_bot', f'cannot open the bot kubeconfig {path}: {e.strerror}')
-    try:
-        if not stat.S_ISREG(os.fstat(src).st_mode):
-            raise Refusal('kubeconfig_not_bot', f'the bot kubeconfig {path} is not a regular file')
-        data = os.read(src, KUBECONFIG_MAX + 1)
-    finally:
-        os.close(src)
-    if len(data) > KUBECONFIG_MAX:
-        raise Refusal('kubeconfig_not_bot', f'the bot kubeconfig {path} is larger than {KUBECONFIG_MAX} bytes')
-    if not hasattr(os, 'memfd_create') or not os.path.isdir('/proc/self/fd'):
-        raise Refusal('kubeconfig_not_bot', 'this host has no memfd or /proc/self/fd; the check needs Linux')
-    fd = os.memfd_create('k8s-check-kubeconfig', os.MFD_ALLOW_SEALING)
-    view = memoryview(data)
-    while view:
-        view = view[os.write(fd, view):]
-    fcntl.fcntl(fd, fcntl.F_ADD_SEALS,
-                fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
-    os.set_inheritable(fd, True)
-    return fd
-
 
 class Kubectl:
     """kubectl reading one sealed copy of the bot kubeconfig (see sealed_copy)."""

@@ -3,10 +3,12 @@
 The schema is references/profiles.md. Shared by k8s-check and k8s-guard, so both
 refuse the same bad file the same way. Standard library only.
 """
+import fcntl
 import os
 from pathlib import Path
 import pwd
 import shutil
+import stat
 import tomllib
 
 SCHEMA_VERSION = 1
@@ -131,6 +133,40 @@ def kubectl_env(environ=None):
            if k != 'KUBECONFIG' and not k.startswith('KUBECTL_')}
     env['KUBECTL_KUBERC'] = 'false'
     return env
+
+
+KUBECONFIG_MAX = 1 << 20
+
+
+def sealed_copy(path):
+    """Read path once into a memfd sealed against any change, and return its descriptor.
+
+    Every kubectl call (k8s-check and k8s-guard) reads the kubeconfig through /proc/self/fd/<n> of this memfd. The
+    bytes the credential check reads are the bytes every later call reads: neither
+    replacing nor rewriting the file on disk changes them, and the seals stop writes.
+    """
+    try:
+        src = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as e:
+        raise ProfileError('kubeconfig_not_bot', f'cannot open the bot kubeconfig {path}: {e.strerror}')
+    try:
+        if not stat.S_ISREG(os.fstat(src).st_mode):
+            raise ProfileError('kubeconfig_not_bot', f'the bot kubeconfig {path} is not a regular file')
+        data = os.read(src, KUBECONFIG_MAX + 1)
+    finally:
+        os.close(src)
+    if len(data) > KUBECONFIG_MAX:
+        raise ProfileError('kubeconfig_not_bot', f'the bot kubeconfig {path} is larger than {KUBECONFIG_MAX} bytes')
+    if not hasattr(os, 'memfd_create') or not os.path.isdir('/proc/self/fd'):
+        raise ProfileError('kubeconfig_not_bot', 'this host has no memfd or /proc/self/fd; the check needs Linux')
+    fd = os.memfd_create('k8s-check-kubeconfig', os.MFD_ALLOW_SEALING)
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+    fcntl.fcntl(fd, fcntl.F_ADD_SEALS,
+                fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
+    os.set_inheritable(fd, True)
+    return fd
 
 
 def profiles_path():
