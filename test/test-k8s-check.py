@@ -602,6 +602,40 @@ class K8sCheck(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertEqual(set(out['clusters']['lab-ci']), {'context', 'allowed', 'source'})
 
+    def test_bot_path_cannot_delegate_credentials_to_tsh(self):
+        self.bot_kubeconfig.write_text(json.dumps({
+            'apiVersion': 'v1', 'kind': 'Config',
+            'clusters': [{'name': 'example', 'cluster': {'server': 'https://proxy.example.test'}}],
+            'contexts': [{'name': CTX, 'context': {'cluster': 'example', 'user': 'owner'}}],
+            'users': [{'name': 'owner', 'user': {'exec': {
+                'apiVersion': 'client.authentication.k8s.io/v1',
+                'interactiveMode': 'Never', 'command': 'tsh',
+                'args': ['kube', 'credentials', '--kube-cluster=lab-arm-a',
+                         '--teleport-cluster=proxy.example.test']}}}],
+        }))
+        # Model client-go's exec delegation, using only the harness's fake tsh.
+        credential_step = textwrap.dedent('''\
+            if rest[:2] != ['config', 'get-contexts']:
+                import subprocess
+                config = json.load(open(flags['--kubeconfig']))
+                context = next(c['context'] for c in config['contexts'] if c['name'] == flags['--context'])
+                user = next(u['user'] for u in config['users'] if u['name'] == context['user'])
+                plugin = user.get('exec')
+                if plugin is not None:
+                    assert plugin['command'] == 'tsh'
+                    stub = os.path.join(os.path.dirname(os.environ['FAKE_TSH_LOG']), 'bin', 'tsh')
+                    result = subprocess.run([stub, *plugin.get('args', [])], stdin=subprocess.DEVNULL,
+                                            capture_output=True, text=True, timeout=5)
+                    sys.stdout.write(result.stdout)
+                    sys.stderr.write(result.stderr)
+                    sys.exit(result.returncode)
+            ''')
+        kubectl = self.tmp / 'bin/kubectl'
+        kubectl.write_text(FAKE_KUBECTL.replace(
+            "scenario = json.load(open(os.environ['FAKE_KUBECTL_SCENARIO']))",
+            credential_step + "scenario = json.load(open(os.environ['FAKE_KUBECTL_SCENARIO']))"))
+        self.run_check('lab-arm-a')
+
 
 if __name__ == '__main__':
     unittest.main()
