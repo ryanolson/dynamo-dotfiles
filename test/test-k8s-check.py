@@ -748,6 +748,65 @@ class K8sCheck(unittest.TestCase):
         self.assertEqual(owner_calls, [], f'tbot reads a different identity than the checked destination: {out}')
         self.assert_refused_without_contact(out, rc, 'kubeconfig_credentials')
 
+    def test_tbot_destination_uri_fragment_cannot_select_another_identity(self):
+        identity = self.bot_kubeconfig.parent / 'identity'
+        identity.write_text(BOT)
+        # DestinationFromURI uses url.Parse(...).Path, which omits a fragment.
+        # https://github.com/gravitational/teleport/blob/v18.7.6/lib/tbot/config/config.go#L517
+        self.tbot.write_text(textwrap.dedent('''\
+            #!/usr/bin/env python3
+            import json, os, sys
+            from urllib.parse import urlsplit, unquote
+            assert sys.argv[1:3] == ['kube', 'credentials'] and len(sys.argv) == 4
+            destination = unquote(urlsplit(sys.argv[3].removeprefix('--destination-dir=')).path)
+            identity = os.path.normpath(os.path.join(destination, 'identity'))
+            fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
+            assert os.path.commonpath([os.path.realpath(identity), fixture_root]) == fixture_root
+            with open(identity) as source:
+                credential_user = source.read()
+            print(json.dumps({'status': {'clientCertificateData': credential_user,
+                                         'clientKeyData': 'made-up-key'}}))
+            '''))
+        credential_step = textwrap.dedent('''\
+            credential_user = None
+            if rest[:1] != ['config']:
+                import subprocess
+                plugin = kubeconfig_user()['exec']
+                fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
+                assert os.path.commonpath([os.path.realpath(plugin['command']), fixture_root]) == fixture_root
+                result = subprocess.run([plugin['command'], *plugin['args']], stdin=subprocess.DEVNULL,
+                                        capture_output=True, text=True, timeout=5, check=True)
+                credential_user = json.loads(result.stdout)['status']['clientCertificateData']
+            ''')
+        response_step = textwrap.dedent('''\
+            if rest[:2] == ['auth', 'whoami']:
+                reply = {'stdout': json.dumps({'status': {'userInfo': {'username': credential_user}}})}
+            ''')
+        (self.tmp / 'bin/kubectl').write_text(FAKE_KUBECTL.replace(
+            "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:",
+            credential_step + "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:").replace(
+                "'key': ' '.join(rest)", "'key': ' '.join(rest), 'credential_user': credential_user").replace(
+                    "sys.stdout.write(reply.get('stdout', ''))",
+                    response_step + "sys.stdout.write(reply.get('stdout', ''))"))
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(all(c['credential_user'] == BOT for c in self.calls()
+                            if not c['key'].startswith('config ')))
+        self.log.unlink()
+        # A tool names a new output directory kube#staging beside an output for another identity.
+        identity.write_text('alice@example.test')
+        staged = self.bot_kubeconfig.parent.with_name('kube#staging')
+        staged.mkdir()
+        (staged / 'identity').write_text(BOT)
+        self.bot_kubeconfig = staged / 'kubeconfig.yaml'
+        self.bot_kubeconfig.write_text(self.kc())
+        self.profiles.write_text(EXAMPLE.read_text().replace('/kube/kubeconfig.yaml', '/kube#staging/kubeconfig.yaml'))
+        self.env['KUBECONFIG'] = str(self.bot_kubeconfig)
+        rc, out = self.run_check('lab-arm-a')
+        owner_calls = [c['key'] for c in self.calls() if c['credential_user'] == 'alice@example.test']
+        self.assertEqual(owner_calls, [], f'tbot treats the accepted destination as a URI: exit={rc}, {out}')
+        self.assert_refused_without_contact(out, rc, 'kubeconfig_credentials')
+
     def test_kubeconfig_unset(self):
         # kubectl would fall back to ~/.kube/config, the owner's login.
         del self.env['KUBECONFIG']
