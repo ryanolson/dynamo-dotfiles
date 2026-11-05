@@ -22,6 +22,7 @@ the PRIVATE-TOKEN header, never across a redirect.
 import argparse
 from datetime import date, datetime, timezone
 import fcntl
+import http.client
 import json
 import os
 from pathlib import Path
@@ -179,11 +180,12 @@ class GitLab:
             req.add_header('Content-Type', 'application/json')
         try:
             with _OPENER.open(req, timeout=HTTP_TIMEOUT) as r:
-                return r.read(), r.headers
+                # A reflected token goes no further: not into state, the ask, bb's argv or output.
+                return r.read().replace(self.token.encode(), b'[redacted]'), r.headers
         except urllib.error.HTTPError as e:
             detail = e.read()[:300].decode(errors='replace')
             raise GitLabError(e.code, redact(f'{method} {path}: HTTP {e.code}: {detail}'))
-        except (urllib.error.URLError, OSError, ValueError) as e:
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
             raise Refusal('gitlab_unreachable', redact(f'{method} {path}: {type(e).__name__}: {e}'))
 
     def get(self, path, query=None, raw=False):
@@ -400,7 +402,16 @@ def jobs_for(gl, head):
     if not pipes:
         raise Refusal('pipeline_missing', f'no pipeline ran on {head}')
     pipe = max(pipes, key=lambda p: p['id'])
-    jobs = gl.get(gl.p(f'/pipelines/{int(pipe["id"])}/jobs'), {'per_page': 100})[0]
+    jobs, page = [], 1
+    while True:
+        chunk, headers = gl.get(gl.p(f'/pipelines/{int(pipe["id"])}/jobs'), {'per_page': 100, 'page': page})
+        jobs += chunk
+        nxt = headers.get('X-Next-Page') or ''
+        if not nxt:
+            break
+        page = int(nxt)
+        if page > TREE_PAGES:
+            raise Refusal('gitlab_error', f'pipeline {pipe["id"]} has more than {TREE_PAGES} pages of jobs')
     found = {}
     for name in R.REQUIRED_JOBS:
         mine = [j for j in jobs if j.get('name') == name]
@@ -486,6 +497,8 @@ def unmoved(gl, iid, check):
 
 def push_file(gl, branch, path, base, text, kind):
     site = R.site_of(path)
+    if gl.token in text:
+        raise Refusal('secret_in_content', 'the file holds the GitLab token; it is not pushed')
     R.classify(site, gl.raw(path, base), text, kind)
     exists = gl.branch(branch) is not None
     body = {'branch': branch, 'start_sha': base, 'commit_message': f'{branch}: update {site} values',
@@ -635,17 +648,22 @@ def cmd_merge(gl, cfg, args):
             out = gl.write('PUT', gl.p(f'/merge_requests/{int(args.mr)}/merge'), {'sha': check['head']})
         except GitLabError as e:
             raise Refusal('merge_failed', e.message)
+        except Exception as e:
+            raise Refusal('merge_unknown', redact(f'{type(e).__name__}: {e}'[:200]) + f'; the merge may have '
+                          f'landed: read !{int(args.mr)} before anything else')
         if out.get('state') != 'merged':
             raise Refusal('merge_failed', f'GitLab answered state {out.get("state")!r}')
         landed = out.get('merge_commit_sha') or out.get('squash_commit_sha')
         entry.update(result='merged', merge_commit=landed)
         update(gl.pid, args.mr, merged={'at': now(), 'ask_id': args.answer, 'head': check['head'],
                                         'target': check['target'], 'landed': landed})
-    except Refusal as e:
+    except Exception as e:
+        if not isinstance(e, Refusal):
+            e = Refusal('internal_error', redact(f'{type(e).__name__}: {e}'[:300]))
         entry.update(code=e.code, reason=e.message)
         log_approval(entry)
         e.extra = {'comment': comment(entry, issue, web_url), 'comment_issue': issue}
-        raise
+        raise e
     log_approval(entry)
     return {'result': 'merged', 'mr': int(args.mr), 'head': entry['head'], 'target': entry['target'],
             'merge_commit': entry['merge_commit'], 'comment': comment(entry, issue, web_url),

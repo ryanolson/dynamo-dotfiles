@@ -42,8 +42,8 @@ The token cannot approve, rebase, comment, retarget, reopen, or set auto-merge t
 4. Compare the two commits' trees, level by level. The only change allowed is the content of one of `dynamo-workloads/values/pdx04-dev/values.yaml` and `dynamo-workloads/values/pdx04-stg/values.yaml`, with mode `100644` on both sides. Anything else is refused (`path_not_allowed`), and a change to both files is refused (`one_site`). The tree comparison does not depend on GitLab's diff, which can truncate.
 5. Parse both versions of the file and apply the diff rules (below).
 6. A deploy needs one `Expires: YYYY-MM-DD` line in the merge request description, not in the past.
-7. In the latest pipeline whose `sha` is the head, the latest `helm:plan` and `validate:tests` jobs must each have status `success`. The project marks both jobs `allow_failure`, so the pipeline's own status proves nothing.
-8. The `helm:plan` log must name each changed entry, and every one of our resources in it must be in `--namespace` (`rendered_namespace_mismatch`). A log in which the guard finds none of our resources fails closed (`rendered_namespace_unverified`).
+7. In the latest pipeline whose `sha` is the head, the latest `helm:plan` and `validate:tests` jobs, from every page of jobs, must each have status `success`. The project marks both jobs `allow_failure`, so the pipeline's own status proves nothing.
+8. The `helm:plan` log must name each changed entry, and every one of our resources in it must be in `--namespace`, so a cluster-scoped resource (empty namespace) is refused (`rendered_namespace_mismatch`). A log in which the guard finds none of our resources, or a resource line it cannot read, fails closed (`rendered_namespace_unverified`).
 9. The ArgoCD app's destination namespace, read from the file the config names, must equal `--namespace`. No configured source fails closed (`argocd_destination_unverified`).
 10. Build the ask text. It must fit in the 4000 characters of `bb sgc ask` (`ask_too_long`).
 
@@ -52,10 +52,10 @@ The token cannot approve, rebase, comment, retarget, reopen, or set auto-merge t
 These are the pure functions in `scripts/astra_guard_rules.py`.
 
 - An entry is an item of one of the top-level workload lists (`mockerRepros`, `vllmModels`, `sglangModels`, `trtllmModels`, `vllmDisaggModels`, `sglangDisaggModels`, `stockVllmModels`, `nimModels`) whose `name` starts with `wcep-`. A `wcep-*` item anywhere else, such as a secret list, is not an entry.
-- With our entries removed, both parsed files must be equal (`outside_entries`). The guard compares parsed YAML, not lines, so an anchor in our entry that changes the value of an IT entry is refused.
+- With our entries removed, both parsed files must be equal, types included, so `true` never equals `1` (`outside_entries`). The guard compares parsed YAML, not lines, so an anchor in our entry that changes the value of an IT entry is refused.
 - Duplicate keys and more than one YAML document are refused (`yaml_invalid`). PyYAML and Helm's parser would resolve them differently.
-- Entry names are lower-case `wcep-<word>[-<word>...]` and never end in `-prd` (`entry_name`).
-- On `pdx04-dev`, an added or changed entry has no field whose key contains `gpu` with a non-zero value (`dev_gpu`). `gpuType: B200` counts too.
+- Every entry the change adds, changes or removes has a lower-case `wcep-<word>[-<word>...]` name that does not end in `-prd` (`entry_name`).
+- On `pdx04-dev`, an added or changed entry has no non-zero field whose key names an accelerator: a key that contains `gpu` or `mig-`, or a resource under `nvidia.com/`, `amd.com/`, `gpu.intel.com/` or `habana.ai/` (`dev_gpu`). `gpuType: B200` counts too.
 - A deploy adds or changes at least one entry. A teardown only removes entries and changes nothing else (`teardown_not_removal`). A merge request that changes no entry is refused (`no_entry_change`).
 
 ### The inverse patch
@@ -77,7 +77,7 @@ The window note says: GitLab's merge call checks the head but not `main`. A chan
 3. a head or `main` that moved since the check (`head_moved`, `main_moved`). Push, check and ask again;
 4. an answer that fails the answer-of contract (below);
 5. any failure of the full check, run again on the same pair;
-6. a merge GitLab refuses (`merge_failed`), for example 409 when the branch moved after the last read.
+6. a merge GitLab refuses (`merge_failed`), for example 409 when the branch moved after the last read. When the merge call fails without an answer from GitLab, such as a cut connection, the result is `merge_unknown`: read the merge request before doing anything else.
 
 The merge sends the head as `sha`, so GitLab refuses it if the branch moved. Nothing refuses a move of `main` inside the merge call itself (the window above).
 
@@ -96,7 +96,7 @@ The guard reads only that command's output. It never reads a Linear comment, bec
 
 ### The approval log
 
-Every merge and every refusal at merge time appends one JSON line to `${XDG_STATE_HOME:-~/.local/state}/astra-guard/approvals.jsonl`: `time`, `ask_id`, `answer` (`status`, `channel`, `option`, `answeredAt` as read, or `null`), `mr`, `head`, `target`, `result` (`merged` or `refused`), `code`, `reason` and `merge_commit`.
+Every merge and every refusal at merge time, unexpected errors included, appends one JSON line to `${XDG_STATE_HOME:-~/.local/state}/astra-guard/approvals.jsonl`: `time`, `ask_id`, `answer` (`status`, `channel`, `option`, `answeredAt` as read, or `null`), `mr`, `head`, `target`, `result` (`merged` or `refused`), `code`, `reason` and `merge_commit`.
 
 The output also holds `comment`, a signed text, and `comment_issue`. Post `comment` on that issue as it is. It names the ask, the merge request, both commits and the result. The steward compares these comments with the owner's answers.
 
@@ -123,7 +123,7 @@ argocd = { project = 678, file = "path/to/stg-app.yaml", key = "spec.destination
 
 ## Token
 
-The guard re-runs itself as `fleet secret env ASTRA_GUARD_TOKEN=<token_ref> -- python3 -I astra-guard ...`. It removes the token from its environment at once. It sends the token only in the `PRIVATE-TOKEN` header, which is not resent on a redirect, and it follows no redirects. Child processes (`bb`) do not get it. Output, errors, state files and the log pass through a filter that replaces the token. The token is never in an argument or a file.
+The guard re-runs itself as `fleet secret env ASTRA_GUARD_TOKEN=<token_ref> -- python3 -I astra-guard ...`. It removes the token from its environment at once. It sends the token only in the `PRIVATE-TOKEN` header, which is not resent on a redirect, and it follows no redirects. Child processes (`bb`) do not get it. The guard replaces the token in every response from GitLab before it reads it, so a token GitLab echoes reaches no state file, ask, `bb` argument or output. Output, errors and the log pass through the same filter. `push` refuses a file that holds the token (`secret_in_content`). The token is never in an argument or a file.
 
 ## State
 

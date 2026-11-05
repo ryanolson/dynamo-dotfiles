@@ -124,6 +124,19 @@ def strip(doc):
     return out
 
 
+def same(a, b):
+    """Equality that also compares types, so `true` never equals `1` and `1` never equals `1.0`."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict):
+        return {(type(k), k) for k in a} == {(type(k), k) for k in b} and all(same(a[k], b[k]) for k in a)
+    if isinstance(a, list):
+        return len(a) == len(b) and all(same(x, y) for x, y in zip(a, b))
+    if isinstance(a, float) and a != a:
+        return b != b
+    return a == b
+
+
 def _walk(obj, path=()):
     if isinstance(obj, dict):
         for k, v in obj.items():
@@ -138,12 +151,16 @@ def _zero(v):
     return v is None or v is False or v == 0 or (isinstance(v, str) and v.strip() in ('', '0'))
 
 
+_ACCELERATOR = re.compile(r'gpu|mig-|^(nvidia\.com|amd\.com|gpu\.intel\.com|habana\.ai)/', re.I)
+
+
 def gpu_fields(entry):
-    """Every field of an entry whose key names a GPU, with a non-zero value."""
+    """Every field of an entry whose key names a GPU or another accelerator resource
+    (MIG slices included), with a non-zero value."""
     return [('.'.join(p), v) for p, k, v in _walk(entry)
-            if 'gpu' in str(k).lower() and not isinstance(v, (dict, list)) and not _zero(v)] + \
+            if _ACCELERATOR.search(str(k)) and not isinstance(v, (dict, list)) and not _zero(v)] + \
            [('.'.join(p), '<structure>') for p, k, v in _walk(entry)
-            if 'gpu' in str(k).lower() and isinstance(v, (dict, list)) and v]
+            if _ACCELERATOR.search(str(k)) and isinstance(v, (dict, list)) and v]
 
 
 def classify(site, base_text, head_text, kind):
@@ -152,16 +169,16 @@ def classify(site, base_text, head_text, kind):
     kind is 'deploy' or 'teardown', as recorded when the guard opened the merge request.
     """
     base, head = load_values(base_text), load_values(head_text)
-    if strip(base) != strip(head):
+    if not same(strip(base), strip(head)):
         raise Refusal('outside_entries', 'the change touches more than entries named wcep-* '
                                          f'in the workload lists ({", ".join(ENTRY_LISTS)})')
     old, new = entries(base), entries(head)
-    for (_, name) in new:
-        if not ENTRY_NAME.match(name) or name.endswith('-prd'):
-            raise Refusal('entry_name', f'entry {name!r} is not a lower-case wcep-* name, or ends in -prd')
     added = sorted(k for k in new if k not in old)
     removed = sorted(k for k in old if k not in new)
-    changed = sorted(k for k in new if k in old and new[k] != old[k])
+    changed = sorted(k for k in new if k in old and not same(new[k], old[k]))
+    for (_, name) in added + removed + changed:
+        if not ENTRY_NAME.match(name) or name.endswith('-prd'):
+            raise Refusal('entry_name', f'entry {name!r} is not a lower-case wcep-* name, or ends in -prd')
     if not (added or removed or changed):
         raise Refusal('no_entry_change', 'the change adds, changes and removes no wcep-* entry')
     if kind == 'teardown':
@@ -220,8 +237,9 @@ def apply_patch(text, hunks):
 # -- helm:plan ---------------------------------------------------------------
 
 _ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
-_PLAN = re.compile(r'^(?P<ns>[a-z0-9][a-z0-9.-]*), (?P<name>[A-Za-z0-9][A-Za-z0-9._-]*), (?P<kind>[A-Za-z0-9]+) '
+_PLAN = re.compile(r'^(?P<ns>[^,\s]*), (?P<name>[A-Za-z0-9][A-Za-z0-9._-]*), (?P<kind>[A-Za-z0-9]+) '
                    r'\([^)]*\) has (?P<action>been added|changed|been removed):\s*$')
+_PLAN_ANY = re.compile(r'has (been added|changed|been removed):\s*$')
 
 
 def parse_plan(trace):
@@ -233,7 +251,10 @@ def parse_plan(trace):
     """
     out = []
     for raw in trace.replace('\r', '\n').splitlines():
-        m = _PLAN.match(_ANSI.sub('', raw).strip())
+        line = _ANSI.sub('', raw).strip()
+        m = _PLAN.match(line)
+        if not m and _PLAN_ANY.search(line):
+            raise Refusal('rendered_namespace_unverified', f'cannot read the helm:plan line {line[:120]!r}')
         if m:
             action = m.group('action').split()[-1]
             out.append((m.group('ns'), m.group('name'), m.group('kind'), action))
