@@ -13,6 +13,10 @@ The source of truth is the Linear document "Runbook: build and run on our Dynamo
 - Pass `--context` on every `kubectl` call. Never rely on the current context.
 - Make no write with plain `kubectl`. Writes go through `k8s-guard` only, once it exists.
 
+## Threat model
+
+`k8s-check` and `k8s-guard` protect against accidental use of credentials other than the bot's: a stray kubeconfig, a kuberc, `KUBECONFIG`, a `tsh` exec plugin, a wrong path, or a file swapped by mistake. They do not protect against a malicious process running as the same Unix user, which could replace `~/.local/bin/tbot` or trace the checker. The bot's own permissions on the server are the boundary against that.
+
 ## Profiles
 
 `~/.config/k8s-clusters/profiles.toml` (or `$K8S_CLUSTERS_PROFILES`) holds one profile per cluster: its context, GPUs, taint, storage, pull secret, whether the bot can write, and whether we may use it. It is written by hand from the runbook's section 3, and never committed, because it holds internal names. The schema is in `references/profiles.md`, with a made-up example in `references/profiles.example.toml`.
