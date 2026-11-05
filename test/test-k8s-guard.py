@@ -1832,6 +1832,38 @@ class DownClassificationRaces(GuardCase):
         self.assertEqual(body['gpu_pods_left'], 1, body)
         self.assertIn(NS, self.k8s['namespaces'])
 
+    @unittest.skip("F19: a deleted owned DGD name makes its foreign replacement's pods hold the namespace")
+    def test_f19_foreign_replacement_pods_do_not_hold_the_namespace(self):
+        self.add_ns(thread=OTHER)
+        lid = self.add_lease(thread=OTHER, state='revoking')
+        self.add_obj(gpu_dgd('shared', 1, lid), uid='uid-owned-dgd')
+        self.add_pod(pod('shared', 1, name='owned-pod'))
+        replacement = gpu_dgd('shared', 2, 'lse_previous01')
+        replacement['metadata'].update(namespace=NS, uid='uid-foreign-dgd', resourceVersion='1000',
+                                       labels={NS_UID: 'uid-deleted-ns'})
+        foreign_pod = pod('shared', 2, name='foreign-still-running')
+        foreign_pod['metadata']['ownerReferences'] = [
+            {'apiVersion': DGD_API, 'kind': 'DynamoGraphDeployment', 'name': 'shared',
+             'uid': 'uid-foreign-dgd', 'controller': True}]
+        self.k8s['replacement_dgd'] = replacement
+        self.k8s['replacement_pod'] = foreign_pod
+        self.flush()
+        anchor = "        save(); emit({'kind': 'Status', 'status': 'Success'})\n    fail('fake kubectl: no handler for raw delete '"
+        hook = """        st['pods_after_owned_delete'] = copy.deepcopy(st['pods'][ns])
+        st['objects'][ns]['DynamoGraphDeployment/' + name] = st['replacement_dgd']
+        st['pods'][ns] = [st['replacement_pod']]
+""" + anchor
+        self.assertEqual(FAKE_KUBECTL.count(anchor), 1)
+        (self.bin / 'kubectl').write_text(FAKE_KUBECTL.replace(anchor, hook, 1))
+
+        rc, body, _ = self.guard('--context', CTX, 'down', NS, '--uid', 'uid-ns-1', '--lease', lid,
+                                 host_entry=True)
+
+        self.assertEqual(self.k8s['pods_after_owned_delete'], [])
+        self.assertEqual(rc, 0, f'only the foreign replacement has GPU pods, but down kept the namespace: {body}')
+        self.assertNotIn(NS, self.k8s['namespaces'])
+        self.assertEqual(body['foreign_gpu_pods'], 1, body)
+
     def test_f16_foreign_replacement_cannot_hide_a_deleted_owned_dgds_pod(self):
         self.add_ns(thread=OTHER)
         lid = self.add_lease(thread=OTHER, state='revoking')
