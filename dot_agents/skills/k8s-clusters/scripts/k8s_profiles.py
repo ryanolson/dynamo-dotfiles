@@ -7,7 +7,6 @@ import fcntl
 import os
 from pathlib import Path
 import pwd
-import shutil
 import stat
 import tomllib
 
@@ -87,21 +86,79 @@ BOT_USER_KEYS = {'exec', 'client-certificate', 'client-certificate-data', 'clien
 # Where tbot is installed (the tbot setup in the dotfiles README): an exec plugin may run only
 # the file one of these resolves to. A name alone is not enough: /tmp/tbot can link to tsh.
 TBOT_INSTALLS = ('/usr/local/bin/tbot', '~/.local/bin/tbot')
+# The one exec shape tbot v18.7.6 writes (lib/tbot/services/k8s/output_v2.go,
+# generateKubeConfigV2WithPlugin), as `kubectl config view -o json` prints it: kubectl adds
+# env null, provideClusterInfo false and interactiveMode IfAvailable. Widen only from a real
+# tbot kubeconfig, never by guess: `tbot proxy`, for one, hands off to tsh.
+TBOT_EXEC_API = 'client.authentication.k8s.io/v1beta1'
+TBOT_EXEC_DEFAULTS = {'env': (None, []), 'provideClusterInfo': (None, False),
+                      'interactiveMode': (None, 'IfAvailable'), 'installHint': (None, '')}
+TBOT_DESTINATION_FLAG = '--destination-dir='
 
 
 def tbot_binaries():
-    """The resolved paths of the installed tbot binaries, with ~ as the account's home."""
+    """(st_dev, st_ino) of each installed tbot, following symlinks, with ~ as the account's home.
+
+    File identity, not a path string: tbot may write either the install path or the
+    file it links to (on one host /usr/local/bin/tbot links into /opt/teleport).
+    """
     home = account_home()
     found = set()
     for p in TBOT_INSTALLS:
-        real = os.path.realpath(home + p[1:] if p.startswith('~/') else p)
-        if os.path.isfile(real):
-            found.add(real)
+        try:
+            st = os.stat(home + p[1:] if p.startswith('~/') else p)
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode):
+            found.add((st.st_dev, st.st_ino))
     return found
 
 
-def bot_credential_problem(view, context):
-    """Why the context in a `kubectl config view -o json` result does not use bot credentials, or None."""
+def tbot_exec_problem(plugin, kubeconfig):
+    """Why an exec plugin is not exactly tbot's `kube credentials` for this kubeconfig, or None.
+
+    kubeconfig is the resolved bot kubeconfig. tbot writes it into the same directory it
+    names in --destination-dir, so that flag must resolve to the kubeconfig's directory.
+    """
+    if not isinstance(plugin, dict):
+        return 'exec is not a table'
+    extra = sorted(set(plugin) - {'command', 'args', 'apiVersion', *TBOT_EXEC_DEFAULTS})
+    if extra:
+        return f'exec holds {", ".join(extra)}'
+    command = plugin.get('command')
+    # An absolute path only: a bare name goes through PATH, and Go and Python resolve
+    # PATH entries such as current/../bin differently. No "." or ".." either.
+    if not isinstance(command, str) or not os.path.isabs(command) or \
+            any(part in ('.', '..') for part in command.split('/')):
+        return f'exec runs {command!r}; it must be an absolute path to an installed tbot, without . or ..'
+    try:
+        st = os.stat(command)
+    except OSError:
+        return f'exec runs {command!r}, which does not exist'
+    if (st.st_dev, st.st_ino) not in tbot_binaries():
+        return f'exec runs {command!r}, which is not an installed tbot ({", ".join(TBOT_INSTALLS)})'
+    if plugin.get('apiVersion') != TBOT_EXEC_API:
+        return f'exec apiVersion is {plugin.get("apiVersion")!r}, not {TBOT_EXEC_API}'
+    for key, allowed in TBOT_EXEC_DEFAULTS.items():
+        if plugin.get(key) not in allowed:
+            return f'exec sets {key} to {plugin.get(key)!r}; tbot writes none'
+    args = plugin.get('args')
+    shape = f'["kube", "credentials", "{TBOT_DESTINATION_FLAG}<the kubeconfig\'s directory>"]'
+    if not isinstance(args, list) or len(args) != 3 or args[:2] != ['kube', 'credentials'] or \
+            not isinstance(args[2], str) or not args[2].startswith(TBOT_DESTINATION_FLAG):
+        return f'exec args are {args!r}; only {shape} is allowed'
+    destination = args[2][len(TBOT_DESTINATION_FLAG):]
+    if not os.path.isabs(destination) or \
+            os.path.realpath(destination) != os.path.dirname(os.path.realpath(kubeconfig)):
+        return f'exec args are {args!r}; only {shape} is allowed'
+    return None
+
+
+def bot_credential_problem(view, context, kubeconfig):
+    """Why the context in a `kubectl config view -o json` result does not use bot credentials, or None.
+
+    kubeconfig is the resolved path of the bot kubeconfig the view was read from.
+    """
     ctx = next((c.get('context') or {} for c in view.get('contexts') or [] if c.get('name') == context), None)
     if ctx is None:
         return f'context {context} is not in the bot kubeconfig'
@@ -112,12 +169,9 @@ def bot_credential_problem(view, context):
     if extra:
         return f'the user of context {context} holds {", ".join(extra)}; only tbot credentials are allowed'
     if 'exec' in user:
-        command = str((user['exec'] or {}).get('command') or '')
-        # client-go looks a bare name up on PATH; kubectl runs with the caller's PATH.
-        path = command if os.path.isabs(command) else (shutil.which(command) or '') if command else ''
-        if not path or os.path.realpath(path) not in tbot_binaries():
-            return (f'the user of context {context} runs {command!r}, which is not an installed tbot '
-                    f'({", ".join(TBOT_INSTALLS)})')
+        problem = tbot_exec_problem(user['exec'], kubeconfig)
+        if problem:
+            return f'the user of context {context}: {problem}'
     if not user:
         return f'the user of context {context} holds no credentials'
     return None

@@ -161,7 +161,7 @@ def run_check(report, profiles, cluster, want_crd):
         raise KubectlError(('config', 'view'), 0, 'output is not JSON')
     if prof['context'] not in [c.get('name') for c in view.get('contexts') or []]:
         raise Refusal('context_missing', f'context {prof["context"]} is not in the bot kubeconfig')
-    problem = bot_credential_problem(view, prof['context'])
+    problem = bot_credential_problem(view, prof['context'], bot['kubeconfig'])
     if problem:
         raise Refusal('kubeconfig_credentials', problem)
 
