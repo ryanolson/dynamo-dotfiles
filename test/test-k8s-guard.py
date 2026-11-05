@@ -81,7 +81,8 @@ while i < len(argv):
 stdin = sys.stdin.read() if flags.get('-f', flags.get('--filename')) == '-' or \
     '/dev/stdin' in flags.get('--from-file', '') else ''
 with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:
-    log.write(json.dumps({'argv': argv, 'pos': pos, 'flags': flags}) + '\n')
+    log.write(json.dumps({'argv': argv, 'pos': pos, 'flags': flags,
+                          'env': {k: os.environ.get(k) for k in ('KUBECONFIG', 'KUBECTL_KUBERC')}}) + '\n')
 st = json.load(open(STATE))
 ns_flag = flags.get('-n') or flags.get('--namespace')
 out_json = flags.get('-o', flags.get('--output')) == 'json'
@@ -162,6 +163,9 @@ def json_patch(obj, ops):
 
 
 cmd = pos[0] if pos else ''
+if pos[:2] == ['config', 'view']:
+    # Local: kubectl reads the file it was given (here /proc/self/fd/<n>, inherited from the guard).
+    emit(json.load(open(flags['--kubeconfig'])))
 for needle in st.get('forbid', []):
     if needle in ' '.join(argv):
         fail(f'Error from server (Forbidden): fake forbids "{needle}"')
@@ -427,6 +431,32 @@ printf '%s\\n' "$FAKE_SECRET"
 
 FAKE_TSH = '#!/bin/sh\necho tsh >> "$FAKE_TSH_LOG"\necho "fake tsh: agents never use tsh" >&2\nexit 98\n'
 
+# The profile parser takes the account's home from the password database, not $HOME. The tests run
+# the guard through this runner (as test-k8s-check.py does), which answers pwd.getpwuid with the
+# temporary home.
+RUNNER = r'''
+import os, pwd, runpy, sys
+real = pwd.getpwuid
+class Entry:
+    def __init__(self, entry):
+        self.pw_name, self.pw_uid, self.pw_dir = entry.pw_name, entry.pw_uid, os.environ['FAKE_PW_DIR']
+pwd.getpwuid = lambda uid: Entry(real(uid))
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name='__main__')
+'''
+
+
+def kubeconfig(user=None, contexts=(CTX, CTX_QA, CTX_B200)):
+    """A bot kubeconfig as tbot writes it with its exec plugin on, in JSON (also valid YAML)."""
+    user = user if user is not None else {'exec': {
+        'apiVersion': 'client.authentication.k8s.io/v1beta1', 'command': '/usr/local/bin/tbot',
+        'args': ['kube', 'credentials', '--destination-dir=/example/kube']}}
+    return json.dumps({
+        'apiVersion': 'v1', 'kind': 'Config',
+        'clusters': [{'name': 'example', 'cluster': {'server': 'https://proxy.example.test'}}],
+        'contexts': [{'name': c, 'context': {'cluster': 'example', 'user': 'bot'}} for c in contexts],
+        'users': [{'name': 'bot', 'user': user}]})
+
 
 def iso_ms(dt):
     return dt.strftime('%Y-%m-%dT%H:%M:%S.') + f'{dt.microsecond // 1000:03d}Z'
@@ -510,7 +540,9 @@ class GuardCase(unittest.TestCase):
         self.home = self.tmp / 'home'
         self.bot_kubeconfig = self.home / '.local/share/tbot/example/kube/kubeconfig.yaml'
         self.bot_kubeconfig.parent.mkdir(parents=True)
-        self.bot_kubeconfig.write_text('apiVersion: v1\nkind: Config\n')
+        self.bot_kubeconfig.write_text(kubeconfig())
+        self.runner = self.tmp / 'runner.py'
+        self.runner.write_text(RUNNER)
         for rel in ('.kube/config', '.tsh/keys/example/kubeconfig'):
             p = self.home / rel
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -538,8 +570,10 @@ class GuardCase(unittest.TestCase):
     def tearDown(self):
         self.assertFalse(self.tsh_log.exists(), 'tsh was invoked')
         for call in self.kubectl_calls():
-            self.assertEqual(call['flags'].get('--kubeconfig'), str(self.bot_kubeconfig), call)
+            # The pinned bot kubeconfig, a context, no KUBECONFIG and kuberc off on every call.
+            self.assertTrue(call['flags'].get('--kubeconfig', '').startswith('/proc/self/fd/'), call)
             self.assertIn('--context', call['flags'], call)
+            self.assertEqual(call['env'], {'KUBECONFIG': None, 'KUBECTL_KUBERC': 'false'}, call)
 
     # --- world -------------------------------------------------------------
 
@@ -588,7 +622,10 @@ class GuardCase(unittest.TestCase):
                'FAKE_K8S_STATE': str(self.k8s_state), 'FAKE_KUBECTL_LOG': str(self.kubectl_log),
                'FAKE_BB_STATE': str(self.bb_state), 'FAKE_BB_LOG': str(self.bb_log),
                'FAKE_FLEET_LOG': str(self.fleet_log), 'FAKE_TSH_LOG': str(self.tsh_log),
-               'FAKE_SECRET': SECRET, 'K8S_GUARD_DOWN_WAIT_SECONDS': '0', 'K8S_GUARD_POLL_SECONDS': '0'}
+               'FAKE_SECRET': SECRET, 'K8S_GUARD_DOWN_WAIT_SECONDS': '0', 'K8S_GUARD_POLL_SECONDS': '0',
+               'FAKE_PW_DIR': str(self.home),
+               # The caller's kubectl settings must never reach kubectl.
+               'KUBECTL_KUBERC': 'true', 'KUBECTL_EXPLAIN_OPENAPIV3': 'true'}
         if host_entry:
             # What the k8s-leases host entry gives the guard: no BB_THREAD_ID, no thread storage.
             env['BB_SERVER_URL'] = 'http://127.0.0.1:1'
@@ -600,7 +637,8 @@ class GuardCase(unittest.TestCase):
         return env
 
     def guard(self, *args, stdin_file=None, **env_kw):
-        p = subprocess.run(['python3', '-I', str(GUARD), *args], env=self.env(**env_kw), capture_output=True,
+        p = subprocess.run(['python3', '-I', str(self.runner), str(GUARD), *args], env=self.env(**env_kw),
+                           capture_output=True,
                            text=True, timeout=60, stdin=subprocess.DEVNULL)
         self.reload()
         try:
@@ -676,6 +714,26 @@ class Identity(GuardCase):
         self.refused('kubeconfig_not_bot', '--context', CTX, 'inspect', NS,
                      kubeconfig=self.home / '.tsh/keys/example/kubeconfig')
         self.assertEqual(self.kubectl_calls(), [])
+
+    def test_kubeconfig_credentials_other_than_tbot_refused(self):
+        self.add_ns()
+        users = {'token': {'token': 'not-a-real-token'},
+                 'tsh exec': {'exec': {'apiVersion': 'client.authentication.k8s.io/v1beta1', 'command': 'tsh',
+                                       'args': ['kube', 'credentials']}},
+                 'impersonation': {'exec': {'apiVersion': 'client.authentication.k8s.io/v1beta1',
+                                            'command': 'tbot'}, 'as': 'cluster-admin'}}
+        for label, user in users.items():
+            with self.subTest(user=label):
+                self.bot_kubeconfig.write_text(kubeconfig(user=user))
+                self.kubectl_log.unlink(missing_ok=True)
+                self.refused('kubeconfig_credentials', '--context', CTX, 'inspect', NS)
+                self.assertEqual([c['pos'][:2] for c in self.kubectl_calls()], [['config', 'view']])
+
+    def test_context_missing_from_kubeconfig_refused(self):
+        self.add_ns()
+        self.bot_kubeconfig.write_text(kubeconfig(contexts=(CTX_QA,)))
+        self.refused('kubeconfig_credentials', '--context', CTX, 'inspect', NS)
+        self.assertEqual([c['pos'][:2] for c in self.kubectl_calls()], [['config', 'view']])
 
     def test_two_kubeconfigs_refused(self):
         self.add_ns()

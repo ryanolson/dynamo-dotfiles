@@ -38,7 +38,7 @@ import time
 # -I drops the script directory from sys.path; the shared parser lives next to this script.
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from k8s_profiles import ProfileError, load_profiles  # noqa: E402
+from k8s_profiles import ProfileError, bot_credential_problem, kubectl_env, load_profiles  # noqa: E402
 from k8s_guard_rules import (  # noqa: E402
     DGD_KIND, HOSTNAME_TOPOLOGY, LEASE_LABEL, LEASE_RECORD, Refusal, admit, allocation,
     check_one_node, dgd_gpus, gpu_pod_summary, zero_patch)
@@ -131,16 +131,29 @@ def parse_time(value, what):
 # --- kubectl --------------------------------------------------------------------
 
 class Kubectl:
-    """Every call carries the bot kubeconfig and the profile's context; none relies on the current context."""
+    """kubectl pinned to one open bot kubeconfig and one context, as k8s-check does it.
+
+    The file is opened once; every call reads it through /proc/self/fd/<n>, the same inode, so a
+    path swapped after the credential check is not followed. The environment has no KUBECONFIG,
+    no KUBECTL_* and kuberc off (k8s_profiles.kubectl_env), so nothing adds a --token.
+    """
 
     def __init__(self, kubeconfig, context):
-        self.base = ['kubectl', '--kubeconfig', kubeconfig, '--context', context]
-        self.env = dict(os.environ, KUBECONFIG=kubeconfig)
+        try:
+            self.fd = os.open(kubeconfig, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError as e:
+            raise Refusal('kubeconfig_not_bot', f'cannot open the bot kubeconfig {kubeconfig}: {e.strerror}')
+        os.set_inheritable(self.fd, True)
+        pinned = f'/proc/self/fd/{self.fd}'
+        if not os.path.exists(pinned):
+            raise Refusal('kubeconfig_not_bot', 'this host has no /proc/self/fd, so the kubeconfig cannot be pinned')
+        self.base = ['kubectl', '--kubeconfig', pinned, '--context', context]
+        self.env = kubectl_env()
 
     def run(self, *args, input=None, timeout=KUBECTL_TIMEOUT):
         try:
             p = subprocess.run(self.base + list(args), input=input, capture_output=True, text=True,
-                               env=self.env, timeout=timeout,
+                               env=self.env, timeout=timeout, pass_fds=(self.fd,),
                                stdin=None if input is not None else subprocess.DEVNULL)
         except subprocess.TimeoutExpired:
             return 124, '', f'kubectl timed out after {timeout}s'
@@ -253,22 +266,24 @@ class Guard:
         self.kc = None
 
     def check_identity(self):
+        # The parser resolved bot.kubeconfig and allows it only under tbot's directory in the
+        # account's home, never in a .kube or .tsh directory. KUBECONFIG must name that file, so
+        # the caller meant it; kubectl itself gets the pinned file and no KUBECONFIG.
         bot_path = self.bot['kubeconfig']
-        home = Path.home()
-        banned = [home / '.kube', home / '.tsh']
         value = os.environ.get('KUBECONFIG')
         if not value:
             raise Refusal('kubeconfig_not_bot', 'KUBECONFIG is unset; export the bot kubeconfig')
         if os.pathsep in value:
             raise Refusal('kubeconfig_not_bot', 'KUBECONFIG lists more than one file; name only the bot kubeconfig')
-        real = Path(os.path.realpath(os.path.expanduser(value)))
-        for path in (real, Path(os.path.realpath(bot_path))):
-            for b in (x.resolve() for x in banned):
-                if path == b or b in path.parents:
-                    raise Refusal('kubeconfig_not_bot', f'{path} is a human login, not the bot kubeconfig')
-        if real != Path(os.path.realpath(bot_path)):
+        if os.path.realpath(value) != bot_path:
             raise Refusal('kubeconfig_not_bot', f'KUBECONFIG is {value}, not the bot kubeconfig {bot_path}')
         self.kc = Kubectl(bot_path, self.context)
+        # Local: config view reads the pinned file and runs no credential plugin. Only tbot's exec
+        # plugin or a client certificate may sign the context's requests.
+        view = self.kc.json('config', 'view', '-o', 'json')
+        problem = bot_credential_problem(view, self.context)
+        if problem:
+            raise Refusal('kubeconfig_credentials', problem)
 
     def require_writable(self):
         if not self.profile.get('bot_can_write'):
