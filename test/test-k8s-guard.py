@@ -996,6 +996,26 @@ class Budget(GuardCase):
         self.assertEqual(body.get('code'), 'lease_required', body)
         self.assertEqual(self.writes(), [])
 
+    @unittest.skip("F2: duplicate DGD names hide an unleased GPU write before a partial apply failure")
+    def test_duplicate_dgd_documents_cannot_leave_gpus_without_a_lease(self):
+        # Each object is a separate API write; a later failure keeps earlier writes.
+        hook = """for obj in docs(stdin):
+        if not dry and out:
+            save()
+            fail('Error from server (InternalError): second apply request failed')"""
+        fake = FAKE_KUBECTL.replace('for obj in docs(stdin):', hook)
+        self.assertNotEqual(fake, FAKE_KUBECTL)
+        (self.bin / 'kubectl').write_text(fake)
+        running = gpu_dgd('w', 4, 'lse_none0001')
+        stopped = gpu_dgd('w', 4, 'lse_none0001', replicas=0)
+
+        rc, body, _ = self.apply(running, stopped)
+
+        self.assertEqual(self.writes(), [], f'{body}; DGD left behind: {self.dgd_obj("w")}')
+        self.assertNotEqual(rc, 0, body)
+        self.assertIsNone(self.dgd_obj('w'))
+        self.assertEqual(self.bb_calls(), [])
+
     def test_cpu_dgd_needs_no_lease(self):
         self.assertEqual(self.apply(dgd('mocker'))[0], 0)
         self.assertEqual(self.bb_calls(), [])
