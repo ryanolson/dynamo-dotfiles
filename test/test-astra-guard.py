@@ -1894,6 +1894,17 @@ class RedesignReview(GuardCase):
 
 class RoundTwoReview(GuardCase):
 
+    def test_gpu_summary_keeps_same_named_entries_in_different_lists(self):
+        values = rules.load_values(stg_deploy())
+        values['nimModels'].append({'name': 'wcep-shadow', 'gpuCount': '8'})
+        iid = self.deployed_mr(json.dumps(values), path=STG)
+
+        question = self.check(iid)['question']
+
+        gpu_line = next(line for line in question.splitlines() if line.startswith('GPUs '))
+        self.assertIn('gpuCount=2', gpu_line)
+        self.assertIn('gpuCount=8', gpu_line)
+
     def test_push_cannot_commit_a_yaml_escaped_token(self):
         escaped = ''.join(f'\\x{ord(c):02x}' for c in SECRET)
         values = stg_deploy().replace('gpuCount: "2"', f'gpuType: "{escaped}"')
