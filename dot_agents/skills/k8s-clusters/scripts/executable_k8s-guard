@@ -280,7 +280,7 @@ class Guard:
         # Local: config view reads the pinned file and runs no credential plugin. Only tbot's exec
         # plugin or a client certificate may sign the context's requests.
         view = self.kc.json('config', 'view', '-o', 'json')
-        problem = bot_credential_problem(view, self.context)
+        problem = bot_credential_problem(view, self.context, self.bot["kubeconfig"])
         if problem:
             raise Refusal('kubeconfig_credentials', problem)
 

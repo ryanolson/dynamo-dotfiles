@@ -457,11 +457,11 @@ runpy.run_path(sys.argv[0], run_name='__main__')
 '''
 
 
-def kubeconfig(tbot, user=None, contexts=(CTX, CTX_QA, CTX_B200)):
+def kubeconfig(tbot, user=None, contexts=(CTX, CTX_QA, CTX_B200), destination=None):
     """A bot kubeconfig as tbot writes it with its exec plugin on, in JSON (also valid YAML)."""
     user = user if user is not None else {'exec': {
         'apiVersion': 'client.authentication.k8s.io/v1beta1', 'command': tbot,
-        'args': ['kube', 'credentials', '--destination-dir=/example/kube']}}
+        'args': ['kube', 'credentials', f'--destination-dir={destination}']}}
     return json.dumps({
         'apiVersion': 'v1', 'kind': 'Config',
         'clusters': [{'name': 'example', 'cluster': {'server': 'https://proxy.example.test'}}],
@@ -558,7 +558,7 @@ class GuardCase(unittest.TestCase):
         self.tbot.parent.mkdir(parents=True)
         self.tbot.write_text('#!/bin/sh\nexit 0\n')
         self.tbot.chmod(0o755)
-        self.bot_kubeconfig.write_text(kubeconfig(str(self.tbot)))
+        self.bot_kubeconfig.write_text(kubeconfig(str(self.tbot), destination=self.bot_kubeconfig.parent))
         self.runner = self.tmp / 'runner.py'
         self.runner.write_text(RUNNER)
         for rel in ('.kube/config', '.tsh/keys/example/kubeconfig'):
@@ -742,10 +742,13 @@ class Identity(GuardCase):
                  'tsh exec': {'exec': {'apiVersion': 'client.authentication.k8s.io/v1beta1', 'command': 'tsh',
                                        'args': ['kube', 'credentials']}},
                  'impersonation': {'exec': {'apiVersion': 'client.authentication.k8s.io/v1beta1',
-                                            'command': 'tbot'}, 'as': 'cluster-admin'}}
+                                            'command': 'tbot'}, 'as': 'cluster-admin'},
+                 'tbot with other args': {'exec': {'apiVersion': 'client.authentication.k8s.io/v1beta1',
+                                                   'command': str(self.tbot), 'args': ['kube', 'credentials',
+                                                                               '--destination-dir=/elsewhere']}}}
         for label, user in users.items():
             with self.subTest(user=label):
-                self.bot_kubeconfig.write_text(kubeconfig(str(self.tbot), user=user))
+                self.bot_kubeconfig.write_text(kubeconfig(str(self.tbot), user=user, destination=self.bot_kubeconfig.parent))
                 self.kubectl_log.unlink(missing_ok=True)
                 self.refused('kubeconfig_credentials', '--context', CTX, 'inspect', NS)
                 self.assertEqual([c['pos'][:2] for c in self.kubectl_calls()], [['config', 'view']])
@@ -755,7 +758,7 @@ class Identity(GuardCase):
         fake_tbot = self.tmp / 'evil/tbot'
         fake_tbot.parent.mkdir()
         fake_tbot.symlink_to(self.bin / 'tsh')
-        self.bot_kubeconfig.write_text(kubeconfig(str(fake_tbot)))
+        self.bot_kubeconfig.write_text(kubeconfig(str(fake_tbot), destination=self.bot_kubeconfig.parent))
         self.refused('kubeconfig_credentials', '--context', CTX, 'inspect', NS)
         self.assertEqual([c['pos'][:2] for c in self.kubectl_calls()], [['config', 'view']])
 
@@ -780,7 +783,7 @@ class Identity(GuardCase):
 
     def test_context_missing_from_kubeconfig_refused(self):
         self.add_ns()
-        self.bot_kubeconfig.write_text(kubeconfig(str(self.tbot), contexts=(CTX_QA,)))
+        self.bot_kubeconfig.write_text(kubeconfig(str(self.tbot), contexts=(CTX_QA,), destination=self.bot_kubeconfig.parent))
         self.refused('kubeconfig_credentials', '--context', CTX, 'inspect', NS)
         self.assertEqual([c['pos'][:2] for c in self.kubectl_calls()], [['config', 'view']])
 

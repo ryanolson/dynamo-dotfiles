@@ -25,7 +25,7 @@ Every command needs `--context`. `-n` can come anywhere. Everything else is refu
 
 - `KUBECONFIG` must name exactly the bot's kubeconfig from the profiles, which the parser allows only under tbot's directory in the account's home. The guard never runs `tsh`.
 - It reads that file once into a memory file sealed against writes (`k8s_profiles.sealed_copy`), and passes it to every `kubectl` call as `/proc/self/fd/<n>`. Replacing or rewriting the file later changes nothing. `kubectl` gets no `KUBECONFIG`, no `KUBECTL_*` variable, and `KUBECTL_KUBERC=false`.
-- Before any cluster call, `kubectl config view` (local) must show that the context's user holds only a client certificate or an exec plugin that resolves to an installed tbot (`/usr/local/bin/tbot` or `~/.local/bin/tbot`). A token, an impersonation, or another exec command such as `tsh` is refused with `kubeconfig_credentials`.
+- Before any cluster call, `kubectl config view` (local) must show that the context's user holds only a client certificate or exactly the exec plugin tbot writes: an installed tbot (`/usr/local/bin/tbot` or `~/.local/bin/tbot`) with `kube credentials --destination-dir=<the kubeconfig's directory>`. A token, an impersonation, or another exec command such as `tsh` is refused with `kubeconfig_credentials`.
 - `--context` must equal the `context` of one profile. A profile with `allowed = "never"` is refused. A profile with `bot_can_write = false` allows only `inspect`.
 - The guard calls the lease plugin with the profile name (the `[clusters.<name>]` key), and checks that a lease's `cluster` equals it.
 
