@@ -157,6 +157,18 @@ def gate(method, path, body, pid):
         raise
 
 
+def _strings(obj):
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            yield str(k)
+            yield from _strings(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _strings(v)
+
+
 class GitLabError(Refusal):
     def __init__(self, status, message):
         super().__init__('gitlab_error', message)
@@ -180,13 +192,28 @@ class GitLab:
             req.add_header('Content-Type', 'application/json')
         try:
             with _OPENER.open(req, timeout=HTTP_TIMEOUT) as r:
-                # A reflected token goes no further: not into state, the ask, bb's argv or output.
-                return r.read().replace(self.token.encode(), b'[redacted]'), r.headers
+                payload, headers = r.read(), r.headers
         except urllib.error.HTTPError as e:
             detail = e.read()[:300].decode(errors='replace')
             raise GitLabError(e.code, redact(f'{method} {path}: HTTP {e.code}: {detail}'))
         except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
             raise Refusal('gitlab_unreachable', redact(f'{method} {path}: {type(e).__name__}: {e}'))
+        self._refuse_echo(method, path, payload)
+        return payload, headers
+
+    def _refuse_echo(self, method, path, payload):
+        # A response that carries the token is refused, not rewritten: rewriting would change
+        # the text the checks compare, and an echo could hide behind a JSON or URL escape.
+        text = payload.decode(errors='replace')
+        found = self.token in text or self.token in urllib.parse.unquote(text)
+        if not found:
+            try:
+                found = any(self.token in s or self.token in urllib.parse.unquote(s)
+                            for s in _strings(json.loads(text)))
+            except (json.JSONDecodeError, RecursionError):
+                pass
+        if found:
+            raise Refusal('secret_in_response', f'{method} {path}: GitLab echoed the token; nothing was kept')
 
     def get(self, path, query=None, raw=False):
         payload, headers = self._request('GET', path, query)
@@ -582,7 +609,11 @@ def cmd_close(gl, cfg, args):
 
 
 def cmd_check(gl, cfg, args):
+    if not re.fullmatch(r'[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?', args.namespace):
+        raise Refusal('namespace_invalid', f'{args.namespace!r} is not a namespace name')
     rec = record(gl.pid, args.mr)
+    if rec.get('merged'):
+        raise Refusal('mr_not_open', f'!{args.mr} was merged by this guard')
     update(gl.pid, args.mr, check=None, ask=None)
     check = bind_and_check(gl, cfg, args.mr, rec, args.namespace)
     update(gl.pid, args.mr, check=check)
@@ -656,7 +687,8 @@ def cmd_merge(gl, cfg, args):
         landed = out.get('merge_commit_sha') or out.get('squash_commit_sha')
         entry.update(result='merged', merge_commit=landed)
         update(gl.pid, args.mr, merged={'at': now(), 'ask_id': args.answer, 'head': check['head'],
-                                        'target': check['target'], 'landed': landed})
+                                        'target': check['target'], 'landed': landed, 'path': check['path'],
+                                        'inverse': check['inverse']})
     except Exception as e:
         if not isinstance(e, Refusal):
             e = Refusal('internal_error', redact(f'{type(e).__name__}: {e}'[:300]))
@@ -670,11 +702,22 @@ def cmd_merge(gl, cfg, args):
             'comment_issue': issue}
 
 
+def log_startup_refusal(args, e):
+    """A merge refused before cmd_merge ran (config, fleet, token) is logged like any other."""
+    entry = {'time': now(), 'ask_id': args.answer, 'answer': None, 'mr': int(args.mr), 'head': None,
+             'target': None, 'result': 'refused', 'code': e.code, 'reason': e.message, 'merge_commit': None}
+    try:
+        log_approval(entry)
+    except OSError as err:
+        e.message += f' (and the approval log could not be written: {type(err).__name__})'
+    return {'comment': comment(entry, None, None), 'comment_issue': None}
+
+
 def cmd_teardown(gl, cfg, args):
     R.check_branch(args.branch)
     rec = record(gl.pid, args.deploy_mr)
     merged = rec.get('merged')
-    if rec.get('kind') != 'deploy' or not merged or not (rec.get('check') or {}).get('inverse'):
+    if rec.get('kind') != 'deploy' or not merged or not merged.get('inverse'):
         raise Refusal('not_merged', f'!{args.deploy_mr} is not a deploy this guard merged')
     mr = gl.mr(args.deploy_mr)
     landed = merged.get('landed')
@@ -683,8 +726,8 @@ def cmd_teardown(gl, cfg, args):
     target = gl.main()
     if gl.merge_base(landed, target) != landed:
         raise Refusal('not_landed', f'main {target} does not contain the deploy {landed}')
-    path = rec['check']['path']
-    text = R.apply_patch(gl.raw(path, target), rec['check']['inverse'])
+    path = merged['path']
+    text = R.apply_patch(gl.raw(path, target), merged['inverse'])
     return push_file(gl, args.branch, path, target, text, 'teardown')
 
 
@@ -747,11 +790,12 @@ def main(argv=None):
         gl = GitLab(cfg, _TOKEN)
         emit(COMMANDS[args.cmd](gl, cfg, args))
         return 0
-    except Refusal as e:
-        emit({'error': e.message, 'code': e.code, **getattr(e, 'extra', {})})
-        return 1
     except Exception as e:  # never a traceback: it could carry request state
-        emit({'error': f'{type(e).__name__}: {e}'[:300], 'code': 'internal_error'})
+        if not isinstance(e, Refusal):
+            e = Refusal('internal_error', redact(f'{type(e).__name__}: {e}'[:300]))
+        if args.cmd == 'merge' and not hasattr(e, 'extra'):
+            e.extra = log_startup_refusal(args, e)
+        emit({'error': e.message, 'code': e.code, **getattr(e, 'extra', {})})
         return 1
 
 

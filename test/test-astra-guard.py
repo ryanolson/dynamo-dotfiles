@@ -1386,8 +1386,9 @@ class AdversarialReview(GuardCase):
     def test_a_token_echoed_by_gitlab_does_not_reach_state_or_bb_arguments(self):
         iid = self.deployed_mr()
         self.gl.mrs[(PID, iid)]['web_url'] += f'?diagnostic={SECRET}'
-        self.check(iid)
-        self.ask(iid)
+        # The guard refuses a response that echoes the token rather than rewriting it.
+        self.refused('secret_in_response', 'check', '--mr', str(iid), '--namespace', NS)
+        self.refused('not_checked', 'ask', '--mr', str(iid))
         exposed = [path.name for path in (self.state_home / 'astra-guard').iterdir()
                    if path.is_file() and SECRET in path.read_text()]
         exposed += ['bb argv' for call in self.bb_calls() if SECRET in json.dumps(call['argv'])]
@@ -1537,8 +1538,9 @@ class PassTwoReview(GuardCase):
             return status, headers, payload
 
         self.gl.route = escaped_echo
-        self.check(iid)
-        self.ask(iid)
+        # The guard refuses a response that echoes the token rather than rewriting it.
+        self.refused('secret_in_response', 'check', '--mr', str(iid), '--namespace', NS)
+        self.refused('not_checked', 'ask', '--mr', str(iid))
         exposed = [path.name for path in (self.state_home / 'astra-guard').iterdir()
                    if path.is_file() and SECRET in path.read_text()]
         exposed += ['bb argv' for call in self.bb_calls() if SECRET in json.dumps(call['argv'])]

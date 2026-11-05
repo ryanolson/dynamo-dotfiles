@@ -12,7 +12,7 @@ Every command prints one JSON object on stdout. A refusal exits 1 with `{"error"
 | `push --branch <b> --base <main sha> --file <values path>=<local file>` | Reads `main`. It must still be `--base`. Checks the file against the diff rules, then makes one commit on `main` with that file's content, through the commits API. An existing branch is replaced, so a rebase is a new `push`. |
 | `open --branch <b> --issue <ISSUE> --kind deploy\|teardown --title <t> [--expires YYYY-MM-DD]` | Opens a merge request from `b` into `main` of the configured project. A deploy needs `--expires`. The description holds `Kind:`, `Expires:` and `Issue:` lines. The guard records the merge request in its state. |
 | `close --mr <iid>` | Closes a merge request that this guard opened. It sends only `state_event: close`. |
-| `check --mr <iid> --namespace <ns>` | Reads the head and `main` once and runs every rule below on that pair. Prints the ask text. A failed check deletes the earlier check. |
+| `check --mr <iid> --namespace <ns>` | Reads the head and `main` once and runs every rule below on that pair. Prints the ask text. A failed check deletes the earlier check. `<ns>` must be a namespace name (`namespace_invalid`). A merge request this guard merged is refused, and its merge record keeps the inverse patch. |
 | `ask --mr <iid>` | Checks that the head and `main` have not moved. Then runs `bb sgc ask` with the checked text, the options `Approve` and `Reject`, `--recommend none`, `--label astra` and `--issue`. Prints `ask_id`. Needs a bb thread. |
 | `merge --mr <iid> --answer <bbq id>` | Merges only on an Approve for this merge request and this pair of commits. See "The merge". Needs a bb thread. |
 | `teardown --deploy-mr <iid> --branch <b>` | For a deploy this guard merged: reads the current `main`, checks that it contains the landed deploy, applies the deploy's inverse patch, and pushes `b` as one commit on that `main`. Then run `open --kind teardown`. |
@@ -96,7 +96,7 @@ The guard reads only that command's output. It never reads a Linear comment, bec
 
 ### The approval log
 
-Every merge and every refusal at merge time, unexpected errors included, appends one JSON line to `${XDG_STATE_HOME:-~/.local/state}/astra-guard/approvals.jsonl`: `time`, `ask_id`, `answer` (`status`, `channel`, `option`, `answeredAt` as read, or `null`), `mr`, `head`, `target`, `result` (`merged` or `refused`), `code`, `reason` and `merge_commit`.
+Every merge and every refusal at merge time appends one JSON line. This includes unexpected errors and refusals before any GitLab call, such as a bad config. The line goes to `${XDG_STATE_HOME:-~/.local/state}/astra-guard/approvals.jsonl`: `time`, `ask_id`, `answer` (`status`, `channel`, `option`, `answeredAt` as read, or `null`), `mr`, `head`, `target`, `result` (`merged` or `refused`), `code`, `reason` and `merge_commit`.
 
 The output also holds `comment`, a signed text, and `comment_issue`. Post `comment` on that issue as it is. It names the ask, the merge request, both commits and the result. The steward compares these comments with the owner's answers.
 
@@ -123,7 +123,7 @@ argocd = { project = 678, file = "path/to/stg-app.yaml", key = "spec.destination
 
 ## Token
 
-The guard re-runs itself as `fleet secret env ASTRA_GUARD_TOKEN=<token_ref> -- python3 -I astra-guard ...`. It removes the token from its environment at once. It sends the token only in the `PRIVATE-TOKEN` header, which is not resent on a redirect, and it follows no redirects. Child processes (`bb`) do not get it. The guard replaces the token in every response from GitLab before it reads it, so a token GitLab echoes reaches no state file, ask, `bb` argument or output. Output, errors and the log pass through the same filter. `push` refuses a file that holds the token (`secret_in_content`). The token is never in an argument or a file.
+The guard re-runs itself as `fleet secret env ASTRA_GUARD_TOKEN=<token_ref> -- python3 -I astra-guard ...`. It removes the token from its environment at once. It sends the token only in the `PRIVATE-TOKEN` header, which is not resent on a redirect, and it follows no redirects. Child processes (`bb`) do not get it. The guard refuses any GitLab response that holds the token, as raw text, after URL decoding, or in any decoded JSON string (`secret_in_response`). It keeps nothing from that response. It does not rewrite the response, because a rewrite would change the text that the checks compare. Output, errors and the log pass through a filter that replaces the token. `push` refuses a file that holds the token (`secret_in_content`). The token is never in an argument or a file.
 
 ## State
 
@@ -140,5 +140,5 @@ The tests run against a fake GitLab. Three things wait for the first live reads:
 ## Tests
 
 ```bash
-timeout 300 python3 test/test-astra-guard.py
+timeout 600 python3 test/test-astra-guard.py
 ```
