@@ -1940,6 +1940,49 @@ class HostEntryEnvironment(GuardCase):
         self.assertEqual([l['direction'] for l in self.ledger(host=True)], ['extend', 'down', 'down'])
 
 
+class SlotWriteWindows(GuardCase):
+    @unittest.skip("F10: the final UID read can exhaust the slot after its deadline check")
+    def test_final_namespace_read_cannot_outlive_the_operation_slot(self):
+        self.add_ns()
+        lid = self.add_lease(gpus=1)
+        fake = FAKE_KUBECTL.replace("if what == 'namespace':", """if what == 'namespace':
+        st['namespace_reads'] = st.get('namespace_reads', 0) + 1
+        if st['namespace_reads'] == 3:
+            st['elapsed_seconds'] = 125
+        save()""", 1)
+        fake = fake.replace("if what == " + repr(DGD_LIST) + ":", "if what == " + repr(DGD_LIST) + ":\n"
+                            "        st['elapsed_seconds'] = 60\n        save()", 1)
+        fake = fake.replace("if what == 'pods':", "if what == 'pods':\n"
+                            "        st['elapsed_seconds'] = 75\n        save()", 1)
+        self.assertNotEqual(fake, FAKE_KUBECTL)
+        (self.bin / 'kubectl').write_text(fake)
+        # Model bounded calls: dry run 45s, DGD read 15s, pod read 15s, final UID read 50s.
+        launcher = self.tmp / 'slot-clock.py'
+        launcher.write_text("""import json, os, runpy, sys
+from datetime import timedelta
+from pathlib import Path
+scope = runpy.run_path(sys.argv[1])
+real_now = scope['now']
+def delayed_now():
+    state = json.loads(Path(os.environ['FAKE_K8S_STATE']).read_text())
+    return real_now() + timedelta(seconds=state.get('elapsed_seconds', 0))
+scope['main'].__globals__['now'] = delayed_now
+sys.exit(scope['main'](sys.argv[2:]))
+""")
+        manifest = self.manifest(gpu_dgd('w', 1, lid))
+
+        p = subprocess.run(['python3', '-I', str(launcher), str(GUARD), '--context', CTX, '-n', NS,
+                            'apply', '-f', manifest], env=self.env(), capture_output=True, text=True,
+                           timeout=60, stdin=subprocess.DEVNULL)
+        self.reload()
+        body = json.loads(p.stdout)
+
+        self.assertEqual(self.k8s.get('elapsed_seconds'), 125, body)
+        self.assertEqual([c['pos'][0] for c in self.writes()], [], f'write after the 120s slot: {body}')
+        self.assertNotEqual(p.returncode, 0, body)
+        self.assertEqual(body.get('code'), 'slot_expired', body)
+
+
 class GpuTypes(GuardCase):
     @unittest.skip("F9: a matching lease type does not constrain the GPU type requested by the DGD")
     def test_gpu_node_selector_must_match_the_lease_type(self):
