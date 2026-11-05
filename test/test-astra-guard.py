@@ -1754,6 +1754,26 @@ class PassThreeReview(GuardCase):
 
 class RedesignReview(GuardCase):
 
+    def test_a_fleet_failure_still_logs_and_signs_the_merge_refusal(self):
+        iid, qid = self.approved()
+        before = self.main()
+        (self.bin / 'fleet').write_text(
+            '#!/usr/bin/env python3\n'
+            'import sys\n'
+            'print("fake fleet: secret broker unavailable", file=sys.stderr)\n'
+            'sys.exit(23)\n')
+
+        rc, body, err = self.guard('merge', '--mr', str(iid), '--answer', qid)
+
+        self.assertNotEqual(rc, 0, (body, err))
+        self.assertEqual(self.merges(), [])
+        self.assertEqual(self.main(), before)
+        lines = self.log_lines()
+        self.assertEqual(len(lines), 1, 'A failed fleet exec bypassed the merge refusal log')
+        self.assertEqual((lines[0]['ask_id'], lines[0]['mr'], lines[0]['result']),
+                         (qid, iid, 'refused'))
+        self.assertIn('comment', body)
+
     def test_merge_refuses_a_log_that_opens_but_cannot_write(self):
         iid, qid = self.approved()
         before = self.main()
