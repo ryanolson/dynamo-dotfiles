@@ -1547,5 +1547,25 @@ class PassTwoReview(GuardCase):
         self.assertEqual(exposed, [], 'JSON escapes must not bypass response redaction')
 
 
+class PassThreeReview(GuardCase):
+
+    def test_yaml_escaped_response_token_never_reaches_state_or_bb_argv(self):
+        escaped = ''.join(f'\\x{ord(c):02x}' for c in SECRET)
+        values = stg_deploy().replace('gpuCount: "2"', f'gpuType: "{escaped}"')
+        self.assertNotIn(SECRET, values)
+        self.assertEqual(rules.load_values(values)['mockerRepros'][-1]['gpuType'], SECRET)
+        self.gl.commit(PID, BRANCH, {STG: values}, parent=self.main())
+        iid = self.open()
+        rc, body, err = self.guard('check', '--mr', str(iid), '--namespace', NS)
+        if rc == 0:
+            self.ask(iid)
+        else:
+            self.assertEqual(body.get('code'), 'secret_in_response', (body, err))
+        exposed = [path.name for path in (self.state_home / 'astra-guard').iterdir()
+                   if path.is_file() and SECRET in path.read_text()]
+        exposed += ['bb argv' for call in self.bb_calls() if SECRET in json.dumps(call['argv'])]
+        self.assertEqual(exposed, [], 'YAML decoding must not put the token in state or bb arguments')
+
+
 if __name__ == '__main__':
     unittest.main()
