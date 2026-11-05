@@ -1802,6 +1802,36 @@ class Down(GuardCase):
 
 
 class DownClassificationRaces(GuardCase):
+    @unittest.skip("F18: a retry loses deleted DGD names and hides their terminating GPU pods")
+    def test_f18_retry_waits_for_deleted_owned_pods_after_foreign_name_reuse(self):
+        self.add_ns(thread=OTHER)
+        lid = self.add_lease(thread=OTHER, state='revoking')
+        self.add_obj(gpu_dgd('shared', 1, lid), uid='uid-owned-dgd')
+        owned_pod = pod('shared', 1, name='owned-still-running')
+        owned_pod['metadata']['ownerReferences'] = [
+            {'apiVersion': DGD_API, 'kind': 'DynamoGraphDeployment', 'name': 'shared',
+             'uid': 'uid-owned-dgd', 'controller': True}]
+        self.add_pod(owned_pod)
+        self.k8s['terminate_pods_on_delete'] = False
+        self.flush()
+
+        first = self.refused('pods_left', '--context', CTX, 'down', NS, '--uid', 'uid-ns-1',
+                             '--lease', lid, host_entry=True)
+        self.assertEqual(first['gpu_pods_left'], 1, first)
+        self.assertIsNone(self.dgd_obj('shared'))
+        self.assertIn('deletionTimestamp', self.k8s['pods'][NS][0]['metadata'])
+        replacement = gpu_dgd('shared', 2, 'lse_previous01')
+        replacement['metadata']['labels'] = {NS_UID: 'uid-deleted-ns'}
+        self.add_obj(replacement, uid='uid-foreign-dgd', stamp=False)
+
+        rc, body, _ = self.guard('--context', CTX, 'down', NS, '--uid', 'uid-ns-1', '--lease', lid,
+                                 host_entry=True)
+
+        self.assertNotEqual(rc, 0, f'retry deleted the namespace with its owned GPU pod still running: {body}')
+        self.assertEqual(body.get('code'), 'pods_left', body)
+        self.assertEqual(body['gpu_pods_left'], 1, body)
+        self.assertIn(NS, self.k8s['namespaces'])
+
     def test_f16_foreign_replacement_cannot_hide_a_deleted_owned_dgds_pod(self):
         self.add_ns(thread=OTHER)
         lid = self.add_lease(thread=OTHER, state='revoking')
