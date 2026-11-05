@@ -559,6 +559,64 @@ class K8sCheck(unittest.TestCase):
         plugin.update(kw)
         return {'exec': plugin}
 
+    def test_tbot_identity_cannot_change_after_bot_whoami(self):
+        identity = self.bot_kubeconfig.parent / 'identity'
+        identity.write_text(BOT)
+        self.env['FAKE_TBOT_IDENTITY'] = str(identity)
+        # tbot reads destination/identity on every invocation, without checking the username.
+        # https://github.com/gravitational/teleport/blob/v18.7.6/tool/tbot/kube.go#L81
+        self.tbot.write_text(textwrap.dedent('''\
+            #!/usr/bin/env python3
+            import json, os, sys
+            assert len(sys.argv) == 4 and sys.argv[1:3] == ['kube', 'credentials']
+            destination = sys.argv[3].removeprefix('--destination-dir=')
+            identity = os.path.join(destination, 'identity')
+            assert identity == os.environ['FAKE_TBOT_IDENTITY']
+            with open(identity) as source:
+                credential_user = source.read()
+            print(json.dumps({'status': {'clientCertificateData': credential_user,
+                                         'clientKeyData': 'made-up-key'}}))
+            '''))
+        credential_step = textwrap.dedent('''\
+            credential_user = None
+            if rest[:1] != ['config']:
+                import subprocess
+                user = kubeconfig_user()
+                plugin = user['exec']
+                fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
+                assert os.path.commonpath([os.path.realpath(plugin['command']), fixture_root]) == fixture_root
+                result = subprocess.run([plugin['command'], *plugin['args']], stdin=subprocess.DEVNULL,
+                                        capture_output=True, text=True, timeout=5, check=True)
+                credential_user = json.loads(result.stdout)['status']['clientCertificateData']
+            ''')
+        response_step = textwrap.dedent('''\
+            if rest[:2] == ['auth', 'whoami']:
+                reply = {'stdout': json.dumps({'status': {'userInfo': {'username': credential_user}}})}
+                if os.environ.get('FAKE_SWAP_TBOT_IDENTITY') == 'yes':
+                    with open(os.environ['FAKE_TBOT_IDENTITY'], 'w') as identity:
+                        identity.write('alice@example.test')
+            ''')
+        (self.tmp / 'bin/kubectl').write_text(FAKE_KUBECTL.replace(
+            "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:",
+            credential_step + "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:").replace(
+                "'key': ' '.join(rest)", "'key': ' '.join(rest), 'credential_user': credential_user").replace(
+                    "sys.stdout.write(reply.get('stdout', ''))",
+                    response_step + "sys.stdout.write(reply.get('stdout', ''))"))
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assertGreater(len(self.calls()), 3)
+        self.assertTrue(all(c['credential_user'] == BOT for c in self.calls()
+                            if not c['key'].startswith('config ')))
+        self.log.unlink()
+        # A credential repair tool copies the owner's identity into the bot destination after whoami.
+        self.env['FAKE_SWAP_TBOT_IDENTITY'] = 'yes'
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(out['identity']['username'], BOT, out)
+        cluster_calls = [c for c in self.calls() if not c['key'].startswith('config ')]
+        self.assertEqual(len({c['kubeconfig_sha'] for c in cluster_calls}), 1)
+        owner_calls = [c['key'] for c in cluster_calls if c['credential_user'] == 'alice@example.test']
+        self.assertEqual(owner_calls, [], f'the sealed exec plugin re-reads the replaced identity: exit={rc}, {owner_calls}')
+
     def test_tbot_by_file_identity(self):
         # tbot may write the install path or the file it links to; both are the same file.
         real = self.tmp / 'opt/teleport/bin/tbot'
