@@ -1549,6 +1549,17 @@ class PassTwoReview(GuardCase):
 
 class PassThreeReview(GuardCase):
 
+    def test_truncated_resource_header_cannot_hide_a_cluster_scoped_resource(self):
+        iid = self.deployed_mr()
+        head = self.gl.branch_sha(BRANCH)
+        self.gl.traces[head] = (
+            f'{NS}, wcep-smoke, DynamoGraphDeployment (nvidia.com) has been added:\n'
+            ', wcep-smoke-admin, ClusterRole (rbac.authorization.k8s.io/v1) has been added')
+        rc, body, err = self.guard('check', '--mr', str(iid), '--namespace', NS)
+        self.assertNotEqual(rc, 0, 'A clipped resource header hid a resource outside the namespace')
+        self.assertIn(body.get('code'), ('rendered_namespace_unverified', 'rendered_namespace_mismatch'),
+                      (body, err))
+
     def test_changed_deploy_can_apply_its_recorded_teardown(self):
         self.gl.commit(PID, 'main', {DEV: dev_deploy()})
         changed = dev_deploy().replace('replicas: 1', 'replicas: 2')
