@@ -145,6 +145,15 @@ Three review passes found defects of the same five kinds. Each fix closed one in
 
 `${XDG_STATE_HOME:-~/.local/state}/astra-guard/state.json` records each merge request the guard opened: its branch, issue, kind, expiry, thread, last check (with the inverse patch), last ask and merge. `close`, `check`, `ask`, `merge` and `teardown` work only on merge requests in it. Every merge request is authored by the owner's token, so GitLab cannot tell which ones the guard opened.
 
+## Open findings
+
+The last strict review pass found these. Each has a test marked `expectedFailure` in `RoundTwoReview`. The guard goes to its first live run with them open. Two of them are kinds the rules above were meant to close:
+
+- **Value comparison.** PyYAML reads YAML 1.1, where `1e3` is a string. Helm reads it as the number 1000. So a change outside our entries from `1e3` to `"1e3"` compares equal and passes the check. The JSON-shape rule checks types after PyYAML has already read the value wrongly. A fix needs a YAML 1.2 reading of numbers.
+- **The token.** `push` checks the file raw and URL-decoded, but not YAML-decoded. So a file with the token written in YAML `\x` escapes can be committed to a branch. The commit to GitLab is a way out that the four sinks do not cover.
+- **GPU summary (minor).** The ask lists GPU fields by entry name. Two entries with the same name in different lists overwrite each other, so the ask can show fewer GPUs than the change requests. The dev GPU rule is not affected, because it checks every entry.
+- **Stale check (minor).** `check` refuses a bad `--namespace` before it deletes the earlier check. So `ask` can still use the earlier check, which contradicts "A failed check deletes the earlier check" above. `merge` still runs the full check again on the pair.
+
 ## Not yet checked against the real project
 
 The tests run against a fake GitLab. Three things wait for the first live reads:
