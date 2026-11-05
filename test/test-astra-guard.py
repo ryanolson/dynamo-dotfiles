@@ -1381,5 +1381,15 @@ class PureRules(unittest.TestCase):
                           ('ns-b', 'it-thing', 'Service', 'changed')])
 
 
+class AdversarialReview(GuardCase):
+
+    def test_teardown_cannot_remove_an_entry_named_prd(self):
+        values = dev_deploy(entry=DEV_ENTRY.replace('wcep-smoke', 'wcep-smoke-prd'))
+        self.gl.commit(PID, 'main', {DEV: values})
+        self.gl.commit(PID, BRANCH, {DEV: DEV_VALUES}, parent=self.main())
+        iid = self.open(kind='teardown', expires=None)
+        self.refused('entry_name', 'check', '--mr', str(iid), '--namespace', NS)
+
+
 if __name__ == '__main__':
     unittest.main()
