@@ -1894,9 +1894,6 @@ class RedesignReview(GuardCase):
 
 class RoundTwoReview(GuardCase):
 
-    # Open (minor): check refuses a bad namespace before it deletes the earlier check.
-    # Kept as evidence; it fails until fixed. See references/astra-guard.md, "Open findings".
-    @unittest.expectedFailure
     def test_a_failed_namespace_check_deletes_the_previous_check(self):
         iid = self.deployed_mr()
         self.check(iid)
@@ -1904,9 +1901,6 @@ class RoundTwoReview(GuardCase):
 
         self.refused('not_checked', 'ask', '--mr', str(iid))
 
-    # Open (minor): the ask keys GPU fields by entry name only, so same-named entries in two lists overwrite each other.
-    # Kept as evidence; it fails until fixed. See references/astra-guard.md, "Open findings".
-    @unittest.expectedFailure
     def test_gpu_summary_keeps_same_named_entries_in_different_lists(self):
         values = rules.load_values(stg_deploy())
         values['nimModels'].append({'name': 'wcep-shadow', 'gpuCount': '8'})
@@ -1918,9 +1912,6 @@ class RoundTwoReview(GuardCase):
         self.assertIn('gpuCount=2', gpu_line)
         self.assertIn('gpuCount=8', gpu_line)
 
-    # Open (token): push checks the file raw and URL-decoded, not YAML-decoded; the commit to GitLab is not one of the four sinks.
-    # Kept as evidence; it fails until fixed. See references/astra-guard.md, "Open findings".
-    @unittest.expectedFailure
     def test_push_cannot_commit_a_yaml_escaped_token(self):
         escaped = ''.join(f'\\x{ord(c):02x}' for c in SECRET)
         values = stg_deploy().replace('gpuCount: "2"', f'gpuType: "{escaped}"')

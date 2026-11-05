@@ -34,6 +34,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import yaml
+
 # -I drops the script directory from sys.path; the rules live next to this script.
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -550,9 +552,21 @@ def unmoved(gl, iid, check):
 
 # -- commands ------------------------------------------------------------------
 
+def content_carries_token(text):
+    """A commit is a way out too: scan the file raw, URL-decoded, and as YAML (which also decodes
+    JSON and every YAML escape), every key and string in it raw and URL-decoded."""
+    if carries_token(text):
+        return True
+    try:
+        docs = list(yaml.safe_load_all(text))
+    except (yaml.YAMLError, RecursionError):
+        return False  # the values check refuses a file that does not parse
+    return any(carries_token(s) for s in _strings(docs))
+
+
 def push_file(gl, branch, path, base, text, kind):
     site = R.site_of(path)
-    if carries_token(text):
+    if content_carries_token(text):
         raise Refusal('secret_in_content', 'the file holds the GitLab token; it is not pushed')
     R.classify(site, gl.raw(path, base), text, kind)
     exists = gl.branch(branch) is not None
@@ -637,12 +651,13 @@ def cmd_close(gl, cfg, args):
 
 
 def cmd_check(gl, cfg, args):
+    rec = record(gl.pid, args.mr)
+    # Void the earlier check before any validation, so a refused check leaves nothing for ask.
+    update(gl.pid, args.mr, check=None, ask=None)
     if not re.fullmatch(r'[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?', args.namespace):
         raise Refusal('namespace_invalid', f'{args.namespace!r} is not a namespace name')
-    rec = record(gl.pid, args.mr)
     if rec.get('merged'):
         raise Refusal('mr_not_open', f'!{args.mr} was merged by this guard')
-    update(gl.pid, args.mr, check=None, ask=None)
     check = bind_and_check(gl, cfg, args.mr, rec, args.namespace)
     fields = {'check': check}
     if check['kind'] == 'deploy':

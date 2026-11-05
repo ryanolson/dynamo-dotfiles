@@ -213,7 +213,8 @@ def classify(site, base_text, head_text, kind):
     for key in added + changed:
         fields = gpu_fields(new[key])
         if fields:
-            gpus[key[1]] = fields
+            # Keyed by values file, list and name: names are unique only within one list.
+            gpus[f'{site} {key[0]}/{key[1]}'] = fields
     if site in ZERO_GPU_SITES and gpus:
         raise Refusal('dev_gpu', f'dev entries request no GPU; found {gpus}')
     return {'site': site, 'added': [k[1] for k in added], 'changed': [k[1] for k in changed],
