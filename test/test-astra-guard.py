@@ -1754,6 +1754,29 @@ class PassThreeReview(GuardCase):
 
 class RedesignReview(GuardCase):
 
+    def test_a_landed_merge_with_a_lost_response_can_still_be_torn_down(self):
+        iid, qid = self.approved()
+        original = self.gl.route
+
+        def lose_merge_response(method, parts, query, body, raw):
+            status, headers, payload = original(method, parts, query, body, raw)
+            if method == 'PUT' and parts == ['projects', str(PID), 'merge_requests', str(iid), 'merge']:
+                return status, headers, json.dumps(payload)[:-1]
+            return status, headers, payload
+
+        self.gl.route = lose_merge_response
+        self.refused('merge_unknown', 'merge', '--mr', str(iid), '--answer', qid)
+        self.assertEqual(len(self.log_lines()), 1)
+        mr = self.ok('get', f'/projects/{PID}/merge_requests/{iid}')['body']
+        self.assertEqual(mr['state'], 'merged')
+        self.assertIn('wcep-smoke', self.gl.file_at('main', DEV))
+        branch = 'wcep/TEAM-910-teardown'
+
+        teardown = self.ok('teardown', '--deploy-mr', str(iid), '--branch', branch)
+
+        self.assertEqual(teardown['base'], self.main())
+        self.assertEqual(self.gl.file_at(branch, DEV), DEV_VALUES)
+
     def test_plan_resources_without_wcep_names_still_need_the_asked_namespace(self):
         iid = self.deployed_mr()
         head = self.gl.branch_sha(BRANCH)
