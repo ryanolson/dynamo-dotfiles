@@ -15,7 +15,7 @@ Every command prints one JSON object on stdout. A refusal exits non-zero with `{
 | `-n <ns> delete <kind>/<name>` | the namespace's thread | Deletes one DGD, ConfigMap, Service, Secret, PVC or PodCliqueSet. The lease record, the model cache PVC and the pull secret are refused. Like `apply`, it takes the lease's slot, or needs a namespace that holds no GPUs. |
 | `down <ns> [--uid <uid>] [--lease <id>]` | the namespace's thread, or anyone with teardown authority | Releases an active lease first (owner only). Deletes each DGD with its UID as a precondition, waits for GPU pods to go, then deletes the namespace with its UID as a precondition. |
 | `expire <ns> [--uid <uid>] [--lease <id>]` | anyone with teardown authority | Sets every replica count of every DGD to 0. |
-| `extend <ns> [--uid <uid>] [--lease <id>]` | anyone | Copies the lease's `expires_at`, unchanged, into the lease record. The lease must be `active` and match the cluster, the namespace and the UID. It never moves the stored expiry earlier, so a late call cannot undo a newer extension. |
+| `extend <ns> [--uid <uid>] [--lease <id>]` | anyone | Copies the lease's `expires_at`, unchanged, into the lease record. It only replaces the record `lease acquire` wrote, under the `resourceVersion` it read, and never creates one. The lease must be `active` and match the cluster, the namespace and the UID. It never moves the stored expiry earlier, so a late call cannot undo a newer extension. |
 | `inspect <ns>` | anyone | Read only. Prints `uid`, `thread`, `expires_at`, `dgd_gpus`, `pod_gpus`, `gpu_type`, `gpu_pods_left`, and also `allocation` and `lease_id`. A missing namespace gives code `not_found`; any other failure gives another code. |
 
 Every command needs `--context`. `-n` can come anywhere. Everything else is refused, including `scale`, `patch`, `edit`, `replace`, `set`, `label`, `annotate`, `get`, and `-A`.
@@ -38,18 +38,19 @@ The expiry of a namespace is the record's `expires_at` when the record's `uid` m
 
 The rules in this section and the next are pure functions in `scripts/k8s_guard_rules.py`.
 
-The guard parses no YAML. It reads the file once and sends the same bytes to `kubectl apply --dry-run=server -o json`, then to the real apply. Every check runs on the JSON from the dry run, so defaults and webhook changes are checked too.
+The guard parses no YAML. `kubectl label --local` (no API call) reads the file and labels every object `wcep.agent/namespace-uid=<namespace UID>`. The guard sends that JSON to `kubectl apply --dry-run=server -o json`, then the same JSON to the real apply. Every check runs on the JSON from the dry run, so defaults and webhook changes are checked too.
 
 - **Kinds:** `DynamoGraphDeployment` (`nvidia.com/v1alpha1` or `v1beta1`), `ConfigMap`, and `Service` of type `ClusterIP`. Each object must be in the `-n` namespace.
 - **DGD fields:** only the fields the guard can count. Refused: scaling adapters, enabled autoscaling, planner, EPP and LPX components, `roles`, DRA resource claims, any GPU resource other than `nvidia.com/gpu`, PVCs the DGD would create, and any field the guard does not know.
 - **Pod specs:** no `hostPath`, `priorityClassName`, `nodeName`, `schedulerName`, privileged containers, `hostNetwork`, `hostPID` or `hostIPC`, and no toleration with `operator: Exists` and no key. Every container needs `cpu` and `memory` in both requests and limits.
 - **Name:** a DGD name has at most 39 characters. An object may appear only once in a file.
+- **GPU type:** every GPU pod needs `nodeSelector` `nvidia.com/gpu.product` equal to the profile's `gpu_product`, the GPU the lease counts.
 
 ## Budget
 
 A DGD's allocation is the larger of two numbers: its spec (replicas times nodes times GPUs per pod) and the GPUs its pods still request. Terminating pods count. Finished pods do not. GPU pods that belong to no DGD count on their own. The namespace's allocation is the sum.
 
-`kubectl` writes the objects of a file one at a time, and a failure keeps the earlier writes. So the guard checks the allocation after each DGD in the file, and the largest one counts.
+`kubectl` writes the objects of a file one at a time and goes on after a failure, so any subset of the file may land. So each DGD in the file counts at the larger of its old and new spec: a shrink that fails never pays for a growth. Shrink in one apply, then grow in the next.
 
 With no lease record, that allocation must be 0. With a record, the guard:
 
@@ -58,7 +59,7 @@ With no lease record, that allocation must be 0. With a record, the guard:
 3. runs the dry run and every check, and reads the DGDs and pods again;
 4. refuses when the allocation is more than the lease;
 5. without `multi_node`, refuses when the allocation is more than one node of the profile, and when a GPU pod lacks the label `wcep.agent/lease=<id>` or a required pod affinity to that label on `kubernetes.io/hostname`;
-6. refuses when less than 40 seconds of the slot are left, and otherwise applies;
+6. reads the namespace UID once more, then refuses when less than 40 seconds of the slot are left, and otherwise applies;
 7. calls `op end`. When it reports the lease as no longer `active`, the guard runs `expire` at once and exits with `lease_revoked`.
 
 Every write in a namespace with a lease record takes the slot, GPU or not. `secret` and `delete` follow the same rule.
@@ -74,7 +75,15 @@ A JSON error from the plugin, such as an unknown lease, is an answer, not an out
 
 ## A re-created namespace
 
-`k8s-leases` sends `expire`, `down` and `extend` with the UID it stored, without reading the namespace first. The guard refuses a `--uid` that differs from the namespace, before any write. It also reads the namespace again after it reads the lease record, after it lists the DGDs, and just before each write, and refuses when the UID has changed. Deletes carry the UID as a precondition. The window that remains is one read before one write.
+`k8s-leases` sends `expire`, `down` and `extend` with the UID it stored, without reading the namespace first. The guard refuses a `--uid` that differs from the namespace, before any write.
+
+A read cannot fence a later write, so the writes carry their own fences, which the API server checks:
+
+- `expire` and `down` select only DGDs labelled with the namespace's UID. A namespace re-created under the same name holds none.
+- Each `expire` patch tests the DGD's UID and that label. Each DGD delete and the namespace delete carry the UID as a precondition.
+- `extend` replaces the lease record under its `resourceVersion` and never creates one.
+
+The guard also reads the UID again before each write, so most races stop before a request is sent.
 
 ## Ledger
 

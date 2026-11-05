@@ -12,6 +12,9 @@ DGD_NAME_LABEL = 'nvidia.com/dynamo-graph-deployment-name'
 DGD_NAME_MAX = 39
 LEASE_LABEL = 'wcep.agent/lease'
 LEASE_RECORD = 'wcep-agent-lease'
+# Every object the guard applies carries the UID of the namespace instance it was applied in.
+NS_UID_LABEL = 'wcep.agent/namespace-uid'
+GPU_PRODUCT_LABEL = 'nvidia.com/gpu.product'
 HOSTNAME_TOPOLOGY = 'kubernetes.io/hostname'
 
 # DGD fields, per API version. A field not listed is refused: a field the guard does not
@@ -109,9 +112,9 @@ def nodes_of(c, where):
 
 
 class Component:
-    def __init__(self, where, per_pod, replicas, nodes, labels, affinity):
+    def __init__(self, where, per_pod, replicas, nodes, labels, affinity, node_selector=None):
         self.where, self.per_pod, self.replicas, self.nodes = where, per_pod, replicas, nodes
-        self.labels, self.affinity = labels or {}, affinity or {}
+        self.labels, self.affinity, self.node_selector = labels or {}, affinity or {}, node_selector or {}
 
     @property
     def gpus(self):
@@ -130,13 +133,15 @@ def components(dgd):
             tmpl = c.get('podTemplate') or {}
             out.append(Component(where, pod_spec_gpus(tmpl.get('spec'), where + '.podTemplate.spec'),
                                  replicas_of(c, where), nodes_of(c, where),
-                                 (tmpl.get('metadata') or {}).get('labels'), (tmpl.get('spec') or {}).get('affinity')))
+                                 (tmpl.get('metadata') or {}).get('labels'), (tmpl.get('spec') or {}).get('affinity'),
+                                 (tmpl.get('spec') or {}).get('nodeSelector')))
             for j, role in enumerate(c.get('roles') or []):
                 rw = f'{where}.roles[{j}]'
                 rt = role.get('podTemplate') or tmpl
                 out.append(Component(rw, pod_spec_gpus(rt.get('spec'), rw + '.podTemplate.spec'),
                                      replicas_of(role, rw), nodes_of(c, where),
-                                     (rt.get('metadata') or {}).get('labels'), (rt.get('spec') or {}).get('affinity')))
+                                     (rt.get('metadata') or {}).get('labels'), (rt.get('spec') or {}).get('affinity'),
+                                     (rt.get('spec') or {}).get('nodeSelector')))
     elif api == 'nvidia.com/v1alpha1':
         for svc, c in (spec.get('services') or {}).items():
             c = c or {}
@@ -156,7 +161,8 @@ def components(dgd):
                 main = max(main, container_gpus(mc, where + '.extraPodSpec.mainContainer'))
             out.append(Component(where, pod_spec_gpus(extra, where + '.extraPodSpec', main_extra=main),
                                  replicas_of(c, where), nodes_of(c, where),
-                                 (c.get('extraPodMetadata') or {}).get('labels'), extra.get('affinity')))
+                                 (c.get('extraPodMetadata') or {}).get('labels'), extra.get('affinity'),
+                                 extra.get('nodeSelector')))
     else:
         raise Refusal('count_failed', f'{name}: DGD API {api!r} is not one the guard counts')
     return out
@@ -190,6 +196,21 @@ def allocation(dgds, pods):
     for name in set(spec) | set(held):
         total += max(spec.get(name, 0), held.get(name, 0))
     return total
+
+
+def budget_allocation(current, new, pods):
+    """The allocation if any subset of the new DGDs lands: each DGD at the larger of its old and new spec.
+
+    kubectl applies a file object by object and goes on after a failure, so a shrink earlier in the
+    file may fail while a later growth lands. A failed reduction must never fund a growth.
+    """
+    old = {(d.get('metadata') or {}).get('name'): d for d in current}
+    worst = dict(old)
+    for d in new:
+        name = d['metadata']['name']
+        if name not in old or dgd_gpus(d) >= dgd_gpus(old[name]):
+            worst[name] = d
+    return allocation(worst.values(), pods)
 
 
 def gpu_pod_summary(pods):
@@ -311,7 +332,7 @@ def check_dgd(dgd, where):
     components(dgd)  # refuses GPU forms the guard cannot count
 
 
-def admit(objects, ns):
+def admit(objects, ns, uid):
     """Check every object the dry run returned. Returns the DGDs among them."""
     dgds, seen = [], set()
     for i, obj in enumerate(objects):
@@ -323,6 +344,8 @@ def admit(objects, ns):
         seen.add((kind, meta.get('name')))
         if meta.get('namespace') != ns:
             raise Refusal('kind_refused', f'{where} is not a namespaced object in {ns}')
+        if (meta.get('labels') or {}).get(NS_UID_LABEL) != uid:
+            raise Refusal('field_refused', f'{where} lost the label {NS_UID_LABEL}={uid}')
         if kind == DGD_KIND and api in DGD_VERSIONS:
             check_dgd(obj, where)
             dgds.append(obj)
@@ -339,6 +362,16 @@ def admit(objects, ns):
             raise Refusal('kind_refused', f'{where} ({api}) is not an admitted kind; admitted: DynamoGraphDeployment, '
                                           'ConfigMap, ClusterIP Service')
     return dgds
+
+
+def check_gpu_product(after, profile):
+    """GPU pods must select the profile's GPU product, the type the lease counts."""
+    want = profile['gpu_product']
+    for d in after:
+        for c in components(d):
+            if c.per_pod and c.replicas and c.node_selector.get(GPU_PRODUCT_LABEL) != want:
+                raise Refusal('gpu_product_required', f'{c.where}: GPU pods need nodeSelector '
+                                                      f'{GPU_PRODUCT_LABEL}: {want}, the GPU the lease is for')
 
 
 def check_one_node(after, lease, profile):
@@ -369,9 +402,16 @@ def esc(name):
     return str(name).replace('~', '~0').replace('/', '~1')
 
 
-def zero_patch(dgd):
-    """A JSON patch that sets every replica count to 0, guarded by the DGD's UID and component names."""
-    ops = [{'op': 'test', 'path': '/metadata/uid', 'value': dgd['metadata']['uid']}]
+def zero_patch(dgd, ns_uid):
+    """A JSON patch that sets every replica count to 0.
+
+    Its test operations make the server refuse it unless the object is still the one read (UID) and
+    was applied in the namespace instance being torn down (the UID label), and every component
+    index still names the same component.
+    """
+    ops = [{'op': 'test', 'path': '/metadata/uid', 'value': dgd['metadata']['uid']},
+           {'op': 'test', 'path': '/metadata/labels/' + NS_UID_LABEL.replace('~', '~0').replace('/', '~1'),
+            'value': ns_uid}]
     spec = dgd.get('spec') or {}
     changed = False
     if dgd.get('apiVersion') == 'nvidia.com/v1beta1':

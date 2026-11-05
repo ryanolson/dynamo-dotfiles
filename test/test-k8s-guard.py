@@ -42,6 +42,7 @@ DGD_API = 'nvidia.com/v1beta1'
 DGD_LIST = 'dynamographdeployments.nvidia.com'
 DGD_NAME_LABEL = 'nvidia.com/dynamo-graph-deployment-name'
 LEASE_CM = 'wcep-agent-lease'
+NS_UID = 'wcep.agent/namespace-uid'
 
 EXTRA_PROFILE = '''
 [clusters.lab-b200]
@@ -163,6 +164,13 @@ def json_patch(obj, ops):
 
 
 cmd = pos[0] if pos else ''
+if pos[:1] == ['label'] and '--local' in pos:
+    # Local: parse the manifest, set the label on every object, print the objects. No API call.
+    k, v = next(p for p in pos[1:] if '=' in p).split('=', 1)
+    for obj in docs(stdin):
+        obj.setdefault('metadata', {}).setdefault('labels', {})[k] = v
+        sys.stdout.write(json.dumps(obj) + '\n')
+    sys.exit(0)
 if pos[:2] == ['config', 'view']:
     # Local: kubectl reads the file it was given (here /proc/self/fd/<n>, inherited from the guard).
     emit(json.load(open(flags['--kubeconfig'])))
@@ -185,6 +193,9 @@ if cmd == 'get':
             st['namespaces'][ns_flag]['metadata']['uid'] = 'uid-recreated'
             save()
         items = [o for o in st['objects'].get(ns_flag, {}).values() if o['kind'] == 'DynamoGraphDeployment']
+        if flags.get('-l'):
+            lk, lv = flags['-l'].split('=', 1)
+            items = [o for o in items if (o['metadata'].get('labels') or {}).get(lk) == lv]
         emit({'kind': 'List', 'apiVersion': 'v1', 'items': items})
     if what == 'pods':
         emit({'kind': 'List', 'apiVersion': 'v1', 'items': st['pods'].get(ns_flag, [])})
@@ -489,6 +500,7 @@ def component(name, gpus=0, replicas=1, lease_id=None, ctype='worker', **extra):
     meta = {}
     if gpus and lease_id:
         spec['affinity'] = one_node(lease_id)
+        spec['nodeSelector'] = {'nvidia.com/gpu.product': 'NVIDIA-GB300'}
         meta['labels'] = {'wcep.agent/lease': lease_id}
     c = {'name': name, 'type': ctype, 'replicas': replicas, 'podTemplate': {'metadata': meta, 'spec': spec}}
     c.update(extra)
@@ -526,7 +538,8 @@ def namespace(name, thread, uid, expires_at=None):
 
 def lease_cm(ns, lease_id, uid, thread, expires_at):
     return {'apiVersion': 'v1', 'kind': 'ConfigMap',
-            'metadata': {'name': LEASE_CM, 'namespace': ns, 'uid': 'uid-cm', 'resourceVersion': '20'},
+            'metadata': {'name': LEASE_CM, 'namespace': ns, 'uid': 'uid-cm', 'resourceVersion': '20',
+                         'labels': {NS_UID: uid}},
             'data': {'lease_id': lease_id, 'expires_at': expires_at, 'thread': thread, 'uid': uid}}
 
 
@@ -591,9 +604,12 @@ class GuardCase(unittest.TestCase):
         self.k8s['pods'].setdefault(name, [])
         self.flush()
 
-    def add_obj(self, obj, ns=NS, uid=None):
+    def add_obj(self, obj, ns=NS, uid=None, stamp=True):
         obj = copy.deepcopy(obj)
         obj['metadata'].update(namespace=ns, uid=uid or f'uid-{obj["metadata"]["name"]}', resourceVersion='30')
+        if stamp and obj['kind'] != 'ConfigMap':
+            # As `apply` writes it: stamped with the namespace instance's UID.
+            obj['metadata'].setdefault('labels', {})[NS_UID] = self.k8s['namespaces'][ns]['metadata']['uid']
         self.k8s['objects'][ns][obj['kind'] + '/' + obj['metadata']['name']] = obj
         self.flush()
 
@@ -1207,8 +1223,12 @@ class Budget(GuardCase):
         self.assertEqual(body.get('code'), 'over_lease', body)
         self.assertEqual(body.get('allocation'), 8, body)
         self.assertEqual(self.writes(), [])
-        # Shrink first, then grow: every prefix fits.
-        self.assertEqual(self.apply(gpu_dgd('old', 4, lid, replicas=0), gpu_dgd('new', 4, lid))[0], 0)
+        # Shrink then grow in one file: the shrink may fail while the grow lands, so it is refused too.
+        rc, body, _ = self.apply(gpu_dgd('old', 4, lid, replicas=0), gpu_dgd('new', 4, lid))
+        self.assertEqual(body.get('code'), 'over_lease', body)
+        # In two applies, it fits.
+        self.assertEqual(self.apply(gpu_dgd('old', 4, lid, replicas=0))[0], 0)
+        self.assertEqual(self.apply(gpu_dgd('new', 4, lid))[0], 0)
 
     def test_scheduler_name_refused(self):
         lid = self.add_lease(gpus=2)
@@ -1469,6 +1489,14 @@ class Expire(GuardCase):
         self.assertEqual(self.expire()[1].get('code'), 'uid_mismatch')
         self.assertEqual(self.replicas(), [1, 2])
         self.assertEqual([c for c in self.writes() if c['pos'][0] == 'patch'], [])
+
+    def test_unstamped_dgd_never_touched(self):
+        # A DGD without this namespace instance's stamp was not applied here by the guard.
+        self.busy(state='revoking')
+        self.add_obj(gpu_dgd('other', 2, self.lid), stamp=False)
+        self.assertEqual(self.expire()[0], 0)
+        self.assertEqual(self.replicas(), [0, 0])
+        self.assertEqual([c['replicas'] for c in self.dgd_obj('other')['spec']['components']], [1, 1])
 
     def test_v1alpha1_scaled_to_zero(self):
         self.busy(state='revoking')
@@ -1941,7 +1969,6 @@ class HostEntryEnvironment(GuardCase):
 
 
 class SlotWriteWindows(GuardCase):
-    @unittest.skip("F10: the final UID read can exhaust the slot after its deadline check")
     def test_final_namespace_read_cannot_outlive_the_operation_slot(self):
         self.add_ns()
         lid = self.add_lease(gpus=1)
@@ -1958,7 +1985,7 @@ class SlotWriteWindows(GuardCase):
         (self.bin / 'kubectl').write_text(fake)
         # Model bounded calls: dry run 45s, DGD read 15s, pod read 15s, final UID read 50s.
         launcher = self.tmp / 'slot-clock.py'
-        launcher.write_text("""import json, os, runpy, sys
+        launcher.write_text(RUNNER.split('sys.argv = sys.argv[1:]')[0] + """import json, os, runpy, sys
 from datetime import timedelta
 from pathlib import Path
 scope = runpy.run_path(sys.argv[1])
@@ -1984,7 +2011,6 @@ sys.exit(scope['main'](sys.argv[2:]))
 
 
 class GpuTypes(GuardCase):
-    @unittest.skip("F9: a matching lease type does not constrain the GPU type requested by the DGD")
     def test_gpu_node_selector_must_match_the_lease_type(self):
         self.add_ns()
         lid = self.add_lease(gpus=1, gpu_type='gb300')
@@ -2000,7 +2026,6 @@ class GpuTypes(GuardCase):
 
 
 class PartialApplyFailures(GuardCase):
-    @unittest.skip("F8: a failed shrink does not stop kubectl applying a later GPU growth")
     def test_failed_shrink_cannot_leave_a_later_growth_over_the_lease(self):
         self.add_ns()
         lid = self.add_lease(gpus=4)
@@ -2028,7 +2053,6 @@ class PartialApplyFailures(GuardCase):
 
 
 class NamespaceWriteWindows(GuardCase):
-    @unittest.skip("F7: UID reads do not fence later writes into a replacement namespace")
     def test_recreation_after_last_uid_read_refuses_every_host_write(self):
         for method, has_record in (('expire', True), ('down', True), ('extend', True), ('extend', False)):
             with self.subTest(method=method, has_record=has_record):
@@ -2063,10 +2087,17 @@ class NamespaceWriteWindows(GuardCase):
                 rc, body, _ = self.guard('--context', CTX, method, NS, '--uid', 'uid-ns-1', '--lease', lid,
                                          host_entry=True)
 
+                if not has_record:
+                    # extend never creates the record, so it stops before the race can matter.
+                    self.assertEqual(body.get('code'), 'lease_record_missing', body)
+                    self.assertEqual(self.writes(), [])
+                    self.assertNotIn('ConfigMap/' + LEASE_CM, self.k8s['objects'][NS])
+                    continue
                 self.assertEqual(self.k8s['namespaces'][NS]['metadata']['uid'], 'uid-recreated')
                 self.assertEqual(self.dgd_obj('w')['spec']['components'][1]['replicas'], 1)
-                record = self.k8s['objects'][NS].get('ConfigMap/' + LEASE_CM)
-                self.assertEqual([c['pos'][0] for c in self.writes()], [], f'rc={rc}, {body}; record={record}')
+                # Ruling on F7: in this race no client-side read can stop the request; the server's
+                # preconditions must refuse it. So every write may be sent, but none may take effect.
+                self.assertEqual(self.k8s['objects'][NS], {'DynamoGraphDeployment/w': replacement}, body)
                 self.assertNotEqual(rc, 0, body)
                 self.assertNotIn('ConfigMap/' + LEASE_CM, self.k8s['objects'][NS])
 
