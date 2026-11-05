@@ -1753,6 +1753,26 @@ class Secrets(GuardCase):
         self.assertNotEqual(rc, 0)
         self.assert_no_leak(p)
 
+    @unittest.skip("F6: truncating kubectl stderr before scrubbing leaks a secret prefix")
+    def test_secret_crossing_error_truncation_boundary_is_scrubbed(self):
+        self.add_ns()
+        self.k8s['forbid'] = ['create secret']
+        self.flush()
+        # Truncating before redaction leaves a credential prefix that no full-value match can find.
+        leaky = FAKE_KUBECTL.replace(
+            "fail(f'Error from server (Forbidden): fake forbids \"{needle}\"')",
+            "fail('x' * 580 + stdin)")
+        self.assertNotEqual(leaky, FAKE_KUBECTL)
+        (self.bin / 'kubectl').write_text(leaky)
+
+        rc, body, p = self.guard('--context', CTX, '-n', NS, 'secret', 'hf')
+
+        self.assertNotEqual(rc, 0, body)
+        self.assertEqual(body.get('code'), 'kubectl_error', body)
+        self.assert_no_leak(p)
+        self.assertNotIn(SECRET[:20], p.stdout)
+        self.assertNotIn(SECRET[:20], p.stderr)
+
     def test_unknown_secret_refused(self):
         self.add_ns()
         self.refused('usage', '--context', CTX, '-n', NS, 'secret', 'aws')
