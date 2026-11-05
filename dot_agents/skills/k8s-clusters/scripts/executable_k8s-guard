@@ -42,7 +42,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from k8s_profiles import ProfileError, bot_credential_problem, kubectl_env, load_profiles, sealed_copy  # noqa: E402
 from k8s_guard_rules import (  # noqa: E402
-    DGD_KIND, DGD_NAME_LABEL, HOSTNAME_TOPOLOGY, LEASE_LABEL, LEASE_RECORD, NS_UID_LABEL, Refusal, admit, allocation,
+    DGD_KIND, HOSTNAME_TOPOLOGY, LEASE_LABEL, LEASE_RECORD, NS_UID_LABEL, Refusal, admit, allocation,
     budget_allocation, check_gpu_product, check_one_node, dgd_gpus, gpu_pod_summary, zero_patch)
 
 DGD_RESOURCE = 'dynamographdeployments.nvidia.com'
@@ -909,35 +909,30 @@ def cmd_down(g, a):
     wait = float(os.environ.get('K8S_GUARD_DOWN_WAIT_SECONDS', '300'))
     poll = float(os.environ.get('K8S_GUARD_POLL_SECONDS', '5'))
     give_up = time.monotonic() + wait
-    # Wait only for GPU pods of this namespace instance. A DGD stamped for another instance (the
-    # accepted F14 residual), or not stamped at all, was not applied here by the guard; its pods must
-    # not hold the namespace. The namespace delete below carries the UID precondition, so it removes
-    # them with this instance and can touch nothing else.
-    # A name this down deleted stays its own even if a foreign DGD takes it later: its pods may still
-    # be terminating, so they are waited for.
-    own_names = {(d.get('metadata') or {}).get('name') for d in dgds}
-    foreign = {(d.get('metadata') or {}).get('name') for d in g.dgds(ns)
-               if ((d.get('metadata') or {}).get('labels') or {}).get(NS_UID_LABEL) != view.uid} - own_names
+    # Wait, bounded, for every GPU pod in the namespace, then delete the namespace whatever is left.
+    # The delete carries the UID precondition, so it can remove only this namespace instance; it stops
+    # the remaining pods, including those of a stray DGD from the accepted F14 residual. Pods are not
+    # matched to DGDs: names can be reused, and pods carry no reliable link to their DGD. k8s-leases
+    # keeps the GPUs charged until a host reports the namespace gone.
     while True:
-        pods = g.pods(ns)
-        own = [p for p in pods if ((p.get('metadata') or {}).get('labels') or {}).get(DGD_NAME_LABEL) not in foreign]
-        _, left = gpu_pod_summary(own)
+        _, left = gpu_pod_summary(g.pods(ns))
         if left == 0 or time.monotonic() >= give_up:
             break
         time.sleep(poll)
-    _, foreign_pods = gpu_pod_summary([p for p in pods if p not in own])
-    if left:
-        g.record(ns, f'Namespace/{ns}', before, 'down', uid=view.uid, lease=lease_id, issue=view.issue)
-        raise Refusal('pods_left', f'{left} GPU pods still run in {ns}; the namespace is kept until they are gone',
-                      gpu_pods_left=left)
+    if (view.obj.get('metadata') or {}).get('deletionTimestamp'):
+        # Already being deleted (an earlier down): a second delete would only be refused.
+        g.record(ns, f'Namespace/{ns}', before, 'down', uid=view.uid, lease=lease_id, issue=view.issue,
+                 gpu_pods_left=left)
+        return {'namespace': ns, 'deleted': True, 'terminating': True, 'authority': why, 'gpu_pods_left': left}
     body = json.dumps({'kind': 'DeleteOptions', 'apiVersion': 'v1', 'preconditions': {'uid': view.uid}})
     rc, out, err = g.kc.run('delete', '--raw', f'/api/v1/namespaces/{ns}', '-f', '-', input=body)
     if rc != 0 and not is_not_found(err):
-        if 'Precondition failed' in err or 'Conflict' in err:
+        if 'Precondition failed' in err or 'UID in precondition' in err:
             raise Refusal('uid_mismatch', f'{ns} was re-created; the new namespace is left alone')
         raise kubectl_error(('delete', 'namespace', ns), rc, err)
-    g.record(ns, f'Namespace/{ns}', before, 'down', uid=view.uid, lease=lease_id, issue=view.issue, deleted=True)
-    return {'namespace': ns, 'deleted': True, 'authority': why, 'foreign_gpu_pods': foreign_pods}
+    g.record(ns, f'Namespace/{ns}', before, 'down', uid=view.uid, lease=lease_id, issue=view.issue, deleted=True,
+             gpu_pods_left=left)
+    return {'namespace': ns, 'deleted': True, 'terminating': bool(left), 'authority': why, 'gpu_pods_left': left}
 
 
 def offline_owner(view):

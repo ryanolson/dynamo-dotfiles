@@ -696,6 +696,18 @@ class GuardCase(unittest.TestCase):
     def apply(self, *objs, ns=NS, **env_kw):
         return self.guard('--context', CTX, '-n', ns, 'apply', '-f', self.manifest(*objs), **env_kw)
 
+    def down_waiting(self, *args, wait='0.3', **env_kw):
+        """Run down with a short bounded wait, so the poll loop really runs."""
+        env = self.env(**env_kw)
+        env.update(K8S_GUARD_DOWN_WAIT_SECONDS=wait, K8S_GUARD_POLL_SECONDS='0.05')
+        p = subprocess.run(['python3', '-I', str(self.runner), str(GUARD), '--context', CTX, 'down', *args],
+                           env=env, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        self.reload()
+        return p.returncode, json.loads(p.stdout)
+
+    def pod_polls(self):
+        return sum(1 for c in self.kubectl_calls() if c['pos'][:2] == ['get', 'pods'])
+
     def kubectl_calls(self):
         if not self.kubectl_log.exists():
             return []
@@ -942,7 +954,7 @@ class NamespaceCreate(GuardCase):
         # the stray DGD and its pods too, so the residual ends at the grace deadline.
         body = self.ok('--context', CTX, 'down', ns, '--uid', uid, '--lease', lid, host_entry=True)
         self.assertNotIn(ns, self.k8s['namespaces'])
-        self.assertEqual(body['foreign_gpu_pods'], 1, body)
+        self.assertEqual(body['gpu_pods_left'], 1, body)
 
     def test_f14_collision_down_removes_the_stray_and_nothing_else(self):
         # Reproduce F14: a late apply from a deleted namespace lands in the new one under the same name.
@@ -973,9 +985,9 @@ class NamespaceCreate(GuardCase):
         self.assertEqual(self.k8s['namespaces'][neighbour], before['namespaces'][neighbour])
         self.assertEqual(self.k8s['objects'][neighbour], before['objects'][neighbour])
         self.assertEqual(self.k8s['pods'][neighbour], before['pods'][neighbour])
-        self.assertEqual(body['foreign_gpu_pods'], 1, body)
+        self.assertEqual(body['gpu_pods_left'], 1, body)
 
-    def test_down_still_waits_for_its_own_gpu_pods_with_a_stray_present(self):
+    def test_down_counts_its_own_and_stray_gpu_pods(self):
         ns, uid = NS + '-' + 'e' * 10, 'uid-current-ns'
         self.add_ns(name=ns, thread=OTHER, uid=uid)
         lid = self.add_lease(ns=ns, uid=uid, thread=OTHER, gpus=1, state='revoking')
@@ -987,9 +999,9 @@ class NamespaceCreate(GuardCase):
         self.add_pod(pod('late', 2), ns=ns)
         self.k8s['terminate_pods_on_delete'] = False
         self.flush()
-        body = self.refused('pods_left', '--context', CTX, 'down', ns, '--uid', uid, '--lease', lid, host_entry=True)
-        self.assertEqual(body['gpu_pods_left'], 1, body)
-        self.assertIn(ns, self.k8s['namespaces'])
+        body = self.ok('--context', CTX, 'down', ns, '--uid', uid, '--lease', lid, host_entry=True)
+        self.assertEqual(body['gpu_pods_left'], 2, body)
+        self.assertNotIn(ns, self.k8s['namespaces'])
 
     def test_hours_bounded(self):
         for hours in ('0', '4.5', '-1', 'nan', 'inf'):
@@ -1764,18 +1776,18 @@ class Down(GuardCase):
         self.refused('lease_release_failed', '--context', CTX, 'down', NS)
         self.assertIn(NS, self.k8s['namespaces'])
 
-    def test_stops_on_gpu_pods_left(self):
+    def test_reports_gpu_pods_left_and_deletes_the_namespace(self):
         self.add_ns(thread=OTHER)
         lid = self.add_lease(thread=OTHER, state='releasing')
         self.add_obj(gpu_dgd('w', 2, lid))
         self.add_pod(pod('w', 2))
         self.k8s['terminate_pods_on_delete'] = False
         self.flush()
-        body = self.refused('pods_left', '--context', CTX, 'down', NS, '--uid', 'uid-ns-1', '--lease', lid,
-                            host_entry=True)
+        rc, body = self.down_waiting(NS, '--uid', 'uid-ns-1', '--lease', lid, host_entry=True)
+        self.assertEqual(rc, 0, body)
+        self.assertGreaterEqual(self.pod_polls(), 2)
         self.assertEqual(body['gpu_pods_left'], 1)
-        self.assertIn(NS, self.k8s['namespaces'])
-        self.assertIsNone(self.dgd_obj('w'))
+        self.assertNotIn(NS, self.k8s['namespaces'])
 
     def test_wrong_uid_refused(self):
         self.add_ns(thread=OTHER)
@@ -1802,8 +1814,9 @@ class Down(GuardCase):
 
 
 class DownClassificationRaces(GuardCase):
-    @unittest.skip("F18: a retry loses deleted DGD names and hides their terminating GPU pods")
-    def test_f18_retry_waits_for_deleted_owned_pods_after_foreign_name_reuse(self):
+    def test_f18_retry_after_foreign_name_reuse_counts_every_pod(self):
+        # Ruling on F16, F18, F19 (driver): no pod classification. down waits, bounded, for every GPU
+        # pod, then deletes the namespace under its UID precondition and reports what was left.
         self.add_ns(thread=OTHER)
         lid = self.add_lease(thread=OTHER, state='revoking')
         self.add_obj(gpu_dgd('shared', 1, lid), uid='uid-owned-dgd')
@@ -1815,24 +1828,25 @@ class DownClassificationRaces(GuardCase):
         self.k8s['terminate_pods_on_delete'] = False
         self.flush()
 
-        first = self.refused('pods_left', '--context', CTX, 'down', NS, '--uid', 'uid-ns-1',
-                             '--lease', lid, host_entry=True)
-        self.assertEqual(first['gpu_pods_left'], 1, first)
-        self.assertIsNone(self.dgd_obj('shared'))
-        self.assertIn('deletionTimestamp', self.k8s['pods'][NS][0]['metadata'])
+        # The foreign DGD takes the name after the owned one is gone, and its pod runs too.
         replacement = gpu_dgd('shared', 2, 'lse_previous01')
-        replacement['metadata']['labels'] = {NS_UID: 'uid-deleted-ns'}
-        self.add_obj(replacement, uid='uid-foreign-dgd', stamp=False)
+        replacement['metadata'].update(namespace=NS, uid='uid-foreign-dgd', resourceVersion='1000',
+                                       labels={NS_UID: 'uid-deleted-ns'})
+        anchor = "        del st['objects'][ns]['DynamoGraphDeployment/' + name]\n"
+        hook = anchor + "        st['objects'][ns]['DynamoGraphDeployment/' + name] = REPLACEMENT\n" \
+                        "        st['pods'][ns].append(FOREIGN_POD)\n"
+        foreign_pod = pod('shared', 2, name='foreign-running')
+        hook = hook.replace('REPLACEMENT', repr(replacement)).replace('FOREIGN_POD', repr(foreign_pod))
+        self.assertEqual(FAKE_KUBECTL.count(anchor), 1)
+        (self.bin / 'kubectl').write_text(FAKE_KUBECTL.replace(anchor, hook, 1))
 
-        rc, body, _ = self.guard('--context', CTX, 'down', NS, '--uid', 'uid-ns-1', '--lease', lid,
-                                 host_entry=True)
+        rc, body = self.down_waiting(NS, '--uid', 'uid-ns-1', '--lease', lid, host_entry=True)
 
-        self.assertNotEqual(rc, 0, f'retry deleted the namespace with its owned GPU pod still running: {body}')
-        self.assertEqual(body.get('code'), 'pods_left', body)
-        self.assertEqual(body['gpu_pods_left'], 1, body)
-        self.assertIn(NS, self.k8s['namespaces'])
+        self.assertEqual(rc, 0, body)
+        self.assertGreaterEqual(self.pod_polls(), 2, 'down did not wait for the pods')
+        self.assertEqual(body['gpu_pods_left'], 2, body)  # the owned pod is counted, not hidden
+        self.assertNotIn(NS, self.k8s['namespaces'])
 
-    @unittest.skip("F19: a deleted owned DGD name makes its foreign replacement's pods hold the namespace")
     def test_f19_foreign_replacement_pods_do_not_hold_the_namespace(self):
         self.add_ns(thread=OTHER)
         lid = self.add_lease(thread=OTHER, state='revoking')
@@ -1856,15 +1870,15 @@ class DownClassificationRaces(GuardCase):
         self.assertEqual(FAKE_KUBECTL.count(anchor), 1)
         (self.bin / 'kubectl').write_text(FAKE_KUBECTL.replace(anchor, hook, 1))
 
-        rc, body, _ = self.guard('--context', CTX, 'down', NS, '--uid', 'uid-ns-1', '--lease', lid,
-                                 host_entry=True)
+        rc, body = self.down_waiting(NS, '--uid', 'uid-ns-1', '--lease', lid, host_entry=True)
 
         self.assertEqual(self.k8s['pods_after_owned_delete'], [])
         self.assertEqual(rc, 0, f'only the foreign replacement has GPU pods, but down kept the namespace: {body}')
         self.assertNotIn(NS, self.k8s['namespaces'])
-        self.assertEqual(body['foreign_gpu_pods'], 1, body)
+        self.assertEqual(body['gpu_pods_left'], 1, body)
 
     def test_f16_foreign_replacement_cannot_hide_a_deleted_owned_dgds_pod(self):
+        # New behavior: the owned pod is waited for and counted; the namespace then goes anyway.
         self.add_ns(thread=OTHER)
         lid = self.add_lease(thread=OTHER, state='revoking')
         self.add_obj(gpu_dgd('shared', 1, lid), uid='uid-owned-dgd')
@@ -1887,14 +1901,24 @@ class DownClassificationRaces(GuardCase):
         self.assertEqual(FAKE_KUBECTL.count(anchor), 1)
         (self.bin / 'kubectl').write_text(FAKE_KUBECTL.replace(anchor, hook, 1))
 
-        rc, body, _ = self.guard('--context', CTX, 'down', NS, '--uid', 'uid-ns-1', '--lease', lid,
-                                 host_entry=True)
+        rc, body = self.down_waiting(NS, '--uid', 'uid-ns-1', '--lease', lid, host_entry=True)
 
         self.assertEqual(self.k8s['owned_pods_after_dgd_delete'], [owned_pod])
-        self.assertNotEqual(rc, 0, f'down deleted the namespace with its owned GPU pod still running: {body}')
-        self.assertEqual(body.get('code'), 'pods_left', body)
+        self.assertEqual(rc, 0, body)
+        self.assertGreaterEqual(self.pod_polls(), 2, 'down did not wait for the owned pod')
         self.assertEqual(body['gpu_pods_left'], 1, body)
-        self.assertIn(NS, self.k8s['namespaces'])
+        self.assertNotIn(NS, self.k8s['namespaces'])
+
+    def test_down_on_a_terminating_namespace_sends_no_second_delete(self):
+        # k8s-leases calls down every tick until the namespace is gone.
+        self.add_ns(thread=OTHER)
+        lid = self.add_lease(thread=OTHER, state='releasing')
+        self.k8s['namespaces'][NS]['metadata']['deletionTimestamp'] = '2026-01-01T00:00:00Z'
+        self.k8s['namespaces'][NS]['status']['phase'] = 'Terminating'
+        self.flush()
+        body = self.ok('--context', CTX, 'down', NS, '--uid', 'uid-ns-1', '--lease', lid, host_entry=True)
+        self.assertTrue(body['terminating'], body)
+        self.assertEqual([c for c in self.writes() if c['flags'].get('--raw', '').startswith('/api/v1/')], [])
 
 
 # --- load-bearing: a namespace re-created under the same name is never touched ---

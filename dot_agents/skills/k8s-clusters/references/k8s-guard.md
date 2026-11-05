@@ -13,7 +13,7 @@ Every command prints one JSON object on stdout. A refusal exits non-zero with `{
 | `-n <ns> secret hf\|ngc` | the namespace's thread | Pipes `fleet secret get` into `kubectl create secret ... --from-file=<key>=/dev/stdin`. Prints only the secret's name. |
 | `-n <ns> apply -f <file>` | the namespace's thread | Applies DGDs, ConfigMaps and ClusterIP Services, after the checks below. |
 | `-n <ns> delete <kind>/<name>` | the namespace's thread | Deletes one DGD, ConfigMap, Service, Secret, PVC or PodCliqueSet. The lease record, the model cache PVC and the pull secret are refused. Like `apply`, it takes the lease's slot, or needs a namespace that holds no GPUs. |
-| `down <ns> [--uid <uid>] [--lease <id>]` | the namespace's thread, or anyone with teardown authority | Releases an active lease first (owner only). Deletes each DGD labelled for this namespace with its UID as a precondition. Waits for their GPU pods, and for GPU pods that belong to no DGD, to go. Then deletes the namespace with its UID as a precondition, which removes anything left in it. |
+| `down <ns> [--uid <uid>] [--lease <id>]` | the namespace's thread, or anyone with teardown authority | Releases an active lease first (owner only). Deletes each DGD labelled for this namespace with its UID as a precondition. Waits, at most `K8S_GUARD_DOWN_WAIT_SECONDS` (300), for every GPU pod in the namespace to go. Then deletes the namespace with its UID as a precondition, whatever is left, and reports `gpu_pods_left`. A namespace already being deleted gets no second delete (`terminating: true`). |
 | `expire <ns> [--uid <uid>] [--lease <id>]` | anyone with teardown authority | Sets every replica count of every DGD to 0. |
 | `extend <ns> [--uid <uid>] [--lease <id>]` | anyone | Copies the lease's `expires_at`, unchanged, into the lease record. It only replaces the record `lease acquire` wrote, under the `resourceVersion` it read, and never creates one. The lease must be `active` and match the cluster, the namespace and the UID. It never moves the stored expiry earlier, so a late call cannot undo a newer extension. |
 | `-n <ns> selftest fences` | the namespace's thread | For the first run on a cluster. On the first DGD the guard applied, it sends each teardown fence once with a wrong UID or a stale `resourceVersion`: two JSON patches, a DGD delete, a namespace delete, and a lease record replace. Each payload changes nothing even if the server ignored its fence. It prints each server response and reads the objects again. It fails with `fence_failed` unless every request was refused for its fence's own reason (`testing value`, `Precondition failed`, `the object has been modified`) and nothing changed. Another error, such as Forbidden, proves nothing. |
@@ -74,7 +74,13 @@ Every write in a namespace with a lease record takes the slot, GPU or not. `secr
 - the plugin says the lease is `revoking` or `releasing`, for this cluster, namespace and UID;
 - the plugin cannot be reached, `--uid` matches the namespace, and the namespace's expiry has passed.
 
-A JSON error from the plugin, such as an unknown lease, is an answer, not an outage, and is refused. So is a lease the plugin reports as `released` or `torn-down`. `down` stops with `pods_left`, and keeps the namespace, while GPU pods of the DGDs it deleted, or GPU pods of no DGD, remain. Pods of a DGD labelled for another namespace instance do not hold it (see the residual below).
+A JSON error from the plugin, such as an unknown lease, is an answer, not an outage, and is refused. So is a lease the plugin reports as `released` or `torn-down`. `down` waits for GPU pods only for a bounded time, then deletes the namespace in any case:
+
+- deleting the namespace stops every pod still in it;
+- a shared-model-cache PVC can stay `Terminating` until its pods are gone, which is expected;
+- `k8s-leases` keeps the namespace's GPUs charged until a host reports the namespace gone, so the budget stays correct while pods finish.
+
+`down` does not match pods to DGDs: names can be reused, and pods carry no reliable link to their DGD.
 
 ## A re-created namespace
 
@@ -86,7 +92,7 @@ One residual remains, and the owner accepted it. All three of these must happen 
 - its suffix collides with a deleted namespace's suffix, about 1 in 3.7e15;
 - the owner races its own `apply` against its own `down`.
 
-Then the late `apply` can land in the new namespace. Its DGD carries the deleted namespace's UID label, so `expire` never touches it. `inspect` counts it, so `k8s-leases` sees the over-allocation, revokes the lease and flags it. At the grace deadline, `down` deletes the namespace: it waits only for the GPU pods of its own labelled DGDs, so the stray DGD and its pods go with the namespace. The namespace delete carries the UID precondition, so nothing outside that namespace is touched.
+Then the late `apply` can land in the new namespace. Its DGD carries the deleted namespace's UID label, so `expire` never touches it. `inspect` counts it, so `k8s-leases` sees the over-allocation, revokes the lease and flags it. At the grace deadline, `down` deletes the namespace after its bounded wait, so the stray DGD and its pods go with it. The namespace delete carries the UID precondition, so nothing outside that namespace is touched.
 
 `k8s-leases` sends `expire`, `down` and `extend` with the UID it stored, without reading the namespace first. The guard refuses a `--uid` that differs from the namespace, before any write.
 
