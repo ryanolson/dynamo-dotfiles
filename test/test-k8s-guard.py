@@ -910,6 +910,32 @@ class NamespaceCreate(GuardCase):
         self.refused('usage', '--context', CTX, 'ns', 'create', 'p' * 28, '--issue', issue, '--hours', '1')
         self.refused('usage', '--context', CTX, 'ns', 'create', 'p', '--issue', '12345678901', '--hours', '1')
 
+    @unittest.skip("F15: expire skips the late DGD's stale UID stamp, so the documented cleanup does not scale it to zero")
+    def test_documented_residual_is_scaled_to_zero_after_lease_revocation(self):
+        # The accepted collision leaves a late apply stamped with the deleted namespace's UID.
+        ns, uid = NS + '-' + 'a' * 10, 'uid-current-ns'
+        self.add_ns(name=ns, thread=OTHER, uid=uid)
+        lid = self.add_lease(ns=ns, uid=uid, thread=OTHER, gpus=1, state='revoking')
+        self.add_obj(gpu_dgd('current', 1, lid), ns=ns)
+        late = gpu_dgd('late', 2, 'lse_previous01')
+        late['metadata']['labels'] = {NS_UID: 'uid-deleted-ns'}
+        self.add_obj(late, ns=ns, stamp=False)
+        self.add_pod(pod('late', 2), ns=ns)
+        before = self.ok('--context', CTX, 'inspect', ns, host_entry=True)
+        self.assertEqual(before['allocation'], 3)
+
+        # Reconcile has revoked the new lease and sends expire with that namespace's UID.
+        rc, body, _ = self.guard('--context', CTX, 'expire', ns, '--uid', uid, '--lease', lid,
+                                 host_entry=True)
+
+        self.assertEqual(rc, 0, body)
+        self.assertEqual(body['gpu_pods_left'], 1)
+        current = self.k8s['objects'][ns]['DynamoGraphDeployment/current']
+        self.assertEqual(current['spec']['components'][1]['replicas'], 0)
+        late = self.k8s['objects'][ns]['DynamoGraphDeployment/late']
+        self.assertEqual(2 * late['spec']['components'][1]['replicas'], 0,
+                         f'documented one-tick cleanup leaves the late DGD allocating GPUs: {body}')
+
     def test_hours_bounded(self):
         for hours in ('0', '4.5', '-1', 'nan', 'inf'):
             with self.subTest(hours=hours):
