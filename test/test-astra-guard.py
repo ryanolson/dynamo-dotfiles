@@ -1754,6 +1754,23 @@ class PassThreeReview(GuardCase):
 
 class RedesignReview(GuardCase):
 
+    def test_plan_resources_without_wcep_names_still_need_the_asked_namespace(self):
+        iid = self.deployed_mr()
+        head = self.gl.branch_sha(BRANCH)
+        self.check(iid)
+        for namespace, kind in (('ns-someone-else', 'Deployment'), ('', 'ClusterRole')):
+            with self.subTest(namespace=namespace, kind=kind):
+                trace = (f'{NS}, wcep-smoke, DynamoGraphDeployment (nvidia.com) has been added:\n'
+                         f'{namespace}, chart-helper, {kind} (example.test/v1) has been added:\n')
+                self.assertEqual(rules.parse_plan(trace)[-1],
+                                 (namespace, 'chart-helper', kind, 'added'))
+                self.gl.traces[head] = trace
+
+                rc, body, err = self.guard('check', '--mr', str(iid), '--namespace', NS)
+
+                self.assertNotEqual(rc, 0,
+                                    f'A fully parsed resource outside the namespace was ignored: {body} {err}')
+
     def test_a_fleet_failure_still_logs_and_signs_the_merge_refusal(self):
         iid, qid = self.approved()
         before = self.main()
