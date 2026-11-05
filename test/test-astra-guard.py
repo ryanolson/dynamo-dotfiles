@@ -1383,6 +1383,37 @@ class PureRules(unittest.TestCase):
 
 class AdversarialReview(GuardCase):
 
+    def test_a_truncated_merge_response_still_logs_the_attempt(self):
+        iid, qid = self.approved()
+        handler_class = self.gl.server.RequestHandlerClass
+        original = handler_class.do_PUT
+        fake = self.gl
+
+        def truncated_response(handler):
+            if not handler.path.endswith('/merge'):
+                return original(handler)
+            length = int(handler.headers.get('Content-Length') or 0)
+            body = handler.rfile.read(length).decode()
+            with fake.lock:
+                status, headers, payload = fake.handle('PUT', handler.path, body, handler.headers)
+            data = json.dumps(payload).encode()
+            handler.send_response(status)
+            for key, value in headers.items():
+                handler.send_header(key, value)
+            handler.send_header('Content-Length', str(len(data)))
+            handler.end_headers()
+            handler.wfile.write(data[:-1])
+            handler.close_connection = True
+
+        handler_class.do_PUT = truncated_response
+        rc, body, err = self.guard('merge', '--mr', str(iid), '--answer', qid)
+        self.assertNotEqual(rc, 0, (body, err))
+        self.assertEqual(self.gl.mrs[(PID, iid)]['state'], 'merged')
+        lines = self.log_lines()
+        self.assertEqual(len(lines), 1, f'The merge reached GitLab but has no audit line: {body}')
+        self.assertEqual(lines[0]['ask_id'], qid)
+        self.assertIn('comment', body)
+
     def test_it_values_cannot_change_from_a_boolean_to_a_number(self):
         base = DEV_VALUES + 'itFeature: true\n'
         head = dev_deploy(base).replace('itFeature: true', 'itFeature: 1')
