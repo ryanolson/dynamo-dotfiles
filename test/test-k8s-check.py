@@ -858,6 +858,60 @@ class K8sCheck(unittest.TestCase):
         rc, out = self.run_check('lab-arm-a')
         self.assert_refused_without_contact(out, rc, 'kubeconfig_credentials')
 
+    def test_installed_tbot_proxy_cannot_delegate_to_tsh(self):
+        # tbot v18.7.6 delegates `proxy` to a tsh subprocess, even with a CLI destination.
+        # https://github.com/gravitational/teleport/blob/v18.7.6/tool/tbot/proxy.go#L88
+        self.tbot.write_text(textwrap.dedent('''\
+            #!/usr/bin/env python3
+            import os, shutil, sys
+            if sys.argv[1:3] == ['kube', 'credentials']:
+                sys.exit(0)
+            assert sys.argv[1] == 'proxy'
+            destination = next(a.split('=', 1)[1] for a in sys.argv if a.startswith('--destination-dir='))
+            proxy = next(a.split('=', 1)[1] for a in sys.argv if a.startswith('--proxy-server='))
+            tsh = os.environ.get('TSH') or shutil.which('tsh')
+            fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
+            assert os.path.commonpath([os.path.realpath(tsh), fixture_root]) == fixture_root
+            os.execv(tsh, [tsh, '-i', os.path.join(destination, 'identity'), 'proxy', '--proxy=' + proxy, 'kube'])
+            '''))
+        installed = self.tmp / 'teleport/tbot'
+        installed.parent.mkdir()
+        self.tbot.rename(installed)
+        self.tbot.symlink_to(installed)
+        credential_step = textwrap.dedent('''\
+            if rest[:1] != ['config']:
+                import subprocess
+                config = json.load(open(flags['--kubeconfig']))
+                context = next(c['context'] for c in config['contexts'] if c['name'] == flags['--context'])
+                user = next(u['user'] for u in config['users'] if u['name'] == context['user'])
+                plugin = user['exec']
+                fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
+                assert os.path.commonpath([os.path.realpath(plugin['command']), fixture_root]) == fixture_root
+                env = dict(os.environ)
+                env.update((item['name'], item['value']) for item in plugin.get('env', []))
+                result = subprocess.run([plugin['command'], *plugin.get('args', [])], env=env,
+                                        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
+                if result.returncode:
+                    sys.stderr.write(result.stderr)
+                    sys.exit(result.returncode)
+            ''')
+        kubectl = self.tmp / 'bin/kubectl'
+        kubectl.write_text(FAKE_KUBECTL.replace(
+            "scenario = json.load(open(os.environ['FAKE_KUBECTL_SCENARIO']))",
+            credential_step + "scenario = json.load(open(os.environ['FAKE_KUBECTL_SCENARIO']))"))
+        # Control: an absolute command through a symlinked install passes with kube credentials.
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assertGreater(len(self.calls()), 3)
+        self.log.unlink()
+        # An agent copies a proxy command into exec.args instead of the credential command.
+        self.bot_kubeconfig.write_text(self.kc(user={'exec': {
+            'apiVersion': 'client.authentication.k8s.io/v1beta1', 'command': str(self.tbot),
+            'args': ['proxy', f'--destination-dir={self.bot_kubeconfig.parent}',
+                     '--proxy-server=proxy.example.test:443', 'kube']}}))
+        rc, out = self.run_check('lab-arm-a')
+        self.assert_refused_without_contact(out, rc, 'kubeconfig_credentials')
+
 
 if __name__ == '__main__':
     unittest.main()
