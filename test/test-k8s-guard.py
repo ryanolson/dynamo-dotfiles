@@ -2138,6 +2138,57 @@ class NamespaceWriteWindows(GuardCase):
                 self.assertNotIn('ConfigMap/' + LEASE_CM, self.k8s['objects'][NS])
 
 
+class OwnerNamespaceWriteWindows(GuardCase):
+    @unittest.skip("F11: owner writes have no server fence against namespace recreation")
+    def test_owner_writes_cannot_land_in_a_recreated_namespace(self):
+        for command in ('apply', 'secret', 'delete', 'acquire'):
+            with self.subTest(command=command):
+                self.k8s = {'namespaces': {}, 'objects': {}, 'pods': {}}
+                self.bb = {'leases': {}}
+                self.kubectl_log.unlink(missing_ok=True)
+                self.bb_log.unlink(missing_ok=True)
+                self.add_ns()
+                if command == 'apply':
+                    lid = self.add_lease(gpus=1)
+                    args = ('apply', '-f', self.manifest(gpu_dgd('w', 1, lid)))
+                elif command == 'secret':
+                    args = ('secret', 'hf')
+                elif command == 'delete':
+                    self.add_obj({'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': 'victim'}})
+                    args = ('delete', 'configmap/victim')
+                else:
+                    args = ('lease', 'acquire', '--gpus', '1', '--hours', '1')
+                replacement_ns = namespace(NS, OTHER, 'uid-recreated')
+                replacement = {'ConfigMap/victim': {
+                    'apiVersion': 'v1', 'kind': 'ConfigMap',
+                    'metadata': {'name': 'victim', 'namespace': NS, 'uid': 'uid-new-cm',
+                                 'resourceVersion': '1000', 'labels': {NS_UID: 'uid-recreated'}},
+                    'data': {'owner': OTHER}}}
+                # Return the old UID, then let another thread recreate the namespace before the write.
+                hook = """if what == 'namespace':
+        st['namespace_reads'] = st.get('namespace_reads', 0) + 1
+        save()
+        if st['namespace_reads'] == 3:
+            reply = copy.deepcopy(st['namespaces'][pos[2]])
+            st['namespaces'][pos[2]] = REPLACEMENT_NS
+            st['objects'][pos[2]] = REPLACEMENT_OBJECTS
+            st['pods'][pos[2]] = []
+            save()
+            emit(reply)""".replace('REPLACEMENT_NS', repr(replacement_ns)).replace(
+                    'REPLACEMENT_OBJECTS', repr(replacement))
+                fake = FAKE_KUBECTL.replace("if what == 'namespace':", hook, 1)
+                self.assertNotEqual(fake, FAKE_KUBECTL)
+                (self.bin / 'kubectl').write_text(fake)
+
+                rc, body, _ = self.guard('--context', CTX, '-n', NS, *args)
+
+                self.assertEqual(self.k8s['namespaces'][NS]['metadata']['uid'], 'uid-recreated')
+                self.assertTrue(self.k8s['objects'][NS] == replacement,
+                                f'{command} changed another thread\'s namespace: {body}; '
+                                f'objects={sorted(self.k8s["objects"][NS])}')
+                self.assertNotEqual(rc, 0, body)
+
+
 class SelftestFences(GuardCase):
     def setUp(self):
         super().setUp()
