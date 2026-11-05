@@ -747,6 +747,33 @@ class K8sCheck(unittest.TestCase):
         owner_calls = [c['key'] for c in self.calls() if c['credential_user'] == 'owner']
         self.assertEqual(owner_calls, [], f'owner path used after whoami: exit={rc}, identity={out.get("identity")}')
 
+    def test_pinned_kubeconfig_cannot_be_rewritten_after_whoami(self):
+        inode = self.bot_kubeconfig.stat().st_ino
+        self.human_kubeconfig.write_text(kubeconfig(user={'token': 'made-up-owner-token'}))
+        self.env['FAKE_REWRITE_SOURCE'] = str(self.human_kubeconfig)
+        # Reopening /proc/self/fd pins the inode, but a writer can still change its bytes.
+        rewrite_step = textwrap.dedent('''\
+            if rest[:2] == ['auth', 'whoami']:
+                with open(os.environ['FAKE_REWRITE_SOURCE']) as source:
+                    replacement = source.read()
+                with open(flags['--kubeconfig'], 'w') as target:
+                    target.write(replacement)
+            ''')
+        kubectl = self.tmp / 'bin/kubectl'
+        kubectl.write_text(FAKE_KUBECTL.replace(
+            "'key': ' '.join(rest)",
+            "'key': ' '.join(rest), 'inode': os.stat(flags['--kubeconfig']).st_ino, "
+            "'credential_token': json.load(open(flags['--kubeconfig']))['users'][0]['user'].get('token')").replace(
+                "sys.stdout.write(reply.get('stdout', ''))",
+                rewrite_step + "sys.stdout.write(reply.get('stdout', ''))"))
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assertGreater(len(self.calls()), 3, 'the rewrite after whoami must be exercised')
+        self.assertEqual({c['inode'] for c in self.calls()}, {inode})
+        self.assertEqual(self.bot_kubeconfig.stat().st_ino, inode)
+        owner_calls = [c['key'] for c in self.calls() if c['credential_token'] == 'made-up-owner-token']
+        self.assertEqual(owner_calls, [], f'owner credentials used after bot whoami: {owner_calls}')
+
 
 if __name__ == '__main__':
     unittest.main()
