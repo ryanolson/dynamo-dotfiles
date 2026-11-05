@@ -16,6 +16,7 @@ Every command prints one JSON object on stdout. A refusal exits non-zero with `{
 | `down <ns> [--uid <uid>] [--lease <id>]` | the namespace's thread, or anyone with teardown authority | Releases an active lease first (owner only). Deletes each DGD with its UID as a precondition, waits for GPU pods to go, then deletes the namespace with its UID as a precondition. |
 | `expire <ns> [--uid <uid>] [--lease <id>]` | anyone with teardown authority | Sets every replica count of every DGD to 0. |
 | `extend <ns> [--uid <uid>] [--lease <id>]` | anyone | Copies the lease's `expires_at`, unchanged, into the lease record. It only replaces the record `lease acquire` wrote, under the `resourceVersion` it read, and never creates one. The lease must be `active` and match the cluster, the namespace and the UID. It never moves the stored expiry earlier, so a late call cannot undo a newer extension. |
+| `-n <ns> selftest fences` | the namespace's thread | For the first run on a cluster. On the first DGD the guard applied, it sends each teardown fence once with a wrong UID or a stale `resourceVersion`: two JSON patches, a DGD delete, a namespace delete, and a lease record replace. Each payload changes nothing even if the server ignored its fence. It prints each server response, reads the objects again, and fails with `fence_failed` unless every request was refused and nothing changed. |
 | `inspect <ns>` | anyone | Read only. Prints `uid`, `thread`, `expires_at`, `dgd_gpus`, `pod_gpus`, `gpu_type`, `gpu_pods_left`, and also `allocation` and `lease_id`. A missing namespace gives code `not_found`; any other failure gives another code. |
 
 Every command needs `--context`. `-n` can come anywhere. Everything else is refused, including `scale`, `patch`, `edit`, `replace`, `set`, `label`, `annotate`, `get`, and `-A`.
@@ -91,7 +92,7 @@ Every write appends one JSON line to `${XDG_STATE_HOME:-~/.local/state}/k8s-guar
 
 ## Not proven without a cluster
 
-The tests use fakes. The first run on a cluster must confirm these:
+The tests use fakes. The first run on a cluster must confirm these, and run `selftest fences` in its smoke namespace:
 
 - the bot can create a namespace with labels and annotations, and can delete it;
 - the API server accepts the `DeleteOptions` body that `kubectl delete --raw <path> -f -` sends without a `Content-Type`;

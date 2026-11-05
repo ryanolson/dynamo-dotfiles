@@ -2135,5 +2135,46 @@ class NamespaceWriteWindows(GuardCase):
                 self.assertNotIn('ConfigMap/' + LEASE_CM, self.k8s['objects'][NS])
 
 
+class SelftestFences(GuardCase):
+    def setUp(self):
+        super().setUp()
+        self.add_ns()
+        self.lid = self.add_lease(gpus=4)
+        self.add_obj(gpu_dgd('smoke', 1, self.lid))
+
+    def test_every_fence_holds_and_nothing_changes(self):
+        before = copy.deepcopy(self.k8s)
+        body = self.ok('--context', CTX, '-n', NS, 'selftest', 'fences')
+        self.assertTrue(body['all_held'], body)
+        self.assertEqual([p['fence'] for p in body['probes']], [
+            'patch: wrong DGD UID', 'patch: wrong namespace-uid label', 'delete DGD: wrong UID precondition',
+            'delete namespace: wrong UID precondition', 'replace lease record: stale resourceVersion'])
+        self.assertTrue(all(p['refused'] for p in body['probes']), body)
+        self.assertEqual(self.k8s['namespaces'], before['namespaces'])
+        self.assertEqual(self.k8s['objects'], before['objects'])
+        # It ran inside the lease's slot, like every other write.
+        self.assertIn(['k8s', 'lease', 'op', 'begin', self.lid], self.bb_calls())
+
+    def test_a_server_that_ignores_a_fence_is_reported(self):
+        # A fake server that ignores the UID precondition on a DGD delete.
+        fake = FAKE_KUBECTL.replace("        if o['metadata']['uid'] != want:\n            fail('Error from server (Conflict): Precondition failed')",
+                                    "        pass", 1)
+        self.assertNotEqual(fake, FAKE_KUBECTL)
+        (self.bin / 'kubectl').write_text(fake)
+        body = self.refused('fence_failed', '--context', CTX, '-n', NS, 'selftest', 'fences')
+        self.assertFalse(body['all_held'])
+        self.assertEqual([p['refused'] for p in body['probes']], [True, True, False, True, True])
+
+    def test_another_threads_namespace_refused(self):
+        self.refused('not_your_namespace', '--context', CTX, '-n', NS, 'selftest', 'fences', thread=OTHER)
+        self.assertEqual(self.writes(), [])
+
+    def test_needs_a_stamped_dgd(self):
+        self.k8s['objects'][NS].pop('DynamoGraphDeployment/smoke')
+        self.flush()
+        self.refused('selftest_needs_dgd', '--context', CTX, '-n', NS, 'selftest', 'fences')
+        self.assertEqual(self.writes(), [])
+
+
 if __name__ == '__main__':
     unittest.main()

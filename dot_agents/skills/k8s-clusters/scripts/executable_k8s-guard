@@ -11,6 +11,7 @@ Usage (every command takes --context <kube context>; -n may come anywhere):
   k8s-guard expire <ns> [--uid <uid>] [--lease <id>]           scale every DGD to 0
   k8s-guard extend <ns> [--uid <uid>] [--lease <id>]           copy the lease's expiry into the namespace
   k8s-guard inspect <ns>                                       read only
+  k8s-guard -n <ns> selftest fences                            send each fence with a wrong UID; change nothing
 
 Every command prints one JSON object on stdout. Failures exit non-zero with
 {"error": ..., "code": ...}. The rules and the reasons for them are in
@@ -915,6 +916,88 @@ def cmd_extend(g, a):
     return {'namespace': ns, 'lease_id': lease_id, 'expires_at': expires}
 
 
+WRONG_UID = '00000000-0000-4000-8000-000000000000'
+
+
+def cmd_selftest_fences(g, a):
+    """Send each teardown fence once with a wrong UID or version, and report what the server said.
+
+    For the first run on a cluster: the fakes model the server's checks; this shows the real ones.
+    Every request carries a payload that changes nothing even if the server ignored its fence, and
+    the guard reads the objects again afterwards to prove nothing changed.
+    """
+    g.require_writable()
+    ns = g.ns_name()
+    view = NsView(g, ns)
+    view.require_owner(g)
+
+    def body(lease, slot):
+        if lease is None and allocation(g.dgds(ns), g.pods(ns)) > 0:
+            raise Refusal('lease_required', f'{ns} holds GPUs but has no lease')
+        dgds = stamped_dgds(g, ns, view.uid)
+        if not dgds:
+            raise Refusal('selftest_needs_dgd', f'{ns} has no DGD applied by the guard; apply one first')
+        d = dgds[0]
+        name, dgd_uid = d['metadata']['name'], d['metadata']['uid']
+        group, _, version = d['apiVersion'].partition('/')
+        res = f'dynamographdeployments.{version}.{group}/{name}'
+        label_path = '/metadata/labels/' + NS_UID_LABEL.replace('~', '~0').replace('/', '~1')
+        # A no-op payload: write back the replica count the first component already has.
+        spec = d.get('spec') or {}
+        if d['apiVersion'] == 'nvidia.com/v1beta1' and spec.get('components'):
+            path, current = '/spec/components/0/replicas', spec['components'][0].get('replicas', 1)
+        elif d['apiVersion'] == 'nvidia.com/v1alpha1' and spec.get('services'):
+            svc = next(iter(spec['services']))
+            path = '/spec/services/' + svc.replace('~', '~0').replace('/', '~1') + '/replicas'
+            current = (spec['services'][svc] or {}).get('replicas', 1)
+        else:
+            raise Refusal('selftest_needs_dgd', f'DGD {name} has no component to write back')
+        noop = {'op': 'add', 'path': path, 'value': current}
+        probes = [
+            ('patch: wrong DGD UID', ('patch', res, '-n', ns, '--type=json', '-p', json.dumps(
+                [{'op': 'test', 'path': '/metadata/uid', 'value': WRONG_UID}, noop])), None),
+            ('patch: wrong namespace-uid label', ('patch', res, '-n', ns, '--type=json', '-p', json.dumps(
+                [{'op': 'test', 'path': '/metadata/uid', 'value': dgd_uid},
+                 {'op': 'test', 'path': label_path, 'value': WRONG_UID}, noop])), None),
+            ('delete DGD: wrong UID precondition', ('delete', '--raw', dgd_path(d, ns), '-f', '-'),
+             json.dumps({'kind': 'DeleteOptions', 'apiVersion': 'v1', 'preconditions': {'uid': WRONG_UID}})),
+            ('delete namespace: wrong UID precondition', ('delete', '--raw', f'/api/v1/namespaces/{ns}', '-f', '-'),
+             json.dumps({'kind': 'DeleteOptions', 'apiVersion': 'v1', 'preconditions': {'uid': WRONG_UID}})),
+        ]
+        if view.record is not None:
+            stale = copy.deepcopy(view.record)
+            stale['metadata']['resourceVersion'] = '1'
+            probes.append(('replace lease record: stale resourceVersion', ('replace', '-f', '-', '-n', ns, '-o', 'json'),
+                           json.dumps(stale)))
+        results = []
+        for label, args, stdin in probes:
+            confirm_uid(g, ns, view.uid)
+            if slot:
+                slot.check()
+            rc, out, err = g.kc.run(*args, input=stdin)
+            results.append({'fence': label, 'refused': rc != 0, 'exit': rc,
+                            'response': clip(err if rc else out, 600)})
+        # Prove nothing changed: the namespace, the DGD and the record, read again.
+        after_ns = g.kc.json('get', 'namespace', ns, '-o', 'json', not_found=MISSING)
+        after_dgd = g.kc.json('get', f'{DGD_RESOURCE}/{name}', '-n', ns, '-o', 'json', not_found=MISSING)
+        unchanged = {
+            'namespace': after_ns is not MISSING and after_ns['metadata'].get('uid') == view.uid,
+            'dgd': after_dgd is not MISSING and after_dgd['metadata'].get('uid') == dgd_uid
+            and after_dgd.get('spec') == d.get('spec'),
+        }
+        if view.record is not None:
+            after_rec = g.lease_record(ns)
+            unchanged['lease_record'] = after_rec is not None and after_rec.get('data') == view.record.get('data')
+        held = all(r['refused'] for r in results) and all(unchanged.values())
+        g.record(ns, f'selftest/fences on {name}', 0, 'selftest', uid=view.uid, lease=view.lease_id, issue=view.issue)
+        report = {'namespace': ns, 'dgd': name, 'probes': results, 'unchanged': unchanged, 'all_held': held}
+        if not held:
+            raise Refusal('fence_failed', 'the server accepted a request its fence should have refused', **report)
+        return report
+
+    return fenced(g, view, body)
+
+
 # --- argv ----------------------------------------------------------------------------
 
 class Parser(argparse.ArgumentParser):
@@ -942,6 +1025,7 @@ COMMANDS = {
     ('down',): (cmd_down, TEARDOWN),
     ('expire',): (cmd_expire, TEARDOWN),
     ('extend',): (cmd_extend, TEARDOWN),
+    ('selftest', 'fences'): (cmd_selftest_fences, ()),
 }
 
 
