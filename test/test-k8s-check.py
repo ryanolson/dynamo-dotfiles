@@ -694,6 +694,51 @@ class K8sCheck(unittest.TestCase):
         self.assertEqual(owner_calls, [], f'cluster URL supplies unchecked credentials: exit={rc}, {owner_calls}')
         self.assert_refused_without_contact(out, rc, 'kubeconfig_credentials')
 
+    def test_http_endpoint_cannot_bypass_bot_credentials_through_owner_proxy(self):
+        self.env['FAKE_BOT_USER'] = BOT
+        self.env['FAKE_LOCAL_PROXY_USER'] = 'alice@example.test'
+        # client-go loads the user only for TLS. An HTTP kubectl proxy supplies its own identity.
+        # https://github.com/kubernetes/client-go/blob/v0.34.1/tools/clientcmd/client_config.go#L208
+        credential_step = textwrap.dedent('''\
+            client_identity = effective_identity = None
+            if rest[:1] != ['config']:
+                from urllib.parse import urlsplit
+                config = json.load(open(flags['--kubeconfig']))
+                context = next(c['context'] for c in config['contexts'] if c['name'] == flags['--context'])
+                cluster = next(c['cluster'] for c in config['clusters'] if c['name'] == context['cluster'])
+                server = urlsplit(cluster['server'])
+                if server.scheme == 'https':
+                    client_identity = effective_identity = os.environ['FAKE_BOT_USER']
+                else:
+                    assert (server.scheme, server.hostname, server.port) == ('http', '127.0.0.1', 8001)
+                    effective_identity = os.environ['FAKE_LOCAL_PROXY_USER']
+            ''')
+        response_step = textwrap.dedent('''\
+            if rest[:2] == ['auth', 'whoami']:
+                reply = {'stdout': json.dumps({'status': {'userInfo': {'username': effective_identity}}})}
+            ''')
+        kubectl = self.tmp / 'bin/kubectl'
+        kubectl.write_text(FAKE_KUBECTL.replace(
+            "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:",
+            credential_step + "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:").replace(
+                "'key': ' '.join(rest)",
+                "'key': ' '.join(rest), 'client_identity': client_identity, 'effective_identity': effective_identity").replace(
+                    "sys.stdout.write(reply.get('stdout', ''))",
+                    response_step + "sys.stdout.write(reply.get('stdout', ''))"))
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(all(c['client_identity'] == BOT for c in self.calls()
+                            if not c['key'].startswith('config ')))
+        self.log.unlink()
+        # An agent keeps a localhost server URL copied from a human's kubectl proxy session.
+        config = json.loads(self.kc())
+        config['clusters'][0]['cluster']['server'] = 'http://127.0.0.1:8001'
+        self.bot_kubeconfig.write_text(json.dumps(config))
+        rc, out = self.run_check('lab-arm-a')
+        owner_calls = [c['key'] for c in self.calls() if c['effective_identity'] == 'alice@example.test']
+        self.assertEqual(owner_calls, [], f'the checked user is not used for HTTP: exit={rc}, {out}')
+        self.assert_refused_without_contact(out, rc, 'kubeconfig_credentials')
+
     def test_context_missing_from_bot_kubeconfig(self):
         self.bot_kubeconfig.write_text(self.kc(contexts=('proxy.example.test-lab-x86-qa',)))
         rc, out = self.run_check('lab-arm-a')
