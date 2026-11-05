@@ -1774,6 +1774,32 @@ class Delete(GuardCase):
         self.assertEqual((self.ledger()[-1]['direction'], self.ledger()[-1]['gpus']), ('down', 2))
         self.assertEqual(body['deleted'], 'DynamoGraphDeployment/w')
 
+    @unittest.skip("F5: delete skips lease validation, op begin, deadline checks, and op end")
+    def test_delete_in_gpu_namespace_requires_active_lease_and_slot(self):
+        for mode in ('no_lease', 'revoking', 'offline', 'slot_busy', 'slot_expired'):
+            with self.subTest(mode=mode):
+                self.k8s = {'namespaces': {}, 'objects': {}, 'pods': {}}
+                self.bb = {'leases': {}}
+                self.kubectl_log.unlink(missing_ok=True)
+                self.add_ns()
+                lid = 'lse_none0001' if mode == 'no_lease' else self.add_lease(
+                    state='revoking' if mode == 'revoking' else 'active')
+                self.add_obj(gpu_dgd('w', 2, lid))
+                self.add_obj({'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': 'scratch'}})
+                if mode == 'offline':
+                    self.bb['unreachable'] = True
+                elif mode == 'slot_busy':
+                    self.bb['leases'][lid]['slot'] = 'tok-another-operation'
+                elif mode == 'slot_expired':
+                    self.bb['slot_seconds'] = -5
+                self.flush()
+
+                rc, body, _ = self.guard('--context', CTX, '-n', NS, 'delete', 'configmap/scratch')
+
+                self.assertEqual(self.writes(), [], body)
+                self.assertNotEqual(rc, 0, body)
+                self.assertIn('ConfigMap/scratch', self.k8s['objects'][NS])
+
     def test_protected_objects_refused(self):
         self.add_lease()
         for target in (f'configmap/{LEASE_CM}', 'pvc/shared-model-cache', 'deployment/x', 'pod/x',
