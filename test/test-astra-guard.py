@@ -36,6 +36,8 @@ import urllib.parse
 ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / 'dot_agents/skills/k8s-clusters'
 GUARD = SKILL / 'scripts/executable_astra-guard'
+# No bytecode next to the skill's sources: chezmoi would deploy it.
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(SKILL / 'scripts'))
 import astra_guard_rules as rules  # noqa: E402
 
