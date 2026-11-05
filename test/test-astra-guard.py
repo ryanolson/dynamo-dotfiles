@@ -1383,6 +1383,16 @@ class PureRules(unittest.TestCase):
 
 class AdversarialReview(GuardCase):
 
+    def test_a_cluster_scoped_resource_is_not_hidden_by_a_valid_plan_line(self):
+        iid = self.deployed_mr()
+        head = self.gl.branch_sha(BRANCH)
+        self.gl.traces[head] = (
+            f'{NS}, wcep-smoke, DynamoGraphDeployment (nvidia.com) has been added:\n'
+            ', wcep-smoke-admin, ClusterRole (rbac.authorization.k8s.io/v1) has been added:\n')
+        rc, body, err = self.guard('check', '--mr', str(iid), '--namespace', NS)
+        self.assertNotEqual(rc, 0, f'A resource outside the namespace was allowed: {body} {err}')
+        self.assertIn(body.get('code'), ('rendered_namespace_mismatch', 'rendered_namespace_unverified'))
+
     def test_successful_required_jobs_on_page_two_are_found(self):
         iid = self.deployed_mr()
         head = self.gl.branch_sha(BRANCH)
