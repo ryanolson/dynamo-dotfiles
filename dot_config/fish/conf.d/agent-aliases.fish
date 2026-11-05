@@ -47,6 +47,11 @@ function ast --description "Agent status overview"
 end
 
 # Claude Code shortcuts
+# Makes bypass-permissions mode selectable (shift-tab) in every session; it does not start in it.
+function claude --wraps claude --description "Claude Code with bypass mode available"
+    command claude --allow-dangerously-skip-permissions $argv
+end
+
 function cc --description "Claude Code"
     claude $argv
 end
