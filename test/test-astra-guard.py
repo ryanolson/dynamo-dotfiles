@@ -1894,6 +1894,13 @@ class RedesignReview(GuardCase):
 
 class RoundTwoReview(GuardCase):
 
+    def test_a_failed_namespace_check_deletes_the_previous_check(self):
+        iid = self.deployed_mr()
+        self.check(iid)
+        self.refused('namespace_invalid', 'check', '--mr', str(iid), '--namespace', 'INVALID_NAMESPACE')
+
+        self.refused('not_checked', 'ask', '--mr', str(iid))
+
     def test_gpu_summary_keeps_same_named_entries_in_different_lists(self):
         values = rules.load_values(stg_deploy())
         values['nimModels'].append({'name': 'wcep-shadow', 'gpuCount': '8'})
