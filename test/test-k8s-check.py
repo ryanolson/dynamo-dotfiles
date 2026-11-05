@@ -45,15 +45,33 @@ while i < len(argv):
         flags[name] = argv[i + 1]; i += 2
     else:
         flags[name] = a.split('=', 1)[1]; i += 1
+def kubeconfig_user():
+    # The user entry of the context kubectl would use, from the file it was given.
+    if '--kubeconfig' not in flags or '--context' not in flags:
+        return None
+    config = json.load(open(flags['--kubeconfig']))
+    ctx = next((c['context'] for c in config.get('contexts', []) if c['name'] == flags['--context']), {})
+    return next((u['user'] for u in config.get('users', []) if u['name'] == ctx.get('user')), None)
 with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:
     log.write(json.dumps({'argv': argv, 'flags': flags, 'key': ' '.join(rest),
                           'kubeconfig_sha': hashlib.sha256(open(flags['--kubeconfig'], 'rb').read()).hexdigest()
                           if '--kubeconfig' in flags else None,
+                          'kubeconfig_user': kubeconfig_user(),
                           'env_kuberc': os.environ.get('KUBECTL_KUBERC'),
                           'env_kubeconfig': os.environ.get('KUBECONFIG')}) + '\n')
-if rest == ['config', 'view', '-o', 'json']:
-    # Local, like kubectl: read the file it was given and print it. The fixtures are JSON.
-    print(json.dumps(json.load(open(flags['--kubeconfig']))))
+if rest in (['config', 'view', '-o', 'json'], ['config', 'view', '--raw', '--flatten', '-o', 'json']):
+    # Local, like kubectl: read the file it was given and print it (the fixtures are JSON).
+    # --flatten inlines files named by client-certificate, client-key and certificate-authority.
+    import base64
+    config = json.load(open(flags['--kubeconfig']))
+    if '--flatten' in rest:
+        for kind, key in (('users', 'user'), ('clusters', 'cluster')):
+            for entry in config.get(kind, []):
+                body = entry.get(key) or {}
+                for name in ('client-certificate', 'client-key', 'certificate-authority'):
+                    if name in body:
+                        body[name + '-data'] = base64.b64encode(open(body.pop(name), 'rb').read()).decode()
+    print(json.dumps(config))
     sys.exit(0)
 scenario = json.load(open(os.environ['FAKE_KUBECTL_SCENARIO']))
 reply = scenario.get(' '.join(rest))
@@ -75,6 +93,13 @@ class Entry:
         self.pw_name, self.pw_uid, self.pw_dir = entry.pw_name, entry.pw_uid, os.environ['FAKE_PW_DIR']
 pwd.getpwuid = lambda uid: Entry(real(uid))
 sys.argv = sys.argv[1:]
+if os.environ.get('FAKE_KUBECTL'):
+    # The fake kubectl is a script; the real rule (ELF only, fixed paths) is unit-tested in
+    # test-k8s-render.py. Older scripts (K8S_CHECK_SCRIPTS) ignore these attributes.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0])))
+    import k8s_profiles
+    k8s_profiles.KUBECTL_INSTALLS = (os.environ['FAKE_KUBECTL'],)
+    k8s_profiles.is_elf = lambda path: True
 runpy.run_path(sys.argv[0], run_name='__main__')
 '''
 
@@ -112,7 +137,8 @@ def kubeconfig(tbot, destination='/example/kube', contexts=(CTX, 'proxy.example.
         'args': ['kube', 'credentials', f'--destination-dir={destination}']}}
     return json.dumps({
         'apiVersion': 'v1', 'kind': 'Config',
-        'clusters': [{'name': 'example', 'cluster': {'server': 'https://proxy.example.test'}}],
+        'clusters': [{'name': 'example', 'cluster': {'server': 'https://proxy.example.test:443',
+                                                     'certificate-authority-data': 'Q0E='}}],
         'contexts': [{'name': c, 'context': {'cluster': 'example', 'user': 'bot'}} for c in contexts],
         'users': [{'name': 'bot', 'user': user}]})
 
@@ -190,12 +216,19 @@ class K8sCheck(unittest.TestCase):
             'PATH': f'{bin_dir}:/usr/bin:/bin',
             'HOME': str(self.home),
             'FAKE_PW_DIR': str(self.home),
+            'FAKE_KUBECTL': str(bin_dir / 'kubectl'),
             'K8S_CLUSTERS_PROFILES': str(self.profiles),
             'KUBECONFIG': str(self.bot_kubeconfig),
             'FAKE_KUBECTL_LOG': str(self.log),
             'FAKE_KUBECTL_SCENARIO': str(self.scenario_path),
             'FAKE_TSH_LOG': str(self.tsh_log),
         }
+
+    def rendered_user(self):
+        user = next(u['user'] for u in json.loads(self.bot_kubeconfig.read_text())['users'] if u['name'] == 'bot')
+        if 'exec' in user:
+            return {'exec': {k: user['exec'][k] for k in ('apiVersion', 'command', 'args')}}
+        return user
 
     def kc(self, **kw):
         return kubeconfig(str(self.tbot), str(self.bot_kubeconfig.parent), **kw)
@@ -234,9 +267,13 @@ class K8sCheck(unittest.TestCase):
                           READ_ONLY, f'not a read: {call["argv"]}')
             if words[0] == 'get':
                 self.assertFalse(set(words) & MUTATING, call['argv'])
-            # kubectl reads the sealed copy (/proc/self/fd/<n>); its bytes are the bot file's.
-            self.assertEqual(call['kubeconfig_sha'], hashlib.sha256(self.bot_kubeconfig.read_bytes()).hexdigest(),
-                             call['argv'])
+            if call['key'].startswith('config '):
+                # config view reads the sealed copy of the bot file itself.
+                self.assertEqual(call['kubeconfig_sha'], hashlib.sha256(self.bot_kubeconfig.read_bytes()).hexdigest(),
+                                 call['argv'])
+            else:
+                # Every cluster call reads the rendered copy: the bot file's user, tbot fields only.
+                self.assertEqual(call['kubeconfig_user'], self.rendered_user(), call['argv'])
             self.assertEqual(call['env_kuberc'], 'false', call['argv'])
             self.assertIsNone(call['env_kubeconfig'], call['argv'])
             if not call['key'].startswith('config '):
@@ -448,11 +485,11 @@ class K8sCheck(unittest.TestCase):
                 rc, out = self.run_check('lab-arm-a')
                 self.assert_refused_without_contact(out, rc, 'kubeconfig_credentials')
                 self.assertIn(needle, ' '.join(f['message'] for f in out['failures']))
-                self.assertEqual([c['key'] for c in self.calls()], ['config view -o json'])
+                self.assertEqual([c['key'] for c in self.calls()], ['config view --raw --flatten -o json'])
 
     def test_client_certificate_is_bot_credentials(self):
-        self.bot_kubeconfig.write_text(self.kc(user={'client-certificate': '/example/tls.crt',
-                                                        'client-key': '/example/tls.key'}))
+        self.bot_kubeconfig.write_text(self.kc(user={'client-certificate-data': 'Q0VSVA==',
+                                                        'client-key-data': 'S0VZ'}))
         rc, out = self.run_check('lab-arm-a')
         self.assertEqual(rc, 0, out)
 
@@ -473,10 +510,16 @@ class K8sCheck(unittest.TestCase):
                 config = json.load(open(flags['--kubeconfig']))
                 context = next(c['context'] for c in config['contexts'] if c['name'] == flags['--context'])
                 user = next(u['user'] for u in config['users'] if u['name'] == context['user'])
-                with open(user['client-certificate']) as cert:
-                    credential_user = cert.read()
-                with open(user['client-key']) as key:
-                    assert key.read().startswith('made-up-')
+                # client-go uses embedded data when present, and reads the file otherwise.
+                if 'client-certificate-data' in user:
+                    import base64
+                    credential_user = base64.b64decode(user['client-certificate-data']).decode()
+                    assert base64.b64decode(user['client-key-data']).decode().startswith('made-up-')
+                else:
+                    with open(user['client-certificate']) as cert:
+                        credential_user = cert.read()
+                    with open(user['client-key']) as key:
+                        assert key.read().startswith('made-up-')
             ''')
         response_step = textwrap.dedent('''\
             if rest[:2] == ['auth', 'whoami']:
@@ -499,14 +542,14 @@ class K8sCheck(unittest.TestCase):
         self.assertGreater(len(self.calls()), 3)
         self.assertTrue(all(c['credential_user'] == BOT for c in self.calls()
                             if not c['key'].startswith('config ')))
-        checked_sha = hashlib.sha256(self.bot_kubeconfig.read_bytes()).hexdigest()
         self.log.unlink()
         # A tool refreshes shared certificate files with the owner's credentials after whoami.
         self.env['FAKE_REPLACE_CERT'] = 'yes'
         rc, out = self.run_check('lab-arm-a')
         self.assertEqual(out['identity']['username'], BOT, out)
         self.assertGreater(len(self.calls()), 3)
-        self.assertTrue(all(c['kubeconfig_sha'] == checked_sha for c in self.calls()))
+        # Every cluster call reads the same sealed, rendered bytes.
+        self.assertEqual(len({c['kubeconfig_sha'] for c in self.calls() if not c['key'].startswith('config ')}), 1)
         owner_calls = [c['key'] for c in self.calls() if c['credential_user'] == 'alice@example.test']
         self.assertEqual(owner_calls, [], f'certificate files bypass the sealed kubeconfig: exit={rc}, {owner_calls}')
 
@@ -757,7 +800,7 @@ class K8sCheck(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertEqual(self.codes(out), ['not_bot'])
         self.assertEqual(out['identity']['username'], 'alice@example.test')
-        self.assertEqual([c['key'] for c in self.calls()], ['config view -o json', 'auth whoami -o json'])
+        self.assertEqual([c['key'] for c in self.calls()], ['config view --raw --flatten -o json', 'auth whoami -o json'])
 
     def test_can_create_outside_our_namespaces(self):
         self.scenario['auth can-i create dynamographdeployments.nvidia.com -n default'] = can_i('yes')

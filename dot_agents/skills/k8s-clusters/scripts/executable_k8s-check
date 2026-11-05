@@ -25,7 +25,7 @@ import sys
 # -I drops the script directory from sys.path; the shared parser lives next to this script.
 sys.dont_write_bytecode = True  # keep the deployed skill directory clean
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from k8s_profiles import ProfileError, bot_credential_problem, kubectl_env, load_profiles, sealed_copy  # noqa: E402
+from k8s_profiles import ProfileError, kubectl_env, load_profiles, prepare_bot_kubeconfig  # noqa: E402
 
 DGD_CRD = 'dynamographdeployments.nvidia.com'
 DGD_RESOURCE = 'dynamographdeployments.nvidia.com'
@@ -45,28 +45,27 @@ class Refusal(ProfileError):
 # --- kubectl ----------------------------------------------------------------
 
 class Kubectl:
-    """kubectl reading one sealed copy of the bot kubeconfig (see sealed_copy)."""
+    """The pinned kubectl, reading the sealed, rendered bot kubeconfig (prepare_bot_kubeconfig)."""
 
     def __init__(self, kubeconfig, context):
-        self.fd = sealed_copy(kubeconfig)
-        pinned = f'/proc/self/fd/{self.fd}'
-        self.base = ['kubectl', '--kubeconfig', pinned]
+        binary, self.fd = prepare_bot_kubeconfig(kubeconfig, context, timeout=KUBECTL_TIMEOUT)
+        self.base = [binary, '--kubeconfig', f'/proc/self/fd/{self.fd}']
         self.context = context
         self.env = kubectl_env()
 
-    def run(self, *args, local=False):
-        cmd = self.base + ([] if local else ['--context', self.context]) + list(args)
+    def run(self, *args):
+        cmd = self.base + ['--context', self.context] + list(args)
         try:
             p = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
                                timeout=KUBECTL_TIMEOUT, env=self.env, pass_fds=(self.fd,))
         except subprocess.TimeoutExpired:
             return 124, '', f'timed out after {KUBECTL_TIMEOUT}s'
         except FileNotFoundError:
-            return 127, '', 'kubectl not found on PATH'
+            return 127, '', f'{self.base[0]} not found'
         return p.returncode, p.stdout, p.stderr
 
-    def read(self, *args, local=False):
-        rc, out, err = self.run(*args, local=local)
+    def read(self, *args):
+        rc, out, err = self.run(*args)
         if rc != 0:
             raise KubectlError(args, rc, err)
         return out
@@ -153,17 +152,6 @@ def run_check(report, profiles, cluster, want_crd):
     bot = profiles['bot']
     check_kubeconfig(bot)
     kc = Kubectl(bot['kubeconfig'], prof['context'])
-
-    # Local: config view reads the file and runs no credential plugin.
-    try:
-        view = json.loads(kc.read('config', 'view', '-o', 'json', local=True))
-    except json.JSONDecodeError:
-        raise KubectlError(('config', 'view'), 0, 'output is not JSON')
-    if prof['context'] not in [c.get('name') for c in view.get('contexts') or []]:
-        raise Refusal('context_missing', f'context {prof["context"]} is not in the bot kubeconfig')
-    problem = bot_credential_problem(view, prof['context'], bot['kubeconfig'])
-    if problem:
-        raise Refusal('kubeconfig_credentials', problem)
 
     who = kc.json('auth', 'whoami', '-o', 'json')
     user = ((who.get('status') or {}).get('userInfo') or {})

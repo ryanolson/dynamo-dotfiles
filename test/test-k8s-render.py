@@ -1,4 +1,4 @@
-"""DRAFT, pending the ruling on option A: tests for the bot kubeconfig renderer.
+"""Tests for the bot kubeconfig renderer and the pinned kubectl (k8s_profiles.py).
 
 The renderer reads `kubectl config view --raw --flatten -o json` of the bot kubeconfig and
 writes a fresh kubeconfig with only the fields tbot v18.7.6 writes for one context
@@ -6,7 +6,7 @@ writes a fresh kubeconfig with only the fields tbot v18.7.6 writes for one conte
 the renderer does not copy cannot act. A field outside tbot's shape is refused by name, so a
 mistake is reported rather than silently dropped.
 
-Proposed interface, in k8s_profiles.py:
+Interface, in k8s_profiles.py:
   render_bot_kubeconfig(view, context, kubeconfig) -> (rendered JSON bytes, None) or (None, problem)
   kubectl_binary() -> absolute path of an installed kubectl ELF binary; never PATH.
 """
@@ -49,7 +49,7 @@ class Render(unittest.TestCase):
         self.m = load_module()
         self.m.account_home = lambda: str(self.home)
         if not hasattr(self.m, 'render_bot_kubeconfig'):
-            self.fail('render_bot_kubeconfig is not implemented yet (draft)')
+            self.fail('render_bot_kubeconfig is missing')
 
     def view(self, cluster=None, user=None, context=None):
         cluster = cluster if cluster is not None else {
