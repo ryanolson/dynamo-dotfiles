@@ -1343,11 +1343,114 @@ class TokenAndLog(GuardCase):
             self.assertIn(part, c)
         self.assertTrue(c.startswith(f'[agent:claude-code {ME}]'))
         self.assertNotIn(SECRET, c)
-        iid2 = self.deployed_mr(dev_deploy(entry=DEV_ENTRY.replace('wcep-smoke', 'wcep-other')))
+        iid2 = self.deployed_mr(self.gl.file_at('main', DEV) + '  - name: wcep-other\n    enabled: true\n')
         refused = self.refused('not_checked', 'merge', '--mr', str(iid2), '--answer', qid)
         self.assertIn('refused', refused['comment'])
         self.assertIn('not_checked', refused['comment'])
         self.assertNotIn(SECRET, refused['comment'])
+
+
+class StructuralRules(GuardCase):
+    """One test per structural rule of the redesign after review pass 3. Each fails on the
+    pre-redesign head and passes after it. The rules and why point patches were not enough
+    are in references/astra-guard.md, "Five kinds, five rules"."""
+
+    def test_values_are_json_shaped(self):
+        for value in ('!!set {a: null}', '2026-11-05', '2026-11-05T00:00:00Z', '!!binary aGk=', '{1: x}',
+                      '{true: x}', '!!omap [{a: 1}]'):
+            with self.subTest(value=value):
+                with self.assertRaises(rules.Refusal) as cm:
+                    rules.load_values(f'itSetting: {value}\n')
+                self.assertEqual(cm.exception.code, 'yaml_invalid')
+        entry = DEV_ENTRY + '    started: 2026-11-05\n'
+        self.gl.commit(PID, BRANCH, {DEV: dev_deploy(entry=entry)}, parent=self.main())
+        iid = self.open()
+        self.refused('yaml_invalid', 'check', '--mr', str(iid), '--namespace', NS)
+
+    def guard_module(self):
+        loader = importlib.machinery.SourceFileLoader('astra_guard_sinks', str(GUARD))
+        spec = importlib.util.spec_from_loader('astra_guard_sinks', loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        mod._TOKEN = SECRET
+        return mod
+
+    def test_every_sink_refuses_the_token_raw_or_url_encoded(self):
+        mod = self.guard_module()
+        encoded = ''.join(f'%{ord(c):02X}' for c in SECRET)
+        old = os.environ.get('XDG_STATE_HOME')
+        os.environ['XDG_STATE_HOME'] = str(self.state_home)
+        try:
+            for form in (SECRET, encoded):
+                with self.subTest(sink='state.json', form=form[:6]):
+                    with mod.State() as st:
+                        st.data['mrs']['x'] = {'note': f'nested {form}'}
+                        with self.assertRaises(rules.Refusal) as cm:
+                            st.save()
+                    self.assertEqual(cm.exception.code, 'secret_at_sink')
+                with self.subTest(sink='approvals.jsonl', form=form[:6]):
+                    with mod.open_log() as log:
+                        mod.write_log(log, {'time': 't', 'ask_id': 'bbq_x1', 'answer': {'option': {'text': form}},
+                                            'mr': 7, 'head': 'a' * 40, 'target': 'b' * 40, 'result': 'refused',
+                                            'code': 'answer_not_approve', 'reason': 'r', 'merge_commit': None})
+                    last = json.loads((self.state_home / 'astra-guard/approvals.jsonl').read_text().splitlines()[-1])
+                    self.assertEqual((last['mr'], last['code'], last['answer']), (7, 'answer_not_approve', None))
+                with self.subTest(sink='bb argv', form=form[:6]):
+                    with self.assertRaises(rules.Refusal) as cm:
+                        mod.bb_ask(f'question {form}', ISSUE)
+                    self.assertEqual(cm.exception.code, 'secret_at_sink')
+                with self.subTest(sink='stdout', form=form[:6]):
+                    import contextlib
+                    import io
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        mod.emit({'body': {'deep': [form]}})
+                    self.assertNotIn(SECRET, urllib.parse.unquote(buf.getvalue()))
+                    self.assertEqual(json.loads(buf.getvalue())['code'], 'secret_at_sink')
+            for f in (self.state_home / 'astra-guard').iterdir():
+                if f.is_file():
+                    self.assertNotIn(SECRET, urllib.parse.unquote(f.read_text()))
+        finally:
+            if old is None:
+                os.environ.pop('XDG_STATE_HOME', None)
+            else:
+                os.environ['XDG_STATE_HOME'] = old
+
+    def test_a_header_shaped_line_parses_completely_or_refuses(self):
+        for line in ('ns-a, wcep-x, DynamoGraphDeployment (nvidia.com) has been add',
+                     'ns-a, wcep-x, DynamoGraphDeployment (',
+                     'ns-a, wcep x, DynamoGraphDeployment (nvidia.com) has been added:',
+                     'ns-a, wcep-x, DynamoGraphDeployment (nvidia.com) has been added: trailing',
+                     'ns a, wcep-x, Service (v1) has changed:'):
+            with self.subTest(line=line):
+                with self.assertRaises(rules.Refusal) as cm:
+                    rules.parse_plan(f'{NS}, wcep-ok, Service (v1) has been added:\n{line}\n')
+                self.assertEqual(cm.exception.code, 'rendered_namespace_unverified')
+
+    def test_the_merge_opens_the_log_before_any_gitlab_call(self):
+        iid, qid = self.approved()
+        log = self.state_home / 'astra-guard' / 'approvals.jsonl'
+        log.write_text('')
+        log.chmod(0o444)
+        before = len(self.gl.requests)
+        body = self.refused('log_unusable', 'merge', '--mr', str(iid), '--answer', qid)
+        self.assertEqual(self.gl.requests[before:], [], 'the merge reached GitLab before its log was open')
+        self.assertIn('comment', body)
+        self.assertEqual(self.gl.mrs[(PID, iid)]['state'], 'opened')
+
+    def test_a_deploy_only_adds_entries(self):
+        self.gl.commit(PID, 'main', {DEV: dev_deploy()})
+        changed = dev_deploy().replace('replicas: 1', 'replicas: 3')
+        swapped = dev_deploy(entry=DEV_ENTRY.replace('wcep-smoke', 'wcep-other'))
+        for n, text in enumerate((changed, swapped)):
+            with self.subTest(case=n):
+                branch = f'wcep/TEAM-910-add{n}'
+                self.gl.commit(PID, branch, {DEV: text}, parent=self.main())
+                iid = self.open(branch)
+                self.refused('deploy_not_addition', 'check', '--mr', str(iid), '--namespace', NS)
+        hunks = rules.inverse_patch(DEV_VALUES, dev_deploy())
+        undone = rules.entries(rules.load_values(rules.apply_patch(dev_deploy(), hunks)))
+        self.assertEqual(undone, {}, 'the inverse of an add-only deploy is a pure removal')
 
 
 class PureRules(unittest.TestCase):
@@ -1552,14 +1655,16 @@ class PassThreeReview(GuardCase):
     def test_it_set_members_cannot_change_from_boolean_to_integer(self):
         base = DEV_VALUES + 'itSetting: !!set {true: null}\n'
         head = dev_deploy(base).replace('!!set {true: null}', '!!set {1: null}')
-        old = rules.load_values(base)['itSetting']
-        new = rules.load_values(head)['itSetting']
-        self.assertIs(type(next(iter(old))), bool)
-        self.assertIs(type(next(iter(new))), int)
+        # Values are JSON-shaped since the redesign: a set is refused at load, so no comparison
+        # ever sees one.
+        for text in (base, head):
+            with self.assertRaises(rules.Refusal) as cm:
+                rules.load_values(text)
+            self.assertEqual(cm.exception.code, 'yaml_invalid')
         self.gl.commit(PID, 'main', {DEV: base})
         self.gl.commit(PID, BRANCH, {DEV: head}, parent=self.main())
         iid = self.open()
-        self.refused('outside_entries', 'check', '--mr', str(iid), '--namespace', NS)
+        self.refused('yaml_invalid', 'check', '--mr', str(iid), '--namespace', NS)
 
     def test_merge_refuses_before_writing_when_approval_log_is_unusable(self):
         iid, qid = self.approved()
@@ -1584,14 +1689,15 @@ class PassThreeReview(GuardCase):
                       (body, err))
 
     def test_changed_deploy_can_apply_its_recorded_teardown(self):
+        # Ruling A: a deploy only adds entries. A change is a teardown and then a new deploy,
+        # so a deploy that changes an entry is refused at check and never needs a restoring teardown.
         self.gl.commit(PID, 'main', {DEV: dev_deploy()})
         changed = dev_deploy().replace('replicas: 1', 'replicas: 2')
-        iid, qid = self.approved(changed)
-        self.merge(iid, qid)
-        self.assertEqual(self.gl.file_at('main', DEV), changed)
-        teardown = 'wcep/TEAM-910-teardown'
-        self.ok('teardown', '--deploy-mr', str(iid), '--branch', teardown)
-        self.assertEqual(self.gl.file_at(teardown, DEV), dev_deploy())
+        self.refused('deploy_not_addition', 'push', '--branch', BRANCH, '--base', self.main(),
+                     '--file', f'{DEV}={self.local(changed)}')
+        self.gl.commit(PID, BRANCH, {DEV: changed}, parent=self.main())
+        iid = self.open()
+        self.refused('deploy_not_addition', 'check', '--mr', str(iid), '--namespace', NS)
 
     def test_url_escaped_token_in_http_error_never_reaches_output_or_log(self):
         iid, qid = self.approved()
@@ -1626,7 +1732,7 @@ class PassThreeReview(GuardCase):
         if rc == 0:
             self.ask(iid)
         else:
-            self.assertEqual(body.get('code'), 'secret_in_response', (body, err))
+            self.assertIn(body.get('code'), ('secret_in_response', 'secret_at_sink'), (body, err))
         exposed = [path.name for path in (self.state_home / 'astra-guard').iterdir()
                    if path.is_file() and SECRET in path.read_text()]
         exposed += ['bb argv' for call in self.bb_calls() if SECRET in json.dumps(call['argv'])]

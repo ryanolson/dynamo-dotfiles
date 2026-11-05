@@ -51,8 +51,17 @@ CONFIG_KEYS = {'gitlab_url', 'project_id', 'token_ref', 'shared_namespaces', 'si
 _TOKEN = None
 
 
-def redact(text):
-    return text.replace(_TOKEN, '[redacted]') if _TOKEN else text
+def carries_token(text):
+    return bool(_TOKEN) and (_TOKEN in text or _TOKEN in urllib.parse.unquote(text))
+
+
+def sink(text, where):
+    """The token rule: every place data leaves the guard (state.json, the approval log, bb's
+    argv, stdout) checks its final text, raw and URL-decoded. Checking inputs instead missed
+    each new encoding (JSON, YAML, URL escapes) that decoded into the token later."""
+    if carries_token(text):
+        raise Refusal('secret_at_sink', f'{where} would hold the GitLab token; nothing was written')
+    return text
 
 
 def now():
@@ -194,10 +203,9 @@ class GitLab:
             with _OPENER.open(req, timeout=HTTP_TIMEOUT) as r:
                 payload, headers = r.read(), r.headers
         except urllib.error.HTTPError as e:
-            detail = e.read()[:300].decode(errors='replace')
-            raise GitLabError(e.code, redact(f'{method} {path}: HTTP {e.code}: {detail}'))
+            raise GitLabError(e.code, f'{method} {path}: HTTP {e.code}')
         except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
-            raise Refusal('gitlab_unreachable', redact(f'{method} {path}: {type(e).__name__}: {e}'))
+            raise Refusal('gitlab_unreachable', f'{method} {path}: {type(e).__name__}')
         self._refuse_echo(method, path, payload)
         return payload, headers
 
@@ -297,8 +305,9 @@ class State:
         return self
 
     def save(self):
+        text = sink(json.dumps(self.data, indent=1, sort_keys=True), 'state.json')
         tmp = self.path.with_suffix('.tmp')
-        tmp.write_text(json.dumps(self.data, indent=1, sort_keys=True))
+        tmp.write_text(text)
         os.replace(tmp, self.path)
 
     def __exit__(self, *exc):
@@ -329,11 +338,25 @@ def update(pid, iid, **fields):
         st.save()
 
 
-def log_approval(entry):
-    with open(state_dir() / 'approvals.jsonl', 'a') as f:
-        f.write(redact(json.dumps(entry, sort_keys=True)) + '\n')
-        f.flush()
-        os.fsync(f.fileno())
+def open_log():
+    """Open the approval log for append. A merge opens it before anything else, so no merge
+    can land that the log cannot record."""
+    try:
+        return open(state_dir() / 'approvals.jsonl', 'a')
+    except OSError as e:
+        raise Refusal('log_unusable', f'cannot open the approval log: {type(e).__name__}; nothing was merged')
+
+
+def write_log(f, entry):
+    line = json.dumps(entry, sort_keys=True)
+    if carries_token(line):
+        safe = {k: entry.get(k) for k in ('time', 'mr', 'head', 'target', 'result', 'code', 'merge_commit')}
+        safe.update(ask_id=entry['ask_id'] if R.ASK_ID.match(str(entry.get('ask_id'))) else None, answer=None,
+                    reason='a field held the GitLab token and was left out')
+        line = sink(json.dumps(safe, sort_keys=True), 'the approval log')
+    f.write(line + '\n')
+    f.flush()
+    os.fsync(f.fileno())
 
 
 # -- subprocesses ------------------------------------------------------------
@@ -352,6 +375,7 @@ def thread_id():
 def bb_ask(question, issue):
     argv = ['bb', 'sgc', 'ask', '--question', question, '--option', R.OPTIONS[0], '--option', R.OPTIONS[1],
             '--recommend', 'none', '--label', 'astra', '--issue', issue, '--json']
+    sink('\0'.join(argv), "bb's argv")
     try:
         p = subprocess.run(argv, capture_output=True, text=True, timeout=BB_TIMEOUT, env=child_env(),
                            stdin=subprocess.DEVNULL)
@@ -370,7 +394,7 @@ def bb_ask(question, issue):
 
 def answer_of(qid):
     try:
-        p = subprocess.run(['bb', 'sgc', 'answer-of', qid, '--json'], capture_output=True, text=True,
+        p = subprocess.run(['bb', 'sgc', 'answer-of', sink(qid, "bb's argv"), '--json'], capture_output=True, text=True,
                            timeout=BB_TIMEOUT, env=child_env(), stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise Refusal('answer_unknown', f'bb sgc answer-of: {type(e).__name__}')
@@ -524,7 +548,7 @@ def unmoved(gl, iid, check):
 
 def push_file(gl, branch, path, base, text, kind):
     site = R.site_of(path)
-    if gl.token in text:
+    if carries_token(text):
         raise Refusal('secret_in_content', 'the file holds the GitLab token; it is not pushed')
     R.classify(site, gl.raw(path, base), text, kind)
     exists = gl.branch(branch) is not None
@@ -567,7 +591,7 @@ def cmd_push(gl, cfg, args):
         text = Path(local).read_text()
     except (OSError, UnicodeDecodeError) as e:
         raise Refusal('file_unreadable', f'{local}: {type(e).__name__}')
-    return push_file(gl, args.branch, repo_path, target, text, 'deploy')
+    return push_file(gl, args.branch, repo_path, target, text, 'any')
 
 
 def cmd_open(gl, cfg, args):
@@ -644,7 +668,7 @@ def agent_name():
 def comment(entry, issue, web_url):
     result = (f'merged as {entry["merge_commit"]}' if entry['result'] == 'merged'
               else f'refused ({entry["code"]}): {entry["reason"]}')
-    return redact('\n'.join([
+    return ('\n'.join([
         f'[agent:{agent_name()} {os.environ.get("BB_THREAD_ID", "no-thread")}] astra-guard merge on {issue or "an issue this guard did not record"}',
         f'Ask: {entry["ask_id"]}',
         f'Merge request: !{entry["mr"]} {web_url or ""}'.rstrip(),
@@ -655,6 +679,18 @@ def comment(entry, issue, web_url):
 
 
 def cmd_merge(gl, cfg, args):
+    try:
+        log = open_log()
+    except Refusal as e:
+        e.extra = {'comment': comment({'ask_id': args.answer, 'mr': int(args.mr), 'head': None, 'target': None,
+                                       'result': 'refused', 'code': e.code, 'reason': e.message}, None, None),
+                   'comment_issue': None}
+        raise
+    with log:
+        return _merge(gl, cfg, args, log)
+
+
+def _merge(gl, cfg, args, log):
     entry = {'time': now(), 'ask_id': args.answer, 'answer': None, 'mr': int(args.mr), 'head': None,
              'target': None, 'result': 'refused', 'code': None, 'reason': None, 'merge_commit': None}
     issue, web_url = None, None
@@ -680,8 +716,8 @@ def cmd_merge(gl, cfg, args):
         except GitLabError as e:
             raise Refusal('merge_failed', e.message)
         except Exception as e:
-            raise Refusal('merge_unknown', redact(f'{type(e).__name__}: {e}'[:200]) + f'; the merge may have '
-                          f'landed: read !{int(args.mr)} before anything else')
+            raise Refusal('merge_unknown', f'{type(e).__name__}; the merge may have landed: read '
+                                           f'!{int(args.mr)} before anything else')
         if out.get('state') != 'merged':
             raise Refusal('merge_failed', f'GitLab answered state {out.get("state")!r}')
         landed = out.get('merge_commit_sha') or out.get('squash_commit_sha')
@@ -691,12 +727,12 @@ def cmd_merge(gl, cfg, args):
                                         'inverse': check['inverse']})
     except Exception as e:
         if not isinstance(e, Refusal):
-            e = Refusal('internal_error', redact(f'{type(e).__name__}: {e}'[:300]))
+            e = Refusal('internal_error', f'{type(e).__name__}: {e}'[:300])
         entry.update(code=e.code, reason=e.message)
-        log_approval(entry)
+        write_log(log, entry)
         e.extra = {'comment': comment(entry, issue, web_url), 'comment_issue': issue}
         raise e
-    log_approval(entry)
+    write_log(log, entry)
     return {'result': 'merged', 'mr': int(args.mr), 'head': entry['head'], 'target': entry['target'],
             'merge_commit': entry['merge_commit'], 'comment': comment(entry, issue, web_url),
             'comment_issue': issue}
@@ -707,8 +743,9 @@ def log_startup_refusal(args, e):
     entry = {'time': now(), 'ask_id': args.answer, 'answer': None, 'mr': int(args.mr), 'head': None,
              'target': None, 'result': 'refused', 'code': e.code, 'reason': e.message, 'merge_commit': None}
     try:
-        log_approval(entry)
-    except OSError as err:
+        with open_log() as log:
+            write_log(log, entry)
+    except (Refusal, OSError) as err:
         e.message += f' (and the approval log could not be written: {type(err).__name__})'
     return {'comment': comment(entry, None, None), 'comment_issue': None}
 
@@ -767,7 +804,11 @@ def parser():
 
 
 def emit(obj):
-    print(redact(json.dumps(obj, indent=1)))
+    text = json.dumps(obj, indent=1)
+    try:
+        print(sink(text, 'the output'))
+    except Refusal as e:
+        print(json.dumps({'error': e.message, 'code': e.code}, indent=1))
 
 
 def main(argv=None):
@@ -792,7 +833,7 @@ def main(argv=None):
         return 0
     except Exception as e:  # never a traceback: it could carry request state
         if not isinstance(e, Refusal):
-            e = Refusal('internal_error', redact(f'{type(e).__name__}: {e}'[:300]))
+            e = Refusal('internal_error', f'{type(e).__name__}: {e}'[:300])
         if args.cmd == 'merge' and not hasattr(e, 'extra'):
             e.extra = log_startup_refusal(args, e)
         emit({'error': e.message, 'code': e.code, **getattr(e, 'extra', {})})

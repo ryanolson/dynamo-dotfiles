@@ -43,7 +43,7 @@ The token cannot approve, rebase, comment, retarget, reopen, or set auto-merge t
 5. Parse both versions of the file and apply the diff rules (below).
 6. A deploy needs one `Expires: YYYY-MM-DD` line in the merge request description, not in the past.
 7. In the latest pipeline whose `sha` is the head, the latest `helm:plan` and `validate:tests` jobs, from every page of jobs, must each have status `success`. The project marks both jobs `allow_failure`, so the pipeline's own status proves nothing.
-8. The `helm:plan` log must name each changed entry, and every one of our resources in it must be in `--namespace`, so a cluster-scoped resource (empty namespace) is refused (`rendered_namespace_mismatch`). A log in which the guard finds none of our resources, or a resource line it cannot read, fails closed (`rendered_namespace_unverified`).
+8. The `helm:plan` log must name each changed entry, and every one of our resources in it must be in `--namespace`, so a cluster-scoped resource (empty namespace) is refused (`rendered_namespace_mismatch`). A log in which the guard finds none of our resources fails closed (`rendered_namespace_unverified`). So does any line shaped like a resource header (`<x>, <y>, <Kind> (`) or naming an action (`has been added`, `has changed`, `has been removed`) that does not parse completely.
 9. The ArgoCD app's destination namespace, read from the file the config names, must equal `--namespace`. No configured source fails closed (`argocd_destination_unverified`).
 10. Build the ask text. It must fit in the 4000 characters of `bb sgc ask` (`ask_too_long`).
 
@@ -54,13 +54,14 @@ These are the pure functions in `scripts/astra_guard_rules.py`.
 - An entry is an item of one of the top-level workload lists (`mockerRepros`, `vllmModels`, `sglangModels`, `trtllmModels`, `vllmDisaggModels`, `sglangDisaggModels`, `stockVllmModels`, `nimModels`) whose `name` starts with `wcep-`. A `wcep-*` item anywhere else, such as a secret list, is not an entry.
 - With our entries removed, both parsed files must be equal, types included, so `true` never equals `1` (`outside_entries`). The guard compares parsed YAML, not lines, so an anchor in our entry that changes the value of an IT entry is refused.
 - Duplicate keys and more than one YAML document are refused (`yaml_invalid`). PyYAML and Helm's parser would resolve them differently.
+- Values are JSON-shaped: mappings with string keys, lists, strings, numbers, booleans and null. A set, a timestamp, binary data or a non-string key is refused at load (`yaml_invalid`). Quote a date to keep it.
 - Every entry the change adds, changes or removes has a lower-case `wcep-<word>[-<word>...]` name that does not end in `-prd` (`entry_name`).
 - On `pdx04-dev`, an added or changed entry has no non-zero field whose key names an accelerator: a key that contains `gpu` or `mig-`, or a resource under `nvidia.com/`, `amd.com/`, `gpu.intel.com/` or `habana.ai/` (`dev_gpu`). `gpuType: B200` counts too.
-- A deploy adds or changes at least one entry. A teardown only removes entries and changes nothing else (`teardown_not_removal`). A merge request that changes no entry is refused (`no_entry_change`).
+- A deploy only adds entries (`deploy_not_addition`). To change an entry, tear it down and deploy it again, each with its own ask. A teardown only removes entries (`teardown_not_removal`). A merge request that changes no entry is refused (`no_entry_change`). `push` accepts either an add-only or a remove-only file. `check` holds it to the kind recorded at `open`.
 
 ### The inverse patch
 
-For a deploy, the guard computes the inverse patch itself: the diff from the head's file back to the target's file, with three lines of context. The ask shows it. `teardown` applies it to the landed `main`, because the project squashes merges and a branch made earlier would remove nothing. Each hunk must match exactly one place in the landed file, or the guard refuses with `inverse_patch_conflict`. Then edit the teardown by hand with `push`, and the check still allows only removals.
+For a deploy, the guard computes the inverse patch itself: the diff from the head's file back to the target's file, with three lines of context. A deploy only adds entries, so the inverse patch only removes them. The ask shows it. `teardown` applies it to the landed `main`, because the project squashes merges and a branch made earlier would remove nothing. Each hunk must match exactly one place in the landed file, or the guard refuses with `inverse_patch_conflict`. Then edit the teardown by hand with `push`, and the check still allows only removals.
 
 ## The ask
 
@@ -123,7 +124,17 @@ argocd = { project = 678, file = "path/to/stg-app.yaml", key = "spec.destination
 
 ## Token
 
-The guard re-runs itself as `fleet secret env ASTRA_GUARD_TOKEN=<token_ref> -- python3 -I astra-guard ...`. It removes the token from its environment at once. It sends the token only in the `PRIVATE-TOKEN` header, which is not resent on a redirect, and it follows no redirects. Child processes (`bb`) do not get it. The guard refuses any GitLab response that holds the token, as raw text, after URL decoding, or in any decoded JSON string (`secret_in_response`). It keeps nothing from that response. It does not rewrite the response, because a rewrite would change the text that the checks compare. Output, errors and the log pass through a filter that replaces the token. `push` refuses a file that holds the token (`secret_in_content`). The token is never in an argument or a file.
+The guard re-runs itself as `fleet secret env ASTRA_GUARD_TOKEN=<token_ref> -- python3 -I astra-guard ...`. It removes the token from its environment at once. It sends the token only in the `PRIVATE-TOKEN` header, which is not resent on a redirect, and it follows no redirects. Child processes (`bb`) do not get it. Every place data leaves the guard checks its final text, raw and URL-decoded: `state.json`, `approvals.jsonl`, the argv of `bb`, and stdout (`secret_at_sink`). A state save or a `bb` call that would carry the token is refused and writes nothing. A log line that would carry it is written without the field. Output that would carry it is replaced by the refusal. Messages never include a GitLab error body. The guard also refuses a GitLab response that holds the token (`secret_in_response`), and `push` refuses a file that holds it (`secret_in_content`).
+
+## Five kinds, five rules
+
+Three review passes found defects of the same five kinds. Each fix closed one input path and the next pass found another. Each kind now has one rule at the point every path goes through:
+
+- **Value comparison.** Rule: values are JSON-shaped, checked once at load. A type-aware comparison was patched for `true` and `1`, and then a YAML set compared its members loosely again. Every new YAML type brings its own equality, so the guard admits none.
+- **The token.** Rule: check the four sinks, on their final text. Redacting responses changed the text the checks compare. Checking responses missed JSON escapes, then YAML escapes, then a URL-encoded error body. Every decoder is a new way in, but there are only four ways out.
+- **Plan parsing.** Rule: a line shaped like a resource header parses completely, or the check refuses. Accepting an empty namespace, and then lines that end in `:`, each left another clipped or odd header to be skipped silently.
+- **Merge logging.** Rule: the log is open before the merge call, and the result line goes to that open file. Catching more errors after the merge could not help when the log itself could not be written.
+- **Teardown data.** Rule: a deploy only adds entries, so every inverse patch is a pure removal. Keeping the patch safe did not help when the patch for a changed entry restored it, which a teardown may not do.
 
 ## State
 

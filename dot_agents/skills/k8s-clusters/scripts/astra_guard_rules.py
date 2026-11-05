@@ -92,7 +92,23 @@ def load_values(text):
         raise Refusal('yaml_invalid', f'values file does not parse: {str(e)[:200]}')
     if len(docs) != 1 or not isinstance(docs[0], dict):
         raise Refusal('yaml_invalid', 'a values file must be one YAML mapping')
+    _json_shaped(docs[0], '')
     return docs[0]
+
+
+def _json_shaped(obj, path):
+    """Helm values are JSON. Anything else (a set, a timestamp, binary, a non-string key) is
+    refused here, once, so no later comparison has to know how such a type compares."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if not isinstance(k, str):
+                raise Refusal('yaml_invalid', f'{path or "/"} has a {type(k).__name__} key; values are JSON')
+            _json_shaped(v, f'{path}.{k}')
+    elif isinstance(obj, list):
+        for n, v in enumerate(obj):
+            _json_shaped(v, f'{path}[{n}]')
+    elif not (obj is None or isinstance(obj, (str, bool, int, float))):
+        raise Refusal('yaml_invalid', f'{path or "/"} is a {type(obj).__name__}; values are JSON')
 
 
 def _is_ours(item):
@@ -181,10 +197,17 @@ def classify(site, base_text, head_text, kind):
             raise Refusal('entry_name', f'entry {name!r} is not a lower-case wcep-* name, or ends in -prd')
     if not (added or removed or changed):
         raise Refusal('no_entry_change', 'the change adds, changes and removes no wcep-* entry')
+    if kind == 'any':  # a push: either a deploy or a teardown, checked again by kind at check
+        kind = 'deploy' if added or changed else 'teardown'
     if kind == 'teardown':
         if added or changed:
             raise Refusal('teardown_not_removal', 'a teardown may only remove our entries')
-    elif kind != 'deploy':
+    elif kind == 'deploy':
+        if changed or removed:
+            raise Refusal('deploy_not_addition', 'a deploy only adds wcep-* entries; to change one, tear it down '
+                                                 f'and deploy again (changed {[k[1] for k in changed]}, '
+                                                 f'removed {[k[1] for k in removed]})')
+    else:
         raise Refusal('kind_unknown', f'unknown kind {kind!r}')
     gpus = {}
     for key in added + changed:
@@ -239,7 +262,8 @@ def apply_patch(text, hunks):
 _ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 _PLAN = re.compile(r'^(?P<ns>[^,\s]*), (?P<name>[A-Za-z0-9][A-Za-z0-9._-]*), (?P<kind>[A-Za-z0-9]+) '
                    r'\([^)]*\) has (?P<action>been added|changed|been removed):\s*$')
-_PLAN_ANY = re.compile(r'has (been added|changed|been removed):\s*$')
+_PLAN_ANY = re.compile(r'has (been added|changed|been removed)')
+_HEADERISH = re.compile(r'^[^,]*, [^,]+, [A-Za-z0-9]+ \(')
 
 
 def parse_plan(trace):
@@ -253,7 +277,7 @@ def parse_plan(trace):
     for raw in trace.replace('\r', '\n').splitlines():
         line = _ANSI.sub('', raw).strip()
         m = _PLAN.match(line)
-        if not m and _PLAN_ANY.search(line):
+        if not m and (_PLAN_ANY.search(line) or _HEADERISH.match(line)):
             raise Refusal('rendered_namespace_unverified', f'cannot read the helm:plan line {line[:120]!r}')
         if m:
             action = m.group('action').split()[-1]
