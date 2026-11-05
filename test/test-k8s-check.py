@@ -668,6 +668,36 @@ class K8sCheck(unittest.TestCase):
         owner_calls = [c['key'] for c in self.calls() if c['effective_token'] == 'made-up-owner-token']
         self.assertEqual(owner_calls, [], f'owner credentials used after whoami: exit={rc}, identity={out.get("identity")}')
 
+    def test_resolved_kubeconfig_cannot_switch_to_owner_after_whoami(self):
+        for path, user, token in ((self.bot_kubeconfig, BOT, 'made-up-bot-token'),
+                                  (self.human_kubeconfig, 'owner', 'made-up-owner-token')):
+            path.write_text(json.dumps({
+                'apiVersion': 'v1', 'kind': 'Config',
+                'clusters': [{'name': 'example', 'cluster': {'server': 'https://proxy.example.test'}}],
+                'contexts': [{'name': CTX, 'context': {'cluster': 'example', 'user': user}}],
+                'users': [{'name': user, 'user': {'token': token}}],
+            }))
+        self.env['FAKE_KUBECONFIG_SWAP_PATH'] = str(self.bot_kubeconfig)
+        self.env['FAKE_OWNER_KUBECONFIG'] = str(self.human_kubeconfig)
+        # Swap the checked target after whoami, when the next kubectl process has not opened it yet.
+        swap_step = textwrap.dedent('''\
+            if rest[:2] == ['auth', 'whoami']:
+                path = os.environ['FAKE_KUBECONFIG_SWAP_PATH']
+                os.unlink(path)
+                os.symlink(os.environ['FAKE_OWNER_KUBECONFIG'], path)
+            ''')
+        kubectl = self.tmp / 'bin/kubectl'
+        kubectl.write_text(FAKE_KUBECTL.replace(
+            "'key': ' '.join(rest)",
+            "'key': ' '.join(rest), 'resolved_kubeconfig': os.path.realpath(flags['--kubeconfig']), "
+            "'credential_token': json.load(open(flags['--kubeconfig']))['users'][0]['user']['token']").replace(
+                "sys.stdout.write(reply.get('stdout', ''))",
+                swap_step + "sys.stdout.write(reply.get('stdout', ''))"))
+        rc, out = self.run_check('lab-arm-a')
+        owner_calls = [c['key'] for c in self.calls()
+                       if c['credential_token'] == 'made-up-owner-token']
+        self.assertEqual(owner_calls, [], f'owner path used after whoami: exit={rc}, identity={out.get("identity")}')
+
 
 if __name__ == '__main__':
     unittest.main()
