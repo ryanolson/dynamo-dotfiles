@@ -1486,6 +1486,14 @@ class AdversarialReview(GuardCase):
 
 class PassTwoReview(GuardCase):
 
+    def test_empty_ask_namespace_cannot_authorize_cluster_scoped_resources(self):
+        self.gl.commit(PLATFORM_PID, 'main', {'apps/dev.yaml': ARGO_APP % '""'})
+        iid = self.deployed_mr()
+        self.gl.traces[self.gl.branch_sha(BRANCH)] = (
+            ', wcep-smoke, ClusterRole (rbac.authorization.k8s.io/v1) has been added:\n')
+        rc, body, err = self.guard('check', '--mr', str(iid), '--namespace', '')
+        self.assertNotEqual(rc, 0, 'An empty ask namespace authorized a cluster-scoped resource')
+
     def test_response_redaction_cannot_hide_an_it_value_change(self):
         base = DEV_VALUES + f'itSetting: "{SECRET}"\n'
         head = dev_deploy(base).replace(SECRET, '[redacted]')
