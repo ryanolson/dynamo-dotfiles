@@ -35,11 +35,12 @@ It exits 1, with a `failures` list of stable codes, when:
 - the cluster has no profile (`unknown_cluster`), or its profile says `never` (`cluster_never`);
 - `KUBECONFIG` is unset, lists two files, or is not the bot's file (`kubeconfig_not_bot`);
 - the bot kubeconfig has no context for the cluster (`context_missing`);
+- that context's user holds anything but tbot's exec plugin or a client certificate: a token, an auth provider, an impersonation, or another command such as `tsh` (`kubeconfig_credentials`);
 - the identity is not the bot (`not_bot`); the check stops at once;
 - the bot can create DGDs outside our namespaces (`can_i_outside`);
 - `--want-crd` names a version the CRD does not serve (`crd_version_not_served`);
 - a `kubectl` read fails (`kubectl_error`).
 
-The first four make no cluster call. A `warnings` list reports where the profile and the cluster disagree. Fix the profile from the runbook's sources, not from the warning alone.
+The first five make no cluster call; the bot kubeconfig is read locally with `kubectl config view`. Every `kubectl` call reads the one kubeconfig file opened at the start, through `/proc/self/fd`, so the check needs Linux. kubectl runs without `KUBECONFIG`, without any other `KUBECTL_*` variable, and with kuberc off. A `warnings` list reports where the profile and the cluster disagree. Fix the profile from the runbook's sources, not from the warning alone.
 
 Every run contacts the cluster. Record it in the thread's ledger, and report it to whoever asked for it.

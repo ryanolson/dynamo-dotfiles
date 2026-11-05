@@ -77,6 +77,43 @@ def resolve_bot_kubeconfig(path):
     return str(real), None
 
 
+# The only credentials a bot kubeconfig user may hold: tbot's exec plugin, or the client
+# certificate tbot writes when its exec plugin is off. A token, an auth provider, an
+# impersonation or any other exec command (tsh above all) would act as someone else.
+BOT_USER_KEYS = {'exec', 'client-certificate', 'client-certificate-data', 'client-key', 'client-key-data'}
+BOT_EXEC_COMMAND = 'tbot'
+
+
+def bot_credential_problem(view, context):
+    """Why the context in a `kubectl config view -o json` result does not use bot credentials, or None."""
+    ctx = next((c.get('context') or {} for c in view.get('contexts') or [] if c.get('name') == context), None)
+    if ctx is None:
+        return f'context {context} is not in the bot kubeconfig'
+    user = next((u.get('user') or {} for u in view.get('users') or [] if u.get('name') == ctx.get('user')), None)
+    if user is None:
+        return f'context {context} names user {ctx.get("user")!r}, which the bot kubeconfig does not define'
+    extra = sorted(set(user) - BOT_USER_KEYS)
+    if extra:
+        return f'the user of context {context} holds {", ".join(extra)}; only tbot credentials are allowed'
+    if 'exec' in user and os.path.basename(str((user['exec'] or {}).get('command', ''))) != BOT_EXEC_COMMAND:
+        return f'the user of context {context} runs {(user["exec"] or {}).get("command")!r}, not {BOT_EXEC_COMMAND}'
+    if not user:
+        return f'the user of context {context} holds no credentials'
+    return None
+
+
+def kubectl_env(environ=None):
+    """The environment for kubectl: no KUBECONFIG and no KUBECTL_* from the caller, and kuberc off.
+
+    --kubeconfig already overrides KUBECONFIG; dropping it too leaves one source. A kuberc file
+    (~/.kube/kuberc, kubectl 1.33 and later) can add defaults such as --token to every command.
+    """
+    env = {k: v for k, v in (os.environ if environ is None else environ).items()
+           if k != 'KUBECONFIG' and not k.startswith('KUBECTL_')}
+    env['KUBECTL_KUBERC'] = 'false'
+    return env
+
+
 def profiles_path():
     return Path(os.path.expanduser(os.environ.get('K8S_CLUSTERS_PROFILES') or DEFAULT_PROFILES))
 

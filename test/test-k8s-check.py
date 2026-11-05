@@ -29,7 +29,7 @@ BOT = 'bot-example-agent'
 CRD_JSONPATH = '{range .spec.versions[?(@.served==true)]}{.name}{" "}{end}'
 MUTATING = {'create', 'apply', 'delete', 'patch', 'label', 'annotate', 'scale', 'edit', 'replace', 'set',
             'rollout', 'drain', 'cordon', 'uncordon', 'taint', 'expose', 'run', 'exec', 'cp', 'port-forward'}
-READ_ONLY = {('config', 'get-contexts'), ('auth', 'whoami'), ('auth', 'can-i'), 'get'}
+READ_ONLY = {('config', 'view'), ('auth', 'whoami'), ('auth', 'can-i'), 'get'}
 
 FAKE_KUBECTL = r'''#!/usr/bin/env python3
 import json, os, sys
@@ -45,7 +45,14 @@ while i < len(argv):
     else:
         flags[name] = a.split('=', 1)[1]; i += 1
 with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:
-    log.write(json.dumps({'argv': argv, 'flags': flags, 'key': ' '.join(rest)}) + '\n')
+    log.write(json.dumps({'argv': argv, 'flags': flags, 'key': ' '.join(rest),
+                          'kubeconfig_real': os.path.realpath(flags.get('--kubeconfig', '')),
+                          'env_kuberc': os.environ.get('KUBECTL_KUBERC'),
+                          'env_kubeconfig': os.environ.get('KUBECONFIG')}) + '\n')
+if rest == ['config', 'view', '-o', 'json']:
+    # Local, like kubectl: read the file it was given and print it. The fixtures are JSON.
+    print(json.dumps(json.load(open(flags['--kubeconfig']))))
+    sys.exit(0)
 scenario = json.load(open(os.environ['FAKE_KUBECTL_SCENARIO']))
 reply = scenario.get(' '.join(rest))
 if reply is None:
@@ -96,6 +103,18 @@ def pod(ns, name, node_name, gpus, phase='Running', init_gpus=0):
     return {'metadata': {'namespace': ns, 'name': name}, 'spec': spec, 'status': {'phase': phase}}
 
 
+def kubeconfig(contexts=(CTX, 'proxy.example.test-lab-x86-qa'), user=None):
+    """A bot kubeconfig as tbot writes it with its exec plugin on, in JSON (also valid YAML)."""
+    user = user if user is not None else {'exec': {
+        'apiVersion': 'client.authentication.k8s.io/v1beta1', 'command': '/usr/local/bin/tbot',
+        'args': ['kube', 'credentials', '--destination-dir=/example/kube']}}
+    return json.dumps({
+        'apiVersion': 'v1', 'kind': 'Config',
+        'clusters': [{'name': 'example', 'cluster': {'server': 'https://proxy.example.test'}}],
+        'contexts': [{'name': c, 'context': {'cluster': 'example', 'user': 'bot'}} for c in contexts],
+        'users': [{'name': 'bot', 'user': user}]})
+
+
 GPU_TAINT = {'key': 'nvidia.com/gpu', 'value': 'true', 'effect': 'NoSchedule'}
 RESERVED = {'key': 'example.test/reserved', 'value': 'team-b', 'effect': 'NoSchedule'}
 OUR_NS = 'dyntest-alice-12-smoke'
@@ -103,6 +122,7 @@ OUR_NS = 'dyntest-alice-12-smoke'
 
 def happy_scenario():
     return {
+        # Read only by older scripts (K8S_CHECK_SCRIPTS); the current check uses config view.
         'config get-contexts -o name': {'stdout': f'{CTX}\nproxy.example.test-lab-x86-qa\n'},
         'auth whoami -o json': j({'kind': 'SelfSubjectReview', 'status': {'userInfo': {
             'username': BOT, 'groups': ['system:authenticated']}}}),
@@ -142,7 +162,7 @@ class K8sCheck(unittest.TestCase):
         self.home = self.tmp / 'home'
         self.bot_kubeconfig = self.home / '.local/share/tbot/example/kube/kubeconfig.yaml'
         self.bot_kubeconfig.parent.mkdir(parents=True)
-        self.bot_kubeconfig.write_text('apiVersion: v1\nkind: Config\n')
+        self.bot_kubeconfig.write_text(kubeconfig())
         self.human_kubeconfig = self.home / '.kube/config'
         self.human_kubeconfig.parent.mkdir(parents=True)
         self.human_kubeconfig.write_text('apiVersion: v1\nkind: Config\n')
@@ -204,7 +224,10 @@ class K8sCheck(unittest.TestCase):
                           READ_ONLY, f'not a read: {call["argv"]}')
             if words[0] == 'get':
                 self.assertFalse(set(words) & MUTATING, call['argv'])
-            self.assertEqual(call['flags'].get('--kubeconfig'), str(self.bot_kubeconfig), call['argv'])
+            # kubectl gets the pinned file (/proc/self/fd/<n>), and that file is the bot's.
+            self.assertEqual(call['kubeconfig_real'], str(self.bot_kubeconfig), call['argv'])
+            self.assertEqual(call['env_kuberc'], 'false', call['argv'])
+            self.assertIsNone(call['env_kubeconfig'], call['argv'])
             if not call['key'].startswith('config '):
                 self.assertEqual(call['flags'].get('--context'), CTX, call['argv'])
             if call['key'].startswith('auth can-i'):
@@ -397,6 +420,31 @@ class K8sCheck(unittest.TestCase):
         self.assertTrue(self.calls())
         self.assert_read_only()   # every call carried --kubeconfig <the resolved bot file>
 
+    def test_bot_kubeconfig_credentials(self):
+        cases = {
+            'token': ({'token': 'made-up'}, 'token'),
+            'auth provider': ({'auth-provider': {'name': 'oidc'}}, 'auth-provider'),
+            'impersonation': ({'client-certificate-data': 'x', 'client-key-data': 'y', 'as': 'admin'}, 'as'),
+            'other exec': ({'exec': {'command': 'kubelogin', 'args': []}}, 'kubelogin'),
+            'tsh exec': ({'exec': {'command': '/usr/local/bin/tsh', 'args': ['kube', 'credentials']}}, 'tsh'),
+            'no credentials': ({}, 'no credentials'),
+        }
+        for name, (user, needle) in cases.items():
+            with self.subTest(name):
+                if self.log.exists():
+                    self.log.unlink()
+                self.bot_kubeconfig.write_text(kubeconfig(user=user))
+                rc, out = self.run_check('lab-arm-a')
+                self.assert_refused_without_contact(out, rc, 'kubeconfig_credentials')
+                self.assertIn(needle, ' '.join(f['message'] for f in out['failures']))
+                self.assertEqual([c['key'] for c in self.calls()], ['config view -o json'])
+
+    def test_client_certificate_is_bot_credentials(self):
+        self.bot_kubeconfig.write_text(kubeconfig(user={'client-certificate': '/example/tls.crt',
+                                                        'client-key': '/example/tls.key'}))
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+
     def test_kubeconfig_unset(self):
         # kubectl would fall back to ~/.kube/config, the owner's login.
         del self.env['KUBECONFIG']
@@ -411,7 +459,7 @@ class K8sCheck(unittest.TestCase):
         self.assertEqual(self.calls(), [])
 
     def test_context_missing_from_bot_kubeconfig(self):
-        self.scenario['config get-contexts -o name'] = {'stdout': 'proxy.example.test-lab-x86-qa\n'}
+        self.bot_kubeconfig.write_text(kubeconfig(contexts=('proxy.example.test-lab-x86-qa',)))
         rc, out = self.run_check('lab-arm-a')
         self.assert_refused_without_contact(out, rc, 'context_missing')
 
@@ -428,7 +476,7 @@ class K8sCheck(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertEqual(self.codes(out), ['not_bot'])
         self.assertEqual(out['identity']['username'], 'alice@example.test')
-        self.assertEqual([c['key'] for c in self.calls()], ['config get-contexts -o name', 'auth whoami -o json'])
+        self.assertEqual([c['key'] for c in self.calls()], ['config view -o json', 'auth whoami -o json'])
 
     def test_can_create_outside_our_namespaces(self):
         self.scenario['auth can-i create dynamographdeployments.nvidia.com -n default'] = can_i('yes')
@@ -615,7 +663,7 @@ class K8sCheck(unittest.TestCase):
         }))
         # Model client-go's exec delegation, using only the harness's fake tsh.
         credential_step = textwrap.dedent('''\
-            if rest[:2] != ['config', 'get-contexts']:
+            if rest[:1] != ['config']:  # kubectl runs no credential plugin for config commands
                 import subprocess
                 config = json.load(open(flags['--kubeconfig']))
                 context = next(c['context'] for c in config['contexts'] if c['name'] == flags['--context'])
@@ -669,14 +717,14 @@ class K8sCheck(unittest.TestCase):
         self.assertEqual(owner_calls, [], f'owner credentials used after whoami: exit={rc}, identity={out.get("identity")}')
 
     def test_resolved_kubeconfig_cannot_switch_to_owner_after_whoami(self):
-        for path, user, token in ((self.bot_kubeconfig, BOT, 'made-up-bot-token'),
-                                  (self.human_kubeconfig, 'owner', 'made-up-owner-token')):
-            path.write_text(json.dumps({
-                'apiVersion': 'v1', 'kind': 'Config',
-                'clusters': [{'name': 'example', 'cluster': {'server': 'https://proxy.example.test'}}],
-                'contexts': [{'name': CTX, 'context': {'cluster': 'example', 'user': user}}],
-                'users': [{'name': user, 'user': {'token': token}}],
-            }))
+        # The bot file must pass the credential allowlist, or the check stops before the swap.
+        self.bot_kubeconfig.write_text(kubeconfig())
+        self.human_kubeconfig.write_text(json.dumps({
+            'apiVersion': 'v1', 'kind': 'Config',
+            'clusters': [{'name': 'example', 'cluster': {'server': 'https://proxy.example.test'}}],
+            'contexts': [{'name': CTX, 'context': {'cluster': 'example', 'user': 'owner'}}],
+            'users': [{'name': 'owner', 'user': {'token': 'made-up-owner-token'}}],
+        }))
         self.env['FAKE_KUBECONFIG_SWAP_PATH'] = str(self.bot_kubeconfig)
         self.env['FAKE_OWNER_KUBECONFIG'] = str(self.human_kubeconfig)
         # Swap the checked target after whoami, when the next kubectl process has not opened it yet.
@@ -690,12 +738,13 @@ class K8sCheck(unittest.TestCase):
         kubectl.write_text(FAKE_KUBECTL.replace(
             "'key': ' '.join(rest)",
             "'key': ' '.join(rest), 'resolved_kubeconfig': os.path.realpath(flags['--kubeconfig']), "
-            "'credential_token': json.load(open(flags['--kubeconfig']))['users'][0]['user']['token']").replace(
+            "'credential_user': json.load(open(flags['--kubeconfig']))['users'][0]['name']").replace(
                 "sys.stdout.write(reply.get('stdout', ''))",
                 swap_step + "sys.stdout.write(reply.get('stdout', ''))"))
         rc, out = self.run_check('lab-arm-a')
-        owner_calls = [c['key'] for c in self.calls()
-                       if c['credential_token'] == 'made-up-owner-token']
+        self.assertEqual(rc, 0, out)
+        self.assertGreater(len(self.calls()), 3, 'the swap after whoami must be exercised')
+        owner_calls = [c['key'] for c in self.calls() if c['credential_user'] == 'owner']
         self.assertEqual(owner_calls, [], f'owner path used after whoami: exit={rc}, identity={out.get("identity")}')
 
 
