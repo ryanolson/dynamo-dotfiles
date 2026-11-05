@@ -1549,6 +1549,18 @@ class PassTwoReview(GuardCase):
 
 class PassThreeReview(GuardCase):
 
+    def test_it_set_members_cannot_change_from_boolean_to_integer(self):
+        base = DEV_VALUES + 'itSetting: !!set {true: null}\n'
+        head = dev_deploy(base).replace('!!set {true: null}', '!!set {1: null}')
+        old = rules.load_values(base)['itSetting']
+        new = rules.load_values(head)['itSetting']
+        self.assertIs(type(next(iter(old))), bool)
+        self.assertIs(type(next(iter(new))), int)
+        self.gl.commit(PID, 'main', {DEV: base})
+        self.gl.commit(PID, BRANCH, {DEV: head}, parent=self.main())
+        iid = self.open()
+        self.refused('outside_entries', 'check', '--mr', str(iid), '--namespace', NS)
+
     def test_merge_refuses_before_writing_when_approval_log_is_unusable(self):
         iid, qid = self.approved()
         before = self.main()
