@@ -636,6 +636,38 @@ class K8sCheck(unittest.TestCase):
             credential_step + "scenario = json.load(open(os.environ['FAKE_KUBECTL_SCENARIO']))"))
         self.run_check('lab-arm-a')
 
+    def test_kuberc_cannot_change_credentials_after_bot_whoami(self):
+        kuberc = self.home / '.kube/kuberc'
+        kuberc.write_text(json.dumps({
+            'apiVersion': 'kubectl.config.k8s.io/v1beta1', 'kind': 'Preference',
+            'defaults': [{'command': 'get', 'options': [
+                {'name': 'token', 'default': 'made-up-owner-token'}]}],
+        }))
+        self.env['KUBECTL_KUBERC'] = 'true'
+        # Model kubectl's defaults for flags absent from argv, before recording the effective token.
+        preference_step = textwrap.dedent('''\
+            effective_token = None
+            if os.environ.get('KUBECTL_KUBERC', 'true') != 'false' and os.environ.get('KUBERC') != 'off':
+                preference_path = os.path.join(os.environ['HOME'], '.kube', 'kuberc')
+                if os.path.isfile(preference_path):
+                    preferences = json.load(open(preference_path))
+                    for default in preferences.get('defaults', []):
+                        if default['command'].split() == rest[:1]:
+                            for option in default.get('options', []):
+                                if option['name'] == 'token' and not any(
+                                        a == '--token' or a.startswith('--token=') for a in argv):
+                                    effective_token = option['default']
+            ''')
+        kubectl = self.tmp / 'bin/kubectl'
+        kubectl.write_text(FAKE_KUBECTL.replace(
+            "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:",
+            preference_step + "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:").replace(
+                "'key': ' '.join(rest)", "'key': ' '.join(rest), 'effective_token': effective_token"))
+        rc, out = self.run_check('lab-arm-a')
+        self.assert_read_only()
+        owner_calls = [c['key'] for c in self.calls() if c['effective_token'] == 'made-up-owner-token']
+        self.assertEqual(owner_calls, [], f'owner credentials used after whoami: exit={rc}, identity={out.get("identity")}')
+
 
 if __name__ == '__main__':
     unittest.main()
