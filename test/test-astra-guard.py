@@ -1375,6 +1375,17 @@ class StructuralRules(GuardCase):
         mod = importlib.util.module_from_spec(spec)
         loader.exec_module(mod)
         mod._TOKEN = SECRET
+
+        # This runs in the test process, whose PATH holds the real bb. A guard that reaches
+        # a subprocess here would ask the owner a real question, so no subprocess may run.
+        class NoSubprocess:
+            TimeoutExpired = subprocess.TimeoutExpired
+            DEVNULL = subprocess.DEVNULL
+
+            @staticmethod
+            def run(argv, **kwargs):
+                raise AssertionError(f'the sink test reached a subprocess: {argv[:3]}')
+        mod.subprocess = NoSubprocess
         return mod
 
     def test_every_sink_refuses_the_token_raw_or_url_encoded(self):
