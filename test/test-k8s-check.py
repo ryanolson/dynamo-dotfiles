@@ -20,7 +20,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / 'dot_agents/skills/k8s-clusters'
-SCRIPT = SKILL / 'scripts/executable_k8s-check'
+# K8S_CHECK_SCRIPTS points the tests at another commit's scripts, to show an escape test failing there.
+SCRIPT = Path(os.environ.get('K8S_CHECK_SCRIPTS') or SKILL / 'scripts') / 'executable_k8s-check'
 EXAMPLE = SKILL / 'references/profiles.example.toml'
 
 CTX = 'proxy.example.test-lab-arm-a'
@@ -53,6 +54,19 @@ if reply is None:
 sys.stdout.write(reply.get('stdout', ''))
 sys.stderr.write(reply.get('stderr', ''))
 sys.exit(reply.get('exit', 0))
+'''
+
+# The scripts take the account's home from the password database, not from $HOME. The tests run
+# them through this runner, which answers pwd.getpwuid with a temporary home.
+RUNNER = r'''
+import os, pwd, runpy, sys
+real = pwd.getpwuid
+class Entry:
+    def __init__(self, entry):
+        self.pw_name, self.pw_uid, self.pw_dir = entry.pw_name, entry.pw_uid, os.environ['FAKE_PW_DIR']
+pwd.getpwuid = lambda uid: Entry(real(uid))
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name='__main__')
 '''
 
 FAKE_TSH = '#!/bin/sh\necho "fake tsh: agents never use tsh" >&2\necho tsh >> "$FAKE_TSH_LOG"\nexit 98\n'
@@ -137,6 +151,8 @@ class K8sCheck(unittest.TestCase):
         for name, body in (('kubectl', FAKE_KUBECTL), ('tsh', FAKE_TSH)):
             (bin_dir / name).write_text(body)
             (bin_dir / name).chmod(0o755)
+        self.runner = self.tmp / 'runner.py'
+        self.runner.write_text(RUNNER)
         self.profiles = self.tmp / 'profiles.toml'
         self.profiles.write_text(EXAMPLE.read_text())
         self.log = self.tmp / 'kubectl.log'
@@ -146,6 +162,7 @@ class K8sCheck(unittest.TestCase):
         self.env = {
             'PATH': f'{bin_dir}:/usr/bin:/bin',
             'HOME': str(self.home),
+            'FAKE_PW_DIR': str(self.home),
             'K8S_CLUSTERS_PROFILES': str(self.profiles),
             'KUBECONFIG': str(self.bot_kubeconfig),
             'FAKE_KUBECTL_LOG': str(self.log),
@@ -155,7 +172,7 @@ class K8sCheck(unittest.TestCase):
 
     def run_check(self, *args):
         self.scenario_path.write_text(json.dumps(self.scenario))
-        proc = subprocess.run([sys.executable, '-I', str(SCRIPT), *args], env=self.env, stdin=subprocess.DEVNULL,
+        proc = subprocess.run([sys.executable, '-I', str(self.runner), str(SCRIPT), *args], env=self.env, stdin=subprocess.DEVNULL,
                               capture_output=True, text=True, timeout=60)
         try:
             out = json.loads(proc.stdout)
@@ -352,6 +369,33 @@ class K8sCheck(unittest.TestCase):
                     self.assertEqual(cluster_calls, [],
                                      'resolving symlinks before .. reaches the owner kubeconfig')
                     self.assertIn('profiles_invalid', self.codes(out))
+
+    def test_home_override_cannot_widen_the_allowlist(self):
+        # A kubeconfig outside the account's tbot directory: a changed HOME must not make it allowed.
+        other_home = self.tmp / 'other-home'
+        other = other_home / '.local/share/tbot/example/kube/kubeconfig.yaml'
+        other.parent.mkdir(parents=True)
+        other.write_text('apiVersion: v1\nkind: Config\n')
+        self.profiles.write_text(EXAMPLE.read_text().replace(
+            '"~/.local/share/tbot/example/kube/kubeconfig.yaml"', f'"{other}"'))
+        self.env['HOME'] = str(other_home)
+        self.env['KUBECONFIG'] = str(other)
+        rc, out = self.run_check('lab-arm-a')
+        self.assert_refused_without_contact(out, rc, 'profiles_invalid')
+        self.assertEqual(self.calls(), [])
+
+    def test_kubectl_gets_the_resolved_kubeconfig(self):
+        # The path checked is the path used: a link in the profile is resolved once, and kubectl
+        # gets the target, so swapping the link after the check changes nothing.
+        link = self.home / '.local/share/tbot/current.yaml'
+        link.symlink_to(self.bot_kubeconfig)
+        self.profiles.write_text(EXAMPLE.read_text().replace(
+            '"~/.local/share/tbot/example/kube/kubeconfig.yaml"', '"~/.local/share/tbot/current.yaml"'))
+        self.env['KUBECONFIG'] = str(link)
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(self.calls())
+        self.assert_read_only()   # every call carried --kubeconfig <the resolved bot file>
 
     def test_kubeconfig_unset(self):
         # kubectl would fall back to ~/.kube/config, the owner's login.

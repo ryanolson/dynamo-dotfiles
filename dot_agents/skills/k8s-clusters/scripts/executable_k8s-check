@@ -131,7 +131,9 @@ def check_kubeconfig(bot):
                       'KUBECONFIG is unset, so kubectl would use ~/.kube/config; export the bot kubeconfig')
     if os.pathsep in value:
         raise Refusal('kubeconfig_not_bot', 'KUBECONFIG lists more than one file; name only the bot kubeconfig')
-    if os.path.realpath(os.path.expanduser(value)) != os.path.realpath(bot['kubeconfig']):
+    # bot['kubeconfig'] is already resolved by the parser, and kubectl gets that path with
+    # --kubeconfig, which overrides KUBECONFIG. This check makes sure the caller meant it.
+    if os.path.realpath(value) != bot['kubeconfig']:
         raise Refusal('kubeconfig_not_bot', f'KUBECONFIG is {value}, not the bot kubeconfig {bot["kubeconfig"]}')
 
 

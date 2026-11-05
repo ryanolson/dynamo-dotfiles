@@ -35,41 +35,46 @@ OWNER_DIRS = ('.kube', '.tsh')
 TBOT_DIR = '.local/share/tbot'
 
 
-def account_homes():
-    """$HOME and the account's home from the password database: HOME alone can be changed."""
-    homes = {os.path.expanduser('~')}
-    try:
-        homes.add(pwd.getpwuid(os.getuid()).pw_dir)
-    except KeyError:
-        pass
-    return homes
+def account_home():
+    """The account's home from the password database. Unlike $HOME, the caller cannot change it."""
+    return pwd.getpwuid(os.getuid()).pw_dir
 
 
-def bot_kubeconfig_problem(path):
-    """Why path cannot be the bot's kubeconfig, or None when it can.
+def resolve_bot_kubeconfig(path):
+    """Return (resolved path, None) when path may be the bot's kubeconfig, else (None, reason).
 
-    An allowlist: the resolved file must lie in tbot's own directory, where the tbot
-    config writes it. Path checks by denylist kept leaking (a symlink, a changed HOME,
-    a symlink before "..").
-    The denylist stays as a second check: no .kube or .tsh directory in the path as
-    written or as resolved, since those hold the owner's own login.
-    os.path.realpath resolves each symlink before the ".." after it, as the kernel does.
+    The rule is an allowlist: after every symlink is resolved, the file must lie under
+    tbot's own directory in the account's home, where the tbot config writes it.
+    Denylists of path forms kept leaking: a symlinked ~/.kube, a changed HOME, a
+    symlink before "..". A leading ~ also expands to the account's home, not $HOME.
+    A second check refuses any .kube or .tsh directory in the path as written or as
+    resolved, and anything inside the resolved ~/.kube or ~/.tsh of $HOME or the
+    account's home: those hold the owner's own login.
+    Callers pass the resolved path to kubectl, so a symlink swapped after the check
+    is not followed.
     """
-    expanded = os.path.expanduser(path)
+    home = account_home()
+    if path == '~' or path.startswith('~/'):
+        expanded = home + path[1:]
+    elif path.startswith('~'):
+        return None, f'bot.kubeconfig {path}: only ~/ is expanded, as the account\'s home'
+    else:
+        expanded = path
     if not os.path.isabs(expanded):
-        return f'bot.kubeconfig {path} must be an absolute path or start with ~'
+        return None, f'bot.kubeconfig {path} must be an absolute path or start with ~/'
+    # realpath resolves each symlink before the ".." after it, as the kernel does.
     real = Path(os.path.realpath(expanded))
     if any(part in OWNER_DIRS for p in (Path(expanded), real) for part in p.parts):
-        return f'bot.kubeconfig {path} is in a .kube or .tsh directory, the owner\'s login'
-    homes = account_homes()
-    for home in homes:
+        return None, f'bot.kubeconfig {path} is in a .kube or .tsh directory, the owner\'s login'
+    for h in {home, os.path.expanduser('~')}:
         for d in OWNER_DIRS:
-            owner = Path(os.path.realpath(os.path.join(home, d)))
+            owner = Path(os.path.realpath(os.path.join(h, d)))
             if real == owner or owner in real.parents:
-                return f'bot.kubeconfig {path} resolves into {owner}, the owner\'s login'
-    if not any(Path(os.path.realpath(os.path.join(home, TBOT_DIR))) in real.parents for home in homes):
-        return f'bot.kubeconfig {path} resolves to {real}, which is not under ~/{TBOT_DIR}'
-    return None
+                return None, f'bot.kubeconfig {path} resolves into {owner}, the owner\'s login'
+    root = Path(os.path.realpath(os.path.join(home, TBOT_DIR)))
+    if root not in real.parents:
+        return None, f'bot.kubeconfig {path} resolves to {real}, which is not under {root}'
+    return str(real), None
 
 
 def profiles_path():
@@ -160,10 +165,11 @@ def load_profiles():
     prefix = bot.get('namespace_prefix')
     if isinstance(prefix, str) and prefix and not prefix.endswith('-'):
         errors.append('bot.namespace_prefix must end in "-"')
-    kubeconfig = bot.get('kubeconfig')
-    problem = bot_kubeconfig_problem(kubeconfig) if isinstance(kubeconfig, str) and kubeconfig else None
-    if problem:
-        errors.append(problem)
+    resolved = None
+    if isinstance(bot.get('kubeconfig'), str) and bot['kubeconfig']:
+        resolved, problem = resolve_bot_kubeconfig(bot['kubeconfig'])
+        if problem:
+            errors.append(problem)
     clusters = data.get('clusters')
     if not isinstance(clusters, dict) or not clusters:
         errors.append('[clusters.<name>] needs at least one cluster')
@@ -172,5 +178,6 @@ def load_profiles():
         validate_cluster(name, prof, errors)
     if errors:
         raise ProfileError('profiles_invalid', f'{path}: ' + '; '.join(errors))
-    bot = dict(bot, kubeconfig=os.path.expanduser(bot['kubeconfig']))
+    # From here on every reader uses the resolved path, the one that was checked.
+    bot = dict(bot, kubeconfig=resolved)
     return {'schema_version': SCHEMA_VERSION, 'bot': bot, 'clusters': clusters}
