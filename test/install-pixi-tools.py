@@ -31,7 +31,7 @@ STUBS = {
             ' "cp \\"$PIXI_TEMPLATE\\" \\"\\$d/pixi\\""',
 }
 MIGRATED_BINARIES = ['bat', 'eza', 'rg', 'fd', 'zoxide', 'dust', 'procs', 'hx', 'zellij', 'lazygit', 'yazi',
-                     'broot', 'just', 'watchexec', 'hyperfine', 'tokei', 'starship', 'rclone', 'gh']
+                     'broot', 'just', 'watchexec', 'hyperfine', 'tokei', 'starship', 'rclone', 'gh', 'glab']
 
 
 class PixiTools(unittest.TestCase):
@@ -99,6 +99,7 @@ class PixiTools(unittest.TestCase):
         self.assertNotIn('fd', installed)
         self.assertIn('broot', installed)
         self.assertIn('tokei', installed)
+        self.assertIn('glab', installed)
         for name in MIGRATED_BINARIES:
             self.assertTrue((self.pixi_bin() / name).exists(), name)
             self.assertFalse((self.system_bin / name).exists(), name)
