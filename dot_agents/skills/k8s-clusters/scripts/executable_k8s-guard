@@ -204,7 +204,12 @@ def is_not_found(err):
 
 
 def kubectl_error(args, rc, err):
-    return Refusal('kubectl_error', scrub(f'kubectl {" ".join(args[:3])} exited {rc}: {err.strip()[:600]}'))
+    return Refusal('kubectl_error', f'kubectl {" ".join(args[:3])} exited {rc}: {clip(err, 600)}')
+
+
+def clip(text, n):
+    """Redact first, then cut: a cut through a secret would leave a prefix no redaction can find."""
+    return scrub(str(text).strip())[:n]
 
 
 # --- bb (the k8s-leases plugin) ---------------------------------------------------
@@ -232,12 +237,12 @@ def bb(*args):
     except json.JSONDecodeError:
         body = None
     if not isinstance(body, dict):
-        return BbResult(offline=True, error=(p.stderr or p.stdout).strip()[:300] or f'bb exited {p.returncode}')
+        return BbResult(offline=True, error=clip(p.stderr or p.stdout, 300) or f'bb exited {p.returncode}')
     if p.returncode == 0 and 'error' not in body:
         return BbResult(value=body)
     code = body.get('code') if isinstance(body.get('code'), str) and re.match(r'^[a-z0-9_]{1,64}$',
                                                                               body.get('code') or '') else 'lease_error'
-    return BbResult(code=code, error=str(body.get('error', f'bb exited {p.returncode}'))[:300])
+    return BbResult(code=code, error=clip(body.get('error', f'bb exited {p.returncode}'), 300))
 
 
 def lease_show(lease_id):
@@ -371,6 +376,8 @@ class NsView:
         self.lease_id = data.get('lease_id') or None
         # The record's expiry counts only for the namespace it was written in.
         self.record_expires = data.get('expires_at') if data.get('uid') == self.uid else None
+        # The record must come from the namespace whose UID was read, not one re-created in between.
+        confirm_uid(g, ns, self.uid)
 
     def expires_at(self):
         return self.record_expires or self.annotations.get(EXPIRES_ANNOTATION)
@@ -548,6 +555,9 @@ def walk_forbidden(node, where):
                 raise Refusal('field_refused', f'{here}: priorityClassName is refused')
             if key == 'privileged' and value is True:
                 raise Refusal('field_refused', f'{here}: privileged containers are refused')
+            if key in ('nodeName', 'schedulerName') and value:
+                raise Refusal('field_refused', f'{here}: {key} bypasses the scheduler rules the one-node lease '
+                                               'relies on')
             if key in ('hostNetwork', 'hostPID', 'hostIPC') and value is True:
                 raise Refusal('field_refused', f'{here}: {key} is refused')
             if key in ('resourceClaims', 'resourceClaimTemplateName') and value:
@@ -648,11 +658,14 @@ def check_dgd(dgd, where):
 
 def admit(objects, ns):
     """Check every object the dry run returned. Returns the DGDs among them."""
-    dgds = []
+    dgds, seen = [], set()
     for i, obj in enumerate(objects):
         kind, api = obj.get('kind'), obj.get('apiVersion')
         meta = obj.get('metadata') or {}
         where = f'{kind}/{meta.get("name")}'
+        if (kind, meta.get('name')) in seen:
+            raise Refusal('duplicate_object', f'{where} appears twice; kubectl would write both, one at a time')
+        seen.add((kind, meta.get('name')))
         if meta.get('namespace') != ns:
             raise Refusal('kind_refused', f'{where} is not a namespaced object in {ns}')
         if kind == DGD_KIND and api in DGD_VERSIONS:
@@ -782,7 +795,10 @@ def teardown_authority(g, view, uid_arg, lease_arg):
                 return f'lease {lease_id} is {lease["state"]}'
             if lease['state'] == 'active':
                 raise Refusal('lease_active', f'lease {lease_id} is active; only its owner\'s down may end it')
-            # released or torn-down: the plugin vouches for nothing; fall back to the namespace's expiry.
+            # released or torn-down: the plugin answered, so rule (b), which is for an unreachable plugin,
+            # does not apply, and the plugin no longer vouches for this namespace.
+            raise Refusal('lease_ended', f'lease {lease_id} is {lease["state"]}; the plugin gives no teardown '
+                                         'authority for it')
         elif not res.offline:
             raise Refusal(res.code, f'lease {lease_id}: {res.error}')
     if not uid_arg:
@@ -874,11 +890,15 @@ def cmd_lease_acquire(g, a):
     parse_time(expires, 'the lease expiry')
     cm = {'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': LEASE_RECORD, 'namespace': ns},
           'data': {'lease_id': lease_id, 'expires_at': expires, 'thread': g.thread, 'uid': view.uid}}
-    rc, out, err = g.kc.run('create', '-f', '-', '-n', ns, '-o', 'json', input=json.dumps(cm))
+    try:
+        confirm_uid(g, ns, view.uid)
+        rc, out, err = g.kc.run('create', '-f', '-', '-n', ns, '-o', 'json', input=json.dumps(cm))
+    except Refusal as e:
+        rc, err = 1, f'{e.code}: {e}'
     if rc != 0:
-        raise Refusal('lease_record_failed', scrub(f'lease {lease_id} is granted, but its record could not be written '
-                                                   f'({err.strip()[:300]}); run `bb k8s lease release {lease_id}`, '
-                                                   'which tears the namespace down'), lease_id=lease_id)
+        raise Refusal('lease_record_failed', f'lease {lease_id} is granted, but its record could not be written '
+                                             f'({clip(err, 300)}); run `bb k8s lease release {lease_id}`, '
+                                             'which tears the namespace down', lease_id=lease_id)
     g.record(ns, f'ConfigMap/{LEASE_RECORD}', 0, 'up', uid=view.uid, lease=lease_id, issue=view.issue)
     return {'lease_id': lease_id, 'expires_at': expires, 'namespace': ns,
             'pod_label': {LEASE_LABEL: lease_id},
@@ -905,7 +925,7 @@ def cmd_secret(g, a):
         if value:
             remember_secret(value)
         if p.returncode != 0 or not value:
-            raise Refusal('secret_unavailable', scrub(f'fleet secret get exited {p.returncode}: {p.stderr.strip()[:200]}'))
+            raise Refusal('secret_unavailable', f'fleet secret get exited {p.returncode}: {clip(p.stderr, 200)}')
         if a.which == 'ngc':
             auth = base64.b64encode(f'$oauthtoken:{value}'.encode()).decode()
             payload = json.dumps({'auths': {'nvcr.io': {'username': '$oauthtoken', 'password': value, 'auth': auth}}})
@@ -917,6 +937,7 @@ def cmd_secret(g, a):
             args.append(f'--type={spec["type"]}')
         if slot:
             slot.check()
+        confirm_uid(g, ns, view.uid)
         rc, out, err = g.kc.run(*args, input=payload)
         if rc != 0:
             if 'AlreadyExists' in err:
@@ -945,12 +966,15 @@ def cmd_apply(g, a):
         if not objects:
             raise Refusal('usage', f'{a.filename} holds no objects', status=2)
         new = admit(objects, ns)
-        existing = {(d.get('metadata') or {}).get('name'): d for d in g.dgds(ns)}
-        for d in new:
-            existing[d['metadata']['name']] = d  # a re-apply replaces, never adds
-        after = list(existing.values())
+        state = {(d.get('metadata') or {}).get('name'): d for d in g.dgds(ns)}
         pods = g.pods(ns)
-        total = allocation(after, pods)
+        # kubectl writes the objects one at a time, and a failure keeps the earlier writes. So every
+        # prefix of the apply must fit, not only the end state. A re-apply replaces, never adds.
+        total = allocation(state.values(), pods)
+        for d in new:
+            state[d['metadata']['name']] = d
+            total = max(total, allocation(state.values(), pods))
+        after = list(state.values())
         if lease is None:
             if total > 0:
                 raise Refusal('lease_required', f'{ns} would hold {total} GPUs and has no lease; '
@@ -966,6 +990,7 @@ def cmd_apply(g, a):
                               allocation=total)
             check_one_node(after, lease, g.profile)
             slot.check()
+        confirm_uid(g, ns, view.uid)
         out = g.kc.json('apply', '-f', '-', '-n', ns, '-o', 'json',
                         f'--request-timeout={APPLY_REQUEST_TIMEOUT}s', input=manifest,
                         timeout=APPLY_REQUEST_TIMEOUT + 15)
@@ -999,19 +1024,30 @@ def cmd_delete(g, a):
         raise Refusal('object_protected', f'{kind}/{name} is not deleted on its own (runbook section 10)')
     view = NsView(g, ns)
     view.require_owner(g)
-    gpus = 0
-    if kind == DGD_KIND:
-        obj = g.kc.json('get', f'{resource}/{name}', '-n', ns, '-o', 'json', not_found=MISSING)
-        if obj is MISSING:
-            raise Refusal('not_found', f'{kind}/{name} not found in {ns}')
-        gpus = dgd_gpus(obj)
-    rc, out, err = g.kc.run('delete', f'{resource}/{name}', '-n', ns, '--wait=false')
-    if rc != 0:
-        if is_not_found(err):
-            raise Refusal('not_found', f'{kind}/{name} not found in {ns}')
-        raise kubectl_error(('delete', f'{resource}/{name}'), rc, err)
-    g.record(ns, f'{kind}/{name}', gpus, 'down', uid=view.uid, lease=view.lease_id, issue=view.issue)
-    return {'deleted': f'{kind}/{name}', 'namespace': ns}
+
+    def body(lease, slot):
+        # Like every owner write: an active lease and its slot, or a namespace that holds no GPUs.
+        # Teardown of a namespace without that is `down` or `expire`, under their own authority.
+        if lease is None and allocation(g.dgds(ns), g.pods(ns)) > 0:
+            raise Refusal('lease_required', f'{ns} holds GPUs but has no lease; use `k8s-guard down`')
+        gpus = 0
+        if kind == DGD_KIND:
+            obj = g.kc.json('get', f'{resource}/{name}', '-n', ns, '-o', 'json', not_found=MISSING)
+            if obj is MISSING:
+                raise Refusal('not_found', f'{kind}/{name} not found in {ns}')
+            gpus = dgd_gpus(obj)
+        if slot:
+            slot.check()
+        confirm_uid(g, ns, view.uid)
+        rc, out, err = g.kc.run('delete', f'{resource}/{name}', '-n', ns, '--wait=false')
+        if rc != 0:
+            if is_not_found(err):
+                raise Refusal('not_found', f'{kind}/{name} not found in {ns}')
+            raise kubectl_error(('delete', f'{resource}/{name}'), rc, err)
+        g.record(ns, f'{kind}/{name}', gpus, 'down', uid=view.uid, lease=view.lease_id, issue=view.issue)
+        return {'deleted': f'{kind}/{name}', 'namespace': ns}
+
+    return fenced(g, view, body)
 
 
 def dgd_path(dgd, ns):
@@ -1184,6 +1220,7 @@ def cmd_extend(g, a):
     if view.record is None:
         cm = {'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': LEASE_RECORD, 'namespace': ns},
               'data': {'lease_id': lease_id, 'expires_at': expires, 'thread': lease['thread'], 'uid': view.uid}}
+        confirm_uid(g, ns, view.uid)
         g.kc.json('create', '-f', '-', '-n', ns, '-o', 'json', input=json.dumps(cm))
     else:
         if view.lease_id != lease_id:
@@ -1196,10 +1233,11 @@ def cmd_extend(g, a):
         cm = copy.deepcopy(view.record)
         cm['data'] = dict(cm.get('data') or {}, expires_at=expires, uid=view.uid)
         # replace carries the resourceVersion read above: a concurrent change fails with a conflict.
+        confirm_uid(g, ns, view.uid)
         rc, out, err = g.kc.run('replace', '-f', '-', '-n', ns, '-o', 'json', input=json.dumps(cm))
         if rc != 0:
             code = 'record_conflict' if 'Conflict' in err else 'kubectl_error'
-            raise Refusal(code, scrub(f'could not update {LEASE_RECORD}: {err.strip()[:300]}'))
+            raise Refusal(code, f'could not update {LEASE_RECORD}: {clip(err, 300)}')
     g.record(ns, f'ConfigMap/{LEASE_RECORD}', 0, 'extend', uid=view.uid, lease=lease_id, issue=view.issue)
     return {'namespace': ns, 'lease_id': lease_id, 'expires_at': expires}
 

@@ -996,7 +996,6 @@ class Budget(GuardCase):
         self.assertEqual(body.get('code'), 'lease_required', body)
         self.assertEqual(self.writes(), [])
 
-    @unittest.skip("F2: duplicate DGD names hide an unleased GPU write before a partial apply failure")
     def test_duplicate_dgd_documents_cannot_leave_gpus_without_a_lease(self):
         # Each object is a separate API write; a later failure keeps earlier writes.
         hook = """for obj in docs(stdin):
@@ -1142,7 +1141,38 @@ class Budget(GuardCase):
                 self.assertEqual(body.get('code'), 'one_node_required', body)
         self.assertEqual(self.writes(), [])
 
-    @unittest.skip("F3: nodeName bypasses the affinity check and permits two nodes on a single-node lease")
+    def test_every_prefix_of_the_apply_must_fit(self):
+        # Growing a new DGD before shrinking an old one: the end state fits, the moment between does not.
+        lid = self.add_lease(gpus=4)
+        self.add_obj(gpu_dgd('old', 4, lid))
+        rc, body, _ = self.apply(gpu_dgd('new', 4, lid), gpu_dgd('old', 4, lid, replicas=0))
+        self.assertEqual(body.get('code'), 'over_lease', body)
+        self.assertEqual(body.get('allocation'), 8, body)
+        self.assertEqual(self.writes(), [])
+        # Shrink first, then grow: every prefix fits.
+        self.assertEqual(self.apply(gpu_dgd('old', 4, lid, replicas=0), gpu_dgd('new', 4, lid))[0], 0)
+
+    def test_scheduler_name_refused(self):
+        lid = self.add_lease(gpus=2)
+        c = component('decode', gpus=1, lease_id=lid)
+        c['podTemplate']['spec']['schedulerName'] = 'some-scheduler'
+        rc, body, _ = self.apply(dgd('w', c))
+        self.assertEqual(body.get('code'), 'field_refused', body)
+        self.assertEqual(self.writes(), [])
+
+    def test_namespace_recreated_before_the_apply_refused(self):
+        lid = self.add_lease(gpus=4)
+        hook = """if cmd == 'apply':
+    if flags.get('--dry-run') == 'server':
+        st['namespaces'][ns_flag]['metadata']['uid'] = 'uid-recreated'
+        save()"""
+        fake = FAKE_KUBECTL.replace("if cmd == 'apply':", hook, 1)
+        self.assertNotEqual(fake, FAKE_KUBECTL)
+        (self.bin / 'kubectl').write_text(fake.replace(hook, hook + "\n    st = json.load(open(STATE))", 1))
+        rc, body, _ = self.apply(gpu_dgd('w', 1, lid))
+        self.assertEqual(body.get('code'), 'uid_mismatch', body)
+        self.assertEqual(self.writes(), [])
+
     def test_node_name_cannot_bypass_single_node_lease(self):
         lid = self.add_lease(gpus=2, multi_node=False)
         first = component('first', gpus=1, lease_id=lid)
@@ -1349,7 +1379,6 @@ class Expire(GuardCase):
         self.assertEqual(body.get('code'), 'lease_not_found')
         self.assertEqual(self.replicas(), [1, 2])
 
-    @unittest.skip("F4: released and torn-down replies incorrectly grant offline teardown authority")
     def test_terminal_lease_reply_cannot_use_offline_teardown_authority(self):
         for method in ('expire', 'down'):
             for state in ('released', 'torn-down'):
@@ -1564,7 +1593,6 @@ class Extend(GuardCase):
         self.k8s['forbid'] = ['patch namespace']
         self.flush()
 
-    @unittest.skip("F1: extend creates the old lease record in a re-created namespace")
     def test_recreated_namespace_between_uid_and_record_read_refused(self):
         lid = self.add_lease(thread=OTHER)
         hook = """if what == 'configmap':
@@ -1753,7 +1781,6 @@ class Secrets(GuardCase):
         self.assertNotEqual(rc, 0)
         self.assert_no_leak(p)
 
-    @unittest.skip("F6: truncating kubectl stderr before scrubbing leaks a secret prefix")
     def test_secret_crossing_error_truncation_boundary_is_scrubbed(self):
         self.add_ns()
         self.k8s['forbid'] = ['create secret']
@@ -1794,7 +1821,6 @@ class Delete(GuardCase):
         self.assertEqual((self.ledger()[-1]['direction'], self.ledger()[-1]['gpus']), ('down', 2))
         self.assertEqual(body['deleted'], 'DynamoGraphDeployment/w')
 
-    @unittest.skip("F5: delete skips lease validation, op begin, deadline checks, and op end")
     def test_delete_in_gpu_namespace_requires_active_lease_and_slot(self):
         for mode in ('no_lease', 'revoking', 'offline', 'slot_busy', 'slot_expired'):
             with self.subTest(mode=mode):

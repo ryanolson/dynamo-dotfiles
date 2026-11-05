@@ -12,7 +12,7 @@ Every command prints one JSON object on stdout. A refusal exits non-zero with `{
 | `-n <ns> lease acquire --gpus <n> --hours <h>` | the namespace's thread | Calls `bb k8s lease acquire` with the profile name, the namespace UID, the thread, and the profile's GPU type. Writes the lease record (below). Prints the pod label and pod affinity that GPU pods must carry. |
 | `-n <ns> secret hf\|ngc` | the namespace's thread | Pipes `fleet secret get` into `kubectl create secret ... --from-file=<key>=/dev/stdin`. Prints only the secret's name. |
 | `-n <ns> apply -f <file>` | the namespace's thread | Applies DGDs, ConfigMaps and ClusterIP Services, after the checks below. |
-| `-n <ns> delete <kind>/<name>` | the namespace's thread | Deletes one DGD, ConfigMap, Service, Secret, PVC or PodCliqueSet. The lease record, the model cache PVC and the pull secret are refused. |
+| `-n <ns> delete <kind>/<name>` | the namespace's thread | Deletes one DGD, ConfigMap, Service, Secret, PVC or PodCliqueSet. The lease record, the model cache PVC and the pull secret are refused. Like `apply`, it takes the lease's slot, or needs a namespace that holds no GPUs. |
 | `down <ns> [--uid <uid>] [--lease <id>]` | the namespace's thread, or anyone with teardown authority | Releases an active lease first (owner only). Deletes each DGD with its UID as a precondition, waits for GPU pods to go, then deletes the namespace with its UID as a precondition. |
 | `expire <ns> [--uid <uid>] [--lease <id>]` | anyone with teardown authority | Sets every replica count of every DGD to 0. |
 | `extend <ns> [--uid <uid>] [--lease <id>]` | anyone | Copies the lease's `expires_at`, unchanged, into the lease record. The lease must be `active` and match the cluster, the namespace and the UID. It never moves the stored expiry earlier, so a late call cannot undo a newer extension. |
@@ -38,14 +38,16 @@ The guard parses no YAML. It reads the file once and sends the same bytes to `ku
 
 - **Kinds:** `DynamoGraphDeployment` (`nvidia.com/v1alpha1` or `v1beta1`), `ConfigMap`, and `Service` of type `ClusterIP`. Each object must be in the `-n` namespace.
 - **DGD fields:** only the fields the guard can count. Refused: scaling adapters, enabled autoscaling, planner, EPP and LPX components, `roles`, DRA resource claims, any GPU resource other than `nvidia.com/gpu`, PVCs the DGD would create, and any field the guard does not know.
-- **Pod specs:** no `hostPath`, `priorityClassName`, privileged containers, `hostNetwork`, `hostPID` or `hostIPC`, and no toleration with `operator: Exists` and no key. Every container needs `cpu` and `memory` in both requests and limits.
-- **Name:** a DGD name has at most 39 characters.
+- **Pod specs:** no `hostPath`, `priorityClassName`, `nodeName`, `schedulerName`, privileged containers, `hostNetwork`, `hostPID` or `hostIPC`, and no toleration with `operator: Exists` and no key. Every container needs `cpu` and `memory` in both requests and limits.
+- **Name:** a DGD name has at most 39 characters. An object may appear only once in a file.
 
 ## Budget
 
 A DGD's allocation is the larger of two numbers: its spec (replicas times nodes times GPUs per pod) and the GPUs its pods still request. Terminating pods count. Finished pods do not. GPU pods that belong to no DGD count on their own. The namespace's allocation is the sum.
 
-With no lease record, the allocation after the apply must be 0. With a record, the guard:
+`kubectl` writes the objects of a file one at a time, and a failure keeps the earlier writes. So the guard checks the allocation after each DGD in the file, and the largest one counts.
+
+With no lease record, that allocation must be 0. With a record, the guard:
 
 1. reads the lease. It must be `active` and match this thread, the profile name, the namespace, its UID, and the profile's GPU type;
 2. takes the lease's slot (`bb k8s lease op begin`);
@@ -55,7 +57,7 @@ With no lease record, the allocation after the apply must be 0. With a record, t
 6. refuses when less than 40 seconds of the slot are left, and otherwise applies;
 7. calls `op end`. When it reports the lease as no longer `active`, the guard runs `expire` at once and exits with `lease_revoked`.
 
-Every write in a namespace with a lease record takes the slot, GPU or not.
+Every write in a namespace with a lease record takes the slot, GPU or not. `secret` and `delete` follow the same rule.
 
 ## Teardown authority
 
@@ -64,7 +66,11 @@ Every write in a namespace with a lease record takes the slot, GPU or not.
 - the plugin says the lease is `revoking` or `releasing`, for this cluster, namespace and UID;
 - the plugin cannot be reached, `--uid` matches the namespace, and the namespace's expiry has passed.
 
-A JSON error from the plugin, such as an unknown lease, is an answer, not an outage, and is refused. `down` stops with `pods_left` while GPU pods remain, and keeps the namespace.
+A JSON error from the plugin, such as an unknown lease, is an answer, not an outage, and is refused. So is a lease the plugin reports as `released` or `torn-down`. `down` stops with `pods_left` while GPU pods remain, and keeps the namespace.
+
+## A re-created namespace
+
+`k8s-leases` sends `expire`, `down` and `extend` with the UID it stored, without reading the namespace first. The guard refuses a `--uid` that differs from the namespace, before any write. It also reads the namespace again after it reads the lease record, after it lists the DGDs, and just before each write, and refuses when the UID has changed. Deletes carry the UID as a precondition. The window that remains is one read before one write.
 
 ## Ledger
 
