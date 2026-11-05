@@ -1484,5 +1484,30 @@ class AdversarialReview(GuardCase):
         self.refused('entry_name', 'check', '--mr', str(iid), '--namespace', NS)
 
 
+class PassTwoReview(GuardCase):
+
+    def test_json_escaped_token_echo_is_redacted_before_state_and_bb(self):
+        iid = self.deployed_mr()
+        self.gl.mrs[(PID, iid)]['web_url'] += f'?diagnostic={SECRET}'
+        original = self.gl.route
+
+        def escaped_echo(method, parts, query, body, raw):
+            status, headers, payload = original(method, parts, query, body, raw)
+            if method == 'GET' and parts == ['projects', str(PID), 'merge_requests', str(iid)]:
+                wire = json.dumps(payload).replace(SECRET, f'\\u{ord(SECRET[0]):04x}{SECRET[1:]}')
+                self.assertFalse(SECRET in wire)
+                self.assertTrue(SECRET in json.loads(wire)['web_url'])
+                return status, headers, wire
+            return status, headers, payload
+
+        self.gl.route = escaped_echo
+        self.check(iid)
+        self.ask(iid)
+        exposed = [path.name for path in (self.state_home / 'astra-guard').iterdir()
+                   if path.is_file() and SECRET in path.read_text()]
+        exposed += ['bb argv' for call in self.bb_calls() if SECRET in json.dumps(call['argv'])]
+        self.assertEqual(exposed, [], 'JSON escapes must not bypass response redaction')
+
+
 if __name__ == '__main__':
     unittest.main()
