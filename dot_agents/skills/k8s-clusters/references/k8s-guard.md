@@ -8,7 +8,7 @@ Every command prints one JSON object on stdout. A refusal exits non-zero with `{
 
 | Command | Who may run it | What it does |
 |---|---|---|
-| `ns create <purpose> --issue <n> --hours <h>` | a bb thread | Creates `<namespace_prefix><n>-<purpose>` with the opt-in labels, `owner`, `wcep.agent/thread`, `wcep.agent/issue`, and the annotation `wcep.agent/expires-at`. `h` is at most 4. A name that exists is refused. |
+| `ns create <purpose> --issue <n> --hours <h>` | a bb thread | Creates `<namespace_prefix><n>-<purpose>-<suffix>`, where the suffix is 5 random letters and digits from the CSPRNG, with the opt-in labels, `owner`, `wcep.agent/thread`, `wcep.agent/issue`, and the annotation `wcep.agent/expires-at`. `h` is at most 4. A name that exists is refused, and a name longer than 63 characters. It records the name and UID in the thread's ledger. |
 | `-n <ns> lease acquire --gpus <n> --hours <h>` | the namespace's thread | Calls `bb k8s lease acquire` with the profile name, the namespace UID, the thread, and the profile's GPU type. Writes the lease record (below). Prints the pod label and pod affinity that GPU pods must carry. |
 | `-n <ns> secret hf\|ngc` | the namespace's thread | Pipes `fleet secret get` into `kubectl create secret ... --from-file=<key>=/dev/stdin`. Prints only the secret's name. |
 | `-n <ns> apply -f <file>` | the namespace's thread | Applies DGDs, ConfigMaps and ClusterIP Services, after the checks below. |
@@ -16,10 +16,12 @@ Every command prints one JSON object on stdout. A refusal exits non-zero with `{
 | `down <ns> [--uid <uid>] [--lease <id>]` | the namespace's thread, or anyone with teardown authority | Releases an active lease first (owner only). Deletes each DGD with its UID as a precondition, waits for GPU pods to go, then deletes the namespace with its UID as a precondition. |
 | `expire <ns> [--uid <uid>] [--lease <id>]` | anyone with teardown authority | Sets every replica count of every DGD to 0. |
 | `extend <ns> [--uid <uid>] [--lease <id>]` | anyone | Copies the lease's `expires_at`, unchanged, into the lease record. It only replaces the record `lease acquire` wrote, under the `resourceVersion` it read, and never creates one. The lease must be `active` and match the cluster, the namespace and the UID. It never moves the stored expiry earlier, so a late call cannot undo a newer extension. |
-| `-n <ns> selftest fences` | the namespace's thread | For the first run on a cluster. On the first DGD the guard applied, it sends each teardown fence once with a wrong UID or a stale `resourceVersion`: two JSON patches, a DGD delete, a namespace delete, and a lease record replace. Each payload changes nothing even if the server ignored its fence. It prints each server response, reads the objects again, and fails with `fence_failed` unless every request was refused and nothing changed. |
+| `-n <ns> selftest fences` | the namespace's thread | For the first run on a cluster. On the first DGD the guard applied, it sends each teardown fence once with a wrong UID or a stale `resourceVersion`: two JSON patches, a DGD delete, a namespace delete, and a lease record replace. Each payload changes nothing even if the server ignored its fence. It prints each server response and reads the objects again. It fails with `fence_failed` unless every request was refused for its fence's own reason (`testing value`, `Precondition failed`, `the object has been modified`) and nothing changed. Another error, such as Forbidden, proves nothing. |
 | `inspect <ns>` | anyone | Read only. Prints `uid`, `thread`, `expires_at`, `dgd_gpus`, `pod_gpus`, `gpu_type`, `gpu_pods_left`, and also `allocation` and `lease_id`. A missing namespace gives code `not_found`; any other failure gives another code. |
 
-Every command needs `--context`. `-n` can come anywhere. Everything else is refused, including `scale`, `patch`, `edit`, `replace`, `set`, `label`, `annotate`, `get`, and `-A`.
+Every command needs `--context`. `-n` can come anywhere.
+
+The commands for the namespace's thread (`lease acquire`, `secret`, `apply`, `delete`, `selftest fences`, and the owner's `down`) take the namespace from the thread's ledger, `$BB_THREAD_STORAGE/k8s-ledger.jsonl`. A given `-n` must be a namespace this thread created, and its UID must still be the one recorded. Without `-n`, the thread's only live namespace is used. Everything else is refused, including `scale`, `patch`, `edit`, `replace`, `set`, `label`, `annotate`, `get`, and `-A`.
 
 ## Identity and cluster
 
@@ -60,7 +62,7 @@ With no lease record, that allocation must be 0. With a record, the guard:
 3. runs the dry run and every check, and reads the DGDs and pods again;
 4. refuses when the allocation is more than the lease;
 5. without `multi_node`, refuses when the allocation is more than one node of the profile, and when a GPU pod lacks the label `wcep.agent/lease=<id>` or a required pod affinity to that label on `kubernetes.io/hostname`;
-6. reads the namespace UID once more, then refuses when less than 40 seconds of the slot are left, and otherwise applies;
+6. reads the namespace UID once more, then applies the objects one request at a time. Before each one it refuses when less than 40 seconds of the slot are left, and it stops `kubectl` before the slot ends. Objects already applied stay; the budget above counts every subset;
 7. calls `op end`. When it reports the lease as no longer `active`, the guard runs `expire` at once and exits with `lease_revoked`.
 
 Every write in a namespace with a lease record takes the slot, GPU or not. `secret` and `delete` follow the same rule.
@@ -75,6 +77,8 @@ Every write in a namespace with a lease record takes the slot, GPU or not. `secr
 A JSON error from the plugin, such as an unknown lease, is an answer, not an outage, and is refused. So is a lease the plugin reports as `released` or `torn-down`. `down` stops with `pods_left` while GPU pods remain, and keeps the namespace.
 
 ## A re-created namespace
+
+A namespace name is never made twice: `ns create` adds a random suffix and refuses a name that exists. So no namespace can be re-created under a name an earlier one had, through the guard. The checks below stay as defense in depth.
 
 `k8s-leases` sends `expire`, `down` and `extend` with the UID it stored, without reading the namespace first. The guard refuses a `--uid` that differs from the namespace, before any write.
 

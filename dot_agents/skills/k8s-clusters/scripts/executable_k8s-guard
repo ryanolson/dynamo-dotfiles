@@ -32,6 +32,7 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -306,6 +307,57 @@ class Guard:
             raise Refusal('namespace_not_ours', f'{ns} is not one of our namespaces ({prefix}*)')
         return ns
 
+    def ledger_namespaces(self):
+        """This thread's live namespaces on this cluster, name to UID, from its own ledger."""
+        storage = os.environ.get('BB_THREAD_STORAGE')
+        if not storage:
+            raise Refusal('ledger_required', 'BB_THREAD_STORAGE is unset; the thread ledger names its namespaces')
+        live = {}
+        try:
+            lines = (Path(storage) / 'k8s-ledger.jsonl').read_text().splitlines()
+        except FileNotFoundError:
+            lines = []
+        for text in lines:
+            try:
+                line = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if (not isinstance(line, dict) or line.get('thread') != self.thread or line.get('cluster') != self.cluster
+                    or line.get('object') != f'Namespace/{line.get("namespace")}'):
+                continue
+            if line.get('direction') == 'up' and line.get('created'):
+                live[line['namespace']] = line.get('uid')
+            elif line.get('direction') == 'down' and line.get('deleted'):
+                live.pop(line['namespace'], None)
+        return live
+
+    def owned(self):
+        """The caller's namespace and the UID it was created with, from the thread's ledger.
+
+        Names are never reused (ns create adds a random suffix), and a caller-given -n is accepted only
+        when it is one of the thread's own namespaces. With no -n, the thread's only live namespace.
+        """
+        self.require_thread()
+        live = self.ledger_namespaces()
+        if self.namespace is None:
+            if len(live) != 1:
+                raise Refusal('namespace_required', 'name the namespace with -n; this thread has '
+                                                    f'{", ".join(sorted(live)) or "none"} on {self.cluster}')
+            name = self.ns_name(next(iter(live)))
+        else:
+            name = self.ns_name()
+        if name not in live:
+            # Read the label first, for a clearer refusal when the namespace belongs to another thread.
+            NsView(self, name).require_owner(self)
+            raise Refusal('namespace_not_in_ledger', f'{name} is not in this thread\'s ledger; the guard writes '
+                                                     'only in namespaces this thread created')
+        view = NsView(self, name)
+        view.require_owner(self)
+        if view.uid != live[name]:
+            raise Refusal('uid_mismatch', f'{name} has UID {view.uid}, not {live[name]} from the ledger: it was '
+                                          're-created; left alone')
+        return name, view
+
     # --- reads ---
 
     def get_namespace(self, ns):
@@ -326,10 +378,10 @@ class Guard:
 
     # --- ledger ---
 
-    def record(self, ns, obj, gpus, direction, uid=None, lease=None, issue=None):
+    def record(self, ns, obj, gpus, direction, uid=None, lease=None, issue=None, **extra):
         line = {'time': rfc3339(now()), 'thread': self.thread, 'cluster': self.cluster, 'context': self.context,
                 'namespace': ns, 'uid': uid, 'object': obj, 'gpus': gpus, 'direction': direction, 'lease': lease,
-                'issue': issue}
+                'issue': issue, **extra}
         text = scrub(json.dumps(line)) + '\n'
         state = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state')
         paths = [state / 'k8s-guard/ledger.jsonl']
@@ -393,8 +445,15 @@ class Slot:
     def __init__(self, lease_id, token, deadline):
         self.lease_id, self.token, self.deadline = lease_id, token, deadline
 
+    def left(self):
+        return (self.deadline - now()).total_seconds()
+
+    def timeout(self):
+        """How long one kubectl call may run: it is stopped before the slot ends."""
+        return max(1, min(APPLY_REQUEST_TIMEOUT + 15, self.left() - 2))
+
     def check(self):
-        left = (self.deadline - now()).total_seconds()
+        left = self.left()
         if left < SLOT_MARGIN:
             raise Refusal('slot_expired', f'the operation slot of {self.lease_id} has {max(left, 0):.0f}s left, '
                                           f'less than the {SLOT_MARGIN}s an apply may take; try again')
@@ -500,9 +559,12 @@ def cmd_ns_create(g, a):
     if not re.match(r'^[0-9]{1,10}$', a.issue):
         raise Refusal('usage', f'--issue {a.issue!r} must be the issue number', status=2)
     hours = hours_arg(a.hours, MAX_NS_HOURS)
-    ns = f'{g.bot["namespace_prefix"]}{a.issue}-{a.purpose}'
+    # A random suffix from the CSPRNG: a name is never made twice, so no namespace is ever re-created
+    # under a name an earlier one had, and a name identifies one namespace instance.
+    suffix = ''.join(secrets.choice('abcdefghijklmnopqrstuvwxyz0123456789') for _ in range(5))
+    ns = f'{g.bot["namespace_prefix"]}{a.issue}-{a.purpose}-{suffix}'
     if len(ns) > 63:
-        raise Refusal('usage', f'{ns} is longer than 63 characters', status=2)
+        raise Refusal('usage', f'{ns} is longer than 63 characters; shorten the purpose', status=2)
     developer = g.bot['developer']
     expires = rfc3339(now() + timedelta(hours=hours))
     manifest = {'apiVersion': 'v1', 'kind': 'Namespace', 'metadata': {
@@ -517,7 +579,7 @@ def cmd_ns_create(g, a):
             raise Refusal('namespace_exists', f'{ns} already exists; namespaces are never adopted')
         raise kubectl_error(('create', 'namespace', ns), rc, err)
     uid = json.loads(out)['metadata']['uid']
-    g.record(ns, f'Namespace/{ns}', 0, 'up', uid=uid, issue=a.issue)
+    g.record(ns, f'Namespace/{ns}', 0, 'up', uid=uid, issue=a.issue, created=True)
     return {'namespace': ns, 'uid': uid, 'expires_at': expires, 'cluster': g.cluster}
 
 
@@ -533,9 +595,7 @@ def hours_arg(text, maximum):
 
 def cmd_lease_acquire(g, a):
     g.require_writable()
-    ns = g.ns_name()
-    view = NsView(g, ns)
-    view.require_owner(g)
+    ns, view = g.owned()
     if view.record is not None:
         raise Refusal('lease_exists', f'{ns} already has a lease record ({view.lease_id}); a namespace gets one lease')
     if not re.match(r'^[1-9][0-9]{0,3}$', a.gpus):
@@ -572,9 +632,7 @@ def cmd_lease_acquire(g, a):
 
 def cmd_secret(g, a):
     g.require_writable()
-    ns = g.ns_name()
-    view = NsView(g, ns)
-    view.require_owner(g)
+    ns, view = g.owned()
     spec = SECRETS[a.which]
 
     def body(lease, slot):
@@ -636,13 +694,11 @@ def stamp(g, manifest, uid):
 
 def cmd_apply(g, a):
     g.require_writable()
-    ns = g.ns_name()
     try:
         manifest = Path(a.filename).read_bytes().decode()
     except (OSError, UnicodeDecodeError) as e:
         raise Refusal('usage', f'cannot read {a.filename}: {e}', status=2)
-    view = NsView(g, ns)
-    view.require_owner(g)
+    ns, view = g.owned()
 
     def body(lease, slot):
         # kubectl, run locally, parses the file and stamps every object with the namespace's UID;
@@ -678,16 +734,24 @@ def cmd_apply(g, a):
             check_one_node(after, lease, g.profile)
             check_gpu_product(after, g.profile)
         confirm_uid(g, ns, view.uid)
-        if slot:
-            slot.check()  # last thing before the write
-        out = g.kc.json('apply', '-f', '-', '-n', ns, '-o', 'json',
-                        f'--request-timeout={APPLY_REQUEST_TIMEOUT}s', input=stamped,
-                        timeout=APPLY_REQUEST_TIMEOUT + 15)
-        applied = out.get('items') if out.get('kind') == 'List' else [out]
+        # One request per object, each started only with time left in the slot and stopped before
+        # it ends. A whole file in one kubectl run could keep writing long after the slot expired.
+        # Any subset may land: the budget above already counts every subset.
         names = []
-        for obj in applied:
-            name = f'{obj.get("kind")}/{(obj.get("metadata") or {}).get("name")}'
-            gpus = dgd_gpus(obj) if obj.get('kind') == DGD_KIND else 0
+        for item in json.loads(stamped)['items']:
+            name = f'{item.get("kind")}/{(item.get("metadata") or {}).get("name")}'
+            try:
+                if slot:
+                    slot.check()
+                g.kc.json('apply', '-f', '-', '-n', ns, '-o', 'json',
+                          f'--request-timeout={APPLY_REQUEST_TIMEOUT}s', input=json.dumps(item),
+                          timeout=slot.timeout() if slot else APPLY_REQUEST_TIMEOUT + 15)
+            except Refusal as e:
+                if names:
+                    e.extra.setdefault('applied', names)
+                    e.args = (f'{e}; already applied: {", ".join(names)}',)
+                raise
+            gpus = dgd_gpus(item) if item.get('kind') == DGD_KIND else 0
             g.record(ns, name, gpus, 'up', uid=view.uid, lease=view.lease_id, issue=view.issue)
             names.append(name)
         return {'applied': names, 'namespace': ns, 'allocation': total, 'lease': view.lease_id}
@@ -697,7 +761,6 @@ def cmd_apply(g, a):
 
 def cmd_delete(g, a):
     g.require_writable()
-    ns = g.ns_name()
     kind_text, _, name = a.target.partition('/')
     if kind_text.lower() not in DELETABLE:
         raise Refusal('kind_refused', f'{kind_text} is not a kind the guard deletes')
@@ -711,8 +774,7 @@ def cmd_delete(g, a):
         protected.add(('Secret', g.profile['pull_secret']))
     if (kind, name) in protected:
         raise Refusal('object_protected', f'{kind}/{name} is not deleted on its own (runbook section 10)')
-    view = NsView(g, ns)
-    view.require_owner(g)
+    ns, view = g.owned()
 
     def body(lease, slot):
         # Like every owner write: an active lease and its slot, or a namespace that holds no GPUs.
@@ -800,7 +862,12 @@ def cmd_down(g, a):
     view = NsView(g, ns)
     check_uid(view, a.uid)
     lease_id = a.lease or view.lease_id
-    if g.thread and view.thread == g.thread:
+    owner = False
+    if g.thread and view.thread == g.thread and os.environ.get('BB_THREAD_STORAGE'):
+        # The owner is the thread whose label the namespace carries and whose ledger created it
+        # with this UID. Anyone else, the owner without its ledger included, needs teardown authority.
+        owner = g.ledger_namespaces().get(ns) == view.uid
+    if owner:
         why = 'owner'
         if lease_id:
             res = lease_show(lease_id)
@@ -857,7 +924,7 @@ def cmd_down(g, a):
         if 'Precondition failed' in err or 'Conflict' in err:
             raise Refusal('uid_mismatch', f'{ns} was re-created; the new namespace is left alone')
         raise kubectl_error(('delete', 'namespace', ns), rc, err)
-    g.record(ns, f'Namespace/{ns}', before, 'down', uid=view.uid, lease=lease_id, issue=view.issue)
+    g.record(ns, f'Namespace/{ns}', before, 'down', uid=view.uid, lease=lease_id, issue=view.issue, deleted=True)
     return {'namespace': ns, 'deleted': True, 'authority': why}
 
 
@@ -917,6 +984,13 @@ def cmd_extend(g, a):
 
 
 WRONG_UID = '00000000-0000-4000-8000-000000000000'
+# What the API server says when each fence refuses a request. Any other error (Forbidden, an
+# unsupported media type, a timeout) says nothing about the fence, so it does not count as held.
+FENCE_REFUSALS = {
+    'patch test': ('testing value', 'test operation'),
+    'delete precondition': ('Precondition failed', 'UID in precondition'),
+    'stale resourceVersion': ('the object has been modified',),
+}
 
 
 def cmd_selftest_fences(g, a):
@@ -927,9 +1001,7 @@ def cmd_selftest_fences(g, a):
     the guard reads the objects again afterwards to prove nothing changed.
     """
     g.require_writable()
-    ns = g.ns_name()
-    view = NsView(g, ns)
-    view.require_owner(g)
+    ns, view = g.owned()
 
     def body(lease, slot):
         if lease is None and allocation(g.dgds(ns), g.pods(ns)) > 0:
@@ -954,28 +1026,33 @@ def cmd_selftest_fences(g, a):
             raise Refusal('selftest_needs_dgd', f'DGD {name} has no component to write back')
         noop = {'op': 'add', 'path': path, 'value': current}
         probes = [
-            ('patch: wrong DGD UID', ('patch', res, '-n', ns, '--type=json', '-p', json.dumps(
+            ('patch: wrong DGD UID', 'patch test', ('patch', res, '-n', ns, '--type=json', '-p', json.dumps(
                 [{'op': 'test', 'path': '/metadata/uid', 'value': WRONG_UID}, noop])), None),
-            ('patch: wrong namespace-uid label', ('patch', res, '-n', ns, '--type=json', '-p', json.dumps(
+            ('patch: wrong namespace-uid label', 'patch test', ('patch', res, '-n', ns, '--type=json', '-p',
+                                                                json.dumps(
                 [{'op': 'test', 'path': '/metadata/uid', 'value': dgd_uid},
                  {'op': 'test', 'path': label_path, 'value': WRONG_UID}, noop])), None),
-            ('delete DGD: wrong UID precondition', ('delete', '--raw', dgd_path(d, ns), '-f', '-'),
+            ('delete DGD: wrong UID precondition', 'delete precondition',
+             ('delete', '--raw', dgd_path(d, ns), '-f', '-'),
              json.dumps({'kind': 'DeleteOptions', 'apiVersion': 'v1', 'preconditions': {'uid': WRONG_UID}})),
-            ('delete namespace: wrong UID precondition', ('delete', '--raw', f'/api/v1/namespaces/{ns}', '-f', '-'),
+            ('delete namespace: wrong UID precondition', 'delete precondition',
+             ('delete', '--raw', f'/api/v1/namespaces/{ns}', '-f', '-'),
              json.dumps({'kind': 'DeleteOptions', 'apiVersion': 'v1', 'preconditions': {'uid': WRONG_UID}})),
         ]
         if view.record is not None:
             stale = copy.deepcopy(view.record)
             stale['metadata']['resourceVersion'] = '1'
-            probes.append(('replace lease record: stale resourceVersion', ('replace', '-f', '-', '-n', ns, '-o', 'json'),
-                           json.dumps(stale)))
+            probes.append(('replace lease record: stale resourceVersion', 'stale resourceVersion',
+                           ('replace', '-f', '-', '-n', ns, '-o', 'json'), json.dumps(stale)))
         results = []
-        for label, args, stdin in probes:
+        for label, fence, args, stdin in probes:
             confirm_uid(g, ns, view.uid)
             if slot:
                 slot.check()
             rc, out, err = g.kc.run(*args, input=stdin)
+            # Held only when the server refused it for this fence's reason.
             results.append({'fence': label, 'refused': rc != 0, 'exit': rc,
+                            'held': rc != 0 and any(m in err for m in FENCE_REFUSALS[fence]),
                             'response': clip(err if rc else out, 600)})
         # Prove nothing changed: the namespace, the DGD and the record, read again.
         after_ns = g.kc.json('get', 'namespace', ns, '-o', 'json', not_found=MISSING)
@@ -988,11 +1065,12 @@ def cmd_selftest_fences(g, a):
         if view.record is not None:
             after_rec = g.lease_record(ns)
             unchanged['lease_record'] = after_rec is not None and after_rec.get('data') == view.record.get('data')
-        held = all(r['refused'] for r in results) and all(unchanged.values())
+        held = all(r['held'] for r in results) and all(unchanged.values())
         g.record(ns, f'selftest/fences on {name}', 0, 'selftest', uid=view.uid, lease=view.lease_id, issue=view.issue)
         report = {'namespace': ns, 'dgd': name, 'probes': results, 'unchanged': unchanged, 'all_held': held}
         if not held:
-            raise Refusal('fence_failed', 'the server accepted a request its fence should have refused', **report)
+            raise Refusal('fence_failed', 'a fence did not prove itself: the server accepted a request, refused it '
+                                          'for another reason, or something changed', **report)
         return report
 
     return fenced(g, view, body)

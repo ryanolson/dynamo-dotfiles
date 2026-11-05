@@ -603,7 +603,13 @@ class GuardCase(unittest.TestCase):
         self.k8s = json.loads(self.k8s_state.read_text())
         self.bb = json.loads(self.bb_state.read_text())
 
-    def add_ns(self, name=NS, thread=ME, uid='uid-ns-1', expires_at=None):
+    def add_ns(self, name=NS, thread=ME, uid='uid-ns-1', expires_at=None, ledger=True):
+        if ledger:
+            # As `ns create` records it in the creating thread's ledger. Marked so ledger() skips it.
+            with open(self.storage / 'k8s-ledger.jsonl', 'a') as f:
+                f.write(json.dumps({'thread': thread, 'cluster': PROFILE, 'namespace': name, 'uid': uid,
+                                    'object': f'Namespace/{name}', 'direction': 'up', 'created': True,
+                                    'seed': True}) + '\n')
         self.k8s['namespaces'][name] = namespace(name, thread, uid, expires_at)
         self.k8s['objects'].setdefault(name, {})
         self.k8s['pods'].setdefault(name, [])
@@ -635,7 +641,7 @@ class GuardCase(unittest.TestCase):
 
     # --- running ----------------------------------------------------------
 
-    def env(self, thread=ME, host_entry=False, kubeconfig=None):
+    def env(self, thread=ME, host_entry=False, kubeconfig=None, storage=True):
         env = {'PATH': f'{self.bin}:/usr/bin:/bin', 'HOME': str(self.home),
                'K8S_CLUSTERS_PROFILES': str(self.profiles),
                'KUBECONFIG': str(kubeconfig or self.bot_kubeconfig),
@@ -647,7 +653,9 @@ class GuardCase(unittest.TestCase):
                'FAKE_PW_DIR': str(self.home),
                # The caller's kubectl settings must never reach kubectl.
                'KUBECTL_KUBERC': 'true', 'KUBECTL_EXPLAIN_OPENAPIV3': 'true'}
-        if host_entry:
+        if storage is False:
+            env['BB_THREAD_ID'] = thread
+        elif host_entry:
             # What the k8s-leases host entry gives the guard: no BB_THREAD_ID, no thread storage.
             env['BB_SERVER_URL'] = 'http://127.0.0.1:1'
         else:
@@ -711,7 +719,7 @@ class GuardCase(unittest.TestCase):
         path = (self.state_home / 'k8s-guard/ledger.jsonl') if host else (self.storage / 'k8s-ledger.jsonl')
         if not path.exists():
             return []
-        return [json.loads(line) for line in path.read_text().splitlines()]
+        return [l for l in map(json.loads, path.read_text().splitlines()) if not l.get('seed')]
 
     def dgd_obj(self, name, ns=NS):
         return self.k8s['objects'][ns].get('DynamoGraphDeployment/' + name)
@@ -850,8 +858,8 @@ class Commands(GuardCase):
 class NamespaceCreate(GuardCase):
     def test_creates_labelled_namespace_with_expiry(self):
         body = self.ok('--context', CTX, 'ns', 'create', 'smoke', '--issue', '12', '--hours', '2')
-        self.assertEqual(body['namespace'], NS)
-        ns = self.k8s['namespaces'][NS]
+        self.assertRegex(body['namespace'], '^' + NS + '-[a-z0-9]{5}$')
+        ns = self.k8s['namespaces'][body['namespace']]
         labels = ns['metadata']['labels']
         self.assertEqual(labels['wcep.agent/thread'], ME)
         self.assertEqual(labels['owner'], 'alice')
@@ -862,16 +870,44 @@ class NamespaceCreate(GuardCase):
         self.assertAlmostEqual((expires - datetime.now(timezone.utc)).total_seconds(), 7200, delta=120)
         self.assertEqual(body['uid'], ns['metadata']['uid'])
         [line] = self.ledger()
-        self.assertEqual((line['namespace'], line['direction'], line['uid'], line['cluster']),
-                         (NS, 'up', ns['metadata']['uid'], PROFILE))
+        self.assertEqual((line['namespace'], line['direction'], line['uid'], line['cluster'], line['created']),
+                         (body['namespace'], 'up', ns['metadata']['uid'], PROFILE, True))
         self.assertEqual(len(self.ledger(host=True)), 1)
 
+    def create_with_suffix(self, char, *args):
+        # Run the guard with the CSPRNG answering one fixed character, to force a name.
+        launcher = self.tmp / 'fixed-suffix.py'
+        launcher.write_text(RUNNER.replace('sys.argv = sys.argv[1:]',
+                                           f'import secrets\nsecrets.choice = lambda seq: {char!r}\n'
+                                           'sys.argv = sys.argv[1:]'))
+        p = subprocess.run(['python3', '-I', str(launcher), str(GUARD), '--context', CTX, 'ns', 'create', *args],
+                           env=self.env(), capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        self.reload()
+        return p.returncode, json.loads(p.stdout)
+
     def test_existing_namespace_never_adopted(self):
-        self.add_ns(thread=ME)
-        before = copy.deepcopy(self.k8s['namespaces'][NS])
-        self.refused('namespace_exists', '--context', CTX, 'ns', 'create', 'smoke', '--issue', '12', '--hours', '1')
-        self.assertEqual(self.k8s['namespaces'][NS], before)
+        taken = NS + '-aaaaa'
+        self.add_ns(name=taken, thread=OTHER, ledger=False)
+        before = copy.deepcopy(self.k8s['namespaces'][taken])
+        rc, body = self.create_with_suffix('a', 'smoke', '--issue', '12', '--hours', '1')
+        self.assertEqual(body.get('code'), 'namespace_exists', body)
+        self.assertEqual(self.k8s['namespaces'][taken], before)
         self.assertEqual(self.ledger(), [])
+
+    def test_names_are_never_reused(self):
+        names = {self.ok('--context', CTX, 'ns', 'create', 'smoke', '--issue', '12', '--hours', '1')['namespace']
+                 for _ in range(3)}
+        self.assertEqual(len(names), 3, names)
+        self.assertTrue(all(n.startswith(NS + '-') for n in names), names)
+
+    def test_63_character_limit_at_the_longest_issue_and_purpose(self):
+        # prefix (14) + issue (10, the longest accepted) + '-' + purpose + '-' + suffix (5) = 63 at purpose 32.
+        issue = '1234567890'
+        rc, body = self.create_with_suffix('b', 'p' * 32, '--issue', issue, '--hours', '1')
+        self.assertEqual(rc, 0, body)
+        self.assertEqual(len(body['namespace']), 63)
+        self.refused('usage', '--context', CTX, 'ns', 'create', 'p' * 33, '--issue', issue, '--hours', '1')
+        self.refused('usage', '--context', CTX, 'ns', 'create', 'p', '--issue', '12345678901', '--hours', '1')
 
     def test_hours_bounded(self):
         for hours in ('0', '4.5', '-1', 'nan', 'inf'):
@@ -881,7 +917,7 @@ class NamespaceCreate(GuardCase):
 
     def test_bad_names_refused(self):
         for purpose, issue in (('Smoke', '12'), ('smoke_1', '12'), ('-x', '12'), ('smoke', 'STRGT-12'),
-                               ('x' * 60, '12')):
+                               ('x' * 50, '12')):
             with self.subTest(purpose=purpose, issue=issue):
                 self.refused('usage', '--context', CTX, 'ns', 'create', purpose, '--issue', issue, '--hours', '1')
         self.assertEqual(self.writes(), [])
@@ -914,9 +950,37 @@ class Ownership(GuardCase):
         self.refused('namespace_not_ours', '--context', CTX, 'down', 'team-x-work')
         self.assertEqual(self.writes(), [])
 
-    def test_namespace_required_for_writes(self):
+    def test_namespace_taken_from_the_ledger(self):
         self.add_ns()
+        # One live namespace in the thread's ledger: -n may be left out.
+        self.assertEqual(self.guard('--context', CTX, 'apply', '-f', self.manifest(dgd('m')))[0], 0)
+        self.add_ns(name=PREFIX + '13-other', uid='uid-ns-2')
         self.refused('namespace_required', '--context', CTX, 'apply', '-f', self.manifest(dgd('m')))
+
+    def test_namespace_not_in_the_callers_ledger_refused(self):
+        # Labelled for this thread, but not created by it: never adopted.
+        self.add_ns(ledger=False)
+        self.refused('namespace_not_in_ledger', '--context', CTX, '-n', NS, 'apply', '-f', self.manifest(dgd('m')))
+        self.refused('namespace_not_in_ledger', '--context', CTX, '-n', NS, 'secret', 'hf')
+        self.assertEqual(self.writes(), [])
+        self.assertFalse(self.fleet_log.exists())
+
+    def test_ledger_uid_must_still_match(self):
+        self.add_ns(uid='uid-ns-1')
+        self.k8s['namespaces'][NS]['metadata']['uid'] = 'uid-ns-recreated'
+        self.flush()
+        for args in (('apply', '-f', self.manifest(dgd('m'))), ('secret', 'hf'), ('delete', 'configmap/x'),
+                     ('lease', 'acquire', '--gpus', '1', '--hours', '1'), ('selftest', 'fences')):
+            with self.subTest(command=args[0]):
+                self.refused('uid_mismatch', '--context', CTX, '-n', NS, *args)
+        self.assertEqual(self.writes(), [])
+        self.assertFalse(any(c[:3] == ['k8s', 'lease', 'acquire'] for c in self.bb_calls()))
+
+    def test_owner_commands_need_the_thread_ledger(self):
+        self.add_ns()
+        self.refused('ledger_required', '--context', CTX, '-n', NS, 'apply', '-f', self.manifest(dgd('m')),
+                     storage=False)
+        self.assertEqual(self.writes(), [])
 
     def test_object_in_another_namespace_refused(self):
         self.add_ns()
@@ -2000,7 +2064,7 @@ class HostEntryEnvironment(GuardCase):
         self.flush()
         self.ok('--context', CTX, 'expire', NS, '--uid', 'uid-ns-1', '--lease', lid, host_entry=True)
         self.ok('--context', CTX, 'down', NS, '--uid', 'uid-ns-1', '--lease', lid, host_entry=True)
-        self.assertFalse((self.storage / 'k8s-ledger.jsonl').exists())
+        self.assertEqual(self.ledger(), [])  # no thread storage: the host ledger only
         self.assertEqual([l['direction'] for l in self.ledger(host=True)], ['extend', 'down', 'down'])
 
 
@@ -2139,7 +2203,6 @@ class NamespaceWriteWindows(GuardCase):
 
 
 class ApplySlotLifetime(GuardCase):
-    @unittest.skip("F12: a 42s apply outlives the slot's remaining 41s and overlaps another writer")
     def test_multi_object_apply_cannot_outlive_its_slot_and_overallocate(self):
         self.add_ns()
         lid = self.add_lease(gpus=3)
@@ -2210,65 +2273,26 @@ def logical_now():
                            timeout=60, stdin=subprocess.DEVNULL)
         self.reload()
 
-        self.assertEqual(self.k8s.get('elapsed_seconds'), 121, p.stdout + p.stderr)
+        # Ruling on F12: the guard applies one object per request and checks the slot before each.
+        # After 'first' lands at 93s, 27s are left, less than one request may take, so it stops.
+        body = json.loads(p.stdout)
+        self.assertEqual(body.get('code'), 'slot_expired', body)
+        self.assertEqual(body.get('applied'), ['DynamoGraphDeployment/first'], body)
+        self.assertEqual(self.k8s.get('elapsed_seconds'), 93, body)
+        # The other guard still gets the expired slot at 121s.
+        self.k8s['elapsed_seconds'] = 121
+        self.flush()
+        other = subprocess.run(concurrent_argv, env=self.env(), capture_output=True, text=True, timeout=60,
+                               stdin=subprocess.DEVNULL)
+        self.reload()
+        self.k8s['concurrent_rc'], self.k8s['concurrent_result'] = other.returncode, json.loads(other.stdout)
         self.assertEqual(self.k8s.get('concurrent_rc'), 0, self.k8s.get('concurrent_result'))
-        self.assertEqual(self.k8s['concurrent_result']['allocation'], 3)
+        self.assertEqual(self.k8s['concurrent_result']['allocation'], 2)
         self.assertEqual(sum(c[:4] == ['k8s', 'lease', 'op', 'begin'] for c in self.bb_calls()), 2)
         held = sum(int(c['podTemplate']['spec']['containers'][0]['resources']['limits'].get('nvidia.com/gpu', 0))
                    * c['replicas'] for obj in self.k8s['objects'][NS].values()
                    if obj['kind'] == 'DynamoGraphDeployment' for c in obj['spec']['components'])
         self.assertLessEqual(held, 3, f'42s apply crosses the 120s slot and leaves {held} GPUs: {p.stdout}')
-
-
-class OwnerNamespaceWriteWindows(GuardCase):
-    @unittest.skip("F11: owner writes have no server fence against namespace recreation")
-    def test_owner_writes_cannot_land_in_a_recreated_namespace(self):
-        for command in ('apply', 'secret', 'delete', 'acquire'):
-            with self.subTest(command=command):
-                self.k8s = {'namespaces': {}, 'objects': {}, 'pods': {}}
-                self.bb = {'leases': {}}
-                self.kubectl_log.unlink(missing_ok=True)
-                self.bb_log.unlink(missing_ok=True)
-                self.add_ns()
-                if command == 'apply':
-                    lid = self.add_lease(gpus=1)
-                    args = ('apply', '-f', self.manifest(gpu_dgd('w', 1, lid)))
-                elif command == 'secret':
-                    args = ('secret', 'hf')
-                elif command == 'delete':
-                    self.add_obj({'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': 'victim'}})
-                    args = ('delete', 'configmap/victim')
-                else:
-                    args = ('lease', 'acquire', '--gpus', '1', '--hours', '1')
-                replacement_ns = namespace(NS, OTHER, 'uid-recreated')
-                replacement = {'ConfigMap/victim': {
-                    'apiVersion': 'v1', 'kind': 'ConfigMap',
-                    'metadata': {'name': 'victim', 'namespace': NS, 'uid': 'uid-new-cm',
-                                 'resourceVersion': '1000', 'labels': {NS_UID: 'uid-recreated'}},
-                    'data': {'owner': OTHER}}}
-                # Return the old UID, then let another thread recreate the namespace before the write.
-                hook = """if what == 'namespace':
-        st['namespace_reads'] = st.get('namespace_reads', 0) + 1
-        save()
-        if st['namespace_reads'] == 3:
-            reply = copy.deepcopy(st['namespaces'][pos[2]])
-            st['namespaces'][pos[2]] = REPLACEMENT_NS
-            st['objects'][pos[2]] = REPLACEMENT_OBJECTS
-            st['pods'][pos[2]] = []
-            save()
-            emit(reply)""".replace('REPLACEMENT_NS', repr(replacement_ns)).replace(
-                    'REPLACEMENT_OBJECTS', repr(replacement))
-                fake = FAKE_KUBECTL.replace("if what == 'namespace':", hook, 1)
-                self.assertNotEqual(fake, FAKE_KUBECTL)
-                (self.bin / 'kubectl').write_text(fake)
-
-                rc, body, _ = self.guard('--context', CTX, '-n', NS, *args)
-
-                self.assertEqual(self.k8s['namespaces'][NS]['metadata']['uid'], 'uid-recreated')
-                self.assertTrue(self.k8s['objects'][NS] == replacement,
-                                f'{command} changed another thread\'s namespace: {body}; '
-                                f'objects={sorted(self.k8s["objects"][NS])}')
-                self.assertNotEqual(rc, 0, body)
 
 
 class SelftestFences(GuardCase):
@@ -2291,7 +2315,6 @@ class SelftestFences(GuardCase):
         # It ran inside the lease's slot, like every other write.
         self.assertIn(['k8s', 'lease', 'op', 'begin', self.lid], self.bb_calls())
 
-    @unittest.skip("F13: selftest treats Forbidden and UnsupportedMediaType as successful fence checks")
     def test_unrelated_request_errors_do_not_prove_fences_hold(self):
         for error in ('Forbidden', 'UnsupportedMediaType'):
             with self.subTest(error=error):
