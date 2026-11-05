@@ -47,6 +47,8 @@ Every profile needs `context`, `allowed` and `source`. A profile with `allowed =
 
 Unknown keys are errors, so a typo does not silently drop a rule.
 
+The identity rules above guard against mistakes, not against a hostile process running as the same user; see "Threat model" in `SKILL.md`.
+
 ## `k8s-check` and the CRD version
 
 No profile field names a DGD API version: it depends on the DGD, not the cluster. `k8s-check --want-crd <version>` fails when the cluster's DGD CRD does not serve that version. Without the flag it only reports the served versions.

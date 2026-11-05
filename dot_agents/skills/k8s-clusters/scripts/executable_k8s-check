@@ -25,7 +25,7 @@ import sys
 # -I drops the script directory from sys.path; the shared parser lives next to this script.
 sys.dont_write_bytecode = True  # keep the deployed skill directory clean
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from k8s_profiles import ProfileError, bot_credential_problem, kubectl_env, load_profiles  # noqa: E402
+from k8s_profiles import ProfileError, bot_credential_problem, kubectl_env, load_profiles, sealed_copy  # noqa: E402
 
 DGD_CRD = 'dynamographdeployments.nvidia.com'
 DGD_RESOURCE = 'dynamographdeployments.nvidia.com'
@@ -45,22 +45,11 @@ class Refusal(ProfileError):
 # --- kubectl ----------------------------------------------------------------
 
 class Kubectl:
-    """kubectl pinned to one open kubeconfig file.
-
-    The file is opened once, and every call reads it through /proc/self/fd/<n>, which
-    opens that same inode again. Replacing the path after the checks changes nothing:
-    the file whose credentials were checked is the file every call uses.
-    """
+    """kubectl reading one sealed copy of the bot kubeconfig (see sealed_copy)."""
 
     def __init__(self, kubeconfig, context):
-        try:
-            self.fd = os.open(kubeconfig, os.O_RDONLY | os.O_NOFOLLOW)
-        except OSError as e:
-            raise Refusal('kubeconfig_not_bot', f'cannot open the bot kubeconfig {kubeconfig}: {e.strerror}')
-        os.set_inheritable(self.fd, True)
+        self.fd = sealed_copy(kubeconfig)
         pinned = f'/proc/self/fd/{self.fd}'
-        if not os.path.exists(pinned):
-            raise Refusal('kubeconfig_not_bot', 'this host has no /proc/self/fd, so the kubeconfig cannot be pinned')
         self.base = ['kubectl', '--kubeconfig', pinned]
         self.context = context
         self.env = kubectl_env()

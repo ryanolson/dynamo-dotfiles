@@ -13,6 +13,10 @@ The source of truth is the Linear document "Runbook: build and run on our Dynamo
 - Pass `--context` on every `kubectl` call. Never rely on the current context.
 - Make no write with plain `kubectl`. Writes go through `scripts/k8s-guard` only; its commands and rules are in `references/k8s-guard.md`.
 
+## Threat model
+
+`k8s-check` and `k8s-guard` protect against accidental use of credentials other than the bot's: a stray kubeconfig, a kuberc, `KUBECONFIG`, a `tsh` exec plugin, a wrong path, or a file swapped by mistake. They do not protect against a malicious process running as the same Unix user, which could replace `~/.local/bin/tbot` or trace the checker. The bot's own permissions on the server are the boundary against that.
+
 ## Profiles
 
 `~/.config/k8s-clusters/profiles.toml` (or `$K8S_CLUSTERS_PROFILES`) holds one profile per cluster: its context, GPUs, taint, storage, pull secret, whether the bot can write, and whether we may use it. It is written by hand from the runbook's section 3, and never committed, because it holds internal names. The schema is in `references/profiles.md`, with a made-up example in `references/profiles.example.toml`.
@@ -41,6 +45,6 @@ It exits 1, with a `failures` list of stable codes, when:
 - `--want-crd` names a version the CRD does not serve (`crd_version_not_served`);
 - a `kubectl` read fails (`kubectl_error`).
 
-The first five make no cluster call; the bot kubeconfig is read locally with `kubectl config view`. Every `kubectl` call reads the one kubeconfig file opened at the start, through `/proc/self/fd`, so the check needs Linux. kubectl runs without `KUBECONFIG`, without any other `KUBECTL_*` variable, and with kuberc off. A `warnings` list reports where the profile and the cluster disagree. Fix the profile from the runbook's sources, not from the warning alone.
+The first five make no cluster call; the bot kubeconfig is read locally with `kubectl config view`. The bot kubeconfig is read once into a sealed in-memory copy, and every `kubectl` call reads that copy through `/proc/self/fd`, so the check needs Linux. Its exec plugin may only run an installed tbot (`/usr/local/bin/tbot` or `~/.local/bin/tbot`), resolved through symlinks. kubectl runs without `KUBECONFIG`, without any other `KUBECTL_*` variable, and with kuberc off. A `warnings` list reports where the profile and the cluster disagree. Fix the profile from the runbook's sources, not from the warning alone.
 
 Every run contacts the cluster. Record it in the thread's ledger, and report it to whoever asked for it.
