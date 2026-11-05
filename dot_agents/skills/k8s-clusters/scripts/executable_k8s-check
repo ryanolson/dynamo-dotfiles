@@ -47,8 +47,8 @@ class Refusal(ProfileError):
 class Kubectl:
     """The pinned kubectl, reading the sealed, rendered bot kubeconfig (prepare_bot_kubeconfig)."""
 
-    def __init__(self, kubeconfig, context):
-        binary, self.fd = prepare_bot_kubeconfig(kubeconfig, context, timeout=KUBECTL_TIMEOUT)
+    def __init__(self, kubeconfig, kubectl_sha256, context):
+        binary, self.fd = prepare_bot_kubeconfig(kubeconfig, context, kubectl_sha256, timeout=KUBECTL_TIMEOUT)
         self.base = [binary, '--kubeconfig', f'/proc/self/fd/{self.fd}']
         self.context = context
         self.env = kubectl_env()
@@ -151,7 +151,7 @@ def run_check(report, profiles, cluster, want_crd):
         raise Refusal('cluster_never', f'{cluster} is marked never: agents must not touch it')
     bot = profiles['bot']
     check_kubeconfig(bot)
-    kc = Kubectl(bot['kubeconfig'], prof['context'])
+    kc = Kubectl(bot['kubeconfig'], bot['kubectl_sha256'], prof['context'])
 
     who = kc.json('auth', 'whoami', '-o', 'json')
     user = ((who.get('status') or {}).get('userInfo') or {})

@@ -8,10 +8,12 @@ it has no recording for, so a new cluster call cannot slip in untested. A fake
 Every name here is made up. The real profiles file is never read: HOME,
 K8S_CLUSTERS_PROFILES and KUBECONFIG all point into a temporary directory.
 """
+import base64
 import copy
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -45,6 +47,11 @@ while i < len(argv):
         flags[name] = argv[i + 1]; i += 2
     else:
         flags[name] = a.split('=', 1)[1]; i += 1
+def cert_user(user):
+    # The identity in embedded client cert data (the fake cert's body is the identity's name).
+    import base64
+    pem = base64.b64decode(user['client-certificate-data']).decode()
+    return next((line for line in pem.splitlines() if line and not line.startswith('-----')), None)
 def kubeconfig_user():
     # The user entry of the context kubectl would use, from the file it was given.
     if '--kubeconfig' not in flags or '--context' not in flags:
@@ -143,6 +150,39 @@ def kubeconfig(tbot, destination='/example/kube', contexts=(CTX, 'proxy.example.
         'users': [{'name': 'bot', 'user': user}]})
 
 
+def cert_pem(identity):
+    return f'-----BEGIN CERTIFICATE-----\n{identity}\n-----END CERTIFICATE-----\n'
+
+
+KEY_PEM = '-----BEGIN PRIVATE KEY-----\nmade-up-key\n-----END PRIVATE KEY-----\n'
+
+# tbot v18.7.6 `kube credentials` (tool/tbot/kube.go): reads <destination>/identity and prints
+# an ExecCredential with the PEM cert and key. The fake's "cert" is the identity's name, read
+# from <destination>/identity when present. FAKE_TBOT_EXPIRES_IN sets the expiry in seconds;
+# FAKE_TBOT_FRESH_AFTER_FIRST makes only the first snapshot near expiry.
+FAKE_TBOT = r'''#!/usr/bin/env python3
+import json, os, sys
+from datetime import datetime, timedelta, timezone
+assert len(sys.argv) == 4 and sys.argv[1:3] == ['kube', 'credentials'], sys.argv
+destination = sys.argv[3].removeprefix('--destination-dir=')
+path = os.path.join(destination, 'identity')
+identity = open(path).read() if os.path.exists(path) else os.environ['FAKE_BOT_USER']
+seconds = int(os.environ.get('FAKE_TBOT_EXPIRES_IN', '3600'))
+counter = os.environ.get('FAKE_TBOT_FRESH_AFTER_FIRST')
+if counter:
+    if os.path.exists(counter):
+        seconds = 3600
+    open(counter, 'a').close()
+if os.environ.get('FAKE_TBOT_JUNK'):
+    print('{"status": {}}'); sys.exit(0)
+expiry = (datetime.now(timezone.utc) + timedelta(seconds=seconds)).strftime('%Y-%m-%dT%H:%M:%SZ')
+print(json.dumps({'kind': 'ExecCredential', 'apiVersion': 'client.authentication.k8s.io/v1beta1', 'spec': {},
+                  'status': {'expirationTimestamp': expiry,
+                             'clientCertificateData': '-----BEGIN CERTIFICATE-----\n' + identity + '\n-----END CERTIFICATE-----\n',
+                             'clientKeyData': '-----BEGIN PRIVATE KEY-----\nmade-up-key\n-----END PRIVATE KEY-----\n'}}))
+'''
+
+
 GPU_TAINT = {'key': 'nvidia.com/gpu', 'value': 'true', 'effect': 'NoSchedule'}
 RESERVED = {'key': 'example.test/reserved', 'value': 'team-b', 'effect': 'NoSchedule'}
 OUR_NS = 'dyntest-alice-12-smoke'
@@ -193,7 +233,7 @@ class K8sCheck(unittest.TestCase):
         # tbot as the dotfiles install it for one user, in the (fake) passwd home.
         self.tbot = self.home / '.local/bin/tbot'
         self.tbot.parent.mkdir(parents=True)
-        self.tbot.write_text('#!/bin/sh\nexit 0\n')
+        self.tbot.write_text(FAKE_TBOT)
         self.tbot.chmod(0o755)
         self.bot_kubeconfig.write_text(self.kc())
         self.human_kubeconfig = self.home / '.kube/config'
@@ -212,11 +252,13 @@ class K8sCheck(unittest.TestCase):
         self.tsh_log = self.tmp / 'tsh.log'
         self.scenario_path = self.tmp / 'scenario.json'
         self.scenario = happy_scenario()
+        self.kubectl_pin = None
         self.env = {
             'PATH': f'{bin_dir}:/usr/bin:/bin',
             'HOME': str(self.home),
             'FAKE_PW_DIR': str(self.home),
             'FAKE_KUBECTL': str(bin_dir / 'kubectl'),
+            'FAKE_BOT_USER': BOT,
             'K8S_CLUSTERS_PROFILES': str(self.profiles),
             'KUBECONFIG': str(self.bot_kubeconfig),
             'FAKE_KUBECTL_LOG': str(self.log),
@@ -227,7 +269,11 @@ class K8sCheck(unittest.TestCase):
     def rendered_user(self):
         user = next(u['user'] for u in json.loads(self.bot_kubeconfig.read_text())['users'] if u['name'] == 'bot')
         if 'exec' in user:
-            return {'exec': {k: user['exec'][k] for k in ('apiVersion', 'command', 'args')}}
+            # The snapshot: tbot's cert and key, embedded; the rendered file has no exec plugin.
+            identity_file = self.bot_kubeconfig.parent / 'identity'
+            identity = identity_file.read_text() if identity_file.exists() else BOT
+            return {'client-certificate-data': base64.b64encode(cert_pem(identity).encode()).decode(),
+                    'client-key-data': base64.b64encode(KEY_PEM.encode()).decode()}
         return user
 
     def kc(self, **kw):
@@ -235,6 +281,13 @@ class K8sCheck(unittest.TestCase):
 
     def run_check(self, *args):
         self.scenario_path.write_text(json.dumps(self.scenario))
+        if self.profiles.exists():
+            pin = self.kubectl_pin or hashlib.sha256((self.tmp / 'bin/kubectl').read_bytes()).hexdigest()
+            self.profiles.write_text(re.sub(r'kubectl_sha256 = "[0-9a-f]*"', f'kubectl_sha256 = "{pin}"',
+                                            self.profiles.read_text()))
+            if 'kubectl_sha256' not in (SCRIPT.parent / 'k8s_profiles.py').read_text():
+                # Older scripts (K8S_CHECK_SCRIPTS) predate the pin and refuse the key.
+                self.profiles.write_text(re.sub(r'.*kubectl_sha256.*\n', '', self.profiles.read_text()))
         proc = subprocess.run([sys.executable, '-I', str(self.runner), str(SCRIPT), *args], env=self.env, stdin=subprocess.DEVNULL,
                               capture_output=True, text=True, timeout=60)
         try:
@@ -574,20 +627,26 @@ class K8sCheck(unittest.TestCase):
             assert identity == os.environ['FAKE_TBOT_IDENTITY']
             with open(identity) as source:
                 credential_user = source.read()
-            print(json.dumps({'status': {'clientCertificateData': credential_user,
-                                         'clientKeyData': 'made-up-key'}}))
+            print(json.dumps({'kind': 'ExecCredential', 'apiVersion': 'client.authentication.k8s.io/v1beta1',
+                              'status': {'expirationTimestamp': '2999-01-01T00:00:00Z',
+                                         'clientCertificateData': '-----BEGIN CERTIFICATE-----\\n' + credential_user
+                                                                  + '\\n-----END CERTIFICATE-----\\n',
+                                         'clientKeyData': '-----BEGIN PRIVATE KEY-----\\nmade-up-key\\n-----END PRIVATE KEY-----\\n'}}))
             '''))
         credential_step = textwrap.dedent('''\
             credential_user = None
             if rest[:1] != ['config']:
                 import subprocess
                 user = kubeconfig_user()
-                plugin = user['exec']
-                fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
-                assert os.path.commonpath([os.path.realpath(plugin['command']), fixture_root]) == fixture_root
-                result = subprocess.run([plugin['command'], *plugin['args']], stdin=subprocess.DEVNULL,
-                                        capture_output=True, text=True, timeout=5, check=True)
-                credential_user = json.loads(result.stdout)['status']['clientCertificateData']
+                plugin = user.get('exec')
+                if plugin is None:  # a rendered snapshot: client-go uses the embedded cert
+                    credential_user = cert_user(user)
+                else:
+                    fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
+                    assert os.path.commonpath([os.path.realpath(plugin['command']), fixture_root]) == fixture_root
+                    result = subprocess.run([plugin['command'], *plugin['args']], stdin=subprocess.DEVNULL,
+                                            capture_output=True, text=True, timeout=5, check=True)
+                    credential_user = json.loads(result.stdout)['status']['clientCertificateData']
             ''')
         response_step = textwrap.dedent('''\
             if rest[:2] == ['auth', 'whoami']:
@@ -707,8 +766,11 @@ class K8sCheck(unittest.TestCase):
             assert os.path.commonpath([os.path.realpath(identity), fixture_root]) == fixture_root
             with open(identity) as source:
                 credential_user = source.read()
-            print(json.dumps({'status': {'clientCertificateData': credential_user,
-                                         'clientKeyData': 'made-up-key'}}))
+            print(json.dumps({'kind': 'ExecCredential', 'apiVersion': 'client.authentication.k8s.io/v1beta1',
+                              'status': {'expirationTimestamp': '2999-01-01T00:00:00Z',
+                                         'clientCertificateData': '-----BEGIN CERTIFICATE-----\\n' + credential_user
+                                                                  + '\\n-----END CERTIFICATE-----\\n',
+                                         'clientKeyData': '-----BEGIN PRIVATE KEY-----\\nmade-up-key\\n-----END PRIVATE KEY-----\\n'}}))
             '''))
         credential_step = textwrap.dedent('''\
             credential_user = None
@@ -717,12 +779,15 @@ class K8sCheck(unittest.TestCase):
                 config = json.load(open(flags['--kubeconfig']))
                 context = next(c['context'] for c in config['contexts'] if c['name'] == flags['--context'])
                 user = next(u['user'] for u in config['users'] if u['name'] == context['user'])
-                plugin = user['exec']
-                fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
-                assert os.path.commonpath([os.path.realpath(plugin['command']), fixture_root]) == fixture_root
-                result = subprocess.run([plugin['command'], *plugin['args']], stdin=subprocess.DEVNULL,
-                                        capture_output=True, text=True, timeout=5, check=True)
-                credential_user = json.loads(result.stdout)['status']['clientCertificateData']
+                plugin = user.get('exec')
+                if plugin is None:  # a rendered snapshot: client-go uses the embedded cert
+                    credential_user = cert_user(user)
+                else:
+                    fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
+                    assert os.path.commonpath([os.path.realpath(plugin['command']), fixture_root]) == fixture_root
+                    result = subprocess.run([plugin['command'], *plugin['args']], stdin=subprocess.DEVNULL,
+                                            capture_output=True, text=True, timeout=5, check=True)
+                    credential_user = json.loads(result.stdout)['status']['clientCertificateData']
             ''')
         response_step = textwrap.dedent('''\
             if rest[:2] == ['auth', 'whoami']:
@@ -764,19 +829,26 @@ class K8sCheck(unittest.TestCase):
             assert os.path.commonpath([os.path.realpath(identity), fixture_root]) == fixture_root
             with open(identity) as source:
                 credential_user = source.read()
-            print(json.dumps({'status': {'clientCertificateData': credential_user,
-                                         'clientKeyData': 'made-up-key'}}))
+            print(json.dumps({'kind': 'ExecCredential', 'apiVersion': 'client.authentication.k8s.io/v1beta1',
+                              'status': {'expirationTimestamp': '2999-01-01T00:00:00Z',
+                                         'clientCertificateData': '-----BEGIN CERTIFICATE-----\\n' + credential_user
+                                                                  + '\\n-----END CERTIFICATE-----\\n',
+                                         'clientKeyData': '-----BEGIN PRIVATE KEY-----\\nmade-up-key\\n-----END PRIVATE KEY-----\\n'}}))
             '''))
         credential_step = textwrap.dedent('''\
             credential_user = None
             if rest[:1] != ['config']:
                 import subprocess
-                plugin = kubeconfig_user()['exec']
-                fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
-                assert os.path.commonpath([os.path.realpath(plugin['command']), fixture_root]) == fixture_root
-                result = subprocess.run([plugin['command'], *plugin['args']], stdin=subprocess.DEVNULL,
-                                        capture_output=True, text=True, timeout=5, check=True)
-                credential_user = json.loads(result.stdout)['status']['clientCertificateData']
+                user = kubeconfig_user()
+                plugin = user.get('exec')
+                if plugin is None:  # a rendered snapshot: client-go uses the embedded cert
+                    credential_user = cert_user(user)
+                else:
+                    fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
+                    assert os.path.commonpath([os.path.realpath(plugin['command']), fixture_root]) == fixture_root
+                    result = subprocess.run([plugin['command'], *plugin['args']], stdin=subprocess.DEVNULL,
+                                            capture_output=True, text=True, timeout=5, check=True)
+                    credential_user = json.loads(result.stdout)['status']['clientCertificateData']
             ''')
         response_step = textwrap.dedent('''\
             if rest[:2] == ['auth', 'whoami']:
@@ -806,6 +878,55 @@ class K8sCheck(unittest.TestCase):
         owner_calls = [c['key'] for c in self.calls() if c['credential_user'] == 'alice@example.test']
         self.assertEqual(owner_calls, [], f'tbot treats the accepted destination as a URI: exit={rc}, {out}')
         self.assert_refused_without_contact(out, rc, 'kubeconfig_credentials')
+
+    def test_snapshot_near_expiry_is_retaken_once_then_refused(self):
+        # A credential within 5 minutes of expiry is taken once more; still near expiry is refused.
+        self.env['FAKE_TBOT_EXPIRES_IN'] = '60'
+        rc, out = self.run_check('lab-arm-a')
+        self.assert_refused_without_contact(out, rc, 'credentials_expired')
+        self.log.unlink()
+        self.env['FAKE_TBOT_FRESH_AFTER_FIRST'] = str(self.tmp / 'tbot-counter')
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assert_read_only()
+
+    def test_snapshot_must_be_an_exec_credential(self):
+        self.env['FAKE_TBOT_JUNK'] = 'yes'
+        rc, out = self.run_check('lab-arm-a')
+        self.assert_refused_without_contact(out, rc, 'kubeconfig_credentials')
+        self.assertIn('ExecCredential', ' '.join(f['message'] for f in out['failures']))
+
+    def test_rendered_kubeconfig_has_no_exec_plugin(self):
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        cluster_calls = [c for c in self.calls() if not c['key'].startswith('config ')]
+        self.assertTrue(cluster_calls)
+        for call in cluster_calls:
+            self.assertNotIn('exec', call['kubeconfig_user'], call['argv'])
+            self.assertEqual(set(call['kubeconfig_user']), {'client-certificate-data', 'client-key-data'})
+
+    def test_kubectl_pin_mismatch_refused_before_any_call(self):
+        self.kubectl_pin = 'f' * 64
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 1, out)
+        self.assertIn('kubectl_mismatch', self.codes(out))
+        self.assertEqual(self.calls(), [], 'a kubectl that is not the pinned one must not run at all')
+
+    def test_snapshot_destination_must_not_hold_uri_characters(self):
+        for name in ('kube:x', 'kube%41', 'kube?x', 'kube x'):
+            with self.subTest(name):
+                d = self.bot_kubeconfig.parent.with_name(name)
+                d.mkdir()
+                kc = d / 'kubeconfig.yaml'
+                kc.write_text(kubeconfig(str(self.tbot), str(d)))
+                self.profiles.write_text(EXAMPLE.read_text().replace('/kube/kubeconfig.yaml', f'/{name}/kubeconfig.yaml'))
+                self.env['KUBECONFIG'] = str(kc)
+                if self.log.exists():
+                    self.log.unlink()
+                rc, out = self.run_check('lab-arm-a')
+                # ':' is refused even earlier: it splits a KUBECONFIG list.
+                self.assert_refused_without_contact(out, rc, 'kubeconfig_not_bot' if ':' in name
+                                                    else 'kubeconfig_credentials')
 
     def test_kubeconfig_unset(self):
         # kubectl would fall back to ~/.kube/config, the owner's login.
@@ -1135,14 +1256,15 @@ class K8sCheck(unittest.TestCase):
                 context = next(c['context'] for c in config['contexts'] if c['name'] == flags['--context'])
                 user = next(u['user'] for u in config['users'] if u['name'] == context['user'])
                 plugin = user.get('exec')
-                if plugin is not None:
-                    assert plugin['command'] == 'tsh'
-                    stub = os.path.join(os.path.dirname(os.environ['FAKE_TSH_LOG']), 'bin', 'tsh')
-                    result = subprocess.run([stub, *plugin.get('args', [])], stdin=subprocess.DEVNULL,
-                                            capture_output=True, text=True, timeout=5)
-                    sys.stdout.write(result.stdout)
-                    sys.stderr.write(result.stderr)
-                    sys.exit(result.returncode)
+                if plugin is not None:  # a rendered snapshot has no exec plugin to run
+                    if plugin is not None:
+                        assert plugin['command'] == 'tsh'
+                        stub = os.path.join(os.path.dirname(os.environ['FAKE_TSH_LOG']), 'bin', 'tsh')
+                        result = subprocess.run([stub, *plugin.get('args', [])], stdin=subprocess.DEVNULL,
+                                                capture_output=True, text=True, timeout=5)
+                        sys.stdout.write(result.stdout)
+                        sys.stderr.write(result.stderr)
+                        sys.exit(result.returncode)
             ''')
         kubectl = self.tmp / 'bin/kubectl'
         kubectl.write_text(FAKE_KUBECTL.replace(
@@ -1252,12 +1374,13 @@ class K8sCheck(unittest.TestCase):
                 config = json.load(open(flags['--kubeconfig']))
                 context = next(c['context'] for c in config['contexts'] if c['name'] == flags['--context'])
                 user = next(u['user'] for u in config['users'] if u['name'] == context['user'])
-                plugin = user['exec']
-                result = subprocess.run([plugin['command'], *plugin.get('args', [])],
-                                        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
-                sys.stdout.write(result.stdout)
-                sys.stderr.write(result.stderr)
-                sys.exit(result.returncode)
+                plugin = user.get('exec')
+                if plugin is not None:  # a rendered snapshot has no exec plugin to run
+                    result = subprocess.run([plugin['command'], *plugin.get('args', [])],
+                                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
+                    sys.stdout.write(result.stdout)
+                    sys.stderr.write(result.stderr)
+                    sys.exit(result.returncode)
             ''')
         kubectl = self.tmp / 'bin/kubectl'
         kubectl.write_text(FAKE_KUBECTL.replace(
@@ -1284,19 +1407,20 @@ class K8sCheck(unittest.TestCase):
                 config = json.load(open(flags['--kubeconfig']))
                 context = next(c['context'] for c in config['contexts'] if c['name'] == flags['--context'])
                 user = next(u['user'] for u in config['users'] if u['name'] == context['user'])
-                plugin = user['exec']
-                assert plugin['command'] == 'tbot'
-                command = next(candidate for directory in os.get_exec_path()
-                               if os.path.isfile(candidate := os.path.normpath(
-                                   os.path.join(directory, plugin['command'])))
-                               and os.access(candidate, os.X_OK))
-                fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
-                assert os.path.commonpath([os.path.realpath(command), fixture_root]) == fixture_root
-                result = subprocess.run([command, *plugin.get('args', [])],
-                                        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
-                if result.returncode:
-                    sys.stderr.write(result.stderr)
-                    sys.exit(result.returncode)
+                plugin = user.get('exec')
+                if plugin is not None:  # a rendered snapshot has no exec plugin to run
+                    assert plugin['command'] == 'tbot'
+                    command = next(candidate for directory in os.get_exec_path()
+                                   if os.path.isfile(candidate := os.path.normpath(
+                                       os.path.join(directory, plugin['command'])))
+                                   and os.access(candidate, os.X_OK))
+                    fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
+                    assert os.path.commonpath([os.path.realpath(command), fixture_root]) == fixture_root
+                    result = subprocess.run([command, *plugin.get('args', [])],
+                                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
+                    if result.returncode:
+                        sys.stderr.write(result.stderr)
+                        sys.exit(result.returncode)
             ''')
         kubectl = self.tmp / 'bin/kubectl'
         kubectl.write_text(FAKE_KUBECTL.replace(
@@ -1318,8 +1442,12 @@ class K8sCheck(unittest.TestCase):
         # https://github.com/gravitational/teleport/blob/v18.7.6/tool/tbot/proxy.go#L88
         self.tbot.write_text(textwrap.dedent('''\
             #!/usr/bin/env python3
-            import os, shutil, sys
+            import json, os, shutil, sys
             if sys.argv[1:3] == ['kube', 'credentials']:
+                print(json.dumps({'kind': 'ExecCredential', 'apiVersion': 'client.authentication.k8s.io/v1beta1',
+                                  'status': {'expirationTimestamp': '2999-01-01T00:00:00Z',
+                                             'clientCertificateData': '-----BEGIN CERTIFICATE-----\\nx\\n-----END CERTIFICATE-----\\n',
+                                             'clientKeyData': '-----BEGIN PRIVATE KEY-----\\nx\\n-----END PRIVATE KEY-----\\n'}}))
                 sys.exit(0)
             assert sys.argv[1] == 'proxy'
             destination = next(a.split('=', 1)[1] for a in sys.argv if a.startswith('--destination-dir='))
@@ -1339,16 +1467,17 @@ class K8sCheck(unittest.TestCase):
                 config = json.load(open(flags['--kubeconfig']))
                 context = next(c['context'] for c in config['contexts'] if c['name'] == flags['--context'])
                 user = next(u['user'] for u in config['users'] if u['name'] == context['user'])
-                plugin = user['exec']
-                fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
-                assert os.path.commonpath([os.path.realpath(plugin['command']), fixture_root]) == fixture_root
-                env = dict(os.environ)
-                env.update((item['name'], item['value']) for item in plugin.get('env', []))
-                result = subprocess.run([plugin['command'], *plugin.get('args', [])], env=env,
-                                        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
-                if result.returncode:
-                    sys.stderr.write(result.stderr)
-                    sys.exit(result.returncode)
+                plugin = user.get('exec')
+                if plugin is not None:  # a rendered snapshot has no exec plugin to run
+                    fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
+                    assert os.path.commonpath([os.path.realpath(plugin['command']), fixture_root]) == fixture_root
+                    env = dict(os.environ)
+                    env.update((item['name'], item['value']) for item in plugin.get('env', []))
+                    result = subprocess.run([plugin['command'], *plugin.get('args', [])], env=env,
+                                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
+                    if result.returncode:
+                        sys.stderr.write(result.stderr)
+                        sys.exit(result.returncode)
             ''')
         kubectl = self.tmp / 'bin/kubectl'
         kubectl.write_text(FAKE_KUBECTL.replace(

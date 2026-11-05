@@ -8,7 +8,8 @@ mistake is reported rather than silently dropped.
 
 Interface, in k8s_profiles.py:
   render_bot_kubeconfig(view, context, kubeconfig) -> (rendered JSON bytes, None) or (None, problem)
-  kubectl_binary() -> absolute path of an installed kubectl ELF binary; never PATH.
+  kubectl_binary(pinned_sha256) -> absolute path of the installed kubectl ELF binary with that sha256;
+  never PATH.
 """
 import importlib.util
 import json
@@ -27,6 +28,17 @@ SCRIPTS = Path(os.environ.get('K8S_CHECK_SCRIPTS') or ROOT / 'dot_agents/skills/
 CTX = 'proxy.example.test-lab-arm-a'
 CA = 'Q0EtREFUQQ=='       # base64 of made-up bytes
 CERT, KEY = 'Q0VSVA==', 'S0VZ'
+
+
+TBOT_CREDENTIALS = '''#!/usr/bin/env python3
+import json
+from datetime import datetime, timedelta, timezone
+expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
+print(json.dumps({'kind': 'ExecCredential', 'apiVersion': 'client.authentication.k8s.io/v1beta1',
+                  'status': {'expirationTimestamp': expiry,
+                             'clientCertificateData': '-----BEGIN CERTIFICATE-----\\nbot\\n-----END CERTIFICATE-----\\n',
+                             'clientKeyData': '-----BEGIN PRIVATE KEY-----\\nk\\n-----END PRIVATE KEY-----\\n'}}))
+'''
 
 
 def load_module():
@@ -48,7 +60,8 @@ class Render(unittest.TestCase):
         self.kubeconfig.write_text('{}')
         self.tbot = self.home / '.local/bin/tbot'
         self.tbot.parent.mkdir(parents=True)
-        self.tbot.write_text('#!/bin/sh\nexit 0\n')
+        # tbot v18.7.6 `kube credentials` prints an ExecCredential (tool/tbot/kube.go).
+        self.tbot.write_text(TBOT_CREDENTIALS)
         self.tbot.chmod(0o755)
         self.m = load_module()
         self.m.account_home = lambda: str(self.home)
@@ -172,10 +185,10 @@ class Render(unittest.TestCase):
         old_path = os.environ.get('PATH', '')
         os.environ['PATH'] = f'{bindir}:{old_path}'
         try:
-            chosen = self.m.kubectl_binary()
+            chosen = self.m.kubectl_binary('0' * 64)
         except self.m.ProfileError as e:
             chosen = None
-            self.assertEqual(e.code, 'kubectl_not_found')
+            self.assertIn(e.code, ('kubectl_not_found', 'kubectl_mismatch'))
         finally:
             os.environ['PATH'] = old_path
         self.assertNotEqual(chosen, str(wrapper), 'a script wrapper must never be chosen')
@@ -197,7 +210,8 @@ class Render(unittest.TestCase):
             int main(int argc, char **argv) {
                 if (argc != 9 || strcmp(argv[1], "--kubeconfig") ||
                     strcmp(argv[3], "config") || strcmp(argv[4], "view")) return 90;
-                if (getenv("REVIEW_CHECK_TSH")) {
+            #ifdef WRAPPER
+                if (1) {
                     pid_t child = fork();
                     if (child < 0) return 91;
                     if (child == 0) {
@@ -207,6 +221,7 @@ class Render(unittest.TestCase):
                     }
                     if (waitpid(child, NULL, 0) < 0) return 93;
                 }
+            #endif
                 FILE *config = fopen(argv[2], "rb");
                 if (!config) return 94;
                 int c;
@@ -214,9 +229,13 @@ class Render(unittest.TestCase):
                 return fclose(config);
             }
             ''')
-        subprocess.run([compiler, '-x', 'c', '-', '-o', str(wrapper)], input=source,
-                       capture_output=True, text=True, timeout=15, check=True,
-                       env={'PATH': '/usr/bin:/bin'})
+        def build(*defines):
+            subprocess.run([compiler, *defines, '-x', 'c', '-', '-o', str(wrapper)], input=source,
+                           capture_output=True, text=True, timeout=15, check=True,
+                           env={'PATH': '/usr/bin:/bin'})
+            return self.m.file_sha256(wrapper)
+        # The kubectl the pin was taken from: it passes the config through and runs nothing else.
+        pin = build()
         fake_tsh = self.home / '.local/bin/tsh'
         log = self.home / 'fake-tsh.log'
         fake_tsh.write_text('#!/bin/sh\nprintf "tsh status\\n" >> "$REVIEW_TSH_LOG"\nexit 0\n')
@@ -227,19 +246,18 @@ class Render(unittest.TestCase):
         with mock.patch.object(self.m, 'KUBECTL_INSTALLS', ('~/.local/bin/kubectl',)), \
                 mock.patch.dict(os.environ, env, clear=True):
             self.assertTrue(self.m.is_elf(wrapper))
-            selected, fd = self.m.prepare_bot_kubeconfig(str(self.kubeconfig), CTX)
+            selected, fd = self.m.prepare_bot_kubeconfig(str(self.kubeconfig), CTX, pin)
             os.close(fd)
             self.assertEqual(selected, str(wrapper))
             self.assertFalse(log.exists())
-            # A terminal helper installs its compiled Teleport wrapper at ~/.local/bin/kubectl.
-            os.environ['REVIEW_CHECK_TSH'] = 'yes'
-            try:
-                selected, fd = self.m.prepare_bot_kubeconfig(str(self.kubeconfig), CTX)
-            except self.m.ProfileError:
-                pass
-            else:
-                os.close(fd)
-            self.assertFalse(log.exists(), 'the accepted ELF wrapper runs tsh during config view')
+            # A terminal helper later installs its compiled Teleport wrapper at ~/.local/bin/kubectl.
+            # Ruling: a wrapper that IS the pinned binary is out of scope (like replacing tbot);
+            # one installed after the pin was taken has another sha256 and must not run at all.
+            self.assertNotEqual(build('-DWRAPPER'), pin)
+            with self.assertRaises(self.m.ProfileError) as refused:
+                self.m.prepare_bot_kubeconfig(str(self.kubeconfig), CTX, pin)
+            self.assertEqual(refused.exception.code, 'kubectl_mismatch')
+            self.assertFalse(log.exists(), 'a kubectl that is not the pinned binary ran tsh')
 
     def test_sealed_copy_refuses_a_fifo_without_waiting_for_a_writer(self):
         fd = self.m.sealed_copy(str(self.kubeconfig))
