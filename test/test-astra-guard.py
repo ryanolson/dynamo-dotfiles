@@ -1383,6 +1383,16 @@ class PureRules(unittest.TestCase):
 
 class AdversarialReview(GuardCase):
 
+    def test_a_token_echoed_by_gitlab_does_not_reach_state_or_bb_arguments(self):
+        iid = self.deployed_mr()
+        self.gl.mrs[(PID, iid)]['web_url'] += f'?diagnostic={SECRET}'
+        self.check(iid)
+        self.ask(iid)
+        exposed = [path.name for path in (self.state_home / 'astra-guard').iterdir()
+                   if path.is_file() and SECRET in path.read_text()]
+        exposed += ['bb argv' for call in self.bb_calls() if SECRET in json.dumps(call['argv'])]
+        self.assertEqual(exposed, [], 'A reflected token must be redacted before saving or spawning bb')
+
     def test_a_cluster_scoped_resource_is_not_hidden_by_a_valid_plan_line(self):
         iid = self.deployed_mr()
         head = self.gl.branch_sha(BRANCH)
