@@ -1,0 +1,1294 @@
+#!/usr/bin/env python3
+"""The only write path agents have to a shared Kubernetes cluster, as the agents' bot.
+
+Usage (every command takes --context <kube context>; -n may come anywhere):
+  k8s-guard ns create <purpose> --issue <n> --hours <h>      a new namespace, never an existing one
+  k8s-guard -n <ns> lease acquire --gpus <n> --hours <h>      a k8s-leases lease for the namespace
+  k8s-guard -n <ns> secret hf|ngc                              a secret piped from `fleet secret get`
+  k8s-guard -n <ns> apply -f <file>                            DGDs, ConfigMaps, ClusterIP Services
+  k8s-guard -n <ns> delete <kind>/<name>                       one object
+  k8s-guard down <ns> [--uid <uid>] [--lease <id>]             tear down and delete the namespace
+  k8s-guard expire <ns> [--uid <uid>] [--lease <id>]           scale every DGD to 0
+  k8s-guard extend <ns> [--uid <uid>] [--lease <id>]           copy the lease's expiry into the namespace
+  k8s-guard inspect <ns>                                       read only
+
+Every command prints one JSON object on stdout. Failures exit non-zero with
+{"error": ..., "code": ...}. The rules and the reasons for them are in
+references/k8s-guard.md. Profiles come from the shared parser (k8s_profiles.py).
+
+The guard parses no YAML. Each manifest is read once and sent, as the same
+bytes, first to a server-side dry run and then to the apply, and every check
+runs on the JSON the dry run returns, so defaults and webhook mutations are
+checked too.
+"""
+import argparse
+import base64
+import copy
+from datetime import datetime, timedelta, timezone
+import json
+import math
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+
+# -I drops the script directory from sys.path; the shared parser lives next to this script.
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from k8s_profiles import ProfileError, load_profiles  # noqa: E402
+
+GPU = 'nvidia.com/gpu'
+DGD_KIND = 'DynamoGraphDeployment'
+DGD_RESOURCE = 'dynamographdeployments.nvidia.com'
+DGD_VERSIONS = ('nvidia.com/v1alpha1', 'nvidia.com/v1beta1')
+DGD_NAME_LABEL = 'nvidia.com/dynamo-graph-deployment-name'
+DGD_NAME_MAX = 39
+THREAD_LABEL = 'wcep.agent/thread'
+ISSUE_LABEL = 'wcep.agent/issue'
+LEASE_LABEL = 'wcep.agent/lease'
+EXPIRES_ANNOTATION = 'wcep.agent/expires-at'
+LEASE_RECORD = 'wcep-agent-lease'
+HOSTNAME_TOPOLOGY = 'kubernetes.io/hostname'
+MAX_NS_HOURS = 4
+LIVE = ('revoking', 'releasing')
+LEASE_STATES = ('active', 'revoking', 'releasing', 'released', 'torn-down')
+
+KUBECTL_TIMEOUT = 60
+APPLY_REQUEST_TIMEOUT = 30
+# The apply must finish inside the lease's operation slot: refuse unless this much of it is left.
+SLOT_MARGIN = APPLY_REQUEST_TIMEOUT + 10
+BB_TIMEOUT = 30
+FLEET_TIMEOUT = 30
+
+SECRETS = {
+    'hf': {'ref': 'op://Fleet/HuggingFace/credential', 'name': 'hf-token-secret', 'key': 'HF_TOKEN'},
+    'ngc': {'ref': 'op://Fleet/NGC NIM Operations PAT/credential', 'name': 'nvcr-pull',
+            'key': '.dockerconfigjson', 'type': 'kubernetes.io/dockerconfigjson'},
+}
+
+DELETABLE = {  # alias -> (kubectl resource, kind)
+    **dict.fromkeys(('dgd', 'dgds', 'dynamographdeployment', 'dynamographdeployments', DGD_RESOURCE),
+                    (DGD_RESOURCE, DGD_KIND)),
+    **dict.fromkeys(('cm', 'configmap', 'configmaps'), ('configmaps', 'ConfigMap')),
+    **dict.fromkeys(('svc', 'service', 'services'), ('services', 'Service')),
+    **dict.fromkeys(('secret', 'secrets'), ('secrets', 'Secret')),
+    **dict.fromkeys(('pvc', 'pvcs', 'persistentvolumeclaim', 'persistentvolumeclaims'),
+                    ('persistentvolumeclaims', 'PersistentVolumeClaim')),
+    # Leftovers a DGD delete can leave behind (runbook section 10).
+    **dict.fromkeys(('pcs', 'podcliqueset', 'podcliquesets', 'podcliquesets.grove.io'),
+                    ('podcliquesets.grove.io', 'PodCliqueSet')),
+}
+
+# DGD fields, per API version. A field not listed is refused: a field the guard does not
+# model could start a pod it does not count.
+V1BETA1_SPEC = {'annotations', 'labels', 'priorityClassName', 'components', 'env', 'backendFramework', 'restart',
+                'topologyConstraint', 'kvTransferPolicy', 'experimental', 'providerOverride'}
+V1BETA1_COMPONENT = {'name', 'type', 'podTemplate', 'replicas', 'minAvailable', 'multinode', 'sharedMemorySize',
+                     'modelRef', 'globalDynamoNamespace', 'runtimeVersionOverride', 'topologyConstraint'}
+V1ALPHA1_SPEC = {'annotations', 'labels', 'priorityClassName', 'services', 'envs', 'backendFramework', 'restart',
+                 'topologyConstraint', 'pvcs', 'experimental', 'providerOverride'}
+V1ALPHA1_COMPONENT = {'annotations', 'labels', 'serviceName', 'componentType', 'subComponentType', 'dynamoNamespace',
+                      'globalDynamoNamespace', 'resources', 'envs', 'envFromSecret', 'volumeMounts', 'modelRef',
+                      'sharedMemory', 'extraPodMetadata', 'extraPodSpec', 'livenessProbe', 'readinessProbe',
+                      'replicas', 'minAvailable', 'multinode', 'topologyConstraint', 'runtimeVersionOverride'}
+# v1alpha1 fields allowed only while switched off.
+V1ALPHA1_OFF = {'autoscaling', 'scalingAdapter', 'gpuMemoryService', 'failover', 'ingress', 'checkpoint'}
+# Allowed only when empty.
+EMPTY_ONLY = {'priorityClassName', 'experimental', 'providerOverride'}
+COMPONENT_TYPES = {'frontend', 'worker', 'prefill', 'decode', 'default'}
+
+DNS_LABEL = re.compile(r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
+DNS_SUBDOMAIN = re.compile(r'^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$')
+LABEL_VALUE = re.compile(r'^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$')
+LEASE_ID = re.compile(r'^lse_[a-z0-9]{4,64}$')
+UID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9-]{0,63}$')
+
+
+class Refusal(Exception):
+    """A refusal or failure. `code` is stable; `extra` joins the JSON output."""
+
+    def __init__(self, code, message, status=1, **extra):
+        super().__init__(message)
+        self.code = code
+        self.status = status
+        self.extra = extra
+
+
+# --- secrets never leave the process -----------------------------------------
+
+_SECRET_VALUES = []
+
+
+def remember_secret(value):
+    for form in (value, base64.b64encode(value.encode()).decode(),
+                 base64.b64encode(f'$oauthtoken:{value}'.encode()).decode()):
+        if form and form not in _SECRET_VALUES:
+            _SECRET_VALUES.append(form)
+
+
+def scrub(text):
+    text = str(text)
+    for value in _SECRET_VALUES:
+        text = text.replace(value, '[secret]')
+    return text
+
+
+def emit(obj, status=0):
+    sys.stdout.write(scrub(json.dumps(obj, indent=2)) + '\n')
+    return status
+
+
+# --- time ---------------------------------------------------------------------
+
+def now():
+    return datetime.now(timezone.utc)
+
+
+def rfc3339(dt):
+    return dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def parse_time(value, what):
+    try:
+        dt = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    except ValueError:
+        raise Refusal('invalid_time', f'{what} is not an RFC 3339 time: {value!r}')
+    if dt.tzinfo is None:
+        raise Refusal('invalid_time', f'{what} has no time zone: {value!r}')
+    return dt
+
+
+# --- kubectl --------------------------------------------------------------------
+
+class Kubectl:
+    """Every call carries the bot kubeconfig and the profile's context; none relies on the current context."""
+
+    def __init__(self, kubeconfig, context):
+        self.base = ['kubectl', '--kubeconfig', kubeconfig, '--context', context]
+        self.env = dict(os.environ, KUBECONFIG=kubeconfig)
+
+    def run(self, *args, input=None, timeout=KUBECTL_TIMEOUT):
+        try:
+            p = subprocess.run(self.base + list(args), input=input, capture_output=True, text=True,
+                               env=self.env, timeout=timeout,
+                               stdin=None if input is not None else subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            return 124, '', f'kubectl timed out after {timeout}s'
+        except FileNotFoundError:
+            return 127, '', 'kubectl is not on PATH'
+        return p.returncode, p.stdout, p.stderr
+
+    def json(self, *args, input=None, not_found=None, timeout=KUBECTL_TIMEOUT):
+        rc, out, err = self.run(*args, input=input, timeout=timeout)
+        if rc != 0:
+            if not_found is not None and is_not_found(err):
+                return not_found
+            raise kubectl_error(args, rc, err)
+        try:
+            return json.loads(out)
+        except json.JSONDecodeError:
+            raise Refusal('kubectl_error', f'kubectl {args[0]} printed no JSON')
+
+
+class _Missing:
+    pass
+
+
+MISSING = _Missing()
+
+
+def is_not_found(err):
+    return '(NotFound)' in err or 'NotFound' in err.split(':', 1)[0]
+
+
+def kubectl_error(args, rc, err):
+    return Refusal('kubectl_error', scrub(f'kubectl {" ".join(args[:3])} exited {rc}: {err.strip()[:600]}'))
+
+
+# --- bb (the k8s-leases plugin) ---------------------------------------------------
+
+class BbResult:
+    def __init__(self, value=None, code=None, error=None, offline=False):
+        self.value, self.code, self.error, self.offline = value, code, error, offline
+
+    @property
+    def ok(self):
+        return self.value is not None
+
+
+def bb(*args):
+    """Call the plugin. A JSON error is the plugin's answer; anything else means it could not be reached."""
+    try:
+        p = subprocess.run(['bb', *args], capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                           timeout=BB_TIMEOUT)
+    except FileNotFoundError:
+        return BbResult(offline=True, error='bb is not on PATH')
+    except subprocess.TimeoutExpired:
+        return BbResult(offline=True, error=f'bb timed out after {BB_TIMEOUT}s')
+    try:
+        body = json.loads(p.stdout)
+    except json.JSONDecodeError:
+        body = None
+    if not isinstance(body, dict):
+        return BbResult(offline=True, error=(p.stderr or p.stdout).strip()[:300] or f'bb exited {p.returncode}')
+    if p.returncode == 0 and 'error' not in body:
+        return BbResult(value=body)
+    code = body.get('code') if isinstance(body.get('code'), str) and re.match(r'^[a-z0-9_]{1,64}$',
+                                                                              body.get('code') or '') else 'lease_error'
+    return BbResult(code=code, error=str(body.get('error', f'bb exited {p.returncode}'))[:300])
+
+
+def lease_show(lease_id):
+    res = bb('k8s', 'lease', 'show', lease_id)
+    if res.ok:
+        v = res.value
+        shape = {'state': str, 'cluster': str, 'namespace': str, 'uid': str, 'thread': str, 'gpu_type': str,
+                 'gpus': int, 'expires_at': str, 'multi_node': bool}
+        for key, kind in shape.items():
+            if not isinstance(v.get(key), kind) or (kind is int and isinstance(v.get(key), bool)):
+                raise Refusal('lease_invalid', f'bb k8s lease show {lease_id}: {key} is missing or not a {kind.__name__}')
+        if v['state'] not in LEASE_STATES:
+            raise Refusal('lease_invalid', f'lease {lease_id} has an unknown state {v["state"]!r}')
+    return res
+
+
+def lease_unavailable(res, what):
+    return Refusal('lease_unavailable', f'cannot reach the k8s-leases plugin for {what}: {res.error}')
+
+
+# --- the guard's context ------------------------------------------------------------
+
+class Guard:
+    def __init__(self, profiles, context, namespace):
+        self.profiles = profiles
+        self.bot = profiles['bot']
+        if not context:
+            raise Refusal('context_required', 'pass --context <kube context> on every command')
+        matches = [(n, p) for n, p in profiles['clusters'].items() if p['context'] == context]
+        if not matches:
+            raise Refusal('unknown_context', f'no cluster profile has context {context!r}; the guard refuses it')
+        if len(matches) > 1:
+            raise Refusal('profiles_invalid', f'{len(matches)} profiles share context {context!r}')
+        self.cluster, self.profile = matches[0]
+        self.context = context
+        if self.profile['allowed'] == 'never':
+            raise Refusal('cluster_never', f'{self.cluster} is marked never: agents must not touch it')
+        self.namespace = namespace
+        self.thread = os.environ.get('BB_THREAD_ID') or None
+        self.kc = None
+
+    def check_identity(self):
+        bot_path = self.bot['kubeconfig']
+        home = Path.home()
+        banned = [home / '.kube', home / '.tsh']
+        value = os.environ.get('KUBECONFIG')
+        if not value:
+            raise Refusal('kubeconfig_not_bot', 'KUBECONFIG is unset; export the bot kubeconfig')
+        if os.pathsep in value:
+            raise Refusal('kubeconfig_not_bot', 'KUBECONFIG lists more than one file; name only the bot kubeconfig')
+        real = Path(os.path.realpath(os.path.expanduser(value)))
+        for path in (real, Path(os.path.realpath(bot_path))):
+            for b in (x.resolve() for x in banned):
+                if path == b or b in path.parents:
+                    raise Refusal('kubeconfig_not_bot', f'{path} is a human login, not the bot kubeconfig')
+        if real != Path(os.path.realpath(bot_path)):
+            raise Refusal('kubeconfig_not_bot', f'KUBECONFIG is {value}, not the bot kubeconfig {bot_path}')
+        self.kc = Kubectl(bot_path, self.context)
+
+    def require_writable(self):
+        if not self.profile.get('bot_can_write'):
+            raise Refusal('cluster_read_only', f'{self.cluster} is read only for the bot')
+
+    def require_thread(self):
+        if not self.thread:
+            raise Refusal('thread_required', 'BB_THREAD_ID is unset; only a bb thread can own a namespace')
+        if not LABEL_VALUE.match(self.thread):
+            raise Refusal('thread_required', f'BB_THREAD_ID {self.thread!r} is not a valid label value')
+        return self.thread
+
+    def ns_name(self, positional=None):
+        ns = positional or self.namespace
+        if positional and self.namespace and positional != self.namespace:
+            raise Refusal('usage', f'-n {self.namespace} and {positional} disagree', status=2)
+        if not ns:
+            raise Refusal('namespace_required', 'name the namespace with -n')
+        prefix = self.bot['namespace_prefix']
+        if not ns.startswith(prefix) or not DNS_LABEL.match(ns) or len(ns) > 63:
+            raise Refusal('namespace_not_ours', f'{ns} is not one of our namespaces ({prefix}*)')
+        return ns
+
+    # --- reads ---
+
+    def get_namespace(self, ns):
+        obj = self.kc.json('get', 'namespace', ns, '-o', 'json', not_found=MISSING)
+        if obj is MISSING:
+            raise Refusal('not_found', f'namespace {ns} not found')
+        return obj
+
+    def lease_record(self, ns):
+        cm = self.kc.json('get', 'configmap', LEASE_RECORD, '-n', ns, '-o', 'json', not_found=MISSING)
+        return None if cm is MISSING else cm
+
+    def dgds(self, ns):
+        return self.kc.json('get', DGD_RESOURCE, '-n', ns, '-o', 'json').get('items') or []
+
+    def pods(self, ns):
+        return self.kc.json('get', 'pods', '-n', ns, '-o', 'json').get('items') or []
+
+    # --- ledger ---
+
+    def record(self, ns, obj, gpus, direction, uid=None, lease=None, issue=None):
+        line = {'time': rfc3339(now()), 'thread': self.thread, 'cluster': self.cluster, 'context': self.context,
+                'namespace': ns, 'uid': uid, 'object': obj, 'gpus': gpus, 'direction': direction, 'lease': lease,
+                'issue': issue}
+        text = scrub(json.dumps(line)) + '\n'
+        state = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state')
+        paths = [state / 'k8s-guard/ledger.jsonl']
+        if os.environ.get('BB_THREAD_STORAGE'):
+            paths.append(Path(os.environ['BB_THREAD_STORAGE']) / 'k8s-ledger.jsonl')
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, 'a') as f:
+                f.write(text)
+
+
+class NsView:
+    """One read of a namespace: its object, labels and the lease record ConfigMap."""
+
+    def __init__(self, g, ns):
+        self.name = ns
+        self.obj = g.get_namespace(ns)
+        meta = self.obj.get('metadata') or {}
+        self.uid = meta.get('uid')
+        self.labels = meta.get('labels') or {}
+        self.annotations = meta.get('annotations') or {}
+        self.thread = self.labels.get(THREAD_LABEL)
+        self.issue = self.labels.get(ISSUE_LABEL)
+        self.record = g.lease_record(ns)
+        data = (self.record or {}).get('data') or {}
+        self.lease_id = data.get('lease_id') or None
+        # The record's expiry counts only for the namespace it was written in.
+        self.record_expires = data.get('expires_at') if data.get('uid') == self.uid else None
+
+    def expires_at(self):
+        return self.record_expires or self.annotations.get(EXPIRES_ANNOTATION)
+
+    def require_owner(self, g):
+        me = g.require_thread()
+        if self.thread != me:
+            raise Refusal('not_your_namespace', f'{self.name} belongs to thread {self.thread or "nobody"}, not {me}')
+
+
+# --- GPU counting ------------------------------------------------------------------
+
+def quantity(value, where):
+    if isinstance(value, bool):
+        raise Refusal('field_refused', f'{where}: GPU count {value!r} is not a whole number')
+    if isinstance(value, int) and value >= 0:
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    if value in (None, ''):
+        return 0
+    raise Refusal('field_refused', f'{where}: GPU count {value!r} is not a whole number')
+
+
+def check_resource_names(section, where):
+    for name in section or {}:
+        if name != GPU and ('gpu' in name.lower() or name.startswith('nvidia.com/')):
+            raise Refusal('field_refused', f'{where}: resource {name} is not counted by the guard; use {GPU}')
+
+
+def container_gpus(container, where):
+    res = container.get('resources') or {}
+    if res.get('claims'):
+        raise Refusal('field_refused', f'{where}: resource claims (DRA) are not counted by the guard')
+    check_resource_names(res.get('requests'), where)
+    check_resource_names(res.get('limits'), where)
+    return max(quantity((res.get('requests') or {}).get(GPU), where),
+               quantity((res.get('limits') or {}).get(GPU), where))
+
+
+def pod_spec_gpus(spec, where, main_extra=0):
+    """GPUs one pod holds: running containers plus sidecar inits, or the largest init step."""
+    spec = spec or {}
+    if spec.get('resourceClaims'):
+        raise Refusal('field_refused', f'{where}: resourceClaims (DRA) are not counted by the guard')
+    main = sum(container_gpus(c, f'{where}.containers[{i}]') for i, c in enumerate(spec.get('containers') or []))
+    sidecars, inits = 0, [0]
+    for i, c in enumerate(spec.get('initContainers') or []):
+        n = container_gpus(c, f'{where}.initContainers[{i}]')
+        if c.get('restartPolicy') == 'Always':
+            sidecars += n
+        else:
+            inits.append(n)
+    return max(main + main_extra + sidecars, max(inits) + sidecars)
+
+
+def replicas_of(c, where):
+    r = c.get('replicas', 1)
+    if r is None:
+        return 1
+    if isinstance(r, bool) or not isinstance(r, int) or r < 0:
+        raise Refusal('field_refused', f'{where}.replicas must be a whole number')
+    return r
+
+
+def nodes_of(c, where):
+    mn = c.get('multinode')
+    if not mn:
+        return 1
+    n = mn.get('nodeCount', 1)
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise Refusal('field_refused', f'{where}.multinode.nodeCount must be at least 1')
+    return n
+
+
+class Component:
+    def __init__(self, where, per_pod, replicas, nodes, labels, affinity):
+        self.where, self.per_pod, self.replicas, self.nodes = where, per_pod, replicas, nodes
+        self.labels, self.affinity = labels or {}, affinity or {}
+
+    @property
+    def gpus(self):
+        return self.per_pod * self.replicas * self.nodes
+
+
+def components(dgd):
+    """The pod groups of a DGD, with GPUs per pod. Counts leniently: admission refuses what it cannot model."""
+    api = dgd.get('apiVersion')
+    name = (dgd.get('metadata') or {}).get('name')
+    spec = dgd.get('spec') or {}
+    out = []
+    if api == 'nvidia.com/v1beta1':
+        for i, c in enumerate(spec.get('components') or []):
+            where = f'{name}.spec.components[{i}]'
+            tmpl = c.get('podTemplate') or {}
+            out.append(Component(where, pod_spec_gpus(tmpl.get('spec'), where + '.podTemplate.spec'),
+                                 replicas_of(c, where), nodes_of(c, where),
+                                 (tmpl.get('metadata') or {}).get('labels'), (tmpl.get('spec') or {}).get('affinity')))
+            for j, role in enumerate(c.get('roles') or []):
+                rw = f'{where}.roles[{j}]'
+                rt = role.get('podTemplate') or tmpl
+                out.append(Component(rw, pod_spec_gpus(rt.get('spec'), rw + '.podTemplate.spec'),
+                                     replicas_of(role, rw), nodes_of(c, where),
+                                     (rt.get('metadata') or {}).get('labels'), (rt.get('spec') or {}).get('affinity')))
+    elif api == 'nvidia.com/v1alpha1':
+        for svc, c in (spec.get('services') or {}).items():
+            c = c or {}
+            where = f'{name}.spec.services.{svc}'
+            res = c.get('resources') or {}
+            if res.get('claims'):
+                raise Refusal('field_refused', f'{where}.resources.claims (DRA) are not counted by the guard')
+            main = 0
+            for section in ('requests', 'limits'):
+                item = res.get(section) or {}
+                main = max(main, quantity(item.get('gpu'), f'{where}.resources.{section}.gpu'))
+                check_resource_names(item.get('custom'), f'{where}.resources.{section}.custom')
+                main = max(main, quantity((item.get('custom') or {}).get(GPU), f'{where}.resources.{section}.custom'))
+            extra = c.get('extraPodSpec') or {}
+            mc = extra.get('mainContainer')
+            if mc:
+                main = max(main, container_gpus(mc, where + '.extraPodSpec.mainContainer'))
+            out.append(Component(where, pod_spec_gpus(extra, where + '.extraPodSpec', main_extra=main),
+                                 replicas_of(c, where), nodes_of(c, where),
+                                 (c.get('extraPodMetadata') or {}).get('labels'), extra.get('affinity')))
+    else:
+        raise Refusal('count_failed', f'{name}: DGD API {api!r} is not one the guard counts')
+    return out
+
+
+def dgd_gpus(dgd):
+    return sum(c.gpus for c in components(dgd))
+
+
+def pod_gpus(pod):
+    if ((pod.get('status') or {}).get('phase')) in ('Succeeded', 'Failed'):
+        return 0  # a finished pod holds no device; a terminating one still does
+    name = (pod.get('metadata') or {}).get('name')
+    try:
+        return pod_spec_gpus(pod.get('spec'), f'pod {name}')
+    except Refusal:
+        # A GPU in a form the guard cannot count makes every budget answer wrong: stop.
+        raise Refusal('count_failed', f'pod {name} requests GPUs in a form the guard cannot count')
+
+
+def allocation(dgds, pods):
+    """Per DGD, the larger of its spec and its live pods; plus GPU pods that belong to no DGD."""
+    spec = {}
+    for d in dgds:
+        spec[(d.get('metadata') or {}).get('name')] = dgd_gpus(d)
+    held = {}
+    for p in pods:
+        owner = ((p.get('metadata') or {}).get('labels') or {}).get(DGD_NAME_LABEL)
+        held[owner] = held.get(owner, 0) + pod_gpus(p)
+    total = held.pop(None, 0)
+    for name in set(spec) | set(held):
+        total += max(spec.get(name, 0), held.get(name, 0))
+    return total
+
+
+def gpu_pod_summary(pods):
+    counts = [pod_gpus(p) for p in pods]
+    return sum(counts), sum(1 for n in counts if n > 0)
+
+
+# --- admission checks on the dry-run result -------------------------------------------
+
+def walk_forbidden(node, where):
+    """Fields refused wherever they appear in a pod-bearing spec."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            here = f'{where}.{key}'
+            if key == 'hostPath':
+                raise Refusal('field_refused', f'{here}: hostPath volumes are refused')
+            if key == 'priorityClassName' and value:
+                raise Refusal('field_refused', f'{here}: priorityClassName is refused')
+            if key == 'privileged' and value is True:
+                raise Refusal('field_refused', f'{here}: privileged containers are refused')
+            if key in ('hostNetwork', 'hostPID', 'hostIPC') and value is True:
+                raise Refusal('field_refused', f'{here}: {key} is refused')
+            if key in ('resourceClaims', 'resourceClaimTemplateName') and value:
+                raise Refusal('field_refused', f'{here}: resource claims (DRA) are not counted by the guard')
+            if key == 'tolerations' and isinstance(value, list):
+                for i, t in enumerate(value):
+                    if isinstance(t, dict) and t.get('operator') == 'Exists' and not t.get('key'):
+                        raise Refusal('field_refused', f'{here}[{i}]: a toleration with operator Exists and no key '
+                                                       'tolerates every taint, reservations included')
+            walk_forbidden(value, here)
+    elif isinstance(node, list):
+        for i, item in enumerate(node):
+            walk_forbidden(item, f'{where}[{i}]')
+
+
+def require_resources(container, where):
+    res = container.get('resources') or {}
+    for section in ('requests', 'limits'):
+        got = res.get(section) or {}
+        missing = [k for k in ('cpu', 'memory') if not got.get(k)]
+        if missing:
+            raise Refusal('resources_required', f'{where}: resources.{section} needs {" and ".join(missing)}')
+
+
+def alpha_main_resources_ok(c):
+    res = c.get('resources') or {}
+    mc = ((c.get('extraPodSpec') or {}).get('mainContainer') or {}).get('resources') or {}
+    for section in ('requests', 'limits'):
+        merged = dict((mc.get(section) or {}))
+        merged.update({k: v for k, v in (res.get(section) or {}).items() if k in ('cpu', 'memory') and v})
+        if not (merged.get('cpu') and merged.get('memory')):
+            return section
+    return None
+
+
+def check_keys(obj, allowed, where):
+    for key, value in obj.items():
+        if key not in allowed:
+            raise Refusal('field_refused', f'{where}.{key} is a field the guard does not admit')
+        if key in EMPTY_ONLY and value:
+            raise Refusal('field_refused', f'{where}.{key} is refused')
+
+
+def check_dgd(dgd, where):
+    name = (dgd.get('metadata') or {}).get('name') or ''
+    if len(name) > DGD_NAME_MAX:
+        raise Refusal('dgd_name_too_long', f'{where}: DGD name {name} is {len(name)} characters, more than '
+                                           f'{DGD_NAME_MAX}')
+    spec = dgd.get('spec') or {}
+    walk_forbidden(spec, where + '.spec')
+    if dgd['apiVersion'] == 'nvidia.com/v1beta1':
+        check_keys(spec, V1BETA1_SPEC, where + '.spec')
+        for i, c in enumerate(spec.get('components') or []):
+            cw = f'{where}.spec.components[{i}]'
+            check_keys(c, V1BETA1_COMPONENT, cw)
+            ctype = c.get('type')
+            if ctype is not None and ctype not in COMPONENT_TYPES:
+                raise Refusal('field_refused', f'{cw}.type {ctype!r} is refused (planners, EPP and LPX scale or '
+                                               'start pods the guard does not count)')
+            pod_spec = (c.get('podTemplate') or {}).get('spec') or {}
+            for kind in ('containers', 'initContainers'):
+                for j, ctr in enumerate(pod_spec.get(kind) or []):
+                    require_resources(ctr, f'{cw}.podTemplate.spec.{kind}[{j}]')
+            if not pod_spec.get('containers'):
+                raise Refusal('resources_required', f'{cw}: podTemplate.spec.containers must name the main container '
+                                                    'with its requests and limits')
+    else:
+        check_keys(spec, V1ALPHA1_SPEC, where + '.spec')
+        for i, pvc in enumerate(spec.get('pvcs') or []):
+            if (pvc or {}).get('create'):
+                raise Refusal('field_refused', f'{where}.spec.pvcs[{i}]: the guard does not create PVCs')
+        for svc, c in (spec.get('services') or {}).items():
+            c = c or {}
+            cw = f'{where}.spec.services.{svc}'
+            for key, value in c.items():
+                if key in V1ALPHA1_OFF:
+                    if (value or {}).get('enabled'):
+                        raise Refusal('field_refused', f'{cw}.{key} is enabled; the guard admits fixed replicas only')
+                elif key not in V1ALPHA1_COMPONENT:
+                    raise Refusal('field_refused', f'{cw}.{key} is a field the guard does not admit')
+            for key in ('componentType', 'subComponentType'):
+                if str(c.get(key, '')).lower() in ('planner', 'epp', 'lpx'):
+                    raise Refusal('field_refused', f'{cw}.{key} {c[key]!r} is refused')
+            if str(svc).lower() == 'planner':
+                raise Refusal('field_refused', f'{cw}: a planner component is refused')
+            ctype = c.get('componentType')
+            if ctype not in (None, '') and ctype not in COMPONENT_TYPES:
+                raise Refusal('field_refused', f'{cw}.componentType {ctype!r} is refused')
+            missing = alpha_main_resources_ok(c)
+            if missing:
+                raise Refusal('resources_required', f'{cw}: resources.{missing} needs cpu and memory')
+            extra = c.get('extraPodSpec') or {}
+            for kind in ('containers', 'initContainers'):
+                for j, ctr in enumerate(extra.get(kind) or []):
+                    require_resources(ctr, f'{cw}.extraPodSpec.{kind}[{j}]')
+    components(dgd)  # refuses GPU forms the guard cannot count
+
+
+def admit(objects, ns):
+    """Check every object the dry run returned. Returns the DGDs among them."""
+    dgds = []
+    for i, obj in enumerate(objects):
+        kind, api = obj.get('kind'), obj.get('apiVersion')
+        meta = obj.get('metadata') or {}
+        where = f'{kind}/{meta.get("name")}'
+        if meta.get('namespace') != ns:
+            raise Refusal('kind_refused', f'{where} is not a namespaced object in {ns}')
+        if kind == DGD_KIND and api in DGD_VERSIONS:
+            check_dgd(obj, where)
+            dgds.append(obj)
+        elif kind == 'ConfigMap' and api == 'v1':
+            if meta.get('name') == LEASE_RECORD:
+                raise Refusal('kind_refused', f'{where} is the guard\'s own lease record')
+        elif kind == 'Service' and api == 'v1':
+            spec = obj.get('spec') or {}
+            if spec.get('type', 'ClusterIP') != 'ClusterIP' or spec.get('externalIPs'):
+                raise Refusal('service_type_refused', f'{where}: only ClusterIP Services are admitted, not '
+                                                      f'{spec.get("type")}')
+            walk_forbidden(spec, where + '.spec')
+        else:
+            raise Refusal('kind_refused', f'{where} ({api}) is not an admitted kind; admitted: DynamoGraphDeployment, '
+                                          'ConfigMap, ClusterIP Service')
+    return dgds
+
+
+def check_one_node(after, lease, profile):
+    """Without multi-node approval, every GPU pod must land on one node with the lease's other pods."""
+    if lease['multi_node']:
+        return
+    lid = lease['lease_id']
+    for d in after:
+        for c in components(d):
+            if c.per_pod == 0 or c.replicas == 0:
+                continue
+            if c.nodes > 1:
+                raise Refusal('one_node_required', f'{c.where}: multinode needs Ryan\'s multi-node approval')
+            if c.labels.get(LEASE_LABEL) != lid:
+                raise Refusal('one_node_required', f'{c.where}: GPU pods need the label {LEASE_LABEL}={lid}')
+            terms = (((c.affinity.get('podAffinity') or {})
+                      .get('requiredDuringSchedulingIgnoredDuringExecution')) or [])
+            want = {'labelSelector': {'matchLabels': {LEASE_LABEL: lid}}, 'topologyKey': HOSTNAME_TOPOLOGY}
+            if not any(t == want for t in terms):
+                raise Refusal('one_node_required', f'{c.where}: GPU pods need a required podAffinity term exactly '
+                                                   f'{json.dumps(want)}')
+
+
+# --- the lease and its operation slot ----------------------------------------------------
+
+def lease_for_write(g, view):
+    res = lease_show(view.lease_id)
+    if res.offline:
+        raise lease_unavailable(res, f'lease {view.lease_id}')
+    if not res.ok:
+        raise Refusal(res.code, f'lease {view.lease_id}: {res.error}')
+    lease = dict(res.value, lease_id=view.lease_id)
+    if lease['state'] != 'active':
+        raise Refusal('lease_not_active', f'lease {view.lease_id} is {lease["state"]}')
+    wrong = [f'{k} {lease[k]!r}, not {want!r}' for k, want in (
+        ('thread', g.thread), ('cluster', g.cluster), ('namespace', view.name), ('uid', view.uid),
+        ('gpu_type', g.profile['gpu_type'])) if lease[k] != want]
+    if wrong:
+        raise Refusal('lease_mismatch', f'lease {view.lease_id} does not cover this write: ' + '; '.join(wrong))
+    return lease
+
+
+class Slot:
+    def __init__(self, lease_id, token, deadline):
+        self.lease_id, self.token, self.deadline = lease_id, token, deadline
+
+    def check(self):
+        left = (self.deadline - now()).total_seconds()
+        if left < SLOT_MARGIN:
+            raise Refusal('slot_expired', f'the operation slot of {self.lease_id} has {max(left, 0):.0f}s left, '
+                                          f'less than the {SLOT_MARGIN}s an apply may take; try again')
+
+
+def fenced(g, view, body):
+    """Run body(lease, slot) inside the lease's one operation slot; with no lease, body(None, None)."""
+    if not view.lease_id:
+        return body(None, None)
+    lease = lease_for_write(g, view)
+    res = bb('k8s', 'lease', 'op', 'begin', view.lease_id)
+    if res.offline:
+        raise lease_unavailable(res, 'op begin')
+    if not res.ok:
+        raise Refusal(res.code, f'op begin on {view.lease_id}: {res.error}')
+    token, deadline = res.value.get('token'), res.value.get('deadline')
+    if not isinstance(token, str) or not isinstance(deadline, str):
+        raise Refusal('lease_invalid', 'op begin returned no token or deadline')
+    slot = Slot(view.lease_id, token, parse_time(deadline, 'the slot deadline'))
+    error = None
+    try:
+        result = body(lease, slot)
+    except Exception as e:  # end the slot whatever happened
+        error, result = e, None
+    end = bb('k8s', 'lease', 'op', 'end', view.lease_id, token)
+    state = end.value.get('state') if end.ok else None
+    if state is not None and state != 'active':
+        # The lease was revoked while we held the slot. A failed or timed-out apply may still have
+        # landed, so undo at once whatever the write's own outcome, then say so.
+        try:
+            expired = do_expire(g, view.name, uid=view.uid, lease_id=view.lease_id)
+            detail = f'scaled {len(expired["scaled"])} DGDs to 0'
+        except Refusal as e:
+            detail = f'expire failed ({e.code}): {e}'
+        if error is not None:
+            detail += f'; the write itself failed ({getattr(error, "code", type(error).__name__)}): {error}'
+        raise Refusal('lease_revoked', f'lease {view.lease_id} is {state} after the write; {detail}',
+                      result=result)
+    if error is not None:
+        raise error
+    if not end.ok:
+        raise Refusal('op_end_failed', f'the write landed, but op end failed: {end.error}; the slot frees at its '
+                                       'deadline', result=result)
+    return result
+
+
+# --- teardown authority -----------------------------------------------------------------
+
+def teardown_authority(g, view, uid_arg, lease_arg):
+    """expire and down by anyone: (a) the plugin says revoking or releasing; (b) offline, past expires-at."""
+    lease_id = lease_arg or view.lease_id
+    if lease_id:
+        res = lease_show(lease_id)
+        if res.ok:
+            lease = res.value
+            wrong = [f'{k} {lease[k]!r}, not {want!r}' for k, want in (
+                ('cluster', g.cluster), ('namespace', view.name), ('uid', view.uid)) if lease[k] != want]
+            if wrong:
+                raise Refusal('lease_mismatch', f'lease {lease_id} is not this namespace\'s: ' + '; '.join(wrong))
+            if lease['state'] in LIVE:
+                return f'lease {lease_id} is {lease["state"]}'
+            if lease['state'] == 'active':
+                raise Refusal('lease_active', f'lease {lease_id} is active; only its owner\'s down may end it')
+            # released or torn-down: the plugin vouches for nothing; fall back to the namespace's expiry.
+        elif not res.offline:
+            raise Refusal(res.code, f'lease {lease_id}: {res.error}')
+    if not uid_arg:
+        raise Refusal('uid_required', 'without the plugin\'s word, teardown needs --uid from the ledger')
+    expires = view.expires_at()
+    if not expires:
+        raise Refusal('not_expired', f'{view.name} has no expiry')
+    if parse_time(expires, 'expires-at') > now():
+        raise Refusal('not_expired', f'{view.name} expires at {expires}')
+    return f'{view.name} expired at {expires}'
+
+
+def check_uid(view, uid_arg):
+    if uid_arg and uid_arg != view.uid:
+        raise Refusal('uid_mismatch', f'{view.name} has UID {view.uid}, not {uid_arg}: it was re-created')
+
+
+# --- commands -----------------------------------------------------------------------
+
+def cmd_inspect(g, a):
+    ns = g.ns_name(a.namespace)
+    view = NsView(g, ns)
+    dgds, pods = g.dgds(ns), g.pods(ns)
+    pod_total, gpu_pods = gpu_pod_summary(pods)
+    return {'namespace': ns, 'uid': view.uid, 'thread': view.thread, 'expires_at': view.expires_at(),
+            'dgd_gpus': sum(dgd_gpus(d) for d in dgds), 'pod_gpus': pod_total,
+            'gpu_type': g.profile.get('gpu_type'), 'gpu_pods_left': gpu_pods,
+            'allocation': allocation(dgds, pods), 'lease_id': view.lease_id, 'cluster': g.cluster}
+
+
+def cmd_ns_create(g, a):
+    g.require_writable()
+    thread = g.require_thread()
+    if not DNS_LABEL.match(a.purpose):
+        raise Refusal('usage', f'purpose {a.purpose!r} must be lower-case letters, digits and -', status=2)
+    if not re.match(r'^[0-9]{1,10}$', a.issue):
+        raise Refusal('usage', f'--issue {a.issue!r} must be the issue number', status=2)
+    hours = hours_arg(a.hours, MAX_NS_HOURS)
+    ns = f'{g.bot["namespace_prefix"]}{a.issue}-{a.purpose}'
+    if len(ns) > 63:
+        raise Refusal('usage', f'{ns} is longer than 63 characters', status=2)
+    developer = g.bot['developer']
+    expires = rfc3339(now() + timedelta(hours=hours))
+    manifest = {'apiVersion': 'v1', 'kind': 'Namespace', 'metadata': {
+        'name': ns,
+        'labels': {'owner': developer, 'dynamo.nvidia.com/developer': developer,
+                   'dynamo.nvidia.com/developer-agent-rbac': 'true', THREAD_LABEL: thread, ISSUE_LABEL: a.issue},
+        'annotations': {EXPIRES_ANNOTATION: expires}}}
+    # create, never apply: the server refuses a name that exists, so a namespace is never adopted.
+    rc, out, err = g.kc.run('create', '-f', '-', '-o', 'json', input=json.dumps(manifest))
+    if rc != 0:
+        if 'AlreadyExists' in err:
+            raise Refusal('namespace_exists', f'{ns} already exists; namespaces are never adopted')
+        raise kubectl_error(('create', 'namespace', ns), rc, err)
+    uid = json.loads(out)['metadata']['uid']
+    g.record(ns, f'Namespace/{ns}', 0, 'up', uid=uid, issue=a.issue)
+    return {'namespace': ns, 'uid': uid, 'expires_at': expires, 'cluster': g.cluster}
+
+
+def hours_arg(text, maximum):
+    try:
+        hours = float(text)
+    except ValueError:
+        hours = math.nan
+    if not math.isfinite(hours) or hours <= 0 or hours > maximum:
+        raise Refusal('usage', f'--hours must be more than 0 and at most {maximum}', status=2)
+    return hours
+
+
+def cmd_lease_acquire(g, a):
+    g.require_writable()
+    ns = g.ns_name()
+    view = NsView(g, ns)
+    view.require_owner(g)
+    if view.record is not None:
+        raise Refusal('lease_exists', f'{ns} already has a lease record ({view.lease_id}); a namespace gets one lease')
+    if not re.match(r'^[1-9][0-9]{0,3}$', a.gpus):
+        raise Refusal('usage', '--gpus must be a whole number from 1', status=2)
+    hours_arg(a.hours, math.inf)  # the plugin holds the limit
+    res = bb('k8s', 'lease', 'acquire', '--cluster', g.cluster, '--namespace', ns, '--uid', view.uid,
+             '--thread', g.thread, '--gpu-type', g.profile['gpu_type'], '--gpus', a.gpus, '--hours', a.hours)
+    if res.offline:
+        raise lease_unavailable(res, 'acquire')
+    if not res.ok:
+        raise Refusal(res.code, f'the plugin refused the lease: {res.error}')
+    lease_id, expires = res.value.get('lease_id'), res.value.get('expires_at')
+    if not isinstance(lease_id, str) or not LEASE_ID.match(lease_id) or not isinstance(expires, str):
+        raise Refusal('lease_invalid', 'acquire returned no lease id or expiry')
+    parse_time(expires, 'the lease expiry')
+    cm = {'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': LEASE_RECORD, 'namespace': ns},
+          'data': {'lease_id': lease_id, 'expires_at': expires, 'thread': g.thread, 'uid': view.uid}}
+    rc, out, err = g.kc.run('create', '-f', '-', '-n', ns, '-o', 'json', input=json.dumps(cm))
+    if rc != 0:
+        raise Refusal('lease_record_failed', scrub(f'lease {lease_id} is granted, but its record could not be written '
+                                                   f'({err.strip()[:300]}); run `bb k8s lease release {lease_id}`, '
+                                                   'which tears the namespace down'), lease_id=lease_id)
+    g.record(ns, f'ConfigMap/{LEASE_RECORD}', 0, 'up', uid=view.uid, lease=lease_id, issue=view.issue)
+    return {'lease_id': lease_id, 'expires_at': expires, 'namespace': ns,
+            'pod_label': {LEASE_LABEL: lease_id},
+            'pod_affinity': {'podAffinity': {'requiredDuringSchedulingIgnoredDuringExecution': [{
+                'labelSelector': {'matchLabels': {LEASE_LABEL: lease_id}}, 'topologyKey': HOSTNAME_TOPOLOGY}]}}}
+
+
+def cmd_secret(g, a):
+    g.require_writable()
+    ns = g.ns_name()
+    view = NsView(g, ns)
+    view.require_owner(g)
+    spec = SECRETS[a.which]
+
+    def body(lease, slot):
+        if lease is None and allocation(g.dgds(ns), g.pods(ns)) > 0:
+            raise Refusal('lease_required', f'{ns} holds GPUs but has no lease')
+        try:
+            p = subprocess.run(['fleet', 'secret', 'get', spec['ref']], capture_output=True, text=True,
+                               stdin=subprocess.DEVNULL, timeout=FLEET_TIMEOUT)
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            raise Refusal('secret_unavailable', f'fleet secret get failed: {type(e).__name__}')
+        value = p.stdout[:-1] if p.stdout.endswith('\n') else p.stdout
+        if value:
+            remember_secret(value)
+        if p.returncode != 0 or not value:
+            raise Refusal('secret_unavailable', scrub(f'fleet secret get exited {p.returncode}: {p.stderr.strip()[:200]}'))
+        if a.which == 'ngc':
+            auth = base64.b64encode(f'$oauthtoken:{value}'.encode()).decode()
+            payload = json.dumps({'auths': {'nvcr.io': {'username': '$oauthtoken', 'password': value, 'auth': auth}}})
+            remember_secret(payload)
+        else:
+            payload = value
+        args = ['create', 'secret', 'generic', spec['name'], '-n', ns, f'--from-file={spec["key"]}=/dev/stdin']
+        if spec.get('type'):
+            args.append(f'--type={spec["type"]}')
+        if slot:
+            slot.check()
+        rc, out, err = g.kc.run(*args, input=payload)
+        if rc != 0:
+            if 'AlreadyExists' in err:
+                raise Refusal('secret_exists', f'secret {spec["name"]} already exists in {ns}')
+            raise kubectl_error(('create', 'secret', spec['name']), rc, err)
+        g.record(ns, f'Secret/{spec["name"]}', 0, 'up', uid=view.uid, lease=view.lease_id, issue=view.issue)
+        return {'secret': spec['name'], 'namespace': ns}
+
+    return fenced(g, view, body)
+
+
+def cmd_apply(g, a):
+    g.require_writable()
+    ns = g.ns_name()
+    try:
+        manifest = Path(a.filename).read_bytes().decode()
+    except (OSError, UnicodeDecodeError) as e:
+        raise Refusal('usage', f'cannot read {a.filename}: {e}', status=2)
+    view = NsView(g, ns)
+    view.require_owner(g)
+
+    def body(lease, slot):
+        # The same bytes go to the dry run and to the apply; the checks run on what the server returned.
+        result = g.kc.json('apply', '-f', '-', '-n', ns, '--dry-run=server', '-o', 'json', input=manifest)
+        objects = result.get('items') if result.get('kind') == 'List' else [result]
+        if not objects:
+            raise Refusal('usage', f'{a.filename} holds no objects', status=2)
+        new = admit(objects, ns)
+        existing = {(d.get('metadata') or {}).get('name'): d for d in g.dgds(ns)}
+        for d in new:
+            existing[d['metadata']['name']] = d  # a re-apply replaces, never adds
+        after = list(existing.values())
+        pods = g.pods(ns)
+        total = allocation(after, pods)
+        if lease is None:
+            if total > 0:
+                raise Refusal('lease_required', f'{ns} would hold {total} GPUs and has no lease; '
+                                                'run `k8s-guard lease acquire` first', allocation=total)
+        else:
+            if total > lease['gpus']:
+                raise Refusal('over_lease', f'{ns} would hold {total} GPUs (spec or pods, terminating included), more '
+                                            f'than lease {lease["lease_id"]} grants ({lease["gpus"]})',
+                              allocation=total)
+            if not lease['multi_node'] and total > g.profile['gpus_per_node']:
+                raise Refusal('one_node_required', f'{total} GPUs do not fit one {g.profile["gpu_type"]} node '
+                                                   f'({g.profile["gpus_per_node"]}) without multi-node approval',
+                              allocation=total)
+            check_one_node(after, lease, g.profile)
+            slot.check()
+        out = g.kc.json('apply', '-f', '-', '-n', ns, '-o', 'json',
+                        f'--request-timeout={APPLY_REQUEST_TIMEOUT}s', input=manifest,
+                        timeout=APPLY_REQUEST_TIMEOUT + 15)
+        applied = out.get('items') if out.get('kind') == 'List' else [out]
+        names = []
+        for obj in applied:
+            name = f'{obj.get("kind")}/{(obj.get("metadata") or {}).get("name")}'
+            gpus = dgd_gpus(obj) if obj.get('kind') == DGD_KIND else 0
+            g.record(ns, name, gpus, 'up', uid=view.uid, lease=view.lease_id, issue=view.issue)
+            names.append(name)
+        return {'applied': names, 'namespace': ns, 'allocation': total, 'lease': view.lease_id}
+
+    return fenced(g, view, body)
+
+
+def cmd_delete(g, a):
+    g.require_writable()
+    ns = g.ns_name()
+    kind_text, _, name = a.target.partition('/')
+    if kind_text.lower() not in DELETABLE:
+        raise Refusal('kind_refused', f'{kind_text} is not a kind the guard deletes')
+    resource, kind = DELETABLE[kind_text.lower()]
+    if not name or not DNS_SUBDOMAIN.match(name) or len(name) > 253:
+        raise Refusal('usage', f'{a.target!r} is not <kind>/<name>', status=2)
+    protected = {('ConfigMap', LEASE_RECORD)}
+    if g.profile.get('model_cache'):
+        protected.add(('PersistentVolumeClaim', g.profile['model_cache']))
+    if g.profile.get('pull_secret'):
+        protected.add(('Secret', g.profile['pull_secret']))
+    if (kind, name) in protected:
+        raise Refusal('object_protected', f'{kind}/{name} is not deleted on its own (runbook section 10)')
+    view = NsView(g, ns)
+    view.require_owner(g)
+    gpus = 0
+    if kind == DGD_KIND:
+        obj = g.kc.json('get', f'{resource}/{name}', '-n', ns, '-o', 'json', not_found=MISSING)
+        if obj is MISSING:
+            raise Refusal('not_found', f'{kind}/{name} not found in {ns}')
+        gpus = dgd_gpus(obj)
+    rc, out, err = g.kc.run('delete', f'{resource}/{name}', '-n', ns, '--wait=false')
+    if rc != 0:
+        if is_not_found(err):
+            raise Refusal('not_found', f'{kind}/{name} not found in {ns}')
+        raise kubectl_error(('delete', f'{resource}/{name}'), rc, err)
+    g.record(ns, f'{kind}/{name}', gpus, 'down', uid=view.uid, lease=view.lease_id, issue=view.issue)
+    return {'deleted': f'{kind}/{name}', 'namespace': ns}
+
+
+def dgd_path(dgd, ns):
+    group, _, version = dgd['apiVersion'].partition('/')
+    return f'/apis/{group}/{version}/namespaces/{ns}/dynamographdeployments/{dgd["metadata"]["name"]}'
+
+
+def esc(name):
+    return str(name).replace('~', '~0').replace('/', '~1')
+
+
+def zero_patch(dgd):
+    """A JSON patch that sets every replica count to 0, guarded by the DGD's UID and component names."""
+    ops = [{'op': 'test', 'path': '/metadata/uid', 'value': dgd['metadata']['uid']}]
+    spec = dgd.get('spec') or {}
+    changed = False
+    if dgd.get('apiVersion') == 'nvidia.com/v1beta1':
+        for i, c in enumerate(spec.get('components') or []):
+            ops.append({'op': 'test', 'path': f'/spec/components/{i}/name', 'value': c.get('name')})
+            if c.get('replicas', 1) != 0:
+                ops.append({'op': 'add', 'path': f'/spec/components/{i}/replicas', 'value': 0})
+                changed = True
+            for j, role in enumerate(c.get('roles') or []):
+                if role.get('replicas', 1) != 0:
+                    ops.append({'op': 'add', 'path': f'/spec/components/{i}/roles/{j}/replicas', 'value': 0})
+                    changed = True
+    elif dgd.get('apiVersion') == 'nvidia.com/v1alpha1':
+        for svc, c in (spec.get('services') or {}).items():
+            if (c or {}).get('replicas', 1) != 0:
+                ops.append({'op': 'add', 'path': f'/spec/services/{esc(svc)}/replicas', 'value': 0})
+                changed = True
+    else:
+        raise Refusal('count_failed', f'{dgd["metadata"]["name"]}: DGD API {dgd.get("apiVersion")!r} is unknown')
+    return ops if changed else None
+
+
+def confirm_uid(g, ns, uid):
+    """Read the namespace again: the DGDs just listed must belong to the namespace whose UID was checked."""
+    current = (g.get_namespace(ns).get('metadata') or {}).get('uid')
+    if current != uid:
+        raise Refusal('uid_mismatch', f'{ns} now has UID {current}, not {uid}: it was re-created; left alone')
+
+
+def do_expire(g, ns, uid, lease_id):
+    scaled, before = [], 0
+    dgds = g.dgds(ns)
+    confirm_uid(g, ns, uid)
+    for d in dgds:
+        try:
+            before += dgd_gpus(d)
+        except Refusal:
+            pass  # scale it down even when it cannot be counted
+        ops = zero_patch(d)
+        if ops is None:
+            continue
+        group, _, version = d['apiVersion'].partition('/')
+        res = f'dynamographdeployments.{version}.{group}/{d["metadata"]["name"]}'
+        rc, out, err = g.kc.run('patch', res, '-n', ns, '--type=json', '-p', json.dumps(ops))
+        if rc != 0 and not is_not_found(err):
+            raise kubectl_error(('patch', res), rc, err)
+        scaled.append(d['metadata']['name'])
+    _, left = gpu_pod_summary(g.pods(ns))
+    g.record(ns, f'Namespace/{ns}', before, 'down', uid=uid, lease=lease_id)
+    return {'namespace': ns, 'scaled': scaled, 'gpu_pods_left': left}
+
+
+def cmd_expire(g, a):
+    g.require_writable()
+    ns = g.ns_name(a.namespace)
+    view = NsView(g, ns)
+    check_uid(view, a.uid)
+    why = teardown_authority(g, view, a.uid, a.lease)
+    return dict(do_expire(g, ns, view.uid, a.lease or view.lease_id), authority=why)
+
+
+def cmd_down(g, a):
+    g.require_writable()
+    ns = g.ns_name(a.namespace)
+    view = NsView(g, ns)
+    check_uid(view, a.uid)
+    lease_id = a.lease or view.lease_id
+    if g.thread and view.thread == g.thread:
+        why = 'owner'
+        if lease_id:
+            res = lease_show(lease_id)
+            if res.ok:
+                lease = res.value
+                if (lease['cluster'], lease['namespace'], lease['uid']) != (g.cluster, ns, view.uid):
+                    raise Refusal('lease_mismatch', f'lease {lease_id} is not this namespace\'s')
+                if lease['state'] == 'active':
+                    rel = bb('k8s', 'lease', 'release', lease_id)
+                    if not rel.ok:
+                        raise Refusal('lease_release_failed', f'could not release {lease_id}: {rel.error}')
+                    why = f'owner; released {lease_id}'
+            elif res.offline:
+                # The owner cannot release offline; it may still tear down a namespace past its expiry (4b).
+                try:
+                    why = offline_owner(view)
+                except Refusal as e:
+                    raise Refusal('lease_release_failed', f'cannot reach the plugin to release {lease_id} ({res.error}),'
+                                                          f' and {e}')
+            else:
+                raise Refusal(res.code, f'lease {lease_id}: {res.error}')
+    else:
+        why = teardown_authority(g, view, a.uid, a.lease)
+    dgds = g.dgds(ns)
+    confirm_uid(g, ns, view.uid)
+    before = 0
+    for d in dgds:
+        try:
+            before += dgd_gpus(d)
+        except Refusal:
+            pass
+    for d in dgds:
+        body = json.dumps({'kind': 'DeleteOptions', 'apiVersion': 'v1', 'preconditions': {'uid': d['metadata']['uid']}})
+        rc, out, err = g.kc.run('delete', '--raw', dgd_path(d, ns), '-f', '-', input=body)
+        if rc != 0 and not is_not_found(err):
+            raise kubectl_error(('delete', 'dgd', d['metadata']['name']), rc, err)
+    wait = float(os.environ.get('K8S_GUARD_DOWN_WAIT_SECONDS', '300'))
+    poll = float(os.environ.get('K8S_GUARD_POLL_SECONDS', '5'))
+    give_up = time.monotonic() + wait
+    while True:
+        _, left = gpu_pod_summary(g.pods(ns))
+        if left == 0 or time.monotonic() >= give_up:
+            break
+        time.sleep(poll)
+    if left:
+        g.record(ns, f'Namespace/{ns}', before, 'down', uid=view.uid, lease=lease_id, issue=view.issue)
+        raise Refusal('pods_left', f'{left} GPU pods still run in {ns}; the namespace is kept until they are gone',
+                      gpu_pods_left=left)
+    body = json.dumps({'kind': 'DeleteOptions', 'apiVersion': 'v1', 'preconditions': {'uid': view.uid}})
+    rc, out, err = g.kc.run('delete', '--raw', f'/api/v1/namespaces/{ns}', '-f', '-', input=body)
+    if rc != 0 and not is_not_found(err):
+        if 'Precondition failed' in err or 'Conflict' in err:
+            raise Refusal('uid_mismatch', f'{ns} was re-created; the new namespace is left alone')
+        raise kubectl_error(('delete', 'namespace', ns), rc, err)
+    g.record(ns, f'Namespace/{ns}', before, 'down', uid=view.uid, lease=lease_id, issue=view.issue)
+    return {'namespace': ns, 'deleted': True, 'authority': why}
+
+
+def offline_owner(view):
+    expires = view.expires_at()
+    if not expires or parse_time(expires, 'expires-at') > now():
+        raise Refusal('not_expired', f'{view.name} has not expired')
+    return f'owner; plugin unreachable; {view.name} expired at {expires}'
+
+
+def cmd_extend(g, a):
+    g.require_writable()
+    ns = g.ns_name(a.namespace)
+    view = NsView(g, ns)
+    check_uid(view, a.uid)
+    lease_id = a.lease or view.lease_id
+    if not lease_id:
+        raise Refusal('lease_required', f'{ns} has no lease to extend from')
+    res = lease_show(lease_id)
+    if res.offline:
+        raise lease_unavailable(res, f'lease {lease_id}')
+    if not res.ok:
+        raise Refusal(res.code, f'lease {lease_id}: {res.error}')
+    lease = res.value
+    if lease['state'] != 'active':
+        raise Refusal('lease_not_active', f'lease {lease_id} is {lease["state"]}; it cannot be extended')
+    wrong = [f'{k} {lease[k]!r}, not {want!r}' for k, want in (
+        ('cluster', g.cluster), ('namespace', ns), ('uid', view.uid)) if lease[k] != want]
+    if wrong:
+        raise Refusal('lease_mismatch', f'lease {lease_id} is not this namespace\'s: ' + '; '.join(wrong))
+    expires = lease['expires_at']
+    parse_time(expires, 'the lease expiry')
+    if view.record is None:
+        cm = {'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': LEASE_RECORD, 'namespace': ns},
+              'data': {'lease_id': lease_id, 'expires_at': expires, 'thread': lease['thread'], 'uid': view.uid}}
+        g.kc.json('create', '-f', '-', '-n', ns, '-o', 'json', input=json.dumps(cm))
+    else:
+        if view.lease_id != lease_id:
+            raise Refusal('lease_record_mismatch', f'{ns}\'s lease record names {view.lease_id}, not {lease_id}')
+        stored = view.record_expires
+        if stored and parse_time(stored, 'the stored expiry') >= parse_time(expires, 'the lease expiry'):
+            # Monotonic: an extend that timed out can land after a later one; it must not pull the expiry back.
+            # (extend refuses a revoking lease above, so it never needs to move the expiry earlier.)
+            return {'namespace': ns, 'lease_id': lease_id, 'expires_at': stored, 'unchanged': True}
+        cm = copy.deepcopy(view.record)
+        cm['data'] = dict(cm.get('data') or {}, expires_at=expires, uid=view.uid)
+        # replace carries the resourceVersion read above: a concurrent change fails with a conflict.
+        rc, out, err = g.kc.run('replace', '-f', '-', '-n', ns, '-o', 'json', input=json.dumps(cm))
+        if rc != 0:
+            code = 'record_conflict' if 'Conflict' in err else 'kubectl_error'
+            raise Refusal(code, scrub(f'could not update {LEASE_RECORD}: {err.strip()[:300]}'))
+    g.record(ns, f'ConfigMap/{LEASE_RECORD}', 0, 'extend', uid=view.uid, lease=lease_id, issue=view.issue)
+    return {'namespace': ns, 'lease_id': lease_id, 'expires_at': expires}
+
+
+# --- argv ----------------------------------------------------------------------------
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise Refusal('usage', f'{self.prog}: {message}', status=2)
+
+
+def parser(prog, *specs):
+    p = Parser(prog=f'k8s-guard {prog}', allow_abbrev=False, add_help=False)
+    for args, kw in specs:
+        p.add_argument(*args, **kw)
+    return p
+
+
+TEARDOWN = ((('namespace',), {}), (('--uid',), {}), (('--lease',), {}))
+COMMANDS = {
+    ('inspect',): (cmd_inspect, ((('namespace',), {}),)),
+    ('ns', 'create'): (cmd_ns_create, ((('purpose',), {}), (('--issue',), {'required': True}),
+                                       (('--hours',), {'required': True}))),
+    ('lease', 'acquire'): (cmd_lease_acquire, ((('--gpus',), {'required': True}),
+                                               (('--hours',), {'required': True}))),
+    ('secret',): (cmd_secret, ((('which',), {'choices': sorted(SECRETS)}),)),
+    ('apply',): (cmd_apply, ((('-f', '--filename'), {'required': True}),)),
+    ('delete',): (cmd_delete, ((('target',), {}),)),
+    ('down',): (cmd_down, TEARDOWN),
+    ('expire',): (cmd_expire, TEARDOWN),
+    ('extend',): (cmd_extend, TEARDOWN),
+}
+
+
+def split_globals(argv):
+    """Take --context and -n from anywhere; refuse -A outright."""
+    context = namespace = None
+    rest, i = [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ('-A', '--all-namespaces') or a.startswith('--all-namespaces='):
+            raise Refusal('command_refused', 'all-namespace operations are refused', status=2)
+        for flag, short in (('--context', None), ('--namespace', '-n')):
+            if a == flag or (short and a == short):
+                if i + 1 >= len(argv):
+                    raise Refusal('usage', f'{a} needs a value', status=2)
+                value, i = argv[i + 1], i + 2
+                break
+            if a.startswith(flag + '='):
+                value, i = a.split('=', 1)[1], i + 1
+                break
+        else:
+            rest.append(a)
+            i += 1
+            continue
+        if flag == '--context':
+            if context is not None and context != value:
+                raise Refusal('usage', 'two different --context values', status=2)
+            context = value
+        else:
+            if namespace is not None and namespace != value:
+                raise Refusal('usage', 'two different -n values', status=2)
+            namespace = value
+    return context, namespace, rest
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    try:
+        context, namespace, rest = split_globals(argv)
+        key = tuple(rest[:2]) if tuple(rest[:2]) in COMMANDS else tuple(rest[:1])
+        if key not in COMMANDS:
+            word = ' '.join(rest[:2]) or '(nothing)'
+            raise Refusal('command_refused', f'{word} is not a k8s-guard command; the commands are: '
+                                             + ', '.join(' '.join(k) for k in COMMANDS), status=2)
+        func, specs = COMMANDS[key]
+        args = parser(' '.join(key), *specs).parse_args(rest[len(key):])
+        try:
+            profiles = load_profiles()
+        except ProfileError as e:
+            raise Refusal(e.code, str(e))
+        g = Guard(profiles, context, namespace)
+        g.check_identity()
+        return emit(func(g, args))
+    except Refusal as e:
+        return emit(dict(e.extra, error=str(e), code=e.code), status=e.status)
+    except Exception as e:  # still one JSON object, never a traceback that could carry a value
+        return emit({'error': f'internal error: {type(e).__name__}: {e}', 'code': 'internal_error'}, status=1)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -557,6 +557,12 @@ The `k8s-clusters` skill builds on the bot. Its cluster profiles live in an unco
 timeout 60 python3 test/test-k8s-check.py </dev/null
 ```
 
+`k8s-guard` is the only write path to a cluster. It refuses any write outside our namespaces, our kinds, or the namespace's GPU lease from the `k8s-leases` plugin, and records each write in a ledger. Its rules are in `dot_agents/skills/k8s-clusters/references/k8s-guard.md`. The tests use a fake `kubectl`, `bb`, `fleet` and `tsh`, and never contact a cluster:
+
+```bash
+timeout 300 python3 test/test-k8s-guard.py </dev/null
+```
+
 ### Antigravity in bb
 
 `iou_antigravity_acp` installs the Antigravity ACP server from the ACP registry. Google publishes one archive for each platform. The command installs the archive for this machine in `~/.local/share/agy-acp-server/<version>`. It writes `launch.json` there with the command and arguments from the registry (Linux needs `--uid=`). Then it points `current` at that version and removes the other versions. A run that finds the version installed downloads nothing. The command does not sign in.
