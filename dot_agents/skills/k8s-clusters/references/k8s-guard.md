@@ -34,6 +34,8 @@ The expiry of a namespace is the record's `expires_at` when the record's `uid` m
 
 ## Apply
 
+The rules in this section and the next are pure functions in `scripts/k8s_guard_rules.py`.
+
 The guard parses no YAML. It reads the file once and sends the same bytes to `kubectl apply --dry-run=server -o json`, then to the real apply. Every check runs on the JSON from the dry run, so defaults and webhook changes are checked too.
 
 - **Kinds:** `DynamoGraphDeployment` (`nvidia.com/v1alpha1` or `v1beta1`), `ConfigMap`, and `Service` of type `ClusterIP`. Each object must be in the `-n` namespace.
