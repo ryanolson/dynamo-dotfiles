@@ -42,7 +42,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from k8s_profiles import ProfileError, bot_credential_problem, kubectl_env, load_profiles, sealed_copy  # noqa: E402
 from k8s_guard_rules import (  # noqa: E402
-    DGD_KIND, HOSTNAME_TOPOLOGY, LEASE_LABEL, LEASE_RECORD, NS_UID_LABEL, Refusal, admit, allocation,
+    DGD_KIND, DGD_NAME_LABEL, HOSTNAME_TOPOLOGY, LEASE_LABEL, LEASE_RECORD, NS_UID_LABEL, Refusal, admit, allocation,
     budget_allocation, check_gpu_product, check_one_node, dgd_gpus, gpu_pod_summary, zero_patch)
 
 DGD_RESOURCE = 'dynamographdeployments.nvidia.com'
@@ -909,11 +909,20 @@ def cmd_down(g, a):
     wait = float(os.environ.get('K8S_GUARD_DOWN_WAIT_SECONDS', '300'))
     poll = float(os.environ.get('K8S_GUARD_POLL_SECONDS', '5'))
     give_up = time.monotonic() + wait
+    # Wait only for GPU pods of this namespace instance. A DGD stamped for another instance (the
+    # accepted F14 residual), or not stamped at all, was not applied here by the guard; its pods must
+    # not hold the namespace. The namespace delete below carries the UID precondition, so it removes
+    # them with this instance and can touch nothing else.
+    foreign = {(d.get('metadata') or {}).get('name') for d in g.dgds(ns)
+               if ((d.get('metadata') or {}).get('labels') or {}).get(NS_UID_LABEL) != view.uid}
     while True:
-        _, left = gpu_pod_summary(g.pods(ns))
+        pods = g.pods(ns)
+        own = [p for p in pods if ((p.get('metadata') or {}).get('labels') or {}).get(DGD_NAME_LABEL) not in foreign]
+        _, left = gpu_pod_summary(own)
         if left == 0 or time.monotonic() >= give_up:
             break
         time.sleep(poll)
+    _, foreign_pods = gpu_pod_summary([p for p in pods if p not in own])
     if left:
         g.record(ns, f'Namespace/{ns}', before, 'down', uid=view.uid, lease=lease_id, issue=view.issue)
         raise Refusal('pods_left', f'{left} GPU pods still run in {ns}; the namespace is kept until they are gone',
@@ -925,7 +934,7 @@ def cmd_down(g, a):
             raise Refusal('uid_mismatch', f'{ns} was re-created; the new namespace is left alone')
         raise kubectl_error(('delete', 'namespace', ns), rc, err)
     g.record(ns, f'Namespace/{ns}', before, 'down', uid=view.uid, lease=lease_id, issue=view.issue, deleted=True)
-    return {'namespace': ns, 'deleted': True, 'authority': why}
+    return {'namespace': ns, 'deleted': True, 'authority': why, 'foreign_gpu_pods': foreign_pods}
 
 
 def offline_owner(view):

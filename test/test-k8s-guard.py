@@ -938,10 +938,58 @@ class NamespaceCreate(GuardCase):
         # ...but inspect counts it, so the plugin sees the over-allocation and flags it.
         after = self.ok('--context', CTX, 'inspect', ns, host_entry=True)
         self.assertEqual((after['allocation'], after['gpu_pods_left']), (2, 1), after)
-        # down deletes only stamped DGDs and keeps the namespace while GPU pods remain.
-        self.refused('pods_left', '--context', CTX, 'down', ns, '--uid', uid, '--lease', lid, host_entry=True)
+        # down deletes its own stamped DGDs, then the namespace under the UID precondition: that removes
+        # the stray DGD and its pods too, so the residual ends at the grace deadline.
+        body = self.ok('--context', CTX, 'down', ns, '--uid', uid, '--lease', lid, host_entry=True)
+        self.assertNotIn(ns, self.k8s['namespaces'])
+        self.assertEqual(body['foreign_gpu_pods'], 1, body)
+
+    def test_f14_collision_down_removes_the_stray_and_nothing_else(self):
+        # Reproduce F14: a late apply from a deleted namespace lands in the new one under the same name.
+        ns, uid = NS + '-' + 'c' * 10, 'uid-current-ns'
+        neighbour = NS + '-' + 'd' * 10
+        self.add_ns(name=neighbour, thread=OTHER, uid='uid-neighbour')
+        self.add_obj(gpu_dgd('theirs', 1, 'lse_neighbour1'), ns=neighbour)
+        self.add_pod(pod('theirs', 1), ns=neighbour)
+        self.add_ns(name=ns, thread=OTHER, uid=uid)
+        lid = self.add_lease(ns=ns, uid=uid, thread=OTHER, gpus=1, state='revoking')
+        self.add_obj(gpu_dgd('current', 1, lid), ns=ns)
+        self.add_pod(pod('current', 1), ns=ns)
+        late = gpu_dgd('late', 2, 'lse_previous01')
+        late['metadata']['labels'] = {NS_UID: 'uid-deleted-ns'}
+        self.add_obj(late, ns=ns, stamp=False)
+        self.add_pod(pod('late', 2), ns=ns)
+        before = copy.deepcopy(self.k8s)
+
+        body = self.ok('--context', CTX, 'down', ns, '--uid', uid, '--lease', lid, host_entry=True)
+
+        self.assertNotIn(ns, self.k8s['namespaces'])
+        self.assertIn(ns, self.k8s['deleted_namespaces'])
+        # Only this namespace instance: the namespace delete carried its UID; the neighbour is untouched.
+        raws = [c for c in self.writes() if '--raw' in c['flags']]
+        self.assertEqual([c['flags']['--raw'] for c in raws],
+                         [f'/apis/nvidia.com/v1beta1/namespaces/{ns}/dynamographdeployments/current',
+                          f'/api/v1/namespaces/{ns}'])
+        self.assertEqual(self.k8s['namespaces'][neighbour], before['namespaces'][neighbour])
+        self.assertEqual(self.k8s['objects'][neighbour], before['objects'][neighbour])
+        self.assertEqual(self.k8s['pods'][neighbour], before['pods'][neighbour])
+        self.assertEqual(body['foreign_gpu_pods'], 1, body)
+
+    def test_down_still_waits_for_its_own_gpu_pods_with_a_stray_present(self):
+        ns, uid = NS + '-' + 'e' * 10, 'uid-current-ns'
+        self.add_ns(name=ns, thread=OTHER, uid=uid)
+        lid = self.add_lease(ns=ns, uid=uid, thread=OTHER, gpus=1, state='revoking')
+        self.add_obj(gpu_dgd('current', 1, lid), ns=ns)
+        self.add_pod(pod('current', 1), ns=ns)
+        late = gpu_dgd('late', 2, 'lse_previous01')
+        late['metadata']['labels'] = {NS_UID: 'uid-deleted-ns'}
+        self.add_obj(late, ns=ns, stamp=False)
+        self.add_pod(pod('late', 2), ns=ns)
+        self.k8s['terminate_pods_on_delete'] = False
+        self.flush()
+        body = self.refused('pods_left', '--context', CTX, 'down', ns, '--uid', uid, '--lease', lid, host_entry=True)
+        self.assertEqual(body['gpu_pods_left'], 1, body)
         self.assertIn(ns, self.k8s['namespaces'])
-        self.assertIn('DynamoGraphDeployment/late', self.k8s['objects'][ns])
 
     def test_hours_bounded(self):
         for hours in ('0', '4.5', '-1', 'nan', 'inf'):
