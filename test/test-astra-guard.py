@@ -1486,6 +1486,16 @@ class AdversarialReview(GuardCase):
 
 class PassTwoReview(GuardCase):
 
+    def test_merge_config_refusal_is_logged_and_signed(self):
+        iid, qid = self.approved()
+        self.config.write_text('project_id = 0\n')
+        body = self.refused('config_invalid', 'merge', '--mr', str(iid), '--answer', qid)
+        self.assertEqual(self.merges(), [])
+        lines = self.log_lines()
+        self.assertEqual(len(lines), 1, 'A merge refusal before cmd_merge still needs an audit line')
+        self.assertEqual((lines[0]['mr'], lines[0]['ask_id'], lines[0]['result']), (iid, qid, 'refused'))
+        self.assertIn('comment', body)
+
     def test_empty_ask_namespace_cannot_authorize_cluster_scoped_resources(self):
         self.gl.commit(PLATFORM_PID, 'main', {'apps/dev.yaml': ARGO_APP % '""'})
         iid = self.deployed_mr()
