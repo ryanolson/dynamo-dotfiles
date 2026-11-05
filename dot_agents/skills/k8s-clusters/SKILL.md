@@ -12,6 +12,7 @@ The source of truth is the Linear document "Runbook: build and run on our Dynamo
 - Use the agents' Teleport bot only: never the owner's `tsh` login, `~/.tsh`, or `~/.kube/config`.
 - Pass `--context` on every `kubectl` call. Never rely on the current context.
 - Make no write with plain `kubectl`. Writes go through `scripts/k8s-guard` only; its commands and rules are in `references/k8s-guard.md`.
+- Astra changes go through `scripts/astra-guard` only; its commands and rules are in `references/astra-guard.md`.
 
 ## Threat model
 

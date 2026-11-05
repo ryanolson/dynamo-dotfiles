@@ -1,0 +1,909 @@
+#!/usr/bin/env python3
+"""The only tool agents use to call the Astra GitOps project's GitLab API.
+
+Usage:
+  astra-guard get <api-path>                                      GET, any project
+  astra-guard push --branch wcep/<ISSUE>-<purpose> --base <main sha> --file <values path>=<local file>
+  astra-guard open --branch <branch> --issue <ISSUE> --kind deploy|teardown --title <t> [--expires YYYY-MM-DD]
+  astra-guard close --mr <iid>                                    only a merge request the guard opened
+  astra-guard check --mr <iid> --namespace <ns>                   bind head and main, run every rule, print the ask
+  astra-guard ask --mr <iid>                                      `bb sgc ask` with the checked text
+  astra-guard merge --mr <iid> --answer <bbq id>                  only on the owner's Approve
+  astra-guard teardown --deploy-mr <iid> --branch <branch>        branch from the landed main, inverse patch applied
+
+Every command prints one JSON object on stdout. A refusal exits 1 with
+{"error": ..., "code": ...}. The rules and the reasons for them are in
+references/astra-guard.md; the pure rules are in astra_guard_rules.py.
+
+The GitLab token comes only from `fleet secret env`, run as a child that hands
+the token back over a pipe. The guard sends it only in the PRIVATE-TOKEN header,
+never across a redirect.
+"""
+import argparse
+from datetime import date, datetime, timezone
+import fcntl
+import http.client
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
+
+import yaml
+
+# -I drops the script directory from sys.path; the rules live next to this script.
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import astra_guard_rules as R  # noqa: E402
+from astra_guard_rules import Refusal  # noqa: E402
+
+TOKEN_ENV = 'ASTRA_GUARD_TOKEN'
+FD_ENV = 'ASTRA_GUARD_TOKEN_FD'
+FLEET_TIMEOUT = 60
+# Runs under `fleet secret env`: writes the variable fleet set to the inherited pipe, nowhere else.
+HANDOVER = (f'import os; fd = int(os.environ["{FD_ENV}"]); '
+            f'os.write(fd, os.environ.get("{TOKEN_ENV}", "").encode()); os.close(fd)')
+HTTP_TIMEOUT = 30
+BB_TIMEOUT = 30
+TREE_PAGES = 50
+LOOPBACK = ('127.0.0.1', 'localhost', '::1')
+CONFIG_KEYS = {'gitlab_url', 'project_id', 'token_ref', 'shared_namespaces', 'sites'}
+
+_TOKEN = None
+
+
+def carries_token(text):
+    return bool(_TOKEN) and (_TOKEN in text or _TOKEN in urllib.parse.unquote(text))
+
+
+def sink(text, where):
+    """The token rule: every place data leaves the guard (state.json, the approval log, bb's
+    argv, stdout) checks its final text, raw and URL-decoded. Checking inputs instead missed
+    each new encoding (JSON, YAML, URL escapes) that decoded into the token later."""
+    if carries_token(text):
+        raise Refusal('secret_at_sink', f'{where} would hold the GitLab token; nothing was written')
+    return text
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+# -- config ------------------------------------------------------------------
+
+def load_config():
+    path = Path(os.environ.get('ASTRA_GUARD_CONFIG') or Path.home() / '.config/k8s-clusters/astra.toml')
+    try:
+        cfg = tomllib.loads(path.read_text())
+    except FileNotFoundError:
+        raise Refusal('config_missing', f'{path} does not exist; see references/astra-guard.md')
+    except (tomllib.TOMLDecodeError, OSError) as e:
+        raise Refusal('config_invalid', f'{path}: {e}')
+
+    def bad(msg):
+        raise Refusal('config_invalid', f'{path}: {msg}')
+    if set(cfg) - CONFIG_KEYS:
+        bad(f'unknown keys {sorted(set(cfg) - CONFIG_KEYS)}')
+    url = urllib.parse.urlsplit(str(cfg.get('gitlab_url', '')))
+    if not (url.scheme == 'https' or (url.scheme == 'http' and url.hostname in LOOPBACK)) or not url.hostname \
+            or url.username or url.password or url.query or url.fragment or url.path not in ('', '/'):
+        bad('gitlab_url must be https://<host> (plain http only on loopback, for tests)')
+    pid = cfg.get('project_id')
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        bad('project_id must be a positive integer')
+    if not isinstance(cfg.get('token_ref'), str) or not cfg['token_ref']:
+        bad('token_ref must name the fleet secret')
+    shared = cfg.get('shared_namespaces', [])
+    if not isinstance(shared, list) or not all(isinstance(s, str) for s in shared):
+        bad('shared_namespaces must be a list of names')
+    sites = cfg.get('sites', {})
+    if not isinstance(sites, dict) or set(sites) - set(R.SITES):
+        bad(f'sites may only be {sorted(R.SITES)}')
+    for name, s in sites.items():
+        if not isinstance(s, dict) or not isinstance(s.get('cluster'), str) or set(s) - {'cluster', 'argocd'}:
+            bad(f'sites.{name} needs cluster, and may have argocd')
+        a = s.get('argocd')
+        if a is not None and (not isinstance(a, dict) or set(a) - {'project', 'file', 'key', 'ref'}
+                              or not isinstance(a.get('project'), (int, str)) or isinstance(a.get('project'), bool)
+                              or not isinstance(a.get('file'), str) or not isinstance(a.get('key'), str)
+                              or not isinstance(a.get('ref', 'main'), str)):
+            bad(f'sites.{name}.argocd needs project, file and key')
+    cfg['gitlab_url'] = f'{url.scheme}://{url.netloc}'
+    cfg['shared_namespaces'] = shared
+    cfg['sites'] = sites
+    return cfg
+
+
+# -- GitLab ------------------------------------------------------------------
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def gate(method, path, body, pid):
+    """The only writes the guard sends. Everything else is refused here, whatever called it."""
+    p = f'/projects/{pid}'
+    body = body if isinstance(body, dict) else None
+
+    def sha(v):
+        return isinstance(v, str) and R.SHA.match(v) is not None
+    try:
+        if body is None:
+            raise Refusal('write_not_allowed', 'a write needs a JSON body')
+        if method == 'POST' and path == p + '/repository/commits':
+            if set(body) - {'branch', 'start_sha', 'force', 'commit_message', 'actions'}:
+                raise Refusal('write_not_allowed', 'unexpected commit fields')
+            R.check_branch(body.get('branch'))
+            acts = body.get('actions')
+            if not sha(body.get('start_sha')) or not isinstance(body.get('force', False), bool) \
+                    or not isinstance(acts, list) or not acts:
+                raise Refusal('write_not_allowed', 'a commit needs start_sha and actions')
+            for a in acts:
+                if not isinstance(a, dict) or set(a) != {'action', 'file_path', 'content', 'encoding'} \
+                        or a['action'] != 'update' or a['encoding'] != 'text' \
+                        or a['file_path'] not in R.SITES.values() or not isinstance(a['content'], str):
+                    raise Refusal('write_not_allowed', 'a commit may only update a values file, as text')
+        elif method == 'POST' and path == p + '/merge_requests':
+            if set(body) - {'source_branch', 'target_branch', 'title', 'description', 'remove_source_branch'}:
+                raise Refusal('write_not_allowed', 'unexpected merge request fields')
+            R.check_branch(body.get('source_branch'))
+            if body.get('target_branch') != R.TARGET_BRANCH or not isinstance(body.get('title'), str):
+                raise Refusal('write_not_allowed', 'a merge request targets main and has a title')
+        elif method == 'PUT' and re.fullmatch(re.escape(p) + r'/merge_requests/[0-9]+', path):
+            if body != {'state_event': 'close'}:
+                raise Refusal('write_not_allowed', 'a merge request update may only close it')
+        elif method == 'PUT' and re.fullmatch(re.escape(p) + r'/merge_requests/[0-9]+/merge', path):
+            if set(body) != {'sha'} or not sha(body['sha']):
+                raise Refusal('write_not_allowed', 'a merge sends exactly the head as sha')
+        else:
+            raise Refusal('write_not_allowed', f'{method} {path} is not a write the guard makes')
+    except Refusal as e:
+        if e.code != 'write_not_allowed':
+            raise Refusal('write_not_allowed', e.message)
+        raise
+
+
+def _strings(obj):
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            yield str(k)
+            yield from _strings(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _strings(v)
+
+
+class GitLabError(Refusal):
+    def __init__(self, status, message):
+        super().__init__('gitlab_error', message)
+        self.status = status
+
+
+class GitLab:
+    def __init__(self, cfg, token):
+        self.base = cfg['gitlab_url'] + '/api/v4'
+        self.pid = cfg['project_id']
+        self.token = token
+
+    def _request(self, method, path, query=None, body=None):
+        if isinstance(query, (dict, list)):
+            query = urllib.parse.urlencode(query, doseq=True)
+        url = self.base + path + (f'?{query}' if query else '')
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_unredirected_header('PRIVATE-TOKEN', self.token)
+        if data is not None:
+            req.add_header('Content-Type', 'application/json')
+        try:
+            with _OPENER.open(req, timeout=HTTP_TIMEOUT) as r:
+                payload, headers = r.read(), r.headers
+        except urllib.error.HTTPError as e:
+            raise GitLabError(e.code, f'{method} {path}: HTTP {e.code}')
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
+            raise Refusal('gitlab_unreachable', f'{method} {path}: {type(e).__name__}')
+        self._refuse_echo(method, path, payload)
+        return payload, headers
+
+    def _refuse_echo(self, method, path, payload):
+        # A response that carries the token is refused, not rewritten: rewriting would change
+        # the text the checks compare, and an echo could hide behind a JSON or URL escape.
+        text = payload.decode(errors='replace')
+        found = self.token in text or self.token in urllib.parse.unquote(text)
+        if not found:
+            try:
+                found = any(self.token in s or self.token in urllib.parse.unquote(s)
+                            for s in _strings(json.loads(text)))
+            except (json.JSONDecodeError, RecursionError):
+                pass
+        if found:
+            raise Refusal('secret_in_response', f'{method} {path}: GitLab echoed the token; nothing was kept')
+
+    def get(self, path, query=None, raw=False):
+        payload, headers = self._request('GET', path, query)
+        if raw:
+            return payload.decode(errors='replace'), headers
+        try:
+            return json.loads(payload), headers
+        except json.JSONDecodeError:
+            raise Refusal('gitlab_error', f'GET {path}: not JSON')
+
+    def write(self, method, path, body):
+        gate(method, path, body, self.pid)
+        payload, _ = self._request(method, path, body=body)
+        return json.loads(payload) if payload else {}
+
+    # Reads the checks use.
+    def p(self, rest=''):
+        return f'/projects/{self.pid}{rest}'
+
+    def mr(self, iid):
+        return self.get(self.p(f'/merge_requests/{int(iid)}'))[0]
+
+    def branch(self, name):
+        try:
+            return self.get(self.p('/repository/branches/' + urllib.parse.quote(name, safe='')))[0]['commit']['id']
+        except GitLabError as e:
+            if e.status == 404:
+                return None
+            raise
+
+    def main(self):
+        sha = self.branch(R.TARGET_BRANCH)
+        if not sha or not R.SHA.match(sha):
+            raise Refusal('gitlab_error', 'cannot read main')
+        return sha
+
+    def raw(self, path, ref, pid=None):
+        pid = self.pid if pid is None else pid
+        quoted = urllib.parse.quote(str(pid), safe='')
+        return self.get(f'/projects/{quoted}/repository/files/{urllib.parse.quote(path, safe="")}/raw',
+                        {'ref': ref}, raw=True)[0]
+
+    def merge_base(self, a, b):
+        return self.get(self.p('/repository/merge_base'), [('refs[]', a), ('refs[]', b)])[0].get('id')
+
+    def tree(self, ref, path):
+        out, page = {}, 1
+        while True:
+            q = {'ref': ref, 'per_page': 100, 'page': page}
+            if path:
+                q['path'] = path
+            items, headers = self.get(self.p('/repository/tree'), q)
+            for i in items:
+                out[i['name']] = (i['type'], i['mode'], i['id'])
+            nxt = headers.get('X-Next-Page') or ''
+            if not nxt:
+                return out
+            page = int(nxt)
+            if page > TREE_PAGES:
+                raise Refusal('gitlab_error', f'tree {path or "/"} has more than {TREE_PAGES} pages')
+
+
+# -- local state ---------------------------------------------------------------
+
+def state_dir():
+    base = os.environ.get('XDG_STATE_HOME') or str(Path.home() / '.local/state')
+    d = Path(base) / 'astra-guard'
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return d
+
+
+class State:
+    """state.json: the merge requests this guard opened, their checks, asks and merges."""
+
+    def __enter__(self):
+        d = state_dir()
+        self.lock = open(d / 'state.lock', 'a')
+        fcntl.flock(self.lock, fcntl.LOCK_EX)
+        self.path = d / 'state.json'
+        self.data = json.loads(self.path.read_text()) if self.path.exists() else {'mrs': {}}
+        return self
+
+    def save(self):
+        text = sink(json.dumps(self.data, indent=1, sort_keys=True), 'state.json')
+        tmp = self.path.with_suffix('.tmp')
+        tmp.write_text(text)
+        os.replace(tmp, self.path)
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.lock, fcntl.LOCK_UN)
+        self.lock.close()
+
+
+def key(pid, iid):
+    return f'{pid}!{int(iid)}'
+
+
+def record(pid, iid):
+    with State() as st:
+        rec = st.data['mrs'].get(key(pid, iid))
+    if not rec:
+        raise Refusal('not_guard_mr', f'!{iid} was not opened by this guard')
+    return rec
+
+
+def update(pid, iid, **fields):
+    with State() as st:
+        rec = st.data['mrs'][key(pid, iid)]
+        for k, v in fields.items():
+            if v is None:
+                rec.pop(k, None)
+            else:
+                rec[k] = v
+        st.save()
+
+
+def open_log():
+    """Open the approval log for append. A merge opens it before anything else, so no merge
+    can land that the log cannot record."""
+    try:
+        return open(state_dir() / 'approvals.jsonl', 'a')
+    except OSError as e:
+        raise Refusal('log_unusable', f'cannot open the approval log: {type(e).__name__}; nothing was merged')
+
+
+def write_log(f, entry):
+    line = json.dumps(entry, sort_keys=True)
+    if carries_token(line):
+        safe = {k: entry.get(k) for k in ('time', 'mr', 'head', 'target', 'result', 'code', 'merge_commit')}
+        safe.update(ask_id=entry['ask_id'] if R.ASK_ID.match(str(entry.get('ask_id'))) else None, answer=None,
+                    reason='a field held the GitLab token and was left out')
+        line = sink(json.dumps(safe, sort_keys=True), 'the approval log')
+    f.write(line + '\n')
+    f.flush()
+    os.fsync(f.fileno())
+
+
+# -- subprocesses ------------------------------------------------------------
+
+def child_env():
+    return {k: v for k, v in os.environ.items() if k not in (TOKEN_ENV, FD_ENV)}
+
+
+def thread_id():
+    t = os.environ.get('BB_THREAD_ID')
+    if not t or not re.fullmatch(r'thr_[A-Za-z0-9]+', t):
+        raise Refusal('thread_required', 'BB_THREAD_ID is unset; only a bb thread asks and merges')
+    return t
+
+
+def bb_ask(question, issue):
+    argv = ['bb', 'sgc', 'ask', '--question', question, '--option', R.OPTIONS[0], '--option', R.OPTIONS[1],
+            '--recommend', 'none', '--label', 'astra', '--issue', issue, '--json']
+    sink('\0'.join(argv), "bb's argv")
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=BB_TIMEOUT, env=child_env(),
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise Refusal('bb_failed', f'bb sgc ask: {type(e).__name__}')
+    if p.returncode:
+        raise Refusal('bb_failed', f'bb sgc ask exited {p.returncode}: {p.stderr.strip()[:200]}')
+    try:
+        qid = json.loads(p.stdout).get('id')
+    except (json.JSONDecodeError, AttributeError):
+        qid = None
+    if not isinstance(qid, str) or not R.ASK_ID.match(qid):
+        raise Refusal('bb_failed', 'bb sgc ask printed no question id')
+    return qid
+
+
+def answer_of(qid):
+    try:
+        p = subprocess.run(['bb', 'sgc', 'answer-of', sink(qid, "bb's argv"), '--json'], capture_output=True, text=True,
+                           timeout=BB_TIMEOUT, env=child_env(), stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise Refusal('answer_unknown', f'bb sgc answer-of: {type(e).__name__}')
+    if p.returncode:
+        raise Refusal('answer_unknown', f'the plugin has no answer {qid} (exit {p.returncode})')
+    try:
+        return json.loads(p.stdout)
+    except json.JSONDecodeError:
+        raise Refusal('answer_invalid', 'bb sgc answer-of did not print JSON')
+
+
+# -- the check -----------------------------------------------------------------
+
+def changed_files(gl, base, head):
+    """Every path that differs between the two commits, from the trees themselves.
+
+    Only directories on the way to a values file are opened; any other
+    difference, a mode change, or a values file added or removed is refused.
+    """
+    allowed = set(R.SITES.values())
+    out = []
+
+    def walk(path):
+        a, b = gl.tree(base, path), gl.tree(head, path)
+        for name in sorted(set(a) | set(b)):
+            if a.get(name) == b.get(name):
+                continue
+            full = f'{path}/{name}' if path else name
+            if a.get(name, ('',))[0] == 'tree' and b.get(name, ('',))[0] == 'tree' \
+                    and any(p.startswith(full + '/') for p in allowed):
+                walk(full)
+            elif full in allowed and a.get(name, ('',))[:2] == ('blob', '100644') == b.get(name, ('',))[:2]:
+                out.append(full)
+            else:
+                raise Refusal('path_not_allowed', f'{full} changed; only the two values files may')
+    walk('')
+    return out
+
+
+def read_expiry(description):
+    hits = re.findall(r'^Expires: (\d{4}-\d{2}-\d{2})\s*$', description or '', re.M)
+    if len(hits) != 1:
+        raise Refusal('expiry_missing', 'a deploy merge request needs one "Expires: YYYY-MM-DD" line')
+    try:
+        when = date.fromisoformat(hits[0])
+    except ValueError:
+        raise Refusal('expiry_missing', f'{hits[0]} is not a date')
+    if when < datetime.now(timezone.utc).date():
+        raise Refusal('expiry_past', f'the expiry {when} has passed')
+    return str(when)
+
+
+def jobs_for(gl, head):
+    pipes = [p for p in gl.get(gl.p('/pipelines'), {'sha': head, 'order_by': 'id', 'sort': 'desc',
+                                                     'per_page': 20})[0] if p.get('sha') == head]
+    if not pipes:
+        raise Refusal('pipeline_missing', f'no pipeline ran on {head}')
+    pipe = max(pipes, key=lambda p: p['id'])
+    jobs, page = [], 1
+    while True:
+        chunk, headers = gl.get(gl.p(f'/pipelines/{int(pipe["id"])}/jobs'), {'per_page': 100, 'page': page})
+        jobs += chunk
+        nxt = headers.get('X-Next-Page') or ''
+        if not nxt:
+            break
+        page = int(nxt)
+        if page > TREE_PAGES:
+            raise Refusal('gitlab_error', f'pipeline {pipe["id"]} has more than {TREE_PAGES} pages of jobs')
+    found = {}
+    for name in R.REQUIRED_JOBS:
+        mine = [j for j in jobs if j.get('name') == name]
+        if not mine:
+            raise Refusal('job_missing', f'pipeline {pipe["id"]} on {head} has no {name} job')
+        job = max(mine, key=lambda j: j['id'])
+        if job.get('status') != 'success':
+            raise Refusal('job_not_passed', f'{name} on {head} is {job.get("status")!r}; each job must pass, '
+                                            'whatever the pipeline says')
+        found[name] = job['id']
+    return found
+
+
+def argocd_namespace(gl, cfg, site):
+    a = cfg['sites'][site].get('argocd')
+    if not a:
+        raise Refusal('argocd_destination_unverified', f'no ArgoCD source configured for {site}')
+    try:
+        doc = R.load_values(gl.raw(a['file'], a.get('ref', 'main'), pid=a['project']))
+    except Refusal as e:
+        raise Refusal('argocd_destination_unverified', f'cannot read the ArgoCD app: {e.message}')
+    ns = R.dig(doc, a['key'])
+    if not isinstance(ns, str):
+        raise Refusal('argocd_destination_unverified', f'{a["key"]} is not set in the ArgoCD app')
+    return ns
+
+
+def bind_and_check(gl, cfg, iid, rec, namespace):
+    """Read the head and main once, and run every rule on that pair."""
+    mr = gl.mr(iid)
+    if mr.get('state') != 'opened' or mr.get('draft') or mr.get('work_in_progress'):
+        raise Refusal('mr_not_open', f'!{iid} is {mr.get("state")!r}' + (' (draft)' if mr.get('draft') else ''))
+    if mr.get('source_branch') != rec['branch'] or mr.get('target_branch') != R.TARGET_BRANCH \
+            or mr.get('source_project_id') != gl.pid or mr.get('target_project_id') != gl.pid:
+        raise Refusal('mr_mismatch', f'!{iid} is not {rec["branch"]} into main of the configured project')
+    head = mr.get('sha')
+    if not isinstance(head, str) or not R.SHA.match(head):
+        raise Refusal('gitlab_error', f'!{iid} has no head commit')
+    target = gl.main()
+    if gl.merge_base(target, head) != target:
+        raise Refusal('behind_main', f'the branch does not contain main {target}; rebase it with push')
+    files = changed_files(gl, target, head)
+    if not files:
+        raise Refusal('no_entry_change', 'the branch changes nothing')
+    if len(files) != 1:
+        raise Refusal('one_site', 'one merge request changes one values file')
+    path = files[0]
+    site = R.site_of(path)
+    if site not in cfg['sites']:
+        raise Refusal('site_unconfigured', f'{site} has no [sites.{site}] in the config')
+    base_text, head_text = gl.raw(path, target), gl.raw(path, head)
+    change = R.classify(site, base_text, head_text, rec['kind'])
+    expires = read_expiry(mr.get('description')) if rec['kind'] == 'deploy' else None
+    jobs = jobs_for(gl, head)
+    trace = gl.get(gl.p(f'/jobs/{int(jobs["helm:plan"])}/trace'), raw=True)[0]
+    R.check_plan(R.parse_plan(trace), change['added'] + change['changed'] + change['removed'], namespace)
+    dest = argocd_namespace(gl, cfg, site)
+    if dest != namespace:
+        raise Refusal('argocd_destination_mismatch', f'the ArgoCD app deploys to {dest}, not {namespace}')
+    hunks = R.inverse_patch(base_text, head_text) if rec['kind'] == 'deploy' else None
+    patch = R.render_patch(base_text, head_text, path) if rec['kind'] == 'deploy' else ''
+    question = R.ask_text(iid=iid, web_url=mr.get('web_url', ''), head=head, target=target, kind=rec['kind'],
+                          cluster=cfg['sites'][site]['cluster'], site=site, namespace=namespace,
+                          shared=namespace in cfg['shared_namespaces'], change=change, expires=expires,
+                          patch=patch)
+    return {'head': head, 'target': target, 'site': site, 'path': path, 'namespace': namespace,
+            'kind': rec['kind'], 'change': change, 'expires': expires, 'inverse': hunks,
+            'question': question, 'web_url': mr.get('web_url', ''), 'checked_at': now()}
+
+
+def unmoved(gl, iid, check):
+    mr = gl.mr(iid)
+    if mr.get('state') != 'opened':
+        raise Refusal('mr_not_open', f'!{iid} is {mr.get("state")!r}')
+    if mr.get('sha') != check['head']:
+        raise Refusal('head_moved', f'the branch moved from {check["head"]} to {mr.get("sha")}; check and ask again')
+    target = gl.main()
+    if target != check['target']:
+        raise Refusal('main_moved', f'main moved from {check["target"]} to {target}; push, check and ask again')
+
+
+# -- commands ------------------------------------------------------------------
+
+def content_carries_token(text):
+    """A commit is a way out too: scan the file raw, URL-decoded, and as YAML (which also decodes
+    JSON and every YAML escape), every key and string in it raw and URL-decoded."""
+    if carries_token(text):
+        return True
+    try:
+        docs = list(yaml.safe_load_all(text))
+    except (yaml.YAMLError, RecursionError):
+        return False  # the values check refuses a file that does not parse
+    return any(carries_token(s) for s in _strings(docs))
+
+
+def push_file(gl, branch, path, base, text, kind):
+    site = R.site_of(path)
+    if content_carries_token(text):
+        raise Refusal('secret_in_content', 'the file holds the GitLab token; it is not pushed')
+    R.classify(site, gl.raw(path, base), text, kind)
+    exists = gl.branch(branch) is not None
+    body = {'branch': branch, 'start_sha': base, 'commit_message': f'{branch}: update {site} values',
+            'actions': [{'action': 'update', 'file_path': path, 'content': text, 'encoding': 'text'}]}
+    if exists:
+        body['force'] = True
+    out = gl.write('POST', gl.p('/repository/commits'), body)
+    return {'branch': branch, 'commit': out.get('id'), 'base': base, 'file': path}
+
+
+def cmd_get(gl, cfg, args):
+    path, _, query = args.path.partition('?')
+    segments = path.split('/')[1:]
+    if not path.startswith('/') or path.startswith('//') or any(s in ('', '.', '..') for s in segments) \
+            or not re.fullmatch(r"[A-Za-z0-9_.~%/:@,+*-]+", path) \
+            or not re.fullmatch(r"[A-Za-z0-9_.~%/?=&\[\]:@,+*-]*", query):
+        raise Refusal('path_not_allowed', 'get takes an API path such as /projects/<id>/merge_requests')
+    payload, headers = gl._request('GET', path, query or None)
+    text = payload.decode(errors='replace')
+    try:
+        body = json.loads(text)
+    except json.JSONDecodeError:
+        body = text
+    return {'body': body, 'next_page': headers.get('X-Next-Page') or None}
+
+
+def cmd_push(gl, cfg, args):
+    R.check_branch(args.branch)
+    repo_path, sep, local = args.file.partition('=')
+    if not sep:
+        raise Refusal('path_not_allowed', '--file takes <values path>=<local file>')
+    R.site_of(repo_path)
+    if not R.SHA.match(args.base):
+        raise Refusal('main_moved', '--base takes the full main commit the edit started from')
+    target = gl.main()
+    if target != args.base:
+        raise Refusal('main_moved', f'main is {target}, not {args.base}; read the file again and redo the edit')
+    try:
+        text = Path(local).read_text()
+    except (OSError, UnicodeDecodeError) as e:
+        raise Refusal('file_unreadable', f'{local}: {type(e).__name__}')
+    return push_file(gl, args.branch, repo_path, target, text, 'any')
+
+
+def cmd_open(gl, cfg, args):
+    if not R.ISSUE.match(args.issue):
+        raise Refusal('issue_invalid', f'{args.issue!r} is not an issue key')
+    R.check_branch(args.branch, args.issue)
+    lines = [f'Kind: {args.kind}']
+    expires = None
+    if args.kind == 'deploy':
+        if not args.expires:
+            raise Refusal('expiry_missing', 'a deploy needs --expires YYYY-MM-DD')
+        expires = read_expiry(f'Expires: {args.expires}')
+        lines.append(f'Expires: {expires}')
+    elif args.expires:
+        raise Refusal('expiry_not_allowed', 'a teardown has no expiry')
+    lines += [f'Issue: {args.issue}', '',
+              'Opened by astra-guard. It merges this only after the owner approves this exact head and target '
+              'commit. It changes only entries named wcep-*.']
+    mr = gl.write('POST', gl.p('/merge_requests'), {
+        'source_branch': args.branch, 'target_branch': R.TARGET_BRANCH, 'title': args.title,
+        'description': '\n'.join(lines) + '\n'})
+    iid = int(mr['iid'])
+    with State() as st:
+        st.data['mrs'][key(gl.pid, iid)] = {
+            'iid': iid, 'branch': args.branch, 'issue': args.issue, 'kind': args.kind, 'expires': expires,
+            'thread': os.environ.get('BB_THREAD_ID'), 'opened_at': now(), 'web_url': mr.get('web_url')}
+        st.save()
+    return {'iid': iid, 'web_url': mr.get('web_url'), 'kind': args.kind}
+
+
+def cmd_close(gl, cfg, args):
+    rec = record(gl.pid, args.mr)
+    mr = gl.mr(args.mr)
+    if mr.get('source_branch') != rec['branch']:
+        raise Refusal('mr_mismatch', f'!{args.mr} is not {rec["branch"]}')
+    out = gl.write('PUT', gl.p(f'/merge_requests/{int(args.mr)}'), {'state_event': 'close'})
+    update(gl.pid, args.mr, closed_at=now())
+    return {'iid': int(args.mr), 'state': out.get('state')}
+
+
+def cmd_check(gl, cfg, args):
+    rec = record(gl.pid, args.mr)
+    # Void the earlier check before any validation, so a refused check leaves nothing for ask.
+    update(gl.pid, args.mr, check=None, ask=None)
+    if not re.fullmatch(r'[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?', args.namespace):
+        raise Refusal('namespace_invalid', f'{args.namespace!r} is not a namespace name')
+    if rec.get('merged'):
+        raise Refusal('mr_not_open', f'!{args.mr} was merged by this guard')
+    check = bind_and_check(gl, cfg, args.mr, rec, args.namespace)
+    fields = {'check': check}
+    if check['kind'] == 'deploy':
+        # Only a checked head can merge, so this names what teardown must find landed.
+        fields['teardown'] = {'head': check['head'], 'path': check['path'], 'inverse': check['inverse']}
+    update(gl.pid, args.mr, **fields)
+    return {'mr': int(args.mr), 'head': check['head'], 'target': check['target'], 'question': check['question'],
+            'options': list(R.OPTIONS), 'next': f'astra-guard ask --mr {int(args.mr)}'}
+
+
+def cmd_ask(gl, cfg, args):
+    thread_id()
+    rec = record(gl.pid, args.mr)
+    check = rec.get('check')
+    if not check:
+        raise Refusal('not_checked', f'run check on !{args.mr} first')
+    unmoved(gl, args.mr, check)
+    qid = bb_ask(check['question'], rec['issue'])
+    update(gl.pid, args.mr, ask={'id': qid, 'head': check['head'], 'target': check['target'], 'at': now()})
+    return {'ask_id': qid, 'mr': int(args.mr), 'head': check['head'], 'target': check['target']}
+
+
+def agent_name():
+    if os.environ.get('CLAUDECODE'):
+        return 'claude-code'
+    if any(k.startswith('CODEX_') for k in os.environ):
+        return 'codex'
+    return 'agent'
+
+
+def comment(entry, issue, web_url):
+    result = (f'merged as {entry["merge_commit"]}' if entry['result'] == 'merged'
+              else f'refused ({entry["code"]}): {entry["reason"]}')
+    return ('\n'.join([
+        f'[agent:{agent_name()} {os.environ.get("BB_THREAD_ID", "no-thread")}] astra-guard merge on {issue or "an issue this guard did not record"}',
+        f'Ask: {entry["ask_id"]}',
+        f'Merge request: !{entry["mr"]} {web_url or ""}'.rstrip(),
+        f'Head commit: {entry["head"] or "not read"}',
+        f'Target main commit: {entry["target"] or "not read"}',
+        f'Result: {result}',
+    ]) + '\n')
+
+
+def cmd_merge(gl, cfg, args):
+    try:
+        log = open_log()
+    except Refusal as e:
+        e.extra = {'comment': comment({'ask_id': args.answer, 'mr': int(args.mr), 'head': None, 'target': None,
+                                       'result': 'refused', 'code': e.code, 'reason': e.message}, None, None),
+                   'comment_issue': None}
+        raise
+    with log:
+        return _merge(gl, cfg, args, log)
+
+
+def _merge(gl, cfg, args, log):
+    entry = {'time': now(), 'ask_id': args.answer, 'answer': None, 'mr': int(args.mr), 'head': None,
+             'target': None, 'result': 'refused', 'code': None, 'reason': None, 'merge_commit': None}
+    issue, web_url = None, None
+    try:
+        if not R.ASK_ID.match(args.answer):
+            raise Refusal('answer_id', 'the answer is a bb question id, bbq_...')
+        thread = thread_id()
+        rec = record(gl.pid, args.mr)
+        issue, web_url = rec.get('issue'), rec.get('web_url')
+        check = rec.get('check')
+        if not check:
+            raise Refusal('not_checked', f'run check on !{args.mr} first')
+        entry.update(head=check['head'], target=check['target'])
+        unmoved(gl, args.mr, check)
+        answer = answer_of(args.answer)
+        entry['answer'] = R.answer_summary(answer)
+        R.check_answer(answer, thread, int(args.mr), check['head'], check['target'])
+        fresh = bind_and_check(gl, cfg, args.mr, rec, check['namespace'])
+        if (fresh['head'], fresh['target']) != (check['head'], check['target']):
+            raise Refusal('head_moved', 'the head or main moved during the merge check')
+        try:
+            write_log(log, {**entry, 'time': now(), 'result': 'attempt'})
+        except OSError as e:
+            raise Refusal('log_unusable', f'cannot write the attempt line: {type(e).__name__}; nothing was merged')
+        try:
+            out = gl.write('PUT', gl.p(f'/merge_requests/{int(args.mr)}/merge'), {'sha': check['head']})
+        except GitLabError as e:
+            raise Refusal('merge_failed', e.message)
+        except Exception as e:
+            raise Refusal('merge_unknown', f'{type(e).__name__}; the merge may have landed: read '
+                                           f'!{int(args.mr)} before anything else')
+        if out.get('state') != 'merged':
+            raise Refusal('merge_failed', f'GitLab answered state {out.get("state")!r}')
+        landed = out.get('merge_commit_sha') or out.get('squash_commit_sha')
+        entry.update(result='merged', merge_commit=landed)
+        update(gl.pid, args.mr, merged={'at': now(), 'ask_id': args.answer, 'head': check['head'],
+                                        'target': check['target'], 'landed': landed})
+    except Exception as e:
+        if not isinstance(e, Refusal):
+            e = Refusal('internal_error', f'{type(e).__name__}: {e}'[:300])
+        entry.update(code=e.code, reason=e.message)
+        try:
+            write_log(log, entry)
+        except OSError as err:
+            e.message += f' (and the approval log could not be written: {type(err).__name__})'
+            entry['reason'] = e.message
+        e.extra = {'comment': comment(entry, issue, web_url), 'comment_issue': issue}
+        raise e
+    try:
+        write_log(log, entry)
+    except OSError as err:
+        # The merge landed; its attempt line is in the log with no result.
+        entry['log_error'] = f'the result line could not be written: {type(err).__name__}'
+    return {'result': 'merged', 'log_error': entry.get('log_error'), 'mr': int(args.mr), 'head': entry['head'], 'target': entry['target'],
+            'merge_commit': entry['merge_commit'], 'comment': comment(entry, issue, web_url),
+            'comment_issue': issue}
+
+
+def log_startup_refusal(args, e):
+    """A merge refused before cmd_merge ran (config, fleet, token) is logged like any other."""
+    entry = {'time': now(), 'ask_id': args.answer, 'answer': None, 'mr': int(args.mr), 'head': None,
+             'target': None, 'result': 'refused', 'code': e.code, 'reason': e.message, 'merge_commit': None}
+    try:
+        with open_log() as log:
+            write_log(log, entry)
+    except (Refusal, OSError) as err:
+        e.message += f' (and the approval log could not be written: {type(err).__name__})'
+    return {'comment': comment(entry, None, None), 'comment_issue': None}
+
+
+def cmd_teardown(gl, cfg, args):
+    R.check_branch(args.branch)
+    rec = record(gl.pid, args.deploy_mr)
+    td = rec.get('teardown')
+    if rec.get('kind') != 'deploy' or not td:
+        raise Refusal('not_merged', f'!{args.deploy_mr} is not a deploy this guard checked')
+    # GitLab, not the local merge record, proves the merge: a lost merge reply leaves no record.
+    mr = gl.mr(args.deploy_mr)
+    if mr.get('state') != 'merged':
+        raise Refusal('not_merged', f'!{args.deploy_mr} is {mr.get("state")!r} in GitLab')
+    if mr.get('sha') != td['head']:
+        raise Refusal('landed_head_mismatch', f'!{args.deploy_mr} merged {mr.get("sha")}, not the checked '
+                                              f'head {td["head"]}')
+    landed = mr.get('merge_commit_sha') or mr.get('squash_commit_sha')
+    if not isinstance(landed, str) or not R.SHA.match(landed):
+        raise Refusal('not_merged', f'GitLab names no landed commit for !{args.deploy_mr}')
+    target = gl.main()
+    if gl.merge_base(landed, target) != landed:
+        raise Refusal('not_landed', f'main {target} does not contain the deploy {landed}')
+    path = td['path']
+    text = R.apply_patch(gl.raw(path, target), td['inverse'])
+    return push_file(gl, args.branch, path, target, text, 'teardown')
+
+
+COMMANDS = {'get': cmd_get, 'push': cmd_push, 'open': cmd_open, 'close': cmd_close, 'check': cmd_check,
+            'ask': cmd_ask, 'merge': cmd_merge, 'teardown': cmd_teardown}
+
+
+def parser():
+    ap = argparse.ArgumentParser(prog='astra-guard', description=__doc__.split('\n')[0])
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    s = sub.add_parser('get')
+    s.add_argument('path')
+    s = sub.add_parser('push')
+    s.add_argument('--branch', required=True)
+    s.add_argument('--base', required=True)
+    s.add_argument('--file', required=True)
+    s = sub.add_parser('open')
+    s.add_argument('--branch', required=True)
+    s.add_argument('--issue', required=True)
+    s.add_argument('--kind', required=True, choices=('deploy', 'teardown'))
+    s.add_argument('--title', required=True)
+    s.add_argument('--expires')
+    s = sub.add_parser('close')
+    s.add_argument('--mr', required=True, type=int)
+    s = sub.add_parser('check')
+    s.add_argument('--mr', required=True, type=int)
+    s.add_argument('--namespace', required=True)
+    s = sub.add_parser('ask')
+    s.add_argument('--mr', required=True, type=int)
+    s = sub.add_parser('merge')
+    s.add_argument('--mr', required=True, type=int)
+    s.add_argument('--answer', required=True)
+    s = sub.add_parser('teardown')
+    s.add_argument('--deploy-mr', required=True, type=int)
+    s.add_argument('--branch', required=True)
+    return ap
+
+
+def emit(obj):
+    text = json.dumps(obj, indent=1)
+    try:
+        print(sink(text, 'the output'))
+    except Refusal as e:
+        print(json.dumps({'error': e.message, 'code': e.code}, indent=1))
+
+
+def fetch_token(cfg):
+    """Run `fleet secret env` as a child and read the token from a pipe.
+
+    The guard is not replaced by fleet, so a fleet failure is refused, and for a merge
+    logged, in this process. The token is never in argv, a file or output.
+    """
+    r, w = os.pipe()
+    argv = ['fleet', 'secret', 'env', f'{TOKEN_ENV}={cfg["token_ref"]}', '--', sys.executable, '-I', '-c', HANDOVER]
+    try:
+        p = subprocess.Popen(argv, pass_fds=(w,), env={**child_env(), FD_ENV: str(w)}, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except OSError as e:
+        os.close(r)
+        os.close(w)
+        raise Refusal('fleet_missing', f'cannot run fleet: {type(e).__name__}')
+    os.close(w)
+    try:
+        p.communicate(timeout=FLEET_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.communicate()
+        os.close(r)
+        raise Refusal('fleet_failed', f'fleet secret env took more than {FLEET_TIMEOUT} s')
+    chunks = []
+    with os.fdopen(r, 'rb') as f:
+        chunks.append(f.read())
+    if p.returncode:
+        raise Refusal('fleet_failed', f'fleet secret env exited {p.returncode}')
+    token = b''.join(chunks).decode(errors='replace')
+    if not token:
+        raise Refusal('token_missing', f'fleet secret env gave no {TOKEN_ENV}')
+    return token
+
+
+def main(argv=None):
+    global _TOKEN
+    argv = sys.argv[1:] if argv is None else argv
+    args = parser().parse_args(argv)
+    try:
+        cfg = load_config()
+        os.environ.pop(TOKEN_ENV, None)
+        _TOKEN = fetch_token(cfg)
+        gl = GitLab(cfg, _TOKEN)
+        emit(COMMANDS[args.cmd](gl, cfg, args))
+        return 0
+    except Exception as e:  # never a traceback: it could carry request state
+        if not isinstance(e, Refusal):
+            e = Refusal('internal_error', f'{type(e).__name__}: {e}'[:300])
+        if args.cmd == 'merge' and not hasattr(e, 'extra'):
+            e.extra = log_startup_refusal(args, e)
+        emit({'error': e.message, 'code': e.code, **getattr(e, 'extra', {})})
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
