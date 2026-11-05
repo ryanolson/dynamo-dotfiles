@@ -1549,6 +1549,16 @@ class PassTwoReview(GuardCase):
 
 class PassThreeReview(GuardCase):
 
+    def test_changed_deploy_can_apply_its_recorded_teardown(self):
+        self.gl.commit(PID, 'main', {DEV: dev_deploy()})
+        changed = dev_deploy().replace('replicas: 1', 'replicas: 2')
+        iid, qid = self.approved(changed)
+        self.merge(iid, qid)
+        self.assertEqual(self.gl.file_at('main', DEV), changed)
+        teardown = 'wcep/TEAM-910-teardown'
+        self.ok('teardown', '--deploy-mr', str(iid), '--branch', teardown)
+        self.assertEqual(self.gl.file_at(teardown, DEV), dev_deploy())
+
     def test_url_escaped_token_in_http_error_never_reaches_output_or_log(self):
         iid, qid = self.approved()
         escaped = ''.join(f'%{ord(c):02X}' for c in SECRET)
