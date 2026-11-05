@@ -1940,6 +1940,34 @@ class HostEntryEnvironment(GuardCase):
         self.assertEqual([l['direction'] for l in self.ledger(host=True)], ['extend', 'down', 'down'])
 
 
+class PartialApplyFailures(GuardCase):
+    @unittest.skip("F8: a failed shrink does not stop kubectl applying a later GPU growth")
+    def test_failed_shrink_cannot_leave_a_later_growth_over_the_lease(self):
+        self.add_ns()
+        lid = self.add_lease(gpus=4)
+        self.add_obj(gpu_dgd('old', 4, lid))
+        # kubectl collects per-object errors and still applies the remaining objects.
+        hook = """for obj in docs(stdin):
+        if not dry and obj['metadata']['name'] == 'old':
+            st['failed_shrink'] = True
+            continue"""
+        fake = FAKE_KUBECTL.replace('for obj in docs(stdin):', hook, 1)
+        fake = fake.replace("    if not dry:\n        save()\n    emit(out[0]", """    if not dry:
+        save()
+        if st.get('failed_shrink'):
+            fail('Error from server (InternalError): old shrink failed; later objects still applied')
+    emit(out[0]""", 1)
+        self.assertNotEqual(fake, FAKE_KUBECTL)
+        (self.bin / 'kubectl').write_text(fake)
+
+        rc, body, _ = self.apply(gpu_dgd('old', 4, lid, replicas=0), gpu_dgd('new', 4, lid))
+
+        self.assertNotEqual(rc, 0, body)
+        old, new = self.dgd_obj('old'), self.dgd_obj('new')
+        held = sum(4 * obj['spec']['components'][1]['replicas'] for obj in (old, new) if obj is not None)
+        self.assertLessEqual(held, self.bb['leases'][lid]['gpus'], f'{body}; allocation after partial apply={held}')
+
+
 class NamespaceWriteWindows(GuardCase):
     @unittest.skip("F7: UID reads do not fence later writes into a replacement namespace")
     def test_recreation_after_last_uid_read_refuses_every_host_write(self):
