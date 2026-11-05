@@ -1894,6 +1894,21 @@ class RedesignReview(GuardCase):
 
 class RoundTwoReview(GuardCase):
 
+    def test_push_cannot_commit_a_yaml_escaped_token(self):
+        escaped = ''.join(f'\\x{ord(c):02x}' for c in SECRET)
+        values = stg_deploy().replace('gpuCount: "2"', f'gpuType: "{escaped}"')
+        self.assertNotIn(SECRET, values)
+        self.assertEqual(rules.load_values(values)['mockerRepros'][-1]['gpuType'], SECRET)
+
+        rc, body, err = self.guard('push', '--branch', BRANCH, '--base', self.main(),
+                                   '--file', f'{STG}={self.local(values)}')
+
+        if rc == 0:
+            committed = rules.load_values(self.gl.file_at(body['commit'], STG))
+            self.assertEqual(committed['mockerRepros'][-1]['gpuType'], SECRET)
+        self.assertNotEqual(rc, 0, f'The commits API stored a YAML value containing the token: {body} {err}')
+        self.assertEqual(self.gl.writes(), [])
+
     def test_json_exponent_cannot_change_to_a_string_outside_our_entries(self):
         base = rules.load_values(DEV_VALUES)
         base['itSetting'] = 1000.0
