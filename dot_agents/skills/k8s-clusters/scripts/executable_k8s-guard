@@ -913,8 +913,11 @@ def cmd_down(g, a):
     # accepted F14 residual), or not stamped at all, was not applied here by the guard; its pods must
     # not hold the namespace. The namespace delete below carries the UID precondition, so it removes
     # them with this instance and can touch nothing else.
+    # A name this down deleted stays its own even if a foreign DGD takes it later: its pods may still
+    # be terminating, so they are waited for.
+    own_names = {(d.get('metadata') or {}).get('name') for d in dgds}
     foreign = {(d.get('metadata') or {}).get('name') for d in g.dgds(ns)
-               if ((d.get('metadata') or {}).get('labels') or {}).get(NS_UID_LABEL) != view.uid}
+               if ((d.get('metadata') or {}).get('labels') or {}).get(NS_UID_LABEL) != view.uid} - own_names
     while True:
         pods = g.pods(ns)
         own = [p for p in pods if ((p.get('metadata') or {}).get('labels') or {}).get(DGD_NAME_LABEL) not in foreign]

@@ -1802,7 +1802,6 @@ class Down(GuardCase):
 
 
 class DownClassificationRaces(GuardCase):
-    @unittest.skip("F16: a foreign same-name DGD hides a still-running owned GPU pod")
     def test_f16_foreign_replacement_cannot_hide_a_deleted_owned_dgds_pod(self):
         self.add_ns(thread=OTHER)
         lid = self.add_lease(thread=OTHER, state='revoking')

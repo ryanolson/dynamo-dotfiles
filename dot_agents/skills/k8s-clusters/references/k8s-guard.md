@@ -74,7 +74,7 @@ Every write in a namespace with a lease record takes the slot, GPU or not. `secr
 - the plugin says the lease is `revoking` or `releasing`, for this cluster, namespace and UID;
 - the plugin cannot be reached, `--uid` matches the namespace, and the namespace's expiry has passed.
 
-A JSON error from the plugin, such as an unknown lease, is an answer, not an outage, and is refused. So is a lease the plugin reports as `released` or `torn-down`. `down` stops with `pods_left` while GPU pods remain, and keeps the namespace.
+A JSON error from the plugin, such as an unknown lease, is an answer, not an outage, and is refused. So is a lease the plugin reports as `released` or `torn-down`. `down` stops with `pods_left`, and keeps the namespace, while GPU pods of the DGDs it deleted, or GPU pods of no DGD, remain. Pods of a DGD labelled for another namespace instance do not hold it (see the residual below).
 
 ## A re-created namespace
 
