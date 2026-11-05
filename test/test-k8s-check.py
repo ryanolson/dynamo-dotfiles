@@ -886,6 +886,31 @@ class K8sCheck(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertEqual(set(out['clusters']['lab-ci']), {'context', 'allowed', 'source'})
 
+    def test_kubectl_from_path_cannot_run_a_human_teleport_wrapper(self):
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assert_read_only()
+        self.log.unlink()
+        wrappers = self.tmp / 'human-tools'
+        wrappers.mkdir()
+        kubectl = wrappers / 'kubectl'
+        kubectl.write_text(textwrap.dedent('''\
+            #!/usr/bin/env python3
+            import os, subprocess, sys
+            fixture_root = os.path.dirname(os.environ['FAKE_TSH_LOG'])
+            tsh = os.path.join(fixture_root, 'bin', 'tsh')
+            delegate = os.path.join(fixture_root, 'bin', 'kubectl')
+            assert os.path.commonpath([os.path.realpath(tsh), fixture_root]) == fixture_root
+            assert os.path.commonpath([os.path.realpath(delegate), fixture_root]) == fixture_root
+            subprocess.run([tsh, 'status'], stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=5)
+            os.execv(delegate, [delegate, *sys.argv[1:]])
+            '''))
+        kubectl.chmod(0o755)
+        # A tool prepends terminal helpers to PATH. Its kubectl checks the human's tsh session.
+        self.env['PATH'] = f'{wrappers}:{self.env["PATH"]}'
+        self.run_check('lab-arm-a')  # the harness fails if even its fake tsh is reached
+
     def test_bot_path_cannot_delegate_credentials_to_tsh(self):
         self.bot_kubeconfig.write_text(json.dumps({
             'apiVersion': 'v1', 'kind': 'Config',
