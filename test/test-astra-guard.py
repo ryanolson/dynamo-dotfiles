@@ -1486,6 +1486,15 @@ class AdversarialReview(GuardCase):
 
 class PassTwoReview(GuardCase):
 
+    def test_response_redaction_cannot_hide_an_it_value_change(self):
+        base = DEV_VALUES + f'itSetting: "{SECRET}"\n'
+        head = dev_deploy(base).replace(SECRET, '[redacted]')
+        self.gl.commit(PID, 'main', {DEV: base})
+        self.gl.commit(PID, BRANCH, {DEV: head}, parent=self.main())
+        iid = self.open()
+        rc, body, err = self.guard('check', '--mr', str(iid), '--namespace', NS)
+        self.assertNotEqual(rc, 0, 'Redaction hid a change outside the wcep entries')
+
     def test_json_escaped_token_echo_is_redacted_before_state_and_bb(self):
         iid = self.deployed_mr()
         self.gl.mrs[(PID, iid)]['web_url'] += f'?diagnostic={SECRET}'
