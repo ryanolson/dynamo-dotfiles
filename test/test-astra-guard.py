@@ -1383,6 +1383,14 @@ class PureRules(unittest.TestCase):
 
 class AdversarialReview(GuardCase):
 
+    def test_dev_cannot_request_a_mig_gpu(self):
+        entry = DEV_ENTRY.replace('requests: { cpu: "1", memory: "2Gi" }',
+                                  'requests: { cpu: "1", memory: "2Gi" }\n'
+                                  '        limits: { nvidia.com/mig-1g.5gb: "1" }')
+        self.gl.commit(PID, BRANCH, {DEV: dev_deploy(entry=entry)}, parent=self.main())
+        iid = self.open()
+        self.refused('dev_gpu', 'check', '--mr', str(iid), '--namespace', NS)
+
     def test_teardown_cannot_remove_an_entry_named_prd(self):
         values = dev_deploy(entry=DEV_ENTRY.replace('wcep-smoke', 'wcep-smoke-prd'))
         self.gl.commit(PID, 'main', {DEV: values})
