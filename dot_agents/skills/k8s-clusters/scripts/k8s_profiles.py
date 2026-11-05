@@ -32,30 +32,44 @@ class ProfileError(Exception):
 
 
 OWNER_DIRS = ('.kube', '.tsh')
+TBOT_DIR = '.local/share/tbot'
 
 
-def owner_login(path):
-    """True when path may be the owner's own login: a file in a .kube or .tsh directory.
-
-    Checks the path as written and as resolved, for any .kube or .tsh component, so
-    neither a symlink nor a changed HOME hides it. Also checks the resolved owner
-    directories of both $HOME and the account's home, for a link whose names say nothing.
-    """
-    given = Path(os.path.abspath(os.path.expanduser(path)))
-    real = Path(os.path.realpath(given))
-    if any(part in OWNER_DIRS for p in (given, real) for part in p.parts):
-        return True
+def account_homes():
+    """$HOME and the account's home from the password database: HOME alone can be changed."""
     homes = {os.path.expanduser('~')}
     try:
         homes.add(pwd.getpwuid(os.getuid()).pw_dir)
     except KeyError:
         pass
+    return homes
+
+
+def bot_kubeconfig_problem(path):
+    """Why path cannot be the bot's kubeconfig, or None when it can.
+
+    An allowlist: the resolved file must lie in tbot's own directory, where the tbot
+    config writes it. Path checks by denylist kept leaking (a symlink, a changed HOME,
+    a symlink before "..").
+    The denylist stays as a second check: no .kube or .tsh directory in the path as
+    written or as resolved, since those hold the owner's own login.
+    os.path.realpath resolves each symlink before the ".." after it, as the kernel does.
+    """
+    expanded = os.path.expanduser(path)
+    if not os.path.isabs(expanded):
+        return f'bot.kubeconfig {path} must be an absolute path or start with ~'
+    real = Path(os.path.realpath(expanded))
+    if any(part in OWNER_DIRS for p in (Path(expanded), real) for part in p.parts):
+        return f'bot.kubeconfig {path} is in a .kube or .tsh directory, the owner\'s login'
+    homes = account_homes()
     for home in homes:
         for d in OWNER_DIRS:
             owner = Path(os.path.realpath(os.path.join(home, d)))
             if real == owner or owner in real.parents:
-                return True
-    return False
+                return f'bot.kubeconfig {path} resolves into {owner}, the owner\'s login'
+    if not any(Path(os.path.realpath(os.path.join(home, TBOT_DIR))) in real.parents for home in homes):
+        return f'bot.kubeconfig {path} resolves to {real}, which is not under ~/{TBOT_DIR}'
+    return None
 
 
 def profiles_path():
@@ -147,8 +161,9 @@ def load_profiles():
     if isinstance(prefix, str) and prefix and not prefix.endswith('-'):
         errors.append('bot.namespace_prefix must end in "-"')
     kubeconfig = bot.get('kubeconfig')
-    if isinstance(kubeconfig, str) and kubeconfig and owner_login(kubeconfig):
-        errors.append(f'bot.kubeconfig {kubeconfig} is the owner\'s login (~/.kube or ~/.tsh), not the bot\'s')
+    problem = bot_kubeconfig_problem(kubeconfig) if isinstance(kubeconfig, str) and kubeconfig else None
+    if problem:
+        errors.append(problem)
     clusters = data.get('clusters')
     if not isinstance(clusters, dict) or not clusters:
         errors.append('[clusters.<name>] needs at least one cluster')
