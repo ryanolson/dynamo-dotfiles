@@ -774,6 +774,33 @@ class K8sCheck(unittest.TestCase):
         owner_calls = [c['key'] for c in self.calls() if c['credential_token'] == 'made-up-owner-token']
         self.assertEqual(owner_calls, [], f'owner credentials used after bot whoami: {owner_calls}')
 
+    def test_tbot_named_symlink_cannot_run_tsh(self):
+        plugin_path = self.tmp / 'bin/tbot'
+        plugin_path.symlink_to(self.tmp / 'bin/tsh')
+        self.bot_kubeconfig.write_text(kubeconfig(user={'exec': {
+            'apiVersion': 'client.authentication.k8s.io/v1beta1',
+            'command': str(plugin_path), 'args': ['kube', 'credentials']}}))
+        # Execute only the fixture plugin, with the same symlink lookup as client-go.
+        credential_step = textwrap.dedent('''\
+            if rest[:1] != ['config']:
+                import subprocess
+                config = json.load(open(flags['--kubeconfig']))
+                context = next(c['context'] for c in config['contexts'] if c['name'] == flags['--context'])
+                user = next(u['user'] for u in config['users'] if u['name'] == context['user'])
+                plugin = user['exec']
+                result = subprocess.run([plugin['command'], *plugin.get('args', [])],
+                                        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
+                sys.stdout.write(result.stdout)
+                sys.stderr.write(result.stderr)
+                sys.exit(result.returncode)
+            ''')
+        kubectl = self.tmp / 'bin/kubectl'
+        kubectl.write_text(FAKE_KUBECTL.replace(
+            "scenario = json.load(open(os.environ['FAKE_KUBECTL_SCENARIO']))",
+            credential_step + "scenario = json.load(open(os.environ['FAKE_KUBECTL_SCENARIO']))"))
+        rc, out = self.run_check('lab-arm-a')
+        self.assert_refused_without_contact(out, rc, 'kubeconfig_credentials')
+
 
 if __name__ == '__main__':
     unittest.main()
