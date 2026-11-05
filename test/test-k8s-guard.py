@@ -2291,6 +2291,24 @@ class SelftestFences(GuardCase):
         # It ran inside the lease's slot, like every other write.
         self.assertIn(['k8s', 'lease', 'op', 'begin', self.lid], self.bb_calls())
 
+    @unittest.skip("F13: selftest treats Forbidden and UnsupportedMediaType as successful fence checks")
+    def test_unrelated_request_errors_do_not_prove_fences_hold(self):
+        for error in ('Forbidden', 'UnsupportedMediaType'):
+            with self.subTest(error=error):
+                self.k8s['forbid'] = ['patch ', 'delete --raw', 'replace -f'] if error == 'Forbidden' else []
+                self.flush()
+                fake = FAKE_KUBECTL
+                if error == 'UnsupportedMediaType':
+                    fake = fake.replace("if cmd == 'delete' and '--raw' in flags:", """if cmd == 'delete' and '--raw' in flags:
+    fail('Error from server (UnsupportedMediaType): unsupported Content-Type for DeleteOptions')""", 1)
+                    self.assertNotEqual(fake, FAKE_KUBECTL)
+                (self.bin / 'kubectl').write_text(fake)
+
+                rc, body, _ = self.guard('--context', CTX, '-n', NS, 'selftest', 'fences')
+
+                self.assertTrue(any(error in p['response'] for p in body.get('probes', [])), body)
+                self.assertNotEqual(rc, 0, f'unrelated errors certified as working fences: {body}')
+
     def test_a_server_that_ignores_a_fence_is_reported(self):
         # A fake server that ignores the UID precondition on a DGD delete.
         fake = FAKE_KUBECTL.replace("        if o['metadata']['uid'] != want:\n            fail('Error from server (Conflict): Precondition failed')",
