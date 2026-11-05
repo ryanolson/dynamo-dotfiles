@@ -1940,6 +1940,22 @@ class HostEntryEnvironment(GuardCase):
         self.assertEqual([l['direction'] for l in self.ledger(host=True)], ['extend', 'down', 'down'])
 
 
+class GpuTypes(GuardCase):
+    @unittest.skip("F9: a matching lease type does not constrain the GPU type requested by the DGD")
+    def test_gpu_node_selector_must_match_the_lease_type(self):
+        self.add_ns()
+        lid = self.add_lease(gpus=1, gpu_type='gb300')
+        obj = gpu_dgd('wrong-type', 1, lid)
+        obj['spec']['components'][1]['podTemplate']['spec']['nodeSelector'] = {
+            'nvidia.com/gpu.product': 'NVIDIA-H100'}
+
+        rc, body, _ = self.apply(obj)
+
+        self.assertEqual([c['pos'][0] for c in self.writes()], [], f'gb300 lease admits an H100 GPU pod: {body}')
+        self.assertNotEqual(rc, 0, body)
+        self.assertIsNone(self.dgd_obj('wrong-type'))
+
+
 class PartialApplyFailures(GuardCase):
     @unittest.skip("F8: a failed shrink does not stop kubectl applying a later GPU growth")
     def test_failed_shrink_cannot_leave_a_later_growth_over_the_lease(self):
