@@ -1861,7 +1861,6 @@ sys.exit(status)
     def test_full_poll_intervals_respect_the_deadline(self):
         self.assertEqual(self.down_elapsed(wait=10, with_gpu_pod=True), 10)
 
-    @unittest.skip("F20: down sleeps past its wait deadline when the remaining time is less than one poll")
     def test_f20_last_poll_is_capped_at_the_deadline(self):
         elapsed = self.down_elapsed(wait=1, with_gpu_pod=True)
         self.assertLessEqual(elapsed, 1, 'the default 5-second poll exceeded the configured 1-second wait')

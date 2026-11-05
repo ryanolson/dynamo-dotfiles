@@ -916,9 +916,10 @@ def cmd_down(g, a):
     # keeps the GPUs charged until a host reports the namespace gone.
     while True:
         _, left = gpu_pod_summary(g.pods(ns))
-        if left == 0 or time.monotonic() >= give_up:
+        remaining = give_up - time.monotonic()
+        if left == 0 or remaining <= 0:
             break
-        time.sleep(poll)
+        time.sleep(min(poll, remaining))  # never past the bound
     if (view.obj.get('metadata') or {}).get('deletionTimestamp'):
         # Already being deleted (an earlier down): a second delete would only be refused.
         g.record(ns, f'Namespace/{ns}', before, 'down', uid=view.uid, lease=lease_id, issue=view.issue,
