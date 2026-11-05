@@ -14,9 +14,13 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = Path(os.environ.get('K8S_CHECK_SCRIPTS') or ROOT / 'dot_agents/skills/k8s-clusters/scripts')
@@ -179,6 +183,63 @@ class Render(unittest.TestCase):
             self.assertTrue(os.path.isabs(chosen))
             with open(chosen, 'rb') as f:
                 self.assertEqual(f.read(4), b'\x7fELF')
+
+    def test_installed_elf_wrapper_cannot_run_tsh(self):
+        compiler = shutil.which('cc', path='/usr/bin:/bin')
+        self.assertIsNotNone(compiler, 'the compiled-wrapper reproduction requires cc')
+        wrapper = self.home / '.local/bin/kubectl'
+        source = textwrap.dedent(r'''
+            #include <stdio.h>
+            #include <stdlib.h>
+            #include <string.h>
+            #include <sys/wait.h>
+            #include <unistd.h>
+            int main(int argc, char **argv) {
+                if (argc != 9 || strcmp(argv[1], "--kubeconfig") ||
+                    strcmp(argv[3], "config") || strcmp(argv[4], "view")) return 90;
+                if (getenv("REVIEW_CHECK_TSH")) {
+                    pid_t child = fork();
+                    if (child < 0) return 91;
+                    if (child == 0) {
+                        const char *tsh = getenv("REVIEW_FAKE_TSH");
+                        execl(tsh, tsh, "status", (char *)NULL);
+                        _exit(92);
+                    }
+                    if (waitpid(child, NULL, 0) < 0) return 93;
+                }
+                FILE *config = fopen(argv[2], "rb");
+                if (!config) return 94;
+                int c;
+                while ((c = fgetc(config)) != EOF) putchar(c);
+                return fclose(config);
+            }
+            ''')
+        subprocess.run([compiler, '-x', 'c', '-', '-o', str(wrapper)], input=source,
+                       capture_output=True, text=True, timeout=15, check=True,
+                       env={'PATH': '/usr/bin:/bin'})
+        fake_tsh = self.home / '.local/bin/tsh'
+        log = self.home / 'fake-tsh.log'
+        fake_tsh.write_text('#!/bin/sh\nprintf "tsh status\\n" >> "$REVIEW_TSH_LOG"\nexit 0\n')
+        fake_tsh.chmod(0o755)
+        self.kubeconfig.write_text(json.dumps(self.view()))
+        env = {'PATH': '/usr/bin:/bin', 'REVIEW_FAKE_TSH': str(fake_tsh), 'REVIEW_TSH_LOG': str(log)}
+        # Test the real ELF check at its default user path, excluding system binaries from execution.
+        with mock.patch.object(self.m, 'KUBECTL_INSTALLS', ('~/.local/bin/kubectl',)), \
+                mock.patch.dict(os.environ, env, clear=True):
+            self.assertTrue(self.m.is_elf(wrapper))
+            selected, fd = self.m.prepare_bot_kubeconfig(str(self.kubeconfig), CTX)
+            os.close(fd)
+            self.assertEqual(selected, str(wrapper))
+            self.assertFalse(log.exists())
+            # A terminal helper installs its compiled Teleport wrapper at ~/.local/bin/kubectl.
+            os.environ['REVIEW_CHECK_TSH'] = 'yes'
+            try:
+                selected, fd = self.m.prepare_bot_kubeconfig(str(self.kubeconfig), CTX)
+            except self.m.ProfileError:
+                pass
+            else:
+                os.close(fd)
+            self.assertFalse(log.exists(), 'the accepted ELF wrapper runs tsh during config view')
 
 
 if __name__ == '__main__':
