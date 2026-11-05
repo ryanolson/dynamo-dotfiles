@@ -38,7 +38,7 @@ import time
 # -I drops the script directory from sys.path; the shared parser lives next to this script.
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from k8s_profiles import ProfileError, bot_credential_problem, kubectl_env, load_profiles  # noqa: E402
+from k8s_profiles import ProfileError, bot_credential_problem, kubectl_env, load_profiles, sealed_copy  # noqa: E402
 from k8s_guard_rules import (  # noqa: E402
     DGD_KIND, HOSTNAME_TOPOLOGY, LEASE_LABEL, LEASE_RECORD, NS_UID_LABEL, Refusal, admit, allocation,
     budget_allocation, check_gpu_product, check_one_node, dgd_gpus, gpu_pod_summary, zero_patch)
@@ -131,22 +131,20 @@ def parse_time(value, what):
 # --- kubectl --------------------------------------------------------------------
 
 class Kubectl:
-    """kubectl pinned to one open bot kubeconfig and one context, as k8s-check does it.
+    """kubectl on one sealed copy of the bot kubeconfig and one context, as k8s-check does it.
 
-    The file is opened once; every call reads it through /proc/self/fd/<n>, the same inode, so a
-    path swapped after the credential check is not followed. The environment has no KUBECONFIG,
-    no KUBECTL_* and kuberc off (k8s_profiles.kubectl_env), so nothing adds a --token.
+    k8s_profiles.sealed_copy reads the file once into a memfd sealed against writes; every call,
+    the credential check's config view included, reads it through /proc/self/fd/<n>. Replacing or
+    rewriting the file on disk changes nothing. The environment has no KUBECONFIG, no KUBECTL_* and
+    kuberc off (k8s_profiles.kubectl_env), so nothing adds a --token.
     """
 
     def __init__(self, kubeconfig, context):
         try:
-            self.fd = os.open(kubeconfig, os.O_RDONLY | os.O_NOFOLLOW)
-        except OSError as e:
-            raise Refusal('kubeconfig_not_bot', f'cannot open the bot kubeconfig {kubeconfig}: {e.strerror}')
-        os.set_inheritable(self.fd, True)
+            self.fd = sealed_copy(kubeconfig)
+        except ProfileError as e:
+            raise Refusal(e.code, str(e))
         pinned = f'/proc/self/fd/{self.fd}'
-        if not os.path.exists(pinned):
-            raise Refusal('kubeconfig_not_bot', 'this host has no /proc/self/fd, so the kubeconfig cannot be pinned')
         self.base = ['kubectl', '--kubeconfig', pinned, '--context', context]
         self.env = kubectl_env()
 

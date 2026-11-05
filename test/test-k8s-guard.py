@@ -457,10 +457,10 @@ runpy.run_path(sys.argv[0], run_name='__main__')
 '''
 
 
-def kubeconfig(user=None, contexts=(CTX, CTX_QA, CTX_B200)):
+def kubeconfig(tbot, user=None, contexts=(CTX, CTX_QA, CTX_B200)):
     """A bot kubeconfig as tbot writes it with its exec plugin on, in JSON (also valid YAML)."""
     user = user if user is not None else {'exec': {
-        'apiVersion': 'client.authentication.k8s.io/v1beta1', 'command': '/usr/local/bin/tbot',
+        'apiVersion': 'client.authentication.k8s.io/v1beta1', 'command': tbot,
         'args': ['kube', 'credentials', '--destination-dir=/example/kube']}}
     return json.dumps({
         'apiVersion': 'v1', 'kind': 'Config',
@@ -553,7 +553,12 @@ class GuardCase(unittest.TestCase):
         self.home = self.tmp / 'home'
         self.bot_kubeconfig = self.home / '.local/share/tbot/example/kube/kubeconfig.yaml'
         self.bot_kubeconfig.parent.mkdir(parents=True)
-        self.bot_kubeconfig.write_text(kubeconfig())
+        # tbot as the dotfiles install it for one user, in the (fake) passwd home.
+        self.tbot = self.home / '.local/bin/tbot'
+        self.tbot.parent.mkdir(parents=True)
+        self.tbot.write_text('#!/bin/sh\nexit 0\n')
+        self.tbot.chmod(0o755)
+        self.bot_kubeconfig.write_text(kubeconfig(str(self.tbot)))
         self.runner = self.tmp / 'runner.py'
         self.runner.write_text(RUNNER)
         for rel in ('.kube/config', '.tsh/keys/example/kubeconfig'):
@@ -740,14 +745,42 @@ class Identity(GuardCase):
                                             'command': 'tbot'}, 'as': 'cluster-admin'}}
         for label, user in users.items():
             with self.subTest(user=label):
-                self.bot_kubeconfig.write_text(kubeconfig(user=user))
+                self.bot_kubeconfig.write_text(kubeconfig(str(self.tbot), user=user))
                 self.kubectl_log.unlink(missing_ok=True)
                 self.refused('kubeconfig_credentials', '--context', CTX, 'inspect', NS)
                 self.assertEqual([c['pos'][:2] for c in self.kubectl_calls()], [['config', 'view']])
 
+    def test_tbot_name_linking_to_tsh_refused(self):
+        self.add_ns()
+        fake_tbot = self.tmp / 'evil/tbot'
+        fake_tbot.parent.mkdir()
+        fake_tbot.symlink_to(self.bin / 'tsh')
+        self.bot_kubeconfig.write_text(kubeconfig(str(fake_tbot)))
+        self.refused('kubeconfig_credentials', '--context', CTX, 'inspect', NS)
+        self.assertEqual([c['pos'][:2] for c in self.kubectl_calls()], [['config', 'view']])
+
+    def test_kubeconfig_rewritten_after_the_check_is_not_read(self):
+        # kubectl reads a sealed in-memory copy: rewriting the file after the guard read it changes
+        # nothing, so every call sees the credentials the check passed.
+        self.add_ns()
+        hook = """if pos[:2] == ['config', 'view']:
+    open(os.environ['FAKE_BOT_KUBECONFIG'], 'w').write('{"rewritten": true}')"""
+        fake = FAKE_KUBECTL.replace("if pos[:2] == ['config', 'view']:", hook + "\nif pos[:2] == ['config', 'view']:", 1)
+        fake = fake.replace("if what == 'namespace':", """if what == 'namespace':
+        if json.load(open(flags['--kubeconfig'])).get('rewritten'):
+            fail('fake kubectl: read the rewritten kubeconfig', 96)""", 1)
+        self.assertNotEqual(fake, FAKE_KUBECTL)
+        (self.bin / 'kubectl').write_text(fake)
+        env = self.env()
+        env['FAKE_BOT_KUBECONFIG'] = str(self.bot_kubeconfig)
+        p = subprocess.run(['python3', '-I', str(self.runner), str(GUARD), '--context', CTX, 'inspect', NS], env=env,
+                           capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('rewritten', self.bot_kubeconfig.read_text())
+
     def test_context_missing_from_kubeconfig_refused(self):
         self.add_ns()
-        self.bot_kubeconfig.write_text(kubeconfig(contexts=(CTX_QA,)))
+        self.bot_kubeconfig.write_text(kubeconfig(str(self.tbot), contexts=(CTX_QA,)))
         self.refused('kubeconfig_credentials', '--context', CTX, 'inspect', NS)
         self.assertEqual([c['pos'][:2] for c in self.kubectl_calls()], [['config', 'view']])
 
