@@ -1509,6 +1509,28 @@ class Extend(GuardCase):
         self.k8s['forbid'] = ['patch namespace']
         self.flush()
 
+    @unittest.skip("F1: extend creates the old lease record in a re-created namespace")
+    def test_recreated_namespace_between_uid_and_record_read_refused(self):
+        lid = self.add_lease(thread=OTHER)
+        hook = """if what == 'configmap':
+        st['namespaces'][ns_flag]['metadata']['uid'] = 'uid-recreated'
+        st['namespaces'][ns_flag]['metadata']['labels']['wcep.agent/thread'] = 'thr_recreated'
+        st['objects'][ns_flag] = {}
+        st['pods'][ns_flag] = []
+        save()"""
+        fake = FAKE_KUBECTL.replace("if what == 'configmap':", hook)
+        self.assertNotEqual(fake, FAKE_KUBECTL)
+        (self.bin / 'kubectl').write_text(fake)
+
+        rc, body, _ = self.guard('--context', CTX, 'extend', NS, '--uid', 'uid-ns-1', '--lease', lid,
+                                 host_entry=True)
+
+        self.assertEqual(self.k8s['namespaces'][NS]['metadata']['uid'], 'uid-recreated')
+        self.assertEqual(self.writes(), [], body)
+        self.assertNotEqual(rc, 0, body)
+        self.assertEqual(body.get('code'), 'uid_mismatch', body)
+        self.assertNotIn('ConfigMap/' + LEASE_CM, self.k8s['objects'][NS])
+
     def test_sets_expiry_to_exactly_the_lease_and_never_patches_namespace(self):
         lid = self.add_lease(thread=OTHER, expires_at='2026-11-05T03:00:00.000Z')
         self.bb['leases'][lid]['expires_at'] = '2026-11-05T04:30:00.123Z'  # the panel extended it
