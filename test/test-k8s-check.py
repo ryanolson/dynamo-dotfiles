@@ -47,11 +47,13 @@ while i < len(argv):
         flags[name] = argv[i + 1]; i += 2
     else:
         flags[name] = a.split('=', 1)[1]; i += 1
-def cert_user(user):
-    # The identity in embedded client cert data (the fake cert's body is the identity's name).
-    import base64
-    pem = base64.b64decode(user['client-certificate-data']).decode()
+def pem_user(pem):
+    # The fake cert's body is the identity's name; plain text is taken as the name itself.
     return next((line for line in pem.splitlines() if line and not line.startswith('-----')), None)
+def cert_user(user):
+    # The identity in embedded client cert data.
+    import base64
+    return pem_user(base64.b64decode(user['client-certificate-data']).decode())
 def kubeconfig_user():
     # The user entry of the context kubectl would use, from the file it was given.
     if '--kubeconfig' not in flags or '--context' not in flags:
@@ -646,7 +648,7 @@ class K8sCheck(unittest.TestCase):
                     assert os.path.commonpath([os.path.realpath(plugin['command']), fixture_root]) == fixture_root
                     result = subprocess.run([plugin['command'], *plugin['args']], stdin=subprocess.DEVNULL,
                                             capture_output=True, text=True, timeout=5, check=True)
-                    credential_user = json.loads(result.stdout)['status']['clientCertificateData']
+                    credential_user = pem_user(json.loads(result.stdout)['status']['clientCertificateData'])
             ''')
         response_step = textwrap.dedent('''\
             if rest[:2] == ['auth', 'whoami']:
@@ -822,7 +824,7 @@ class K8sCheck(unittest.TestCase):
                     assert os.path.commonpath([os.path.realpath(plugin['command']), fixture_root]) == fixture_root
                     result = subprocess.run([plugin['command'], *plugin['args']], stdin=subprocess.DEVNULL,
                                             capture_output=True, text=True, timeout=5, check=True)
-                    credential_user = json.loads(result.stdout)['status']['clientCertificateData']
+                    credential_user = pem_user(json.loads(result.stdout)['status']['clientCertificateData'])
             ''')
         response_step = textwrap.dedent('''\
             if rest[:2] == ['auth', 'whoami']:
@@ -883,7 +885,7 @@ class K8sCheck(unittest.TestCase):
                     assert os.path.commonpath([os.path.realpath(plugin['command']), fixture_root]) == fixture_root
                     result = subprocess.run([plugin['command'], *plugin['args']], stdin=subprocess.DEVNULL,
                                             capture_output=True, text=True, timeout=5, check=True)
-                    credential_user = json.loads(result.stdout)['status']['clientCertificateData']
+                    credential_user = pem_user(json.loads(result.stdout)['status']['clientCertificateData'])
             ''')
         response_step = textwrap.dedent('''\
             if rest[:2] == ['auth', 'whoami']:
