@@ -1549,6 +1549,28 @@ class PassTwoReview(GuardCase):
 
 class PassThreeReview(GuardCase):
 
+    def test_url_escaped_token_in_http_error_never_reaches_output_or_log(self):
+        iid, qid = self.approved()
+        escaped = ''.join(f'%{ord(c):02X}' for c in SECRET)
+        self.assertNotIn(SECRET, escaped)
+        self.assertEqual(urllib.parse.unquote(escaped), SECRET)
+        original = self.gl.route
+
+        def echo_error(method, parts, query, body, raw):
+            if method == 'GET' and parts[-1] == 'merge_base':
+                return 500, {}, {'message': f'diagnostic={escaped}'}
+            return original(method, parts, query, body, raw)
+
+        self.gl.route = echo_error
+        rc, body, err = self.guard('merge', '--mr', str(iid), '--answer', qid)
+        self.assertNotEqual(rc, 0, (body, err))
+        self.assertEqual(self.merges(), [])
+        self.assertEqual(len(self.log_lines()), 1)
+        exposed = ['output' for out in self.outputs if SECRET in urllib.parse.unquote(out)]
+        exposed += [path.name for path in (self.state_home / 'astra-guard').iterdir()
+                    if path.is_file() and SECRET in urllib.parse.unquote(path.read_text())]
+        self.assertEqual(exposed, [], 'HTTP errors must not retain an encoded token')
+
     def test_yaml_escaped_response_token_never_reaches_state_or_bb_argv(self):
         escaped = ''.join(f'\\x{ord(c):02x}' for c in SECRET)
         values = stg_deploy().replace('gpuCount: "2"', f'gpuType: "{escaped}"')
