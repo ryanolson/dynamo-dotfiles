@@ -1801,6 +1801,41 @@ class Down(GuardCase):
                      host_entry=True)
 
 
+class DownClassificationRaces(GuardCase):
+    @unittest.skip("F16: a foreign same-name DGD hides a still-running owned GPU pod")
+    def test_f16_foreign_replacement_cannot_hide_a_deleted_owned_dgds_pod(self):
+        self.add_ns(thread=OTHER)
+        lid = self.add_lease(thread=OTHER, state='revoking')
+        self.add_obj(gpu_dgd('shared', 1, lid), uid='uid-owned-dgd')
+        owned_pod = pod('shared', 1, name='owned-still-running')
+        owned_pod['metadata']['ownerReferences'] = [
+            {'apiVersion': DGD_API, 'kind': 'DynamoGraphDeployment', 'name': 'shared',
+             'uid': 'uid-owned-dgd', 'controller': True}]
+        self.add_pod(owned_pod)
+        replacement = gpu_dgd('shared', 2, 'lse_previous01')
+        replacement['metadata'].update(namespace=NS, uid='uid-foreign-dgd', resourceVersion='1000',
+                                       labels={NS_UID: 'uid-deleted-ns'})
+        self.k8s['replacement_dgd'] = replacement
+        self.k8s['terminate_pods_on_delete'] = False
+        self.flush()
+        # A late foreign apply reuses the DGD name after its delete, while its owned pod still runs.
+        anchor = "        del st['objects'][ns]['DynamoGraphDeployment/' + name]\n"
+        hook = anchor + """        st['objects'][ns]['DynamoGraphDeployment/' + name] = st['replacement_dgd']
+        st['owned_pods_after_dgd_delete'] = copy.deepcopy(st['pods'][ns])
+"""
+        self.assertEqual(FAKE_KUBECTL.count(anchor), 1)
+        (self.bin / 'kubectl').write_text(FAKE_KUBECTL.replace(anchor, hook, 1))
+
+        rc, body, _ = self.guard('--context', CTX, 'down', NS, '--uid', 'uid-ns-1', '--lease', lid,
+                                 host_entry=True)
+
+        self.assertEqual(self.k8s['owned_pods_after_dgd_delete'], [owned_pod])
+        self.assertNotEqual(rc, 0, f'down deleted the namespace with its owned GPU pod still running: {body}')
+        self.assertEqual(body.get('code'), 'pods_left', body)
+        self.assertEqual(body['gpu_pods_left'], 1, body)
+        self.assertIn(NS, self.k8s['namespaces'])
+
+
 # --- load-bearing: a namespace re-created under the same name is never touched ---
 
 class RecreatedNamespace(GuardCase):
