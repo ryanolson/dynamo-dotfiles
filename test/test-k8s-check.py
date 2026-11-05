@@ -660,6 +660,40 @@ class K8sCheck(unittest.TestCase):
         self.assert_refused_without_contact(out, rc, 'kubeconfig_not_bot')
         self.assertEqual(self.calls(), [])
 
+    def test_cluster_server_url_cannot_supply_owner_basic_auth(self):
+        # Go's HTTP client adds Authorization from URL userinfo before its transport runs.
+        # https://github.com/golang/go/blob/go1.25.0/src/net/http/client.go#L246
+        authorization_step = textwrap.dedent('''\
+            authorization = None
+            if rest[:1] != ['config']:
+                import base64
+                from urllib.parse import urlsplit, unquote
+                config = json.load(open(flags['--kubeconfig']))
+                context = next(c['context'] for c in config['contexts'] if c['name'] == flags['--context'])
+                cluster = next(c['cluster'] for c in config['clusters'] if c['name'] == context['cluster'])
+                server = urlsplit(cluster['server'])
+                if server.username is not None:
+                    credentials = unquote(server.username) + ':' + unquote(server.password or '')
+                    authorization = 'Basic ' + base64.b64encode(credentials.encode()).decode()
+            ''')
+        kubectl = self.tmp / 'bin/kubectl'
+        kubectl.write_text(FAKE_KUBECTL.replace(
+            "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:",
+            authorization_step + "with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:").replace(
+                "'key': ' '.join(rest)", "'key': ' '.join(rest), 'authorization': authorization"))
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(all(c['authorization'] is None for c in self.calls()))
+        self.log.unlink()
+        # An agent copies a URL with an owner's basic-auth credentials into the cluster stanza.
+        config = json.loads(self.kc())
+        config['clusters'][0]['cluster']['server'] = 'https://alice:made-up-password@proxy.example.test'
+        self.bot_kubeconfig.write_text(json.dumps(config))
+        rc, out = self.run_check('lab-arm-a')
+        owner_calls = [c['key'] for c in self.calls() if c['authorization'] is not None]
+        self.assertEqual(owner_calls, [], f'cluster URL supplies unchecked credentials: exit={rc}, {owner_calls}')
+        self.assert_refused_without_contact(out, rc, 'kubeconfig_credentials')
+
     def test_context_missing_from_bot_kubeconfig(self):
         self.bot_kubeconfig.write_text(self.kc(contexts=('proxy.example.test-lab-x86-qa',)))
         rc, out = self.run_check('lab-arm-a')
