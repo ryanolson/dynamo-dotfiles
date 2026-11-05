@@ -1813,6 +1813,60 @@ class Down(GuardCase):
                      host_entry=True)
 
 
+class DownWaitDeadline(GuardCase):
+    def down_elapsed(self, wait, with_gpu_pod):
+        self.add_ns(thread=OTHER)
+        lid = self.add_lease(thread=OTHER, state='releasing')
+        if with_gpu_pod:
+            self.add_pod(pod('unmatched', 1))
+        self.runner.write_text(RUNNER.replace("runpy.run_path(sys.argv[0], run_name='__main__')", r'''
+import json
+from pathlib import Path
+
+class Clock:
+    elapsed = 0.0
+
+    def monotonic(self):
+        return self.elapsed
+
+    def sleep(self, seconds):
+        self.elapsed += seconds
+
+guard = runpy.run_path(sys.argv[0])
+clock = Clock()
+guard['cmd_down'].__globals__['time'] = clock
+status = guard['main']()
+state_path = Path(os.environ['FAKE_K8S_STATE'])
+state = json.loads(state_path.read_text())
+state['down_elapsed_seconds'] = clock.elapsed
+state_path.write_text(json.dumps(state))
+sys.exit(status)
+''', 1))
+        env = self.env(host_entry=True)
+        env['K8S_GUARD_DOWN_WAIT_SECONDS'] = str(wait)
+        del env['K8S_GUARD_POLL_SECONDS']
+        p = subprocess.run(['python3', '-I', str(self.runner), str(GUARD), '--context', CTX, 'down', NS,
+                            '--uid', 'uid-ns-1', '--lease', lid], env=env, capture_output=True, text=True,
+                           timeout=60, stdin=subprocess.DEVNULL)
+        self.reload()
+        body = json.loads(p.stdout)
+        self.assertEqual(p.returncode, 0, f'{body} {p.stderr}')
+        self.assertEqual(body['gpu_pods_left'], int(with_gpu_pod), body)
+        self.assertNotIn(NS, self.k8s['namespaces'])
+        return self.k8s['down_elapsed_seconds']
+
+    def test_no_gpu_pods_delete_without_waiting(self):
+        self.assertEqual(self.down_elapsed(wait=1, with_gpu_pod=False), 0)
+
+    def test_full_poll_intervals_respect_the_deadline(self):
+        self.assertEqual(self.down_elapsed(wait=10, with_gpu_pod=True), 10)
+
+    @unittest.skip("F20: down sleeps past its wait deadline when the remaining time is less than one poll")
+    def test_f20_last_poll_is_capped_at_the_deadline(self):
+        elapsed = self.down_elapsed(wait=1, with_gpu_pod=True)
+        self.assertLessEqual(elapsed, 1, 'the default 5-second poll exceeded the configured 1-second wait')
+
+
 class DownClassificationRaces(GuardCase):
     def test_f18_retry_after_foreign_name_reuse_counts_every_pod(self):
         # Ruling on F16, F18, F19 (driver): no pod classification. down waits, bounded, for every GPU
