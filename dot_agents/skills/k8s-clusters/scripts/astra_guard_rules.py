@@ -286,15 +286,17 @@ def parse_plan(trace):
 
 
 def check_plan(resources, names, namespace):
-    """Every changed entry appears in the plan, and every one of our resources is in `namespace`."""
+    """Every changed entry appears in the plan, and every resource in it is in `namespace`."""
     ours = [r for r in resources if r[1].startswith(OUR_PREFIX)]
     missing = [n for n in names if not any(r[1] == n or r[1].startswith(n + '-') for r in ours)]
     if not ours or missing:
         raise Refusal('rendered_namespace_unverified',
                       f'helm:plan names none of entries {missing or names}; cannot confirm the namespace')
-    wrong = sorted({r[0] for r in ours if r[0] != namespace})
+    # Every resource, whatever its name: the plan diffs this merge request's base and head, so
+    # each resource in it is one this merge request changes. A cluster-scoped one has no namespace.
+    wrong = sorted({f'{r[1]} in {r[0] or "no namespace"}' for r in resources if r[0] != namespace})
     if wrong:
-        raise Refusal('rendered_namespace_mismatch', f'helm:plan renders our resources in {wrong}, not {namespace}')
+        raise Refusal('rendered_namespace_mismatch', f'helm:plan changes resources outside {namespace}: {wrong}')
 
 
 def dig(doc, key):

@@ -15,9 +15,9 @@ Every command prints one JSON object on stdout. A refusal exits 1 with
 {"error": ..., "code": ...}. The rules and the reasons for them are in
 references/astra-guard.md; the pure rules are in astra_guard_rules.py.
 
-The GitLab token comes only from `fleet secret env`: the guard re-runs itself
-under it, takes the token out of its environment at once, and sends it only in
-the PRIVATE-TOKEN header, never across a redirect.
+The GitLab token comes only from `fleet secret env`, run as a child that hands
+the token back over a pipe. The guard sends it only in the PRIVATE-TOKEN header,
+never across a redirect.
 """
 import argparse
 from datetime import date, datetime, timezone
@@ -41,7 +41,11 @@ import astra_guard_rules as R  # noqa: E402
 from astra_guard_rules import Refusal  # noqa: E402
 
 TOKEN_ENV = 'ASTRA_GUARD_TOKEN'
-EXEC_ENV = 'ASTRA_GUARD_EXEC'
+FD_ENV = 'ASTRA_GUARD_TOKEN_FD'
+FLEET_TIMEOUT = 60
+# Runs under `fleet secret env`: writes the variable fleet set to the inherited pipe, nowhere else.
+HANDOVER = (f'import os; fd = int(os.environ["{FD_ENV}"]); '
+            f'os.write(fd, os.environ.get("{TOKEN_ENV}", "").encode()); os.close(fd)')
 HTTP_TIMEOUT = 30
 BB_TIMEOUT = 30
 TREE_PAGES = 50
@@ -362,7 +366,7 @@ def write_log(f, entry):
 # -- subprocesses ------------------------------------------------------------
 
 def child_env():
-    return {k: v for k, v in os.environ.items() if k not in (TOKEN_ENV, EXEC_ENV)}
+    return {k: v for k, v in os.environ.items() if k not in (TOKEN_ENV, FD_ENV)}
 
 
 def thread_id():
@@ -640,7 +644,11 @@ def cmd_check(gl, cfg, args):
         raise Refusal('mr_not_open', f'!{args.mr} was merged by this guard')
     update(gl.pid, args.mr, check=None, ask=None)
     check = bind_and_check(gl, cfg, args.mr, rec, args.namespace)
-    update(gl.pid, args.mr, check=check)
+    fields = {'check': check}
+    if check['kind'] == 'deploy':
+        # Only a checked head can merge, so this names what teardown must find landed.
+        fields['teardown'] = {'head': check['head'], 'path': check['path'], 'inverse': check['inverse']}
+    update(gl.pid, args.mr, **fields)
     return {'mr': int(args.mr), 'head': check['head'], 'target': check['target'], 'question': check['question'],
             'options': list(R.OPTIONS), 'next': f'astra-guard ask --mr {int(args.mr)}'}
 
@@ -712,6 +720,10 @@ def _merge(gl, cfg, args, log):
         if (fresh['head'], fresh['target']) != (check['head'], check['target']):
             raise Refusal('head_moved', 'the head or main moved during the merge check')
         try:
+            write_log(log, {**entry, 'time': now(), 'result': 'attempt'})
+        except OSError as e:
+            raise Refusal('log_unusable', f'cannot write the attempt line: {type(e).__name__}; nothing was merged')
+        try:
             out = gl.write('PUT', gl.p(f'/merge_requests/{int(args.mr)}/merge'), {'sha': check['head']})
         except GitLabError as e:
             raise Refusal('merge_failed', e.message)
@@ -723,17 +735,24 @@ def _merge(gl, cfg, args, log):
         landed = out.get('merge_commit_sha') or out.get('squash_commit_sha')
         entry.update(result='merged', merge_commit=landed)
         update(gl.pid, args.mr, merged={'at': now(), 'ask_id': args.answer, 'head': check['head'],
-                                        'target': check['target'], 'landed': landed, 'path': check['path'],
-                                        'inverse': check['inverse']})
+                                        'target': check['target'], 'landed': landed})
     except Exception as e:
         if not isinstance(e, Refusal):
             e = Refusal('internal_error', f'{type(e).__name__}: {e}'[:300])
         entry.update(code=e.code, reason=e.message)
-        write_log(log, entry)
+        try:
+            write_log(log, entry)
+        except OSError as err:
+            e.message += f' (and the approval log could not be written: {type(err).__name__})'
+            entry['reason'] = e.message
         e.extra = {'comment': comment(entry, issue, web_url), 'comment_issue': issue}
         raise e
-    write_log(log, entry)
-    return {'result': 'merged', 'mr': int(args.mr), 'head': entry['head'], 'target': entry['target'],
+    try:
+        write_log(log, entry)
+    except OSError as err:
+        # The merge landed; its attempt line is in the log with no result.
+        entry['log_error'] = f'the result line could not be written: {type(err).__name__}'
+    return {'result': 'merged', 'log_error': entry.get('log_error'), 'mr': int(args.mr), 'head': entry['head'], 'target': entry['target'],
             'merge_commit': entry['merge_commit'], 'comment': comment(entry, issue, web_url),
             'comment_issue': issue}
 
@@ -753,18 +772,24 @@ def log_startup_refusal(args, e):
 def cmd_teardown(gl, cfg, args):
     R.check_branch(args.branch)
     rec = record(gl.pid, args.deploy_mr)
-    merged = rec.get('merged')
-    if rec.get('kind') != 'deploy' or not merged or not merged.get('inverse'):
-        raise Refusal('not_merged', f'!{args.deploy_mr} is not a deploy this guard merged')
+    td = rec.get('teardown')
+    if rec.get('kind') != 'deploy' or not td:
+        raise Refusal('not_merged', f'!{args.deploy_mr} is not a deploy this guard checked')
+    # GitLab, not the local merge record, proves the merge: a lost merge reply leaves no record.
     mr = gl.mr(args.deploy_mr)
-    landed = merged.get('landed')
-    if mr.get('state') != 'merged' or not landed or not R.SHA.match(landed):
+    if mr.get('state') != 'merged':
         raise Refusal('not_merged', f'!{args.deploy_mr} is {mr.get("state")!r} in GitLab')
+    if mr.get('sha') != td['head']:
+        raise Refusal('landed_head_mismatch', f'!{args.deploy_mr} merged {mr.get("sha")}, not the checked '
+                                              f'head {td["head"]}')
+    landed = mr.get('merge_commit_sha') or mr.get('squash_commit_sha')
+    if not isinstance(landed, str) or not R.SHA.match(landed):
+        raise Refusal('not_merged', f'GitLab names no landed commit for !{args.deploy_mr}')
     target = gl.main()
     if gl.merge_base(landed, target) != landed:
         raise Refusal('not_landed', f'main {target} does not contain the deploy {landed}')
-    path = merged['path']
-    text = R.apply_patch(gl.raw(path, target), merged['inverse'])
+    path = td['path']
+    text = R.apply_patch(gl.raw(path, target), td['inverse'])
     return push_file(gl, args.branch, path, target, text, 'teardown')
 
 
@@ -811,23 +836,48 @@ def emit(obj):
         print(json.dumps({'error': e.message, 'code': e.code}, indent=1))
 
 
+def fetch_token(cfg):
+    """Run `fleet secret env` as a child and read the token from a pipe.
+
+    The guard is not replaced by fleet, so a fleet failure is refused, and for a merge
+    logged, in this process. The token is never in argv, a file or output.
+    """
+    r, w = os.pipe()
+    argv = ['fleet', 'secret', 'env', f'{TOKEN_ENV}={cfg["token_ref"]}', '--', sys.executable, '-I', '-c', HANDOVER]
+    try:
+        p = subprocess.Popen(argv, pass_fds=(w,), env={**child_env(), FD_ENV: str(w)}, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except OSError as e:
+        os.close(r)
+        os.close(w)
+        raise Refusal('fleet_missing', f'cannot run fleet: {type(e).__name__}')
+    os.close(w)
+    try:
+        p.communicate(timeout=FLEET_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.communicate()
+        os.close(r)
+        raise Refusal('fleet_failed', f'fleet secret env took more than {FLEET_TIMEOUT} s')
+    chunks = []
+    with os.fdopen(r, 'rb') as f:
+        chunks.append(f.read())
+    if p.returncode:
+        raise Refusal('fleet_failed', f'fleet secret env exited {p.returncode}')
+    token = b''.join(chunks).decode(errors='replace')
+    if not token:
+        raise Refusal('token_missing', f'fleet secret env gave no {TOKEN_ENV}')
+    return token
+
+
 def main(argv=None):
     global _TOKEN
     argv = sys.argv[1:] if argv is None else argv
     args = parser().parse_args(argv)
     try:
         cfg = load_config()
-        _TOKEN = os.environ.pop(TOKEN_ENV, None)
-        if not _TOKEN:
-            if os.environ.get(EXEC_ENV) == '1':
-                raise Refusal('token_missing', f'fleet secret env gave no {TOKEN_ENV}')
-            env = {**os.environ, EXEC_ENV: '1'}
-            try:
-                os.execvpe('fleet', ['fleet', 'secret', 'env', f'{TOKEN_ENV}={cfg["token_ref"]}', '--',
-                                     sys.executable, '-I', str(Path(__file__).resolve()), *argv], env)
-            except OSError as e:
-                raise Refusal('fleet_missing', f'cannot run fleet: {type(e).__name__}')
-        os.environ.pop(EXEC_ENV, None)
+        os.environ.pop(TOKEN_ENV, None)
+        _TOKEN = fetch_token(cfg)
         gl = GitLab(cfg, _TOKEN)
         emit(COMMANDS[args.cmd](gl, cfg, args))
         return 0

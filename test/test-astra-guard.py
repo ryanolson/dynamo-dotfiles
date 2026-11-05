@@ -1310,11 +1310,14 @@ class TokenAndLog(GuardCase):
         for forbidden in ('sqlite', 'interactions', 'respond', "'sgc', 'answer'", '"sgc", "answer"'):
             self.assertNotIn(forbidden, source)
 
-    def test_a_merge_writes_one_log_line(self):
+    def test_a_merge_writes_an_attempt_line_then_a_result_line(self):
+        # Write-ahead log (steward ruling): an attempt line before the merge call, the result after.
         iid, qid, body = self.full_cycle()
         lines = self.log_lines()
-        self.assertEqual(len(lines), 1)
-        line = lines[0]
+        self.assertEqual([l['result'] for l in lines], ['attempt', 'merged'])
+        self.assertEqual((lines[0]['ask_id'], lines[0]['mr'], lines[0]['head'], lines[0]['target']),
+                         (qid, iid, lines[1]['head'], lines[1]['target']))
+        line = lines[1]
         for key in ('time', 'ask_id', 'answer', 'mr', 'head', 'target', 'result'):
             self.assertIn(key, line)
         self.assertEqual(line['ask_id'], qid)
@@ -1466,6 +1469,62 @@ class StructuralRules(GuardCase):
         self.assertEqual(undone, {}, 'the inverse of an add-only deploy is a pure removal')
 
 
+class Invariants(GuardCase):
+    """One test per invariant from the redesign after review R1. Each fails on 42796a6 and
+    passes after. The reasons are in references/astra-guard.md, "Five kinds, five rules"."""
+
+    def test_every_plan_resource_is_in_the_asked_namespace(self):
+        ok = (NS, 'wcep-x', 'DynamoGraphDeployment', 'added')
+        rules.check_plan([ok, (NS, 'chart-helper', 'ConfigMap', 'added')], ['wcep-x'], NS)
+        for other in ((SHARED_NS, 'chart-helper', 'Deployment', 'added'),
+                      ('', 'chart-helper', 'ClusterRole', 'added'),
+                      ('', 'wcep-x-admin', 'ClusterRoleBinding', 'removed')):
+            with self.subTest(other=other):
+                with self.assertRaises(rules.Refusal) as cm:
+                    rules.check_plan([ok, other], ['wcep-x'], NS)
+                self.assertEqual(cm.exception.code, 'rendered_namespace_mismatch')
+
+    def test_the_attempt_line_is_on_disk_before_the_merge_call(self):
+        iid, qid = self.approved()
+        log = self.state_home / 'astra-guard' / 'approvals.jsonl'
+        seen = []
+        original = self.gl.route
+
+        def look(method, parts, query, body, raw):
+            if method == 'PUT' and parts[-1] == 'merge':
+                seen.append([json.loads(l) for l in log.read_text().splitlines()] if log.exists() else [])
+            return original(method, parts, query, body, raw)
+        self.gl.route = look
+        self.merge(iid, qid)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual([(l['result'], l['ask_id'], l['mr'], l['head']) for l in seen[0]],
+                         [('attempt', qid, iid, self.gl.mrs[(PID, iid)]['final_sha'])])
+
+    def test_fleet_runs_as_a_child_and_never_runs_the_guard(self):
+        self.ok('get', f'/projects/{PID}')
+        calls = [json.loads(line) for line in (self.dir / 'fleet.log').read_text().splitlines()]
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]
+        self.assertEqual(argv[:4], ['secret', 'env', f'ASTRA_GUARD_TOKEN={TOKEN_REF}', '--'])
+        self.assertNotIn(str(GUARD), argv, 'the guard re-ran itself under fleet')
+        self.assertNotIn(SECRET, json.dumps(argv))
+        self.assertTrue(self.gl.requests and all(r['token'] for r in self.gl.requests))
+
+    def test_teardown_proves_the_merge_from_gitlab(self):
+        iid, qid = self.approved()
+        self.merge(iid, qid)
+        state = self.state_home / 'astra-guard' / 'state.json'
+        st = json.loads(state.read_text())
+        for rec in st['mrs'].values():
+            rec.pop('merged', None)  # the local record is a convenience only
+        state.write_text(json.dumps(st))
+        self.ok('teardown', '--deploy-mr', str(iid), '--branch', 'wcep/TEAM-910-teardown')
+        self.assertEqual(self.gl.file_at('wcep/TEAM-910-teardown', DEV), DEV_VALUES)
+        # GitLab must show the checked head as the merged one.
+        self.gl.mrs[(PID, iid)]['final_sha'] = 'c' * 40
+        self.refused('landed_head_mismatch', 'teardown', '--deploy-mr', str(iid), '--branch', 'wcep/TEAM-910-t2')
+
+
 class PureRules(unittest.TestCase):
 
     def test_duplicate_keys_and_multiple_documents_refused(self):
@@ -1571,7 +1630,10 @@ class AdversarialReview(GuardCase):
         self.assertNotEqual(rc, 0, (body, err))
         self.assertEqual(self.gl.mrs[(PID, iid)]['state'], 'merged')
         lines = self.log_lines()
-        self.assertEqual(len(lines), 1, f'The merge reached GitLab but has no audit line: {body}')
+        # Write-ahead log: the attempt line, then the result (unknown outcome).
+        self.assertEqual([l['result'] for l in lines], ['attempt', 'refused'],
+                         f'The merge reached GitLab but has no audit line: {body}')
+        self.assertEqual(lines[1]['code'], 'merge_unknown')
         self.assertEqual(lines[0]['ask_id'], qid)
         self.assertIn('comment', body)
 
@@ -1766,7 +1828,7 @@ class RedesignReview(GuardCase):
 
         self.gl.route = lose_merge_response
         self.refused('merge_unknown', 'merge', '--mr', str(iid), '--answer', qid)
-        self.assertEqual(len(self.log_lines()), 1)
+        self.assertEqual([l['result'] for l in self.log_lines()], ['attempt', 'refused'])
         mr = self.ok('get', f'/projects/{PID}/merge_requests/{iid}')['body']
         self.assertEqual(mr['state'], 'merged')
         self.assertIn('wcep-smoke', self.gl.file_at('main', DEV))
