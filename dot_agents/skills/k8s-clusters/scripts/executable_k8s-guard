@@ -561,7 +561,7 @@ def cmd_ns_create(g, a):
     hours = hours_arg(a.hours, MAX_NS_HOURS)
     # A random suffix from the CSPRNG: a name is never made twice, so no namespace is ever re-created
     # under a name an earlier one had, and a name identifies one namespace instance.
-    suffix = ''.join(secrets.choice('abcdefghijklmnopqrstuvwxyz0123456789') for _ in range(5))
+    suffix = ''.join(secrets.choice('abcdefghijklmnopqrstuvwxyz0123456789') for _ in range(10))
     ns = f'{g.bot["namespace_prefix"]}{a.issue}-{a.purpose}-{suffix}'
     if len(ns) > 63:
         raise Refusal('usage', f'{ns} is longer than 63 characters; shorten the purpose', status=2)

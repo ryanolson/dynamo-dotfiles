@@ -8,7 +8,7 @@ Every command prints one JSON object on stdout. A refusal exits non-zero with `{
 
 | Command | Who may run it | What it does |
 |---|---|---|
-| `ns create <purpose> --issue <n> --hours <h>` | a bb thread | Creates `<namespace_prefix><n>-<purpose>-<suffix>`, where the suffix is 5 random letters and digits from the CSPRNG, with the opt-in labels, `owner`, `wcep.agent/thread`, `wcep.agent/issue`, and the annotation `wcep.agent/expires-at`. `h` is at most 4. A name that exists is refused, and a name longer than 63 characters. It records the name and UID in the thread's ledger. |
+| `ns create <purpose> --issue <n> --hours <h>` | a bb thread | Creates `<namespace_prefix><n>-<purpose>-<suffix>`, where the suffix is 10 random letters and digits from the CSPRNG, with the opt-in labels, `owner`, `wcep.agent/thread`, `wcep.agent/issue`, and the annotation `wcep.agent/expires-at`. `h` is at most 4. A name that exists is refused, and a name longer than 63 characters. It records the name and UID in the thread's ledger. |
 | `-n <ns> lease acquire --gpus <n> --hours <h>` | the namespace's thread | Calls `bb k8s lease acquire` with the profile name, the namespace UID, the thread, and the profile's GPU type. Writes the lease record (below). Prints the pod label and pod affinity that GPU pods must carry. |
 | `-n <ns> secret hf\|ngc` | the namespace's thread | Pipes `fleet secret get` into `kubectl create secret ... --from-file=<key>=/dev/stdin`. Prints only the secret's name. |
 | `-n <ns> apply -f <file>` | the namespace's thread | Applies DGDs, ConfigMaps and ClusterIP Services, after the checks below. |
@@ -79,6 +79,14 @@ A JSON error from the plugin, such as an unknown lease, is an answer, not an out
 ## A re-created namespace
 
 A namespace name is never made twice: `ns create` adds a random suffix and refuses a name that exists. So no namespace can be re-created under a name an earlier one had, through the guard. The checks below stay as defense in depth.
+
+One residual remains, and the owner accepted it. All three of these must happen at once:
+
+- another thread uses the same issue number and purpose;
+- its suffix collides with a deleted namespace's suffix, about 1 in 3.7e15;
+- the owner races its own `apply` against its own `down`.
+
+Then the late `apply` can land in the new namespace. When that namespace has a lease, the plugin's reconcile scales it to 0 within one tick.
 
 `k8s-leases` sends `expire`, `down` and `extend` with the UID it stored, without reading the namespace first. The guard refuses a `--uid` that differs from the namespace, before any write.
 

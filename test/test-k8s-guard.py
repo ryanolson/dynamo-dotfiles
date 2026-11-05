@@ -858,7 +858,7 @@ class Commands(GuardCase):
 class NamespaceCreate(GuardCase):
     def test_creates_labelled_namespace_with_expiry(self):
         body = self.ok('--context', CTX, 'ns', 'create', 'smoke', '--issue', '12', '--hours', '2')
-        self.assertRegex(body['namespace'], '^' + NS + '-[a-z0-9]{5}$')
+        self.assertRegex(body['namespace'], '^' + NS + '-[a-z0-9]{10}$')
         ns = self.k8s['namespaces'][body['namespace']]
         labels = ns['metadata']['labels']
         self.assertEqual(labels['wcep.agent/thread'], ME)
@@ -886,7 +886,7 @@ class NamespaceCreate(GuardCase):
         return p.returncode, json.loads(p.stdout)
 
     def test_existing_namespace_never_adopted(self):
-        taken = NS + '-aaaaa'
+        taken = NS + '-' + 'a' * 10
         self.add_ns(name=taken, thread=OTHER, ledger=False)
         before = copy.deepcopy(self.k8s['namespaces'][taken])
         rc, body = self.create_with_suffix('a', 'smoke', '--issue', '12', '--hours', '1')
@@ -901,12 +901,13 @@ class NamespaceCreate(GuardCase):
         self.assertTrue(all(n.startswith(NS + '-') for n in names), names)
 
     def test_63_character_limit_at_the_longest_issue_and_purpose(self):
-        # prefix (14) + issue (10, the longest accepted) + '-' + purpose + '-' + suffix (5) = 63 at purpose 32.
+        # prefix (14) + issue (10, the longest accepted) + '-' + purpose + '-' + suffix (10) = 63 at purpose 27.
         issue = '1234567890'
-        rc, body = self.create_with_suffix('b', 'p' * 32, '--issue', issue, '--hours', '1')
+        rc, body = self.create_with_suffix('b', 'p' * 27, '--issue', issue, '--hours', '1')
         self.assertEqual(rc, 0, body)
         self.assertEqual(len(body['namespace']), 63)
-        self.refused('usage', '--context', CTX, 'ns', 'create', 'p' * 33, '--issue', issue, '--hours', '1')
+        self.assertTrue(body['namespace'].endswith('-' + 'b' * 10), body)
+        self.refused('usage', '--context', CTX, 'ns', 'create', 'p' * 28, '--issue', issue, '--hours', '1')
         self.refused('usage', '--context', CTX, 'ns', 'create', 'p', '--issue', '12345678901', '--hours', '1')
 
     def test_hours_bounded(self):
