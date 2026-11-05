@@ -676,6 +676,41 @@ class K8sCheck(unittest.TestCase):
         owner_calls = [c['key'] for c in cluster_calls if c['credential_user'] == 'alice@example.test']
         self.assertEqual(owner_calls, [], f'the sealed exec plugin re-reads the replaced identity: exit={rc}, {owner_calls}')
 
+    def test_identity_fixture_uses_the_same_username_for_exec_and_snapshot(self):
+        class FixtureChecked(Exception):
+            pass
+
+        def check_fixture(*args):
+            self.scenario_path.write_text(json.dumps(self.scenario))
+            config = json.loads(self.bot_kubeconfig.read_text())
+            exec_user = config['users'][0]['user']
+            snapshot_user = {
+                'client-certificate-data': base64.b64encode(cert_pem(BOT).encode()).decode(),
+                'client-key-data': base64.b64encode(KEY_PEM.encode()).decode(),
+            }
+            for mode, user in (('snapshot', snapshot_user), ('exec', exec_user)):
+                with self.subTest(mode=mode):
+                    config['users'][0]['user'] = user
+                    self.bot_kubeconfig.write_text(json.dumps(config))
+                    result = subprocess.run(
+                        [sys.executable, str(self.tmp / 'bin/kubectl'),
+                         '--kubeconfig', str(self.bot_kubeconfig), '--context', CTX,
+                         'auth', 'whoami', '-o', 'json'],
+                        env=self.env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                        timeout=5, check=True)
+                    username = json.loads(result.stdout)['status']['userInfo']['username']
+                    self.assertEqual(username, BOT, f'{mode} must use the identity in the certificate')
+            raise FixtureChecked
+
+        # Inspect the regression's actual fake before its first checker call.
+        run_check = self.run_check
+        self.run_check = check_fixture
+        try:
+            with self.assertRaises(FixtureChecked):
+                self.test_tbot_identity_cannot_change_after_bot_whoami()
+        finally:
+            self.run_check = run_check
+
     def test_tbot_by_file_identity(self):
         # tbot may write the install path or the file it links to; both are the same file.
         real = self.tmp / 'opt/teleport/bin/tbot'
