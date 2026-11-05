@@ -1752,5 +1752,23 @@ class PassThreeReview(GuardCase):
         self.assertEqual(exposed, [], 'YAML decoding must not put the token in state or bb arguments')
 
 
+class RedesignReview(GuardCase):
+
+    def test_merge_refuses_a_log_that_opens_but_cannot_write(self):
+        iid, qid = self.approved()
+        before = self.main()
+        log = self.state_home / 'astra-guard' / 'approvals.jsonl'
+        self.assertTrue(Path('/dev/full').is_char_device())
+        log.symlink_to('/dev/full')
+
+        rc, body, err = self.guard('merge', '--mr', str(iid), '--answer', qid)
+
+        self.assertNotEqual(rc, 0, (body, err))
+        self.assertEqual(self.merges(), [],
+                         'Opening the log succeeded, but the guard merged before discovering ENOSPC')
+        self.assertEqual(self.main(), before)
+        self.assertEqual(self.gl.mrs[(PID, iid)]['state'], 'opened')
+
+
 if __name__ == '__main__':
     unittest.main()
