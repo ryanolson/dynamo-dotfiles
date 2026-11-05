@@ -1383,6 +1383,30 @@ class PureRules(unittest.TestCase):
 
 class AdversarialReview(GuardCase):
 
+    def test_successful_required_jobs_on_page_two_are_found(self):
+        iid = self.deployed_mr()
+        head = self.gl.branch_sha(BRANCH)
+        self.gl.jobs[head] = {'helm:plan': 'success', 'validate:tests': 'success',
+                              **{f'other:{n}': 'success' for n in range(100)}}
+        original = self.gl.route
+        snapshots = {}
+
+        def paginated_jobs(method, parts, query, body, raw):
+            if method == 'GET' and parts[2:3] == ['pipelines'] and parts[-1] == 'jobs':
+                pipeline = parts[3]
+                if pipeline not in snapshots:
+                    status, headers, jobs = original(method, parts, query, body, raw)
+                    snapshots[pipeline] = sorted(jobs, key=lambda job: job['id'], reverse=True)
+                jobs = snapshots[pipeline]
+                size = int(query.get('per_page', ['20'])[0])
+                page = int(query.get('page', ['1'])[0])
+                headers = {'X-Next-Page': str(page + 1) if page * size < len(jobs) else ''}
+                return 200, headers, jobs[(page - 1) * size:page * size]
+            return original(method, parts, query, body, raw)
+
+        self.gl.route = paginated_jobs
+        self.check(iid)
+
     def test_a_truncated_merge_response_still_logs_the_attempt(self):
         iid, qid = self.approved()
         handler_class = self.gl.server.RequestHandlerClass
