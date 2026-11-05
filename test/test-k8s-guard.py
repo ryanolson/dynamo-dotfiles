@@ -1940,5 +1940,49 @@ class HostEntryEnvironment(GuardCase):
         self.assertEqual([l['direction'] for l in self.ledger(host=True)], ['extend', 'down', 'down'])
 
 
+class NamespaceWriteWindows(GuardCase):
+    @unittest.skip("F7: UID reads do not fence later writes into a replacement namespace")
+    def test_recreation_after_last_uid_read_refuses_every_host_write(self):
+        for method, has_record in (('expire', True), ('down', True), ('extend', True), ('extend', False)):
+            with self.subTest(method=method, has_record=has_record):
+                self.k8s = {'namespaces': {}, 'objects': {}, 'pods': {}}
+                self.bb = {'leases': {}}
+                self.kubectl_log.unlink(missing_ok=True)
+                self.bb_log.unlink(missing_ok=True)
+                self.add_ns(thread=OTHER)
+                lid = self.add_lease(thread=OTHER, state='active' if method == 'extend' else 'revoking',
+                                     cm=has_record)
+                if method == 'extend':
+                    self.bb['leases'][lid]['expires_at'] = iso_ms(hours_from_now(3))
+                    self.flush()
+                self.add_obj(gpu_dgd('w', 2, lid))
+                replacement = gpu_dgd('w', 2, 'lse_new000001')
+                replacement['metadata'].update(namespace=NS, uid='uid-new-dgd', resourceVersion='1000')
+                hook = """if what == 'namespace':
+        st['namespace_reads'] = st.get('namespace_reads', 0) + 1
+        save()
+        if st['namespace_reads'] == 3:
+            reply = copy.deepcopy(st['namespaces'][pos[2]])
+            st['namespaces'][pos[2]]['metadata'].update(uid='uid-recreated', resourceVersion='1001')
+            st['namespaces'][pos[2]]['metadata']['labels']['wcep.agent/thread'] = 'thr_recreated'
+            st['objects'][pos[2]] = {'DynamoGraphDeployment/w': REPLACEMENT}
+            st['pods'][pos[2]] = []
+            save()
+            emit(reply)""".replace('REPLACEMENT', repr(replacement))
+                fake = FAKE_KUBECTL.replace("if what == 'namespace':", hook, 1)
+                self.assertNotEqual(fake, FAKE_KUBECTL)
+                (self.bin / 'kubectl').write_text(fake)
+
+                rc, body, _ = self.guard('--context', CTX, method, NS, '--uid', 'uid-ns-1', '--lease', lid,
+                                         host_entry=True)
+
+                self.assertEqual(self.k8s['namespaces'][NS]['metadata']['uid'], 'uid-recreated')
+                self.assertEqual(self.dgd_obj('w')['spec']['components'][1]['replicas'], 1)
+                record = self.k8s['objects'][NS].get('ConfigMap/' + LEASE_CM)
+                self.assertEqual([c['pos'][0] for c in self.writes()], [], f'rc={rc}, {body}; record={record}')
+                self.assertNotEqual(rc, 0, body)
+                self.assertNotIn('ConfigMap/' + LEASE_CM, self.k8s['objects'][NS])
+
+
 if __name__ == '__main__':
     unittest.main()
