@@ -757,7 +757,9 @@ class WritesOutsideTheList(GuardCase):
         self.gl.commit(PID, 'wcep/TEAM-910-other', {DEV: dev_deploy()}, parent=self.main())
         iid = self.gl.new_mr('wcep/TEAM-910-other')
         qid = self.add_question(f'!{iid}')
-        self.refused('not_guard_mr', 'merge', '--mr', str(iid), '--answer', qid)
+        body = self.refused('not_guard_mr', 'merge', '--mr', str(iid), '--answer', qid)
+        self.assertNotIn('None', body['comment'])
+        self.assertIn('an issue this guard did not record', body['comment'])
         self.refused('not_guard_mr', 'check', '--mr', str(iid), '--namespace', NS)
         self.assertEqual(self.merges(), [])
 

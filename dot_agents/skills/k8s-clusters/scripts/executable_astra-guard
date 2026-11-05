@@ -601,11 +601,11 @@ def comment(entry, issue, web_url):
     result = (f'merged as {entry["merge_commit"]}' if entry['result'] == 'merged'
               else f'refused ({entry["code"]}): {entry["reason"]}')
     return redact('\n'.join([
-        f'[agent:{agent_name()} {os.environ.get("BB_THREAD_ID", "no-thread")}] astra-guard merge on {issue}',
+        f'[agent:{agent_name()} {os.environ.get("BB_THREAD_ID", "no-thread")}] astra-guard merge on {issue or "an issue this guard did not record"}',
         f'Ask: {entry["ask_id"]}',
         f'Merge request: !{entry["mr"]} {web_url or ""}'.rstrip(),
-        f'Head commit: {entry["head"]}',
-        f'Target main commit: {entry["target"]}',
+        f'Head commit: {entry["head"] or "not read"}',
+        f'Target main commit: {entry["target"] or "not read"}',
         f'Result: {result}',
     ]) + '\n')
 
