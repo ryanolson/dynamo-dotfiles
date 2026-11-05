@@ -910,8 +910,8 @@ class NamespaceCreate(GuardCase):
         self.refused('usage', '--context', CTX, 'ns', 'create', 'p' * 28, '--issue', issue, '--hours', '1')
         self.refused('usage', '--context', CTX, 'ns', 'create', 'p', '--issue', '12345678901', '--hours', '1')
 
-    @unittest.skip("F15: expire skips the late DGD's stale UID stamp, so the documented cleanup does not scale it to zero")
-    def test_documented_residual_is_scaled_to_zero_after_lease_revocation(self):
+    def test_f14_residual_is_left_alone_but_counted(self):
+        # The F14 residual as it is (ruling on F15: the doc claimed a one-tick cleanup; it was wrong).
         # The accepted collision leaves a late apply stamped with the deleted namespace's UID.
         ns, uid = NS + '-' + 'a' * 10, 'uid-current-ns'
         self.add_ns(name=ns, thread=OTHER, uid=uid)
@@ -932,9 +932,16 @@ class NamespaceCreate(GuardCase):
         self.assertEqual(body['gpu_pods_left'], 1)
         current = self.k8s['objects'][ns]['DynamoGraphDeployment/current']
         self.assertEqual(current['spec']['components'][1]['replicas'], 0)
+        # The late DGD carries the deleted namespace's stamp, so teardown never touches it...
         late = self.k8s['objects'][ns]['DynamoGraphDeployment/late']
-        self.assertEqual(2 * late['spec']['components'][1]['replicas'], 0,
-                         f'documented one-tick cleanup leaves the late DGD allocating GPUs: {body}')
+        self.assertEqual(late['spec']['components'][1]['replicas'], 1, body)
+        # ...but inspect counts it, so the plugin sees the over-allocation and flags it.
+        after = self.ok('--context', CTX, 'inspect', ns, host_entry=True)
+        self.assertEqual((after['allocation'], after['gpu_pods_left']), (2, 1), after)
+        # down deletes only stamped DGDs and keeps the namespace while GPU pods remain.
+        self.refused('pods_left', '--context', CTX, 'down', ns, '--uid', uid, '--lease', lid, host_entry=True)
+        self.assertIn(ns, self.k8s['namespaces'])
+        self.assertIn('DynamoGraphDeployment/late', self.k8s['objects'][ns])
 
     def test_hours_bounded(self):
         for hours in ('0', '4.5', '-1', 'nan', 'inf'):

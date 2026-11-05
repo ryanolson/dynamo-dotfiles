@@ -86,7 +86,7 @@ One residual remains, and the owner accepted it. All three of these must happen 
 - its suffix collides with a deleted namespace's suffix, about 1 in 3.7e15;
 - the owner races its own `apply` against its own `down`.
 
-Then the late `apply` can land in the new namespace. When that namespace has a lease, the plugin's reconcile scales it to 0 within one tick.
+Then the late `apply` can land in the new namespace. Its DGD carries the deleted namespace's UID label, so `expire` and `down` never touch it, and `down` keeps the namespace while its GPU pods run. `inspect` counts it, so `k8s-leases` sees the over-allocation and flags it. A person must remove it.
 
 `k8s-leases` sends `expire`, `down` and `extend` with the UID it stored, without reading the namespace first. The guard refuses a `--uid` that differs from the namespace, before any write.
 
