@@ -241,6 +241,38 @@ class Render(unittest.TestCase):
                 os.close(fd)
             self.assertFalse(log.exists(), 'the accepted ELF wrapper runs tsh during config view')
 
+    def test_sealed_copy_refuses_a_fifo_without_waiting_for_a_writer(self):
+        fd = self.m.sealed_copy(str(self.kubeconfig))
+        try:
+            self.assertEqual(Path(f'/proc/self/fd/{fd}').read_bytes(), self.kubeconfig.read_bytes())
+        finally:
+            os.close(fd)
+        # A tool substitutes a named pipe while trying to stream refreshed credentials.
+        fifo = self.kube_dir / 'streamed-kubeconfig.yaml'
+        os.mkfifo(fifo, 0o600)
+        child = textwrap.dedent('''\
+            import sys
+            sys.dont_write_bytecode = True
+            sys.path.insert(0, sys.argv[1])
+            import k8s_profiles
+            try:
+                fd = k8s_profiles.sealed_copy(sys.argv[2])
+            except k8s_profiles.ProfileError as error:
+                print(error.code)
+            else:
+                import os
+                os.close(fd)
+                sys.exit('a FIFO was accepted as a kubeconfig')
+            ''')
+        try:
+            result = subprocess.run([sys.executable, '-I', '-c', child, str(SCRIPTS), str(fifo)],
+                                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=2,
+                                    env={'PATH': '/usr/bin:/bin'})
+        except subprocess.TimeoutExpired:
+            self.fail('sealed_copy blocks opening a FIFO before it can refuse non-regular files')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'kubeconfig_not_bot')
+
 
 if __name__ == '__main__':
     unittest.main()
