@@ -131,6 +131,22 @@ Either way, mount the source and build incrementally. Do not rebuild or save an 
 
 `references/troubleshooting.md` maps the common symptoms to their causes. Read it before resubmitting a job. Do not loop resubmitting.
 
+## What lives where
+
+Three storage tiers, and a thing in the wrong one is the usual cause of a build that is slow, or that loses its output.
+
+- **The image**: the toolchain. The compiler, the protobuf compiler, libclang, the Python and Rust tooling. A project may also freeze its runtime environment into the image, which makes imports fast and makes a dependency change a rebuild of the image. The alternative is to keep the environment on the parallel filesystem, where a dependency change is a sync and imports cost more. Both are valid; pick one per project and say which in the project's agent file.
+- **The parallel filesystem**: everything stateful. The source, the build output, the package and compiler caches, the interpreter, and the model cache. One target directory per worktree per architecture.
+- **Node-local scratch**: the container runtime's temp directory, and throwaway output. It is gone when the job ends.
+
+Mount a host path at the same path inside the container wherever you can. Build metadata and script shebangs embed absolute paths, so a path that differs between a bare run and a container run, or between two projects, causes rebuilds and broken scripts that are tedious to diagnose.
+
+Before sharing one cache directory between jobs, check that the filesystem gives real `flock` and not `localflock`. The package manager and the compiler lock their caches, and a lock that holds on only one node lets two jobs on different nodes corrupt a shared cache. `references/new-cluster.md` has the check.
+
+## On a cluster you have not used before
+
+Work through `references/new-cluster.md`. It is the ordered checklist: discover, credentials, toolchain, per-worktree environment, images, caches, re-home anything keyed by path, and record what you learned.
+
 ## What to write down
 
 A cluster fact you had to discover belongs in the project's agent file, not only in this skill: the account and partitions, the GPU request syntax, the image paths, the cache paths, the node-local scratch path, and any flag the cluster rejects. Keep this skill to what holds on every cluster.
