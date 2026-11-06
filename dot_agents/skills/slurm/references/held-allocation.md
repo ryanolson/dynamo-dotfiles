@@ -4,6 +4,12 @@ Reported to work on NVIDIA GB200 clusters, from a synthesis of internal reports 
 
 The idea: the queue wait and the first unpack of a large image cost far more than a build does. Pay them once per session instead of once per edit. One report gives about 13 seconds cold and about 1 second warm for a 29 GB image. The warm cache belongs to the job, so ending the allocation throws it away.
 
+## Before you hold anything
+
+Hold a node only on the cluster's preemptible tier, so an idle holder costs other people nothing. The "Hold a node only where holding is free" section of `SKILL.md` says how to find that tier. Where preemption cancels the job, the holder can disappear mid-step: check the job is still running before each step, and resubmit rather than reporting a build failure.
+
+Never run an image import, a `--container-save`, or a benchmark against a preemptible holder.
+
 ## Hold the allocation
 
 ```bash
@@ -12,7 +18,7 @@ JID=$(sbatch --parsable -A "$ACCT" -p "$PART" -N1 -t 04:00:00 \
 until [ "$(squeue -h -j "$JID" -o %T)" = RUNNING ]; do sleep 10; done
 ```
 
-Add the cluster's GPU request where the partition needs one. A non-interactive holder job suits an agent better than `salloc --pty`. `salloc --no-shell` is equivalent.
+Add the cluster's GPU request where the partition needs one, and use the preemptible partition with a walltime matched to the session, not the partition maximum. A non-interactive holder job suits an agent better than `salloc --pty`. `salloc --no-shell` is equivalent.
 
 ## Warm the named container on every node
 
@@ -50,3 +56,5 @@ scancel "$JID"
 ```
 
 The named container and the node-local cache go with the job. Anything on the parallel filesystem stays.
+
+Do this as soon as the work stops, not at the end of the session. A holder left running while nobody is building is the waste this pattern is supposed to avoid.

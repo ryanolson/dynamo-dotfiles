@@ -53,7 +53,9 @@ GPU request syntax is per cluster. Some partitions reject a job that asks for no
 
 **Export every variable a child process must see.** A bare shell variable does not reach the engine or worker that the launcher starts.
 
-**Treat compute nodes as offline.** Pre-stage model weights, run `cargo fetch` and `uv sync` where there is network, and set the offline flag at run time. Where a transfer tool is killed on the login node, fall back to the plain downloader and limit its workers.
+**Treat compute nodes as offline.** Pre-stage model weights and warm the source caches where there is network, with `cargo fetch` and the like, then set the offline flag at run time. Where a transfer tool is killed on the login node, fall back to the plain downloader and limit its workers.
+
+Fetch on the login node, but build in the job. A command that materializes an environment rather than downloading sources, such as `uv sync`, produces architecture-specific artifacts. A work tree shared between architectures usually has one `.venv`, so running it on the login node replaces the compute node's environment with one that cannot run there. Give each architecture its own environment, or run the sync inside the job step.
 
 **Node-local paths disappear.** `/tmp` and `/raid` on a compute node are gone when the job ends. Copy anything you want to keep onto the parallel filesystem.
 
@@ -88,13 +90,40 @@ Pyxis runs a squashfs image that enroot produced. It also accepts a registry ref
 
 Run tests under `timeout` as `AGENTS.md` says. A job that hangs holds the allocation until the walltime runs out.
 
+## Hold a node only where holding is free
+
+A GPU node left idle while an agent thinks is the most expensive mistake available here, so read the scheduler's own answer before you decide to hold one.
+
+```bash
+scontrol show partition <name> | grep -oE 'OverSubscribe=[A-Z]+|PriorityTier=[0-9]+|PreemptMode=[A-Z,]+|GraceTime=[0-9]+'
+scontrol show config | grep -iE 'PreemptType|PreemptMode|PreemptExemptTime'
+```
+
+- `OverSubscribe=EXCLUSIVE` means every job takes a whole node with all of its GPUs. There is then no such thing as a CPU-only build job, however little of the node a build uses.
+- A partition with the lowest `PriorityTier` and `PreemptMode` set to something other than `OFF` is the preemptible tier. A job there yields the node as soon as a higher tier wants it, so holding one costs other people nothing.
+- `PreemptExemptTime` and `GraceTime` say how much warning a preempted job gets. With `PreemptMode=CANCEL` the job then dies, so any tool that holds an allocation must expect it to vanish, notice, and resubmit.
+
+From that, three rules:
+
+- **An idle holder belongs on the preemptible tier**, with a walltime matched to the session rather than the partition maximum, and a `scancel` as soon as the work stops.
+- **Work that must not be interrupted stays off it.** An image import, a `--container-save`, and a benchmark all lose everything on a cancel, and a save can leave a corrupt image behind.
+- **Unattended work goes in one job per unit of work**, not one per command. Put the build, the test, and the gates in a single job rather than three allocations.
+
+Compare partitions before you submit, and do not trust the estimate alone:
+
+```bash
+sbatch --test-only -A <acct> -p <partition> -N1 -t 01:00:00 --wrap true
+```
+
+It prints a predicted start time without queueing anything, which is the cheapest way to see which partition is worth using. It does not account for nodes held back for a higher-priority partition, so a partition it calls immediate can still pend. Check `sinfo -p <partition> -o '%t %D'` for real idle nodes, and read the pending reason with `squeue -j <jobid> -o '%T %R'`.
+
 ## The inner loop
 
 Two shapes work. Pick by how often you rebuild.
 
 **A job per action.** The simplest form, and what the validated harnesses in this owner's workspaces do: one `srun` that allocates a node, runs one step, and exits. Good for an unattended build, a test, or a benchmark.
 
-**One held allocation, many steps.** Submit a holder job, then run each build and test as an `--overlap` step against it with a named container. This avoids paying the queue wait and the cold container start on every edit. `references/held-allocation.md` has the pattern. It is reported to work and has not been measured on this owner's clusters, so measure the cold and warm start times before you build a workflow on it.
+**One held allocation, many steps.** Submit a holder job, then run each build and test as an `--overlap` step against it with a named container. This avoids paying the queue wait and the cold container start on every edit. Hold it on the preemptible tier only, as above. `references/held-allocation.md` has the pattern. It is reported to work and has not been measured on this owner's clusters, so measure the cold and warm start times before you build a workflow on it.
 
 Either way, mount the source and build incrementally. Do not rebuild or save an image to test a code change. An image rebuild is for a system-level dependency only.
 
