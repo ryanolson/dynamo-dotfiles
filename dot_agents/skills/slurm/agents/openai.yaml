@@ -1,0 +1,4 @@
+interface:
+  display_name: "Slurm"
+  short_description: "Build and run on a Slurm cluster through srun, sbatch, and pyxis/enroot."
+  default_prompt: "Use $slurm before building or running anything on this cluster."

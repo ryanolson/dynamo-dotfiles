@@ -23,4 +23,5 @@ agent_skills:
   - review
   - review-loop
   - simple-english
+  - slurm
   - strict-review
