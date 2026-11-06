@@ -86,6 +86,8 @@ Pyxis runs a squashfs image that enroot produced. It also accepts a registry ref
 
 - Import for the target architecture: `enroot import -a aarch64 -o out.sqsh 'docker://<registry>#<repo>:<tag>'`. Build elsewhere with `docker buildx build --platform linux/arm64`.
 - Run both import and bake on a compute node of the target architecture, with the enroot temp directory on node-local scratch. The parallel filesystem rejects the file-capability xattrs that `enroot create` sets, and login-node `/tmp` is usually too small.
+- Do the import inside a job, even for the login node's own architecture. A login node often blocks unprivileged user namespaces (`kernel.apparmor_restrict_unprivileged_userns=1`), and enroot needs one to convert layers. `unshare -Ur true` tells you in one command. Create `ENROOT_TEMP_PATH`, `ENROOT_CACHE_PATH`, and `ENROOT_DATA_PATH` before the import: enroot does not.
+- Read the compute node's `/etc/enroot/enroot.conf` from inside a job. It can differ from the login node's, for example in where the cache and data paths live.
 - Use a clean `PATH` for the import. A login shell profile leaks tools of the other architecture into the job.
 - Registry credentials live in `~/.config/enroot/.credentials`, mode 600. Enroot rejects a looser file and then authenticates anonymously, which shows up as a 401 or 403. For NGC the username is the literal string `$oauthtoken`, so quote it. Take the key through `openv` or `fleet secret get`; never write it into a script.
 - Where compute nodes have no `$HOME`, stage the credentials file onto each node and set `ENROOT_CONFIG_PATH` to that directory.

@@ -16,5 +16,7 @@
 | A gated test reports `ignored`, or a cache looks empty | The cache defaulted to `$HOME/.cache`, which the container does not mount | Point the cache at a mounted path. |
 | `uv` fails to determine an installation plan | A dependency has no wheel for this architecture | Remove it from the step, or build it for the architecture. |
 | A download is killed on the login node | The transfer tool exceeds the login node's limits | Disable the accelerated transfer, limit the workers, and run it under `nice`. |
+| `enroot-aufs2ovlfs: failed to set capabilities: Operation not permitted` at `Converting whiteouts` | The node blocks unprivileged user namespaces, usually a login node. The temp directory is not the cause | Run the import inside a job on a compute node. Check with `unshare -Ur true`. |
+| `mktemp: failed to create directory via template '<dir>/enroot.XXXXXXXXXX'` | `ENROOT_TEMP_PATH` names a directory that does not exist | Create it first: enroot does not. |
 | `enroot import` stalls for hours | Storage or cluster specific | Ask the cluster's support channel. Try a different node type. |
 | The wrong GPU appears inside the container | `ENROOT_RESTRICT_DEV` interacting with `CUDA_VISIBLE_DEVICES` | Do not force `ENROOT_RESTRICT_DEV=y` unless the cluster requires it. |
