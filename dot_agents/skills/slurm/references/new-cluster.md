@@ -2,6 +2,12 @@
 
 Work through this in order on a cluster you have not used before. Each step ends by writing what you learned into the project's agent file, which is what makes the next session cheap. Nothing here is specific to one cluster.
 
+## 0. Ask for what you cannot discover
+
+Before anything else, collect the facts in "Facts you must be given" in `SKILL.md`: the directory on the shared filesystem that is yours, the account, the partition for this work, registry credentials, the model and its token, and the path of any image or model cache that already exists.
+
+Ask for all of them in one message. A setup built on a guessed path looks fine until it fails somewhere far from the cause.
+
 ## 1. Discover
 
 Run the probes in `SKILL.md`, and add these two.

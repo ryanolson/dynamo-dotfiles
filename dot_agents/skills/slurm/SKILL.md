@@ -26,6 +26,27 @@ When the signal is ambiguous, treat the host as a login node. Cross-check with `
 
 The login node and the compute nodes often differ in architecture. One cluster has x86_64 login nodes and aarch64 Grace compute nodes. A build on the login node then produces binaries that no compute node can execute.
 
+## Facts you must be given, and facts you must find
+
+Two kinds of fact. Confusing them is the fastest way to a confident, wrong setup.
+
+**Ask for these. You cannot discover them, and a plausible guess is still a guess.**
+
+| Fact | Why guessing fails |
+| --- | --- |
+| The directory on the shared filesystem that is yours to write in | `df` shows many mounted paths and says nothing about which one you are allocated. A wrong choice can hit someone else's quota or a path that is wiped. |
+| The account to charge | Every job needs one, and the wrong one bills another project. |
+| Which partition suits this work | The scheduler says which partitions accept a job, not which one you should use. |
+| Registry credentials for the container image | A missing credential looks like an anonymous pull and fails as a 403. |
+| The model, and any token to fetch it | There is no way to infer which checkpoint the work needs. |
+| Where an existing image or model cache already lives | Re-importing or re-downloading one costs hours. Ask before you rebuild. |
+
+Ask for every one of these that is missing, in a single message, before you run anything. Do not infer a path from a pattern you have seen elsewhere, and do not create a directory somewhere that looks reasonable. When the project's agent file or an environment file already records a fact, that is your answer; ask only for what is genuinely absent.
+
+Then write the answers into the project's agent file or its environment file, so the next session does not ask again.
+
+**Discover these yourself. Never ask.** The architecture of each node class, whether `$HOME` exists on a compute node, node-local scratch and its size, the GPU request syntax, which partition is the preemptible tier, the topology flag, the lock mode, and what the container image already ships. The next section is how.
+
 ## Learn a cluster before you use it
 
 Do this once per cluster and write the answers into the project agent file.
@@ -76,6 +97,18 @@ Pyxis runs a squashfs image that enroot produced. It also accepts a registry ref
 **Save an image from a clean one, on one node and one task.** `--container-save` writes whatever is on the filesystem at exit, so save from a fresh `--container-image` rather than from a container a run has dirtied, and clean the package and pip caches first. More than one task saving to the same path corrupts the file. Write a new versioned file; never overwrite the image a running job is using. Record the same steps in a Dockerfile or a build script under version control, so the image can be rebuilt.
 
 **A wheel is architecture specific.** A dependency published only for x86_64 cannot install on an aarch64 node, and the error usually names the installation plan rather than the architecture.
+
+## Getting a model onto the cluster
+
+Compute nodes are usually offline, so the weights must be on the shared filesystem before the job starts.
+
+1. **Ask first whether the cluster already has the model.** A shared cache is common, and a re-download of a large checkpoint can take longer than everything else combined. Ask for the path before you fetch anything.
+2. **Point the cache at the shared filesystem, and export the variable.** A cache that defaults into `$HOME` hits the home quota and is often on a filesystem the container does not mount. A bare shell variable does not reach the downloader or the engine.
+3. **Download from the login node**, which is the host that has network. Where an accelerated transfer tool is killed there, turn it off, limit the workers, and run it under `nice`.
+4. **Set the offline flag at run time**, so a missing file fails loudly instead of hanging on a fetch that cannot succeed.
+5. **Start the download first** when it is large, and do the rest of the setup while it runs.
+
+Mount the cache into the container at its own path, and check the size against the quota before starting.
 
 ## Running steps
 
