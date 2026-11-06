@@ -37,7 +37,8 @@ Add the GPU request to the step where the cluster hands out GPUs per step rather
 ## A debug shell
 
 ```bash
-srun --jobid="$JID" --overlap -N1 -n1 --container-name=dev --pty bash
+srun --jobid="$JID" --overlap -N1 -n1 --container-name=dev \
+  --container-mounts="$MNT" --no-container-mount-home --pty bash
 ```
 
 This attaches another step to the same container, which is how to reach a process another step started.

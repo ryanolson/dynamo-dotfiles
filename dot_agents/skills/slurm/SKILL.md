@@ -12,13 +12,17 @@ A Slurm login node is a submission host, not a build host. This skill holds the 
 Run this at session start on an unfamiliar host.
 
 ```bash
-command -v sbatch && echo "slurm host"
-echo "arch=$(uname -m) job=${SLURM_JOB_ID:-none}"
+command -v sbatch >/dev/null && echo "slurm host"
+echo "arch=$(uname -m) node=${SLURMD_NODENAME:-submit-host} job=${SLURM_JOB_ID:-none}"
 ```
 
 - `sbatch` is missing: this skill does not apply.
-- `SLURM_JOB_ID` is set: you are inside an allocation on a compute node. Build and test here.
-- `sbatch` exists and `SLURM_JOB_ID` is empty: you are on a login node. Do not build, do not run tests, and do not run Python that imports CUDA. Dispatch the work with `srun` or `sbatch`.
+- `SLURMD_NODENAME` is set: `slurmd` started this process, so you are on a compute node. Build and test here.
+- `SLURMD_NODENAME` is empty: you are on the submit host. Do not build, do not run tests, and do not run Python that imports CUDA. Dispatch the work with `srun` or `sbatch`.
+
+`SLURM_JOB_ID` does not answer this. Inside an allocation it is set on the submit host too, so it cannot tell a login node from a compute node. Measured on a GB200 cluster, 2026-11-06: `salloc ... bash -c 'hostname; uname -m'` ran on the x86_64 login node with `SLURM_JOB_ID` set and `SLURMD_NODENAME` unset, while an `srun` step from the same allocation ran on an aarch64 node with both set. A cluster with `LaunchParameters=use_interactive_step` moves an interactive `salloc` shell onto a compute node, but a command passed to `salloc` still runs on the submit host.
+
+When the signal is ambiguous, treat the host as a login node. Cross-check with `uname -m` against the compute architecture the project's agent file records.
 
 The login node and the compute nodes often differ in architecture. One cluster has x86_64 login nodes and aarch64 Grace compute nodes. A build on the login node then produces binaries that no compute node can execute.
 
@@ -35,7 +39,7 @@ scontrol show topo                    # topology, where the cluster defines one
 srun -p <partition> -N1 -n1 -t 2 bash -c 'uname -m; echo $HOME; ls -d $HOME; df -h /tmp /raid 2>/dev/null'
 ```
 
-That last probe answers four questions at once: the compute architecture, whether `$HOME` exists on a compute node, and which node-local scratch paths exist and how large they are.
+That last probe answers three questions at once: the compute architecture, whether `$HOME` exists on a compute node, and which node-local scratch paths exist and how large they are.
 
 GPU request syntax is per cluster. Some partitions reject a job that asks for no GPU, so they need `--gres=gpu:1` even for an import or a build. Others hand out whole nodes and reject `--gpus-per-node` with `Invalid generic resource`. Read `%G` from `sinfo` and try one short job before you write the flag into a script.
 
@@ -55,7 +59,7 @@ GPU request syntax is per cluster. Some partitions reject a job that asks for no
 
 ## Containers through pyxis and enroot
 
-Pyxis runs a squashfs image that enroot produced. It cannot run a Docker image directly, and enroot does not emulate: an image of the wrong architecture fails at `enroot-switchroot` with `Exec format error`.
+Pyxis runs a squashfs image that enroot produced. It also accepts a registry reference, such as `--container-image='<registry>#<repo>:<tag>'`, but then it imports the image again for every job. Pre-stage a `.sqsh` on the parallel filesystem instead. Enroot does not emulate: an image of the wrong architecture fails at `enroot-switchroot` with `Exec format error`.
 
 - Import for the target architecture: `enroot import -a aarch64 -o out.sqsh 'docker://<registry>#<repo>:<tag>'`. Build elsewhere with `docker buildx build --platform linux/arm64`.
 - Run both import and bake on a compute node of the target architecture, with the enroot temp directory on node-local scratch. The parallel filesystem rejects the file-capability xattrs that `enroot create` sets, and login-node `/tmp` is usually too small.

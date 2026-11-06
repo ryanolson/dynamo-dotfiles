@@ -12,7 +12,7 @@ Rust and Python systems engineer. Datacenter-scale distributed inference serving
 
 1. Check whether you run under bb: `BB_THREAD_ID` set means you are a bb thread. It changes how you delegate (see "Subagents, workflows, and model choice") and where you work (see "Running under bb").
 2. Read the repository's own agent file and treat it as authoritative over this one.
-3. Check whether this is a Slurm host: `command -v sbatch`. If it is, read the `slurm` skill before any build, test, or GPU work. `SLURM_JOB_ID` unset means you are on a login node, where none of that may run.
+3. Check whether this is a Slurm host: `command -v sbatch`. If it is, read the `slurm` skill before any build, test, or GPU work. `SLURMD_NODENAME` unset means you are on the submit host, where none of that may run; `SLURM_JOB_ID` does not answer this, because an allocation sets it on the login node too.
 4. `git worktree list` — know the checkout layout before touching a build directory or a venv. A bb thread works in its own worktree, not under `~/repos`.
 5. Before selecting workstation tools or changing the environment, read `~/.agents/ENVIRONMENT.md`. It maps capabilities, secrets, command discovery, and source ownership.
 6. Only when the task changes agent configuration, resolve the agent and its home: `CLAUDECODE` means Claude Code (`${CLAUDE_HOME:-~/.claude}`), `CODEX_*` means Codex (`${CODEX_HOME:-~/.codex}`). Under bb, `bb thread show "$BB_THREAD_ID" --json` names the provider.
