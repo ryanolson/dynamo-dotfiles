@@ -14,12 +14,12 @@ Own the post-PR loop. Invoking this skill authorizes edits on the PR branch, tar
 If the user explicitly requests a background task and the Codex task tools are available, split the work as follows. Otherwise, run the loop in this task.
 
 - **Controller:** Keep the task where the user requested babysitting as the controller. It creates tasks and reports their state. It does not adjudicate feedback or change the PR.
-- **Escalator:** Create a local Codex task with `model: gpt-5.6-terra` and `thinking: xhigh`. It performs the initial pass and every later state-change pass. It alone can make PR judgments, edit files, reply to AI reviewers, resolve threads, retry CI, commit, or push.
-- **Monitor:** If the escalator finds pending CI or a stable state that still needs watching, create a local Codex task with `model: gpt-5.6-luna` and `thinking: low`. The monitor is read-only. It records the head SHA, required-check state, and unresolved non-outdated AI-review thread IDs. It waits up to 60 seconds between refreshes and sends the controller a result only when one of those values changes. Do not report unchanged polls.
+- **Escalator:** Create a local Codex task on the model that the "Model routing" table in `~/.agents/ENVIRONMENT.md` gives for Codex review work, at `thinking: xhigh`. It performs the initial pass and every later state-change pass. It alone can make PR judgments, edit files, reply to AI reviewers, resolve threads, retry CI, commit, or push.
+- **Monitor:** If the escalator finds pending CI or a stable state that still needs watching, create a local Codex task on the smallest current Codex model, at `thinking: low`. The monitor is read-only. It records the head SHA, required-check state, and unresolved non-outdated AI-review thread IDs. It waits up to 60 seconds between refreshes and sends the controller a result only when one of those values changes. Do not report unchanged polls.
 
 Pass the controller thread ID and host ID to the monitor. On a state change, the monitor must use `send_message_to_thread` to send a compact record to the controller, then stop. It must not write GitHub, modify files, retry CI, or recommend an action.
 
-Pass the same controller target to the escalator. The escalator must send the controller one compact result when the PR is ready or when it needs user input. After each push or non-terminal state change, it starts the next monitor before it exits. The controller starts a new `gpt-5.6-terra` task at `xhigh` for each monitor result that needs action.
+Pass the same controller target to the escalator. The escalator must send the controller one compact result when the PR is ready or when it needs user input. After each push or non-terminal state change, it starts the next monitor before it exits. The controller starts a new escalator task for each monitor result that needs action.
 
 Use a state record with the PR URL, head SHA, event, changed check or thread IDs, and failed-run URL when available. Events are `head_changed`, `ci_failed`, `ci_green`, `ai_review_changed`, `ready`, or `needs_user`.
 
