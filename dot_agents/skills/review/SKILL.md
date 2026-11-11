@@ -25,7 +25,8 @@ Report a finding only with a concrete, in-scope failure case: the precondition o
 2. Pick the areas that apply: contracts and tests, concurrency and lifecycle, distributed consistency and recovery, architecture, performance. For a non-trivial target, read `references/areas.md` and give each active area its own subagent.
 3. For a Rust change, also apply `references/rust.md`.
 4. For a change to a registered hot path (`hot-paths` skill), run its guard benchmark before and after.
-5. Verify every candidate finding yourself before reporting it. Subagent output is input, not the report.
+5. If the repo's book has a "Coding gotchas" chapter, read it and check the target against every lesson. A finding that breaks a lesson cites its entry.
+6. Verify every candidate finding yourself before reporting it. Subagent output is input, not the report.
 
 Escalate to `strict-review` when the change touches concurrency, `unsafe`, registered hot paths, public interfaces, or a lifecycle across modules.
 

@@ -13,13 +13,14 @@ Run this only once the feature mostly works and relevant tests pass.
 
 - **Range.** Pin the base commit before the first pass. Each pass reviews `<base>..<current head>`, so it sees the fixes from the passes before it, and gets the earlier rulings.
 - **Reviewer.** A reviewer the user names wins: "fable mega review" means Fable, "codex mega review" means a Codex bb thread. Otherwise use the cross-family row of the "Model routing" table in `ENVIRONMENT.md` for the author's family. Never the model that wrote the code.
+- **Gotchas.** Name the repo book's "Coding gotchas" chapter in every reviewer brief, when the book has one.
 - **Rubric.** Use the repository's own review skill when its agent file names one; otherwise the global `strict-review`.
 
 ## Loop
 
 1. Launch a fresh reviewer on the range, in test-backed mode (below) when it can build and run the tests, otherwise read-only. It reports findings in the rubric's format. It never edits implementation files on the implementer's branch, and adds no labels.
 2. Rule on each finding before touching code, as `AGENTS.md` "Validating a claim" says: valid, partially valid, or invalid. A finding that repeats an earlier ruling without new evidence stays ruled.
-3. Fix the valid blocker and major findings that are in scope, each with a test that failed first. Record minor findings and out-of-scope suggestions for the next milestone's plan; do not fix them now. Simplification ideas are advisory.
+3. Fix the valid blocker and major findings that are in scope, each with a test that failed first. When a valid finding is a race or a flaky test, the same fix adds or updates its lesson in the repo book's "Coding gotchas" chapter (`AGENTS.md`, "The book"). Record minor findings and out-of-scope suggestions for the next milestone's plan; do not fix them now. Simplification ideas are advisory.
 4. Run the relevant tests under a sized `timeout`.
 5. Start the next pass with a new reviewer, not a reused one.
 

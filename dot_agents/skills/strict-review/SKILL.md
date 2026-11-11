@@ -25,6 +25,8 @@ performance pass, and independent-verification step from `ishandhanani/dotfiles@
    - Otherwise inspect the current branch against the likely base, usually `main`, using
      `git diff --stat`, `git diff`, and changed-file contents.
    - Check file sizes for changed files so crossings around 1000 lines are visible.
+   - Read the repo book's "Coding gotchas" chapter, if it has one. Check the change against every
+     lesson, and cite the entry in any finding that breaks one.
 2. Apply the rubric below only to what the diff and surrounding contents support. Trace cross-file
    impact when module boundaries are touched.
 3. Use subagents when distinct review surfaces benefit from parallel inspection. Keep each pass

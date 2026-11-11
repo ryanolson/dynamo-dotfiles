@@ -82,11 +82,13 @@ Every Rust project past its first weeks has an mdBook in `docs/`, modelled on `.
 | How a subsystem works, and why, with the rejected alternative | A book chapter |
 | Measured numbers, with the command and setup | A chapter under Operations |
 | Rejected designs and negative results | A chapter under Development |
-| A hard lesson ("X breaks when Y") | A test; its doc comment can be long |
+| A hard lesson ("X breaks when Y") | A test; its doc comment can be long. A race or a flaky test also adds its distilled lesson to the "Coding gotchas" chapter (below) |
 | Roadmap, plans, rulings not yet built | The project's plan store (below) |
 | Work-in-progress notes, review ledgers, handoffs | The work branch or bb thread storage |
 
 The book keeps only what lasts, and its main chapters stay lean: detail worth keeping that the main prose does not need goes in an appendix. No plans, phase or milestone labels, ruling numbers, PR numbers, ticket identifiers, or handoff notes. Each behavior change updates the chapters that describe it and the top-level README, which stays short and points into the book. Code comments and the book never cite `agent-docs/`: its notes are deleted when their work ships.
+
+**Coding gotchas.** Every book has a "Coding gotchas" chapter under Development. For every race condition or flaky test you find, add an entry, or update the entry that already covers it. An entry holds the rule, the failure it prevents, how to test for it, and a link to one test that shows it. Distill the lesson; do not list incidents, and a new case of a known lesson sharpens that entry. If the chapter is missing, the first lesson creates it, links it in `SUMMARY.md`, and points to it from the repo's agent file. Read it before you code, review, or test in that repo, and name it in every brief that spawns a coder, reviewer, or test runner there. A race or flaky-test fix is not done until its lesson is in the chapter.
 
 ### Plans: per-project store
 
