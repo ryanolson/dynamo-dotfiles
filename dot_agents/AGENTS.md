@@ -30,6 +30,7 @@ Rust and Python systems engineer. Datacenter-scale distributed inference serving
 - **Show numbers.** Logs, metrics, benchmarks. "It is faster" is not a result.
 - **Profile before guessing** when the question is performance. Hot paths found by profiling go in a register with a guard benchmark (`hot-paths` skill); a change to one reports before and after numbers.
 - **Amend a design on evidence.** When a measurement or a failing test contradicts a design, change the design; do not defend it.
+- **Never rely on hash order.** A `HashMap` or `HashSet` has no iteration order, and Rust's std map picks a new random order for each map. So does any `Vec` or output built by iterating one. When order matters, use an ordered map (`BTreeMap`, `IndexMap`) or sort. A test that compares such output must sort it or compare it as a set. One green run proves nothing here: run a new test that touches map order 50 times in a loop before you call it stable.
 
 ## Validating a claim
 
