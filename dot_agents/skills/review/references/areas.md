@@ -12,7 +12,7 @@ Challenge the target as a whole before dispatching detailed buckets:
 - compare against a materially simpler or safer direction when one is concrete
 - challenge whether the proposed validation can produce false confidence
 
-For non-trivial targets, assign a separate subagent to this adversarial pass. Give it the full target and ask it to attack the premise, integration boundaries, and validation strategy rather than repeat the detailed bucket checklists. Evaluate small targets inline.
+When you dispatch subagents (see Dispatch), give this adversarial pass its own. Give it the full target and ask it to attack the premise, integration boundaries, and validation strategy rather than repeat the detailed bucket checklists. Otherwise do this pass yourself, first.
 
 ## Areas
 
@@ -44,12 +44,11 @@ For every active bucket, the main agent must provide concise dispatch guidance:
 Treat these as hypotheses, not expected findings. Do not lead the subagent toward
 agreement or prevent it from finding a different issue inside its assigned bucket.
 
-Assign one subagent to each active canonical bucket by default. Give that subagent
-only the target artifact, necessary code or file context, a concise conversation
-summary if needed, and the complete checklist for the single canonical bucket it
-owns. Explicitly instruct it to stay within that bucket, make an early relevance
-check, and stop once the bucket is exhausted. Skip this only when the user opts
-out, subagents are unavailable, or the target is clearly very small.
+When you dispatch, assign one subagent to each active canonical bucket. Give that
+subagent only the target artifact, necessary code or file context, a concise
+conversation summary if needed, and the complete checklist for the single
+canonical bucket it owns. Explicitly instruct it to stay within that bucket, make
+an early relevance check, and stop once the bucket is exhausted.
 
 ### Bucket A - Semantics, Contracts, and Tests
 
@@ -110,9 +109,9 @@ out, subagents are unavailable, or the target is clearly very small.
 
 ## Dispatch
 
-When subagents are available, dispatch one subagent per active bucket by default, on a model tier sized to the bucket (`AGENTS.md` tiers, `ENVIRONMENT.md` routing): the fast tier for checkable finding work, the top tier or a different family for judging whether a finding is real. Pass each subagent only the necessary context: the target artifact, the code or files to inspect, a concise conversation summary if needed, exactly one bucket checklist, and the main agent's concise relevance/risk guidance. Ask for concrete candidate issues with file:line references or precise plan references when available. Tell each subagent not to ponder unrelated possibilities: if the target has no meaningful surface for its bucket, it should say so in one line and return immediately.
+Dispatch only when the condition in `SKILL.md` holds: the target is too large to hold in one context, or the active buckets can be checked independently in parallel. A subagent starts from nothing and pays for its own context, so a target you can read in full is cheaper and better judged by you. When you do dispatch, use one subagent per active bucket, on a model tier sized to the bucket (`AGENTS.md` tiers, `ENVIRONMENT.md` routing): the fast tier for checkable finding work, the top tier or a different family for judging whether a finding is real. Pass each subagent only the necessary context: the target artifact, the code or files to inspect, a concise conversation summary if needed, exactly one bucket checklist, and the main agent's concise relevance/risk guidance. Ask for concrete candidate issues with file:line references or precise plan references when available. Tell each subagent not to ponder unrelated possibilities: if the target has no meaningful surface for its bucket, it should say so in one line and return immediately.
 
-Evaluate the active buckets and adversarial pass yourself inline only when the user asks not to use subagents, subagents are unavailable, or the target is clearly very small. If the target is small but still subtle or high-risk, keep the same target artifact for each active bucket rather than sharding by file or subsystem.
+In every other case, evaluate the active buckets and the adversarial pass yourself. When you dispatch for a target that is small but subtle or high-risk, keep the same target artifact for each active bucket rather than sharding by file or subsystem.
 
 While subagents run, the main agent may do only targeted complementary work:
 - inspect the highest-risk invariant or user-called-out area

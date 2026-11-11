@@ -22,7 +22,7 @@ Report a finding only with a concrete, in-scope failure case: the precondition o
 ## Pass
 
 1. Challenge the target as a whole first: is the problem framed right, what does it assume, how could it pass its own checks and still fail end to end. For a plan or design, this is most of the review.
-2. Pick the areas that apply: contracts and tests, concurrency and lifecycle, distributed consistency and recovery, architecture, performance. For a non-trivial target, read `references/areas.md` and give each active area its own subagent.
+2. Pick the areas that apply: contracts and tests, concurrency and lifecycle, distributed consistency and recovery, architecture, performance. For a non-trivial target, read `references/areas.md`. Give an area its own subagent only when the target is too large to hold in one context, or the areas can be checked independently in parallel: a subagent starts from nothing and pays for its own context. Otherwise work through the areas yourself.
 3. For a Rust change, also apply `references/rust.md`.
 4. For a change to a registered hot path (`hot-paths` skill), run its guard benchmark before and after.
 5. If the repo's book has a "Coding gotchas" chapter, read it and check the target against every lesson. A finding that breaks a lesson cites its entry.
