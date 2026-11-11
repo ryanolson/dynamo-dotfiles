@@ -6,7 +6,9 @@ user-invocable: true
 
 # Linear work
 
-Linear holds the owner's work items: plans, follow-ups, and the queue that agent swarms work through. The owner sets what matters (priority) and what it may cost (the token budget). Agents create, claim, update, and close tickets inside those limits.
+Linear holds the owner's work items: plans, follow-ups, and the queue that agents work through. The owner sets what matters (priority) and approves projects and plans. Agents create, claim, update, and close tickets inside those limits.
+
+**The Charter comes first.** Before you file, claim, approve, or close anything, fetch the Charter document and the newest initiative update: `list_documents` with the query `Charter`, then the latest initiative status update, which holds the standing orders. The Charter holds the rules that change: how to pick work, the approval gate and its labels, the signature line that starts every comment and issue you write, the claim and release comments, and the merge rules. Where this skill and the Charter disagree, the Charter wins. This skill covers what the Charter leaves out: the hierarchy, the fields, the issue body, and how to file and close.
 
 Reach Linear through the `linear` MCP server (see `~/.agents/ENVIRONMENT.md`). If the server is not connected, stop and tell the owner. Do not use the API another way.
 
@@ -14,7 +16,7 @@ Reach Linear through the `linear` MCP server (see `~/.agents/ENVIRONMENT.md`). I
 
 Every ticket lives in the owner's private team. Find it with `list_teams`: it is the only team the key returns. If `list_teams` returns more than one team, ask the owner which one to use. Do not guess.
 
-**Never write the team's name, its key, a ticket identifier, or a Linear URL into a repository**: not in code, comments, docs, commit messages, branch names, or PR text. Repositories can be mirrored publicly, and the tracker is private. Link in the other direction. Put the commit or PR URL on the ticket (`create_attachment` or a comment).
+**Never write the team's name, its key, a ticket identifier, or a Linear URL into a repository**: not in code, comments, docs, commit messages, or branch names. Repositories can be mirrored publicly, and the tracker is private. A PR title or body in the owner's own repositories may name its ticket, so that Linear links the two. Also put the commit or PR URL on the ticket (`create_attachment` or a comment).
 
 Do not create or change workspace-level objects: initiatives, workspace labels, workspace templates. The workspace is shared with a whole company. Keep everything inside the team.
 
@@ -24,7 +26,7 @@ Do not create or change workspace-level objects: initiatives, workspace labels, 
 |---|---|---|
 | Project | One workstream with one goal, usually in one repository: a feature (cells), a cleanup (a PR's follow-ups), a docs refactor. Name it `<Repo>: <workstream>`, for example `GDL: cells`. | The owner sets its priority. Agents write its description: goal, repository, scope, out of scope, and the book chapters that describe the design. |
 | Milestone | An ordered stage inside a project. A stage finishes before the next one starts, unless its tickets are independent. Milestones have no priority; their order is the plan. | Agents propose; the owner reorders. |
-| Issue | One reviewable change: one PR, or one commit series on `main` where the repository works that way. | The owner sets priority and estimate. Agents write the body. |
+| Issue | One reviewable change: one PR, or one commit series on `main` where the repository works that way. | The owner sets priority. Agents write the body and set the estimate. |
 | Sub-issue | A follow-up found while working on the parent and deferred, or one step of a parent that is too big for one change. | Agents. |
 | Project document | A plan or design in progress that is too long for an issue body, and the reports about the work (a bake-off, a measurement campaign). | Agents. |
 
@@ -33,25 +35,18 @@ Durable knowledge does not stay in Linear. Once the work is built, how it works 
 ## Fields
 
 - **Priority**: set by the owner on projects and issues. Urgent, High, Medium, Low. An agent that creates an issue leaves priority empty.
-- **Estimate**: the token budget, in millions of tokens, on the exponential scale: 1, 2, 4, 8, 16, 32, 64. It covers the whole ticket: implementation, tests, review rounds, and fixes. The owner sets it. An agent that creates an issue writes a suggested budget in the body (`Suggested budget: 8M`) and leaves the field empty. For calibration: one Opus implementation of a change of about 500 lines, with two or three adversarial review rounds, cost about 4M to 8M tokens.
-- **Labels**: team-scoped only. The team's `area` label group (multi-select) has one child per crate or component, named exactly like it (`gdl-runtime`, `docs`, `velo`); use it for where the change lands, and add a missing child to the group with the team's id. Use the existing `Bug`, `Feature`, `Improvement`, `Test`, and `idea` labels for the kind of work. Do not create a label at workspace level.
+- **Estimate**: the size of the issue. The Charter maps the number to a time limit for an issue in progress. Set it when you file the issue. It is not a token budget.
+- **Labels**: team-scoped only. The team's `area` label group (multi-select) has one child per crate or component, named exactly like it (`gdl-runtime`, `docs`, `velo`); use it for where the change lands, and add a missing child to the group with the team's id. Use the existing `Bug`, `Feature`, `Improvement`, `Test`, and `idea` labels for the kind of work. The Charter lists the labels that gate work: the autonomy label that every issue needs before Todo, the label for the tool that did the work, and the rest. Do not create a label at workspace level.
 - **Assignee**: the owner. An agent working a ticket says so in a comment. It does not reassign the ticket.
 
 ## Status
 
-| Status | Meaning |
-|---|---|
-| Triage | Proposed by an agent. The owner has not accepted it. |
-| Backlog | Accepted, but not ready for a swarm: no priority, no estimate, or open design questions. |
-| Todo | Ready. It has a priority, an estimate, and a complete body. A swarm may claim it. |
-| In Progress | Claimed. The claiming comment names the agent, the bb thread or session, and the branch. |
-| In Review | The change is complete and in review: a PR, or adversarial review rounds. |
-| Done | Merged to `main`. The closing comment links the commit or PR. |
-| Cancelled / Duplicate | Not done. The comment says why, or links the duplicate. |
+The Charter's approval gate defines each status and who may move an issue. For filing, two rules:
 
-Every ticket an agent creates goes to **Triage**, with two exceptions: an item the owner already deferred, or a bare idea with no plan to build it, goes to **Backlog** with the `idea` label. Only the owner moves a ticket to Todo.
+- Every ticket an agent creates goes to **Triage**, with two exceptions: an item the owner already deferred, or a bare idea with no plan to build it, goes to **Backlog** with the `idea` label.
+- An agent does not move its own ticket to Todo. Send the steward the ticket's identifier and start nothing before approval.
 
-A ticket that waits on something outside the ticket gets the `Blocked` label: an owner decision (the body adds an `## Open question` section with the options), outside hardware, or a release of another project. A ticket that waits on another ticket uses Linear's blocked-by relation instead, without the label. Remove the label when the wait ends.
+A ticket that waits on something outside it (an owner decision, an owner action, another team) gets the waiting label that the standing orders name, on the root of a chain only. A ticket that waits on another ticket uses Linear's blocked-by relation instead, without the label. Remove the label when the wait ends.
 
 ## Issue body
 
@@ -74,31 +69,17 @@ What a reasonable agent might do here but must not.
 
 ## Dependencies
 Tickets that must finish first (use Linear's blocked-by relation too).
-
-Suggested budget: 8M
 ```
 
 Write titles in the imperative, under 70 characters: "Seal the crossing marker traits", not "Crossing traits are not sealed".
 
 ## Claim the next ticket
 
-A swarm picks tickets in this order:
+Pick and claim as the Charter says ("How to pick work" and "The agent loop"): which projects and labels are open to you, the order, and the `claim:` and `release:` comments. Claim one ticket per agent at a time.
 
-1. Only `Todo` tickets with an estimate, and with no open blocker.
-2. Project priority, highest first. A project without a priority comes last.
-3. Issue priority, highest first.
-4. Milestone order within the project.
-5. The ticket's position in the project (`sortOrder`).
+## Spend
 
-To claim, move the ticket to In Progress and comment: agent and model, bb thread or session id, branch, and base commit. Claim one ticket per agent at a time.
-
-## Budget
-
-Track spend against the estimate: tokens from the session's context reports where available, otherwise review rounds and wall-clock time.
-
-- At about 75% of the budget, comment with the state and what remains.
-- At 100%, stop. Commit nothing that does not pass the suite. Comment with what is done, what remains, and the spend, then move the ticket back to Todo. The owner decides whether to raise the budget, split the ticket, or drop it.
-- Do not split a ticket to get around its budget.
+There are no token budgets now. Report your token or compute use in the closing comment when your tool shows it.
 
 ## Close a ticket
 
@@ -107,7 +88,7 @@ When the change merges, move the ticket to Done and comment with:
 - the commit or PR link, also as an attachment;
 - the tests that you ran and their results (counts, not "all green");
 - the review rounds and what they found;
-- the spend against the budget;
+- your token or compute use, when your tool shows it;
 - each follow-up you deferred, as a new sub-issue in Triage.
 
 ## Capture follow-ups
@@ -116,4 +97,4 @@ A PR or review that defers work files each deferred item as its own issue, in Tr
 
 ## Ask the owner
 
-Ask when two projects or milestones could each own a ticket, when a ticket needs a design decision that no ruling covers, or when a budget is clearly wrong before you start. Offer options. Do not ask for priority or budget values: leave them empty and the owner sets them in triage.
+Ask through `bb sgc ask` with `--issue <ticket>`: one scenario per question, the outcomes as options, your recommendation first. Ask when two projects or milestones could each own a ticket, or when a ticket needs a decision that no ruling covers and that changes its approved scope. Implementation details inside an approved project are yours and the steward's to decide. Do not ask for priority values: leave the field empty, and the owner sets it in triage.

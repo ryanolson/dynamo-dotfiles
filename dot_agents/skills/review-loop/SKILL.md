@@ -1,6 +1,6 @@
 ---
 name: review-loop
-description: Bring finished work to merge with a bounded loop of cross-family reviews, test-backed findings, and judged fixes. Use when asked for a mega review (wills, fable, codex). Offer it; never run unasked.
+description: Bring finished work to merge with a bounded loop of cross-family reviews, test-backed findings, and judged fixes. Use before the merge of approved, tracked work, when a milestone is done, or when asked for a mega review (wills, fable, codex). For untracked work, offer it first.
 ---
 
 # Review Loop
@@ -56,7 +56,8 @@ The reviewer has the context of each discovery; a failing test carries that cont
 
 1. Check that the documentation the change touches still matches the code.
 2. Write one record per pass: reviewer, range, each finding with its ruling and fix commit, and what was deferred. Put it in bb thread storage, on the work branch, or, outside bb in a repository that commits to `main`, in `~/.local/state/agent-reviews/<repo>/`. Never in `agent-docs/` on `main`. Give its path in the report.
-3. If a valid blocker or major finding is still open, stop here: report it and do not push to `main` or add the label until the user decides. Otherwise deliver by the repository's merge rule:
+3. If a valid blocker or major finding is still open, stop here: report it, and do not merge, push to `main`, or add a label until the owner decides. Otherwise deliver by the repository's merge rule, and by the Charter's for tracked work:
    - Commit to `main`: commit and push.
-   - Pull request: push the branch, add the `human-review` label, and ask for human review. Never add the label earlier.
+   - Pull request that its driver may merge (the Charter names the repositories and the labels): merge it when the build is green on the merged tree.
+   - Any other pull request: push the branch and leave the PR open for the person who merges. Add the `human-review` label where the repository has one, and only now, after the loop is clean.
 4. End with the `AGENTS.md` status block, including the number of passes and the open findings.
