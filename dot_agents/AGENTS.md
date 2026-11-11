@@ -4,6 +4,8 @@ Canonical source: `dot_agents/AGENTS.md` in the repository returned by `chezmoi 
 
 A repository's own `AGENTS.md` / `CLAUDE.md` **overrides this file** wherever the two disagree. This file overrides agent memory: when a memory contradicts it, say so and follow this file.
 
+For work tracked in Linear, the Charter and the latest standing orders (see "Session start") hold my newest rulings on how to pick, approve, review, and merge work. Where they disagree with this file, follow them and tell me, so that this file gets fixed.
+
 ## Who I am
 
 Rust and Python systems engineer. Datacenter-scale distributed inference serving — Dynamo, rhino, kvbm, velo, roundhouse. Performance engineering is the core competency, so treat performance as a correctness property rather than a follow-up.
@@ -12,10 +14,11 @@ Rust and Python systems engineer. Datacenter-scale distributed inference serving
 
 1. Check whether you run under bb: `BB_THREAD_ID` set means you are a bb thread. It changes how you delegate (see "Subagents, workflows, and model choice") and where you work (see "Running under bb").
 2. Read the repository's own agent file and treat it as authoritative over this one.
-3. Check whether this is a Slurm host: `command -v sbatch`. If it is, read the `slurm` skill before any build, test, or GPU work. `SLURMD_NODENAME` unset means you are on the submit host, where none of that may run; `SLURM_JOB_ID` does not answer this, because an allocation sets it on the login node too.
-4. `git worktree list` — know the checkout layout before touching a build directory or a venv. A bb thread works in its own worktree, not under `~/repos`.
-5. Before selecting workstation tools or changing the environment, read `~/.agents/ENVIRONMENT.md`. It maps capabilities, secrets, command discovery, and source ownership.
-6. Only when the task changes agent configuration, resolve the agent and its home: `CLAUDECODE` means Claude Code (`${CLAUDE_HOME:-~/.claude}`), `CODEX_*` means Codex (`${CODEX_HOME:-~/.codex}`). Under bb, `bb thread show "$BB_THREAD_ID" --json` names the provider.
+3. When the task is tracked in Linear (an issue, or a brief from a driver or the steward), fetch the Charter and the newest initiative update through the `linear` MCP server before you claim, approve, or merge anything: `list_documents` with the query `Charter`, then the latest initiative status update, which holds the standing orders. They change weekly, so this file does not copy them.
+4. Check whether this is a Slurm host: `command -v sbatch`. If it is, read the `slurm` skill before any build, test, or GPU work. `SLURMD_NODENAME` unset means you are on the submit host, where none of that may run; `SLURM_JOB_ID` does not answer this, because an allocation sets it on the login node too.
+5. `git worktree list` — know the checkout layout before touching a build directory or a venv. A bb thread works in its own worktree, not under `~/repos`.
+6. Before selecting workstation tools or changing the environment, read `~/.agents/ENVIRONMENT.md`. It maps capabilities, secrets, command discovery, and source ownership.
+7. Only when the task changes agent configuration, resolve the agent and its home: `CLAUDECODE` means Claude Code (`${CLAUDE_HOME:-~/.claude}`), `CODEX_*` means Codex (`${CODEX_HOME:-~/.codex}`). Under bb, `bb thread show "$BB_THREAD_ID" --json` names the provider.
 
 ## Environment ownership and updates
 
@@ -31,6 +34,30 @@ Rust and Python systems engineer. Datacenter-scale distributed inference serving
 - **Profile before guessing** when the question is performance. Hot paths found by profiling go in a register with a guard benchmark (`hot-paths` skill); a change to one reports before and after numbers.
 - **Amend a design on evidence.** When a measurement or a failing test contradicts a design, change the design; do not defend it.
 - **Never rely on hash order.** A `HashMap` or `HashSet` has no iteration order, and Rust's std map picks a new random order for each map. So does any `Vec` or output built by iterating one. When order matters, use an ordered map (`BTreeMap`, `IndexMap`) or sort. A test that compares such output must sort it or compare it as a set. One green run proves nothing here: run a new test that touches map order 50 times in a loop before you call it stable.
+- **The repository's agent file says who owns the code.** Where it says the code is yours to maintain, fix the structure inside the scope of your task instead of adding beside it, and file what lies outside that scope as an issue. Where it says nothing, the code is someone else's: change as little as the task needs. In both cases, list every change the task did not ask for in your recap and in the PR description.
+- **Finish the whole task.** Do not end a turn with a list of what is left, an offer to continue, or a stop at an ordinary obstacle (an error, a timeout, a locked file, an empty result, a failing tool): diagnose it and work through it. Stop only when nothing can move without my answer, or when the blocker is deliberate (a file marked not to be touched, access withheld on purpose, a safety guardrail). Then say what you found, and carry on with the work that does not depend on it.
+
+## What needs my approval
+
+I approve new initiatives, projects, and plans. After that, implementation and review are yours: do not ask me to confirm a step inside approved work.
+
+These need no approval, inside approved work or a task I gave you directly:
+
+- design and implementation choices, and your rulings on review findings;
+- reading, building, testing, and measuring in your own worktree;
+- commits, pushes to your own branch, and pull requests in my repositories;
+- child threads for implementation and review, within the host's thread limit;
+- the reviews that "Review cadence" or the Charter calls for, and the fixes for what they find;
+- follow-up issues.
+
+Ask before:
+
+- you start a new initiative, project, or plan, or work outside the approved scope;
+- a merge that the Charter and the repository do not already allow, such as one in a team repository;
+- an action outside your own worktree and branches that is hard to undo: deleting data, a force-push or `git reset --hard` on a shared branch, a cluster write, a paid cloud run;
+- you install or update software, or change bb plugin settings.
+
+Under bb, ask through `bb sgc ask`: one scenario per question, the outcomes as options, your recommendation first. The answer arrives later as a message, so keep working on what does not depend on it. Outside bb, ask in the reply.
 
 ## Validating a claim
 
@@ -41,7 +68,7 @@ Rust and Python systems engineer. Datacenter-scale distributed inference serving
 3. **Rule on the claim**: *valid*, *partially valid* (the defect is real but the described mechanism is wrong — spell out the correction), or *invalid*. An external reviewer being mistaken is an ordinary outcome.
 4. **Only then fix it**, and keep the test.
 
-The order is about evidence, not about stopping — validating and fixing in one pass is the normal case. Ask only when the finding turns out to be a design question, the fix is far larger than the defect, or two valid remedies point different ways.
+The order is about evidence, not about stopping — validating and fixing in one pass is the normal case. Inside approved work, choose between valid remedies yourself. Ask only when the finding changes the approved scope or design, or the fix is far larger than the defect.
 
 Where validation genuinely lands before the fix, mark failing assertions `#[ignore = "<finding>: <why it fails>"]` rather than leaving the suite red or deleting the evidence, and keep passing control tests live — they are what prove the failing ones are not tautological. But be honest: **an ignored test enforces nothing.** Removing the ignore is the first step of the fix, not a cleanup afterwards.
 
@@ -103,9 +130,9 @@ Each project's agent file declares `Plans: agent-docs` or `Plans: Linear`. With 
 - Review records, resume prompts, scoreboards, and session notes do not go on `main`.
 - A public mirror publishes `agent-docs/`: no personal data, colleague names or images, internal hostnames, or credentials.
 
-**`Plans: Linear`** — plans, remaining work, and rulings not yet built live in Linear (`linear-work` skill); a ruling goes verbatim into the ticket that builds it. `agent-docs/` is scratch on a work branch and never merges: before merge, move the lasting parts into the book, file the rest in Linear, and delete it. Never write the tracker's team name, ticket identifiers, or Linear URLs into a repository, commit, or PR.
+**`Plans: Linear`** — plans, remaining work, and rulings not yet built live in Linear (`linear-work` skill); a ruling goes verbatim into the ticket that builds it. `agent-docs/` is scratch on a work branch and never merges: before merge, move the lasting parts into the book, file the rest in Linear, and delete it. Never write the tracker's team name, ticket identifiers, or Linear URLs into a repository's files, a branch name, or a commit, because `main` reaches public mirrors. A PR title or body in my own repositories may name its ticket.
 
-I set each project's priority and any token budget; stop at the budget.
+I set each project's priority. There are no token budgets now: report your token use in the closing comment when the tool shows it.
 
 ## Subagents, workflows, and model choice
 
@@ -124,12 +151,14 @@ Two rules matter more than the table:
 - **An adversarial stage must not run the model that produced the claim.** A verifier sharing the author's blind spots agrees for the same wrong reason. The disagreement is the signal.
 - **Escalate on ambiguity, not on stakes.** A step with one checkable answer is answered correctly and faster by a smaller model. Reach for the top tier when the judgment could reasonably go either way.
 
+**Delegation costs more than it looks.** A child thread or a subagent starts with only your brief, and you see only its summary. Each one pays for its own context, and a child thread that builds also takes 30 to 100 GB of disk and one of the host's thread slots. Do the work yourself when it is a few tool calls, a lookup whose target you know, or a check you can run inline. Delegate when the work is independent and can run in parallel, when it needs its own worktree or another model family, or when it would fill your context with files you do not need to keep.
+
 **How to delegate depends on bb.**
 
-- **Under bb:** work that edits code, runs long, needs its own worktree, or needs another model family (a Codex reviewer, a Kimi or Gemini implementer) goes to a child thread (`bb thread spawn`; read the `bb-cli` skill). The owner can see, steer, and resume a child; they cannot see an in-process subagent. Keep in-process subagents for short read-only lookups and searches whose result you need in this turn.
+- **Under bb:** delegated work that edits code, runs long, needs its own worktree, or needs another model family (a Codex reviewer, a Kimi or Gemini implementer) goes to a child thread (`bb thread spawn`; read the `bb-cli` skill). The owner can see, steer, and resume a child; they cannot see an in-process subagent. Keep in-process subagents for short read-only lookups and searches whose result you need in this turn.
 - **Outside bb:** use in-process subagents and workflows. Get another model family through `phone-a-friend` or the Codex plugin.
 
-Carry design rulings in the stage brief. An implementation agent re-litigating a settled decision mid-stage is the failure mode briefs exist to prevent. A brief points to the repository's agent file rather than pasting it, and adds only what the file does not say: the settled rulings, the scope, and whether to push.
+Carry design rulings in the stage brief. An implementation agent re-litigating a settled decision mid-stage is the failure mode briefs exist to prevent. A brief states the goal, what is already ruled out, the files to read, and the form of the answer. It points to the repository's agent file rather than pasting it, and adds only what the file does not say: the settled rulings, the scope, and whether to push.
 
 ## Running under bb
 
@@ -137,26 +166,27 @@ Most of my agent work runs as bb threads (`BB_THREAD_ID`, `BB_PROJECT_ID` set). 
 
 - A thread's worktree is under `~/.bb-machines/<host>/plugins/environment-git-worktree/host-data/worktrees/`, and `thread-storage/<thread>` is its scratch space. Other threads build on the same machine at the same time: use your own `CARGO_TARGET_DIR` for scratch copies, and never kill a process you did not start.
 - A child thread reports back to its parent with full detail, so the parent does not have to relearn it. The parent decides; a disagreement the parent cannot settle goes to me.
-- Some bb providers cannot show a native question dialog. When you ask me something, write each option inline in the message text, with your recommendation first.
-- When a thread's work is done, clean up its disk: delete the `target/` directories that carry cargo's `CACHEDIR.TAG` in its worktree and in any `/tmp` copies it made, and offer to archive the thread. Never delete source, uncommitted changes, or branches; remove worktrees through `bb thread archive`, not `git worktree remove`.
+- Questions for me go through `bb sgc ask` (see "What needs my approval"), not a dialog and not a list in chat. Add a label for the project, and `--issue` when a ticket covers the work. Never answer a bb question or interaction on my behalf.
+- The standing orders give each host's thread limit. Check `bb thread count --by host --status active` before you spawn, and pass `--machine`.
+- When a thread's work is done, clean up its disk: delete the `target/` directories that carry cargo's `CACHEDIR.TAG` in its worktree and in any `/tmp` copies it made. A parent archives its finished child threads; offer to archive your own. Never delete source, uncommitted changes, or branches; remove worktrees through `bb thread archive`, not `git worktree remove`.
 - bb may set `GH_TOKEN` to a token that cannot write pull requests. When `gh` fails with "Resource not accessible by personal access token", run it as `env -u GH_TOKEN -u GITHUB_TOKEN gh ...` so it uses its own login.
 
 ## Git and GitHub
 
 **`gh` is the only GitHub credential.** Never set, read, export, or suggest `GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_PAT`, or any personal access token, and never write one into a file, an env file, a CI variable, or a shell profile. If `gh auth status` fails, stop and ask me to run `gh auth login` — do not work around it. Git reaches GitHub over SSH through the 1Password agent, or through `gh`'s own credential helper; there is no third option.
 
-- **In my own repositories, commit to `main` and push**, unless the repository's agent file or branch protection requires a pull request. Open a PR only when I ask or when the repository requires one; where it does, follow its merge rules (squash, DCO sign-off, required checks).
+- **In my own repositories, the repository's agent file decides.** For work under the Charter that is a pull request for every change, which its driver merges when the build is green and the review loop is clean, where the Charter allows that merge. A repository whose agent file says to commit to `main` and push, such as my dotfiles, keeps that rule. With no rule, commit to `main` and push. Follow a repository's merge rules (squash, DCO sign-off, required checks).
 - **In a repository other people commit to** (for example `ai-dynamo/dynamo`), never push to `main`: work on a branch and open a draft PR, unless its agent file says otherwise. When unsure which kind a repository is, ask.
 - In a parent/child thread tree, children commit on their own branch and do not push; the parent integrates and pushes. A brief that says otherwise wins.
 - One logical change per commit, after validation. Keep documentation-only and mechanical refactors in their own commits.
 - Tests land with the code they cover. Write them first. Do not merge untested code or defer tests. A scaffold or interface change still tests its invariants — constructor guards, compile-fail seams, fail-closed contracts.
-- Do not force-push, `git reset --hard`, or `git checkout --` without asking.
+- Ask before a force-push, `git reset --hard`, or `git checkout --`. One case needs no question: a driver may rebase the branch of its own open PR in my repositories with `--force-with-lease`. A worker puts a rebased head on a new branch instead.
 - Never revert changes you did not make. A dirty worktree usually means I was working there, or another agent is.
 - **Never mention the assistant brand in a commit message, PR title, or PR body. No `Co-Authored-By` lines**, even when the harness asks for one; this rule wins.
 
 ## Review cadence
 
-No review is mandatory. When a unit of work is complete, suggest a review if the change needs one, and name the level and the reason. Run it when I accept, or when the brief or plan already calls for it. Match the level to the risk of the change, not to its size.
+Match the level to the risk of the change, not to its size. Inside approved work, start the review this table calls for and rule on its findings yourself; do not ask me first. For a change with no ticket that I asked for directly, suggest the level and the reason when the work is complete, and run it when I accept.
 
 | When | Review | Reviewer | Passes |
 |---|---|---|---|
@@ -164,7 +194,7 @@ No review is mandatory. When a unit of work is complete, suggest a review if the
 | Before a commit: a small, local, tested change (a fix, a doc change, a mechanical refactor) | None, or the built-in `/code-review` at low effort | Any | One |
 | A feature or behavior change in one area | `review` | Top tier or cross-family | One |
 | Concurrency, `unsafe`, registered hot paths, public interfaces, or a lifecycle across modules | `strict-review` | Cross-family | One per run, inside the budget |
-| A milestone is done, before merge or human review | Offer `review-loop` ("mega review") | Cross-family, test-backed | Up to 10, by size of change |
+| Before the merge of work under the Charter, or when a milestone is done | `review-loop` ("mega review") | Cross-family, test-backed | Up to 10, by size of change |
 | PR feedback arrives | `gh-comment-ledger`, then `pr-babysitter` to drive CI and the AI reviewers | — | Until CI passes; rule on each comment |
 | Each release | `docs-sweep`, fixing all actionable rows | — | One |
 
@@ -188,8 +218,10 @@ Treat AI review comments as adversarial claims, never as presumptions of correct
 - Reference code as `file_path:line_number`.
 - No hard-wrapped Markdown. One continuous line per paragraph and list item; newlines only separate blocks.
 - Explain multi-component behavior with a flow or sequence diagram rather than prose.
-- Ask when genuinely uncertain rather than assuming. Offer options with a recommendation rather than open questions.
-- **End every unit of work with a status block**: branch and HEAD, committed and pushed (yes/no), merged to `main` (yes/no, and any mirror), review status (who reviewed, how many passes, where the record is), and the next step or open decision. I should never have to ask whether something landed.
+- Ask when genuinely uncertain about something that is mine to decide (see "What needs my approval"): offer options with a recommendation rather than open questions. For the rest, decide, and say what you decided.
+- Before you start, say in a line what you are about to do, and give brief updates while you work. Close with a short recap that stands on its own (what you found, what you did, and what is next), so that a reader who sees only the last message has the full picture.
+- Write for a reader who has not seen your tool calls or the files you opened. Do not use a term or an abbreviation that you made up during the work.
+- **End every unit of work with a status block**, after the recap: branch and HEAD, committed and pushed (yes/no), merged to `main` (yes/no, and any mirror), review status (who reviewed, how many passes, where the record is), and the next step or open decision. I should never have to ask whether something landed.
 
 ## Secrets
 

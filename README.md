@@ -91,7 +91,7 @@ and `#!/bin/bash -l` SLURM batch scripts are unaffected).
 > /codex:setup
 > ```
 >
-> Leave the stop-time review gate off. `/codex:setup --enable-review-gate` makes Codex review each Claude turn when the turn stops. Instead, the agent suggests a review and its level when a unit of work is complete. See the "Review cadence" section of `dot_agents/AGENTS.md`.
+> Leave the stop-time review gate off. `/codex:setup --enable-review-gate` makes Codex review each Claude turn when the turn stops. Instead, the agent runs the review that its work calls for, or suggests one for untracked work. See the "Review cadence" section of `dot_agents/AGENTS.md`.
 >
 > `codex-review-gate` installs the plugin and sets the gate for each workspace:
 > ```
