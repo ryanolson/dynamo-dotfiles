@@ -287,7 +287,7 @@ API keys and tokens are managed via 1Password CLI (`op`) with on-demand injectio
 - Chezmoi writes `~/.config/dynamo/dev.env.op` with 1Password secret references only
 - Every machine gets `~/.config/dynamo/dev.env.fleet`, with one `VAR=op://Fleet/...` line for each entry in `fleet_secrets` (`.chezmoidata/team.yaml`).
 - `openv <cmd...>` asks `fleet secret get` for each reference on an enrolled machine. `fleet` asks the local `pylon` cache, then the fleet broker. If any value fails, or the machine is not enrolled, `openv` runs `op run --env-file ~/.config/dynamo/dev.env.fleet` instead. A command never gets values from both.
-- `fleet secret flush` empties the `pylon` cache, for example after a rotation in 1Password. On the admin laptop, `fleet secret flush --all` empties it on every enrolled machine through actl (`fleet task secrets-flush --all`; see Fleet tasks through actl).
+- `fleet secret flush` empties the `pylon` cache, for example after a rotation in 1Password. To empty it on every machine, run `bb terminal run --machine NAME -- fleet secret flush` for each connected machine in `bb machine list`.
 - `openv-file <env-file> <cmd...>` does the same for an alternate env-reference file
 - `wcie-codex [args...]` runs `codex -p wcie`, which layers `~/.codex/wcie.config.toml` over the base Codex config. The profile sends requests to OpenRouter. OpenRouter serves Kimi K3 from the NVIDIA endpoint, and GPT-6 Astra from OpenAI. The profile also sends the side work that Codex gives to Luna and Terra (reviews, memories, subagents) to K3. `wcie-codex` sets `OPENROUTER_API_KEY` from `op://Fleet/OpenRouter-WCIE-Limited/credential`: `fleet secret get` first, then `op read` when the machine is not enrolled or the broker fails. The key reaches only the codex process.
   - On each run, `wcie-codex` writes a model catalog to `~/.cache/wcie-codex/models.json` from `codex debug models` and gives it to codex. The `/model` picker then lists K3 and Astra 6. K3 has the reasoning efforts low to max, and the default is max. K3's context window is 1,048,576 tokens, the window every OpenRouter endpoint serves; codex's default for a model it does not know is 272,000. Codex and bb can change the effort. If `codex debug models` fails, `wcie-codex` uses the last catalog.
@@ -351,7 +351,7 @@ The timer is a launchd agent on macOS, a systemd user timer on Linux, or a cront
 | SSH client settings and host CA | Rewritten at enrollment | `~/.ssh/fleet/config`, `~/.ssh/fleet/known_hosts` |
 | Login trust | Until `fleet untrust` | A `# BEGIN fleet` block in `~/.ssh/authorized_keys` |
 
-The state folder is `~/.local/state/fleet` (under `XDG_STATE_HOME`). Set `FLEET_STATE_DIR` to an absolute path to move it, for example to node-local disk on a Slurm cluster where the home folder is shared (agentic-control task 032, part 2). The path can hold only letters, digits, and `/._-`. When it is set, `fleet timer install`, `fleet agent install`, `fleet tunnel add`, and `fleet worker install` write it into the service files and the worker's executor environment, so the services use the same folder. `fleet doctor` prints the state folder and its file system type, and warns, without failing, when it is on a network file system such as NFS, Lustre, GPFS, SMB, or BeeGFS. On Linux it reads the type with `findmnt`, else `stat -f`; on macOS it reads `df` and `mount`.
+The state folder is `~/.local/state/fleet` (under `XDG_STATE_HOME`). Set `FLEET_STATE_DIR` to an absolute path to move it, for example to node-local disk on a Slurm cluster where the home folder is shared (agentic-control task 032, part 2). The path can hold only letters, digits, and `/._-`. When it is set, `fleet timer install`, `fleet agent install`, and `fleet tunnel add` write it into the service files, so the services use the same folder. `fleet doctor` prints the state folder and its file system type, and warns, without failing, when it is on a network file system such as NFS, Lustre, GPFS, SMB, or BeeGFS. On Linux it reads the type with `findmnt`, else `stat -f`; on macOS it reads `df` and `mount`.
 
 Chezmoi includes `~/.ssh/fleet/config` first in `~/.ssh/config`. The fleet file sets an agent only for `github.com`, so the agent settings after it still apply to other hosts. By default, enrollment adds a `cert-authority` line to `~/.ssh/authorized_keys` for the principal `ryan`. Use `--principal NAME` to accept a different principal. Use `--no-trust` on a machine that must not accept fleet logins, for example the CA host. Other lines in `authorized_keys` do not change.
 
@@ -389,7 +389,7 @@ The tests do not pass the parent environment to `fleet`. They pass only `PATH`, 
 
 ### Remove a machine from the fleet
 
-`fleet uninstall` (or `fleet remove`) revokes the machine's certificate, stops the renew timer, the agent, the actl worker, and every tunnel, removes the CA line from `~/.ssh/authorized_keys`, and deletes `~/.ssh/fleet`, the fleet state, and the fleet settings. It asks first; pass `--yes` when there is no terminal. `--keep-cert` skips the revocation. It does not remove `pylon`, `actl`, or a bb host daemon.
+`fleet uninstall` (or `fleet remove`) revokes the machine's certificate, stops the renew timer, the agent, and every tunnel, removes the CA line from `~/.ssh/authorized_keys`, and deletes `~/.ssh/fleet`, the fleet state, and the fleet settings. It asks first; pass `--yes` when there is no terminal. `--keep-cert` skips the revocation. It does not remove `pylon` or a bb host daemon.
 
 ### Fleet SSH names
 
@@ -407,68 +407,6 @@ fleet codex [ARGS...]                          # run codex with CODEX_ACCESS_TOK
 ```
 
 The broker URL defaults to port 8443 on the CA host. `fleet init --broker-url` overrides it.
-
-### Fleet tasks through actl
-
-Fleet maintenance runs as [actl](https://github.com/ryanolson/agentic-control) tasks (agentic-control task 029). One controller runs on brev-x86-cpu. Each fleet machine runs one worker as the user. The broker serves the NATS addresses (`servers`), `tls_first`, the deployment CA, and the list of enrolled workers at `GET /v1/actl`, so the controller's name stays out of this repository. The commands need `python3`.
-
-`actl` and `actl-supervisor` are pinned in `fleet` as one pair (`ACTL_VERSION`, `ACTL_SHA256_*`, `ACTL_SUPERVISOR_SHA256_*`), and the broker serves them at `/v1/artifacts/actl/VERSION/TARGET` and `/v1/artifacts/actl-supervisor/VERSION/TARGET`. `fleet-config/artifacts/release actl` adds the pins. Until the first release, the commands below that need actl stop with `actl is not pinned`. For the laptop commands, `FLEET_ACTL=/path/to/actl` uses a local build instead.
-
-On a worker machine:
-
-```bash
-fleet worker install [--timeout S] [--server URL|default]   # prints ID=OS:PUBLIC_KEY
-fleet worker status
-fleet worker refresh                                         # the service runs this before each start
-```
-
-`fleet worker install` installs the pinned pair into `~/.local/bin` (`~/.local/<arch>/bin` on a no-sudo host) after it checks both checksums. It creates the worker seed once with `actl keygen`, and refuses an existing seed that is not a regular file with mode 600, one link, and the user as owner, in a mode-700 folder. Only the public key leaves the machine. It writes the configuration from `/v1/actl` and starts the service:
-
-| Path | Content |
-| --- | --- |
-| `~/.config/fleet/actl/worker.toml`, `ca.pem` | The `[connection]` section has every URL of `servers` from `/v1/actl`, in order, and `ca.pem` is the deployment CA, which checks the NATS server. With actl 0.3.0 or later it also has `client_certificate` and `client_key`, this machine's fleet certificate `~/.local/state/fleet/node.crt` and `node.key`, and `tls_first` from `/v1/actl` (agentic-control task 030). An older actl refuses these settings, so fleet writes them only when the actl that reads the file reports 0.3.0 or later. Principal `worker.ID`, where ID is the fleet name (`fleet status`), not an SSH alias. Capabilities `host-ID` and `os-linux` or `os-macos`. Repository `dotfiles` is this repository over HTTPS. Executors `fleet-apply`, `pylon-install`, `secrets-flush`, and `fleet-probe`: each runs `/usr/bin/env`, which removes the worker's Git variables and sets `HOME`, `USER`, `LOGNAME`, `LANG`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `FLEET_STATE_DIR` (only when set at install), `XDG_RUNTIME_DIR` (Linux: the folder of the shell that ran install, else `/run/user/UID`), and a fixed `PATH`, then `/bin/bash dot_local/bin/executable_fleet` from the task's checkout. `systemctl --user` reaches the user manager through `XDG_RUNTIME_DIR`, so no D-Bus address is set. |
-| `~/.local/state/fleet/actl/worker.seed`, `worker.pub` | The seed and its public key. |
-| `~/.local/state/fleet/actl-worker` | The worker root, with the drain files. |
-| `fleet-worker.service` (Linux) | systemd user service with linger, `Restart=always`, `RestartSec=30`, `TimeoutStopSec=90`. `ExecStartPre=-fleet worker refresh`; the `-` lets the worker start when the refresh fails. |
-| `dev.fleet.worker` (macOS) | launchd agent in the GUI domain, `ExitTimeOut` 60, log `~/Library/Logs/fleet-worker.log`. `KeepAlive` restarts it only after a failure, because launchd would start it again at once after a drain and replace its acknowledgement. Its program is `fleet worker run`: it runs the refresh, then `exec`s `actl worker`, so the worker keeps the process ID that launchd and the drain check see. |
-
-Before each start, the service runs `fleet worker refresh`. It reads `/v1/actl` again and rewrites the `[connection]` section of `worker.toml` and `ca.pem`; the rest of `worker.toml` stays as install wrote it. So a changed NATS address reaches every worker on its next restart (a reboot, `systemctl --user restart fleet-worker`, or a crash), without SSH to each machine. The new files are checked first: the data from the broker, then the whole new `worker.toml` with the installed `actl doctor --offline`. When the broker cannot be reached, returns invalid data, or actl refuses the new file, both files stay as they were, the refresh exits with an error that says so, and the worker starts with them. Each file is replaced atomically and keeps its mode. A refresh does not change the actl binary or the service; that is `fleet worker install`.
-
-`--server tls://HOST:PORT` writes that NATS URL instead of the URLs from `/v1/actl`, for a machine that reaches NATS through a fleet tunnel. gb300 uses `--server tls://127.0.0.1:38910`, the client end of its `bb-nats` tunnel through spark-p. The fleet NATS certificate names `127.0.0.1`, so TLS checks pass. Install saves the URL as `actl_server` in `~/.config/fleet/config` and uses it for later installs and for each refresh, so an actl update or a restart keeps the tunnel. `--server default` removes it and returns to the broker's URLs. Task 030 removes this option with the gb300 tunnel.
-
-With nothing changed, install changes nothing, but it starts a stopped service. To change a running worker, install drains it first. It creates `<root>/drain` and waits up to `--timeout` seconds (default 600) for `<root>/drained` from the service's main process, which the worker writes when no attempt runs. Then it stops the service, replaces the files, removes both drain files, and starts the service. If the worker exits without the acknowledgement, or the service fails, install stops, keeps the drain file, and prints the worker log: inspect the worker as the actl operations guide requires. If the time runs out, install removes the drain file, so the worker keeps working. While `<root>/unsafe-exit` exists, install refuses to run.
-
-Each executor runs the `fleet` script of the task's commit, so it uses that commit's pins:
-
-- `fleet-apply` (`fleet executor apply`) installs `fleet` and `fleet-ssh-keygen` from the checkout into `~/.local/bin`, mode 755. A file that is already the same is not written. Each file is staged as `~/.local/bin/.fleet-apply.XXXXXX` and checked with `bash -n` first, so a missing file or a script that does not parse changes nothing and fails the task. An apply that was killed can leave these staged files; the next apply removes them while it holds the fence lock. Neither file is a template, so the copy is what `chezmoi apply` would write, and a machine that joined with `join.sh` needs no chezmoi.
-- `pylon-install` (`fleet executor pylon-install`) runs `install-pylon` and then checks the running agent. Within 30 seconds (`FLEET_PYLON_WAIT`), `GET /v1/status` on the secrets socket must report the pinned `PYLON_VERSION`. A status without a version fails. Then a secret reference must arrive, not empty, through the same secrets socket that `openv` uses, with no fallback to the broker. The reference is `op://Fleet/HuggingFace/credential`, or `FLEET_SELFTEST_REF` when it is set. Only the length of the value is checked; the value is not printed or saved. Last, the agent must list keys, within its own `FLEET_PYLON_WAIT` after the secret arrives. Every wait has a limit: the fence lock 600 seconds (`FLEET_FENCE_WAIT`), the download 300, the agent restart 120 (`FLEET_RESTART_WAIT`), the secret 30, and each `ssh-add -L` the time left of the key check's `FLEET_PYLON_WAIT`. The restart and `ssh-add` run with `timeout`, or `perl` where there is no `timeout`, so a hung command fails the executor and no process outlives it. Each wait setting must be a whole number of seconds more than 0. An executor that the actl worker runs gets a scrubbed environment, so it uses the default limits. The settings take effect when you run `fleet install-pylon` or `fleet executor` from a shell.
-- `secrets-flush` runs `fleet secret flush`.
-- `fleet-probe` prints the machine name and the task ID.
-
-`fleet-apply` and `pylon-install` keep a freshness fence in `~/.local/state/fleet/applied`, one line for each executor: `EXECUTOR COMMIT COMMITTER_TIME`. The line is written atomically after the executor succeeds. A commit with an older committer time than the recorded one is refused, and nothing changes. The same commit again does not install or restart pylon again, but it still checks the running agent as above and fails when that check fails. For `fleet-apply` it compares the files again and puts back a file that was changed or removed by hand since, without a new record. This includes a newer `fleet` that `chezmoi apply` installed outside the executor: the record is the source of truth for the files the executor manages, so to move forward, run `fleet-apply` at the newer commit. actl delivers a task at least once, and an abandoned task can be admitted late, after a newer one ran, so a repeated or late task is harmless. The checkout is one commit deep, so the fence reads only that commit. Each executor has its own line, because they change different files: a `fleet-apply` of a newer commit must not refuse a release's `pylon-install` of its pin commit.
-
-To roll back, commit a revert of the bad change (a newer commit), push it, and run the task at that commit: `fleet task fleet-apply --all --commit SHA`, or `pylon-install` for a pylon pin. The fence lets it through because its committer time is newer. Do not edit `~/.local/state/fleet/applied` by hand to roll back: a lower record lets every older task that is still queued apply again, and a late one can put the bad version back.
-
-On the admin laptop:
-
-```bash
-fleet actl client-init        # once, before the deployment: prints the client.cli public key
-fleet actl client-config      # after /v1/actl is published, and after it changes: writes client.toml and ca.pem
-fleet worker enroll HOST [--controller fleet-command] [--provisioner '~/repos/agentic-control-fleet'] [--fleet-config ~/repos/fleet-config] [--timeout 120]
-fleet task NAME --host ID... | --all [--commit SHA] [--timeout 600]
-fleet task --resume RUN [--timeout 600]
-fleet secret flush --all [--commit SHA] [--timeout 600]   # fleet task secrets-flush --all
-```
-
-`fleet actl client-config` writes `client.toml` (principal `client.cli`, seed `~/.local/state/fleet/actl/client.seed`) with the same `[connection]` settings as a worker, for the actl that the laptop commands use. It writes the file again on each run, so run it after `/v1/actl` changes, for example to move to a new address. Each file is replaced atomically and keeps its mode. When this machine also runs a worker and the deployment CA changed, it stops and asks for `fleet worker install` first. Other laptop commands write `client.toml` only when it is missing.
-
-`fleet worker enroll HOST` runs `fleet worker install` on HOST over SSH and reads its `ID=OS:KEY` line. Next, it runs `sudo -n PROVISIONER/scripts/provision.py --config /etc/actl-fleet/deployment.json --environment prod --add-worker ID=OS:KEY` on the controller host. Then it adds `{"id": ID, "os": OS}` to `broker/actl.json` in the fleet-config checkout, once. Last, it waits until `actl workers` lists the worker. The provisioner path is on the controller host. It is a clean checkout of agentic-control at the deployed commit, apart from the working copy there. Quote a path that starts with `~`, or your local shell expands it, and `sudo -n` fails. `FLEET_ACTL_CONTROLLER`, `FLEET_ACTL_PROVISIONER`, and `FLEET_CONFIG_REPO` change the defaults. It does not commit or deploy fleet-config. Commit the roster and deploy the broker yourself, as the fleet-config README describes. Each step is safe to repeat, so after a failure, run the same command again.
-
-`fleet task` sends one task for each machine, `actl submit --requires host-ID`, at an explicit commit of this repository. The default is `main` on GitHub. `--all` uses the workers from `/v1/actl`. An offline machine stays on the list, and its task waits in the queue. The run folder `~/.local/state/fleet/tasks/RUN` gets the run specification first, written atomically. Then each machine's task document is saved (`actl submit --save-task`) before it is sent. The command polls with backoff until each task ends or `--timeout` passes, and prints one line for each machine: `ID STATE DETAIL TASK_ID`. An unfinished machine is listed with the resume command. It exits 0 only when every task completed with exit status 0.
-
-`fleet task --resume RUN` holds a lock on the run folder. For each machine, it keeps a task that `actl status` knows. Otherwise it sends the saved document again (`--task-file`), and the controller deduplicates it. If the controller refuses that document, or no complete document was saved, it sends a new task with a new ID. The old task can still be admitted late. Then the machine runs the task twice. This is allowed, because every fleet executor is idempotent and refuses a stale commit. If the controller cannot be reached, resume creates no new task.
-
-The contract tests run these commands with the real actl and a real NATS broker on Linux. See the comment at the start of `test/test-fleet-actl-contract.py`.
 
 ### bb server
 

@@ -70,7 +70,7 @@ Rules:
 
 ## Flush on every machine
 
-`fleet secret flush --all` on the admin laptop runs `fleet task secrets-flush --all`: each enrolled actl worker runs `fleet secret flush` (agentic-control task 029, part 5). `pylon` updates use the same path: the `pylon-install` executor runs `fleet install-pylon` with the pins of the task's commit and checks that the running pylon reports the pinned version in `/v1/status` and returns a secret reference through its secrets socket, with no broker fallback. `fleet-config/artifacts/release pylon` sends that task when `FLEET_TRANSPORT=actl`.
+Run `fleet secret flush` on each machine with `bb terminal run --machine NAME -- fleet secret flush`. A `pylon` update runs `fleet install-pylon` the same way, then `fleet status` shows the agent and broker. The earlier actl task path (`fleet task secrets-flush --all`, the `pylon-install` executor) was removed on 2026-11-11 in favor of bb.
 
 ## Order of work
 
