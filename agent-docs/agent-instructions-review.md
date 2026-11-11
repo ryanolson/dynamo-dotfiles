@@ -1,7 +1,7 @@
 # Agent instructions review
 
 Status: in progress
-Updated: 2026-10-25
+Updated: 2026-11-11
 
 We want the global agent file (`dot_agents/AGENTS.md`) and the shared skills to match how the agents are actually used, and to follow current Claude and Codex guidance. Agents were ignoring rules the owner had overridden by hand, looping on reviews, and writing too much. This review read the owner's memories, Claude and Codex transcripts, bb prompt history, and the agent files in six repositories, plus current vendor documentation. It is meant to run again on a schedule.
 
@@ -24,6 +24,27 @@ We want the global agent file (`dot_agents/AGENTS.md`) and the shared skills to 
 | `277cada` | `attribution` set to empty in `~/.claude/settings.json` through a modify script. |
 | `d5f0927` | Loop gaps a Codex review found: moving review range, budget across runs, no push with an open blocker. |
 | `f0a2b77` | Model tiers in `AGENTS.md` with a dated routing table in `ENVIRONMENT.md`. Review table ordered by when. Test-backed findings in `wills-mega-review`. |
+
+## Round of 2026-11-11: Fable 5.2 and the Charter
+
+The environment now targets Fable 5.2 and Opus 5.5. This round read the vendor's prompting guides for both models, the Charter and the standing orders in Linear, and the review skills.
+
+**Changed**
+
+- The Charter had moved ahead of these files. `AGENTS.md` now points to the Charter and the standing orders, and says that they win for tracked work, instead of copying their numbers. `linear-work` defers to the Charter for picking, claiming, labels, estimates, and merging. Its token-budget rules are gone: there are no budgets now, and the Fable 5.2 guide found that a budget shown to the model changes what it spends.
+- A new section, "What needs my approval", names the steps that need no approval. Fable 5.2 follows cautious rules closely and treats a rule with "never" as absolute. `review-loop` said "never run unasked", which stops the review that the Charter requires before a merge.
+- Questions for the owner go through `bb sgc ask`. The rule to write options inline in chat is gone.
+- Four rules follow sections of the Fable 5.2 guide: finish the whole task, who owns the code, what delegation costs, and a line of intent with a recap that stands on its own.
+- `review` no longer starts one subagent for each area by default.
+- Model routing: Fable 5.2 joins the top tier at `high`. The owner's effort settings on the other rows did not change.
+- `pr-babysitter` names tiers instead of two pinned model names that newer models have replaced.
+
+**Found, not changed**
+
+- One host's source checkout was 23 commits behind its remote, so its agents read the rules of 2026-10-25. A host that lags makes every rule change a no-op there. Add `git -C "$(chezmoi source-path)" status -sb` on each host to this review.
+- Effort: the vendor guides start Fable 5.2 at `high` and Opus 5.5 at `medium`, and keep `xhigh` and `max` for measured gains. The Opus 5.5 implementation row runs at `max`. No comparison on our own tasks exists.
+- `simple-english` has hard caps on sentence length, which the Fable 5.2 guide says can make prose choppy. A sample of recent book text read well, so the caps stay. Check again after a month of Fable 5.2 text.
+- `strict-review` is about 320 lines, with four lists that overlap and strong emphasis throughout. A model that follows instructions closely can over-flag from it. Compare a trimmed version on a known change before replacing it.
 
 ## Evidence
 
@@ -51,7 +72,7 @@ We want the global agent file (`dot_agents/AGENTS.md`) and the shared skills to 
 5. **Repository files.** dynamo-gdl and agentic-control need a `Plans:` line and a consolidation pass. velo needs `Plans: Linear`, and the repositories without one need an `AGENTS.md` (velo, kvbm) or a `CLAUDE.md` (rhino, agentic-control). agentic-control calls mega review required. kvbm keeps `ACTIVE_PLAN.md` at the root. dynamo uses `agent-docs/` for something else.
 6. **Public mirrors.** A repository with a public mirror publishes its `agent-docs/`. Check what each mirror filter publishes before the next push.
 7. **Memory cleanup.** Delete memories that repeat the global file or are stale (listed in the session report), and move project state out of memory.
-8. **Stale model names** in `pr-babysitter` (`gpt-5.6-*`).
+8. **Stale model names.** Done on 2026-11-11: `pr-babysitter` names tiers. Was: two pinned `gpt-5.6-*` names in the skill.
 
 ## Running this review again
 
