@@ -42,7 +42,7 @@ The environment now targets Fable 5.2 and Opus 5.5. This round read the vendor's
 **Found, not changed**
 
 - One host's source checkout was 23 commits behind its remote, so its agents read the rules of 2026-10-25. A host that lags makes every rule change a no-op there. Add `git -C "$(chezmoi source-path)" status -sb` on each host to this review.
-- Effort: the vendor guides start Fable 5.2 at `high` and Opus 5.5 at `medium`, and keep `xhigh` and `max` for measured gains. The Opus 5.5 implementation row runs at `max`. No comparison on our own tasks exists.
+- Effort: the vendor guides start Fable 5.2 at `high` and Opus 5.5 at `medium`, and keep `xhigh` and `max` for measured gains. The owner then set the split: Fable 5.2 at `high` for design, orchestration, review, and rulings, and Opus 5.5 at `high` for implementation, down from `max`. No comparison on our own tasks exists yet. It is an open idea in the tracker.
 - `simple-english` has hard caps on sentence length, which the Fable 5.2 guide says can make prose choppy. A sample of recent book text read well, so the caps stay. Check again after a month of Fable 5.2 text.
 - `strict-review` is about 320 lines, with four lists that overlap and strong emphasis throughout. A model that follows instructions closely can over-flag from it. Compare a trimmed version on a known change before replacing it.
 

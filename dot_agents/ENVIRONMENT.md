@@ -44,14 +44,14 @@ Updated: 2026-11-11. `AGENTS.md` names tiers; this table maps them to models. A 
 
 | Tier | Model | Provider | Effort | Evidence |
 |---|---|---|---|---|
-| Top, for design, orchestration, whole-codebase review, and rulings on findings | Fable 5.2 | claude-code | high | Owner, 2026-11-11: the environment targets Fable 5.2 and Opus 5.5. Effort from the vendor's Fable 5.2 guide; not compared on our tasks. |
-| Top, for implementation | Opus 5.5 | claude-code | max | Owner, 2026-10-25: more capable than Fable 5.1. Not compared with Fable 5.2 on our tasks. |
+| Top, for design, orchestration, review, and rulings on findings | Fable 5.2 | claude-code | high | Owner, 2026-11-11. Effort from the vendor's Fable 5.2 guide; not compared on our tasks. |
+| Top, for implementation | Opus 5.5 | claude-code | high | Owner, 2026-11-11: Opus 5.5 implements at `high`, not `max`. Not compared with Fable 5.2 on our tasks. |
 | Fast | Sonnet 5.5 | claude-code | default | Owner, 2026-10-22: Sonnet, not Opus, for deep research. |
 | Cross-family, for Claude-authored work | Codex `gpt-6.1-sol` | codex, as a bb thread | max, full access | Owner's reviewer choice, 2026-10-23. Owner, 2026-10-25: Sol reviews at max. |
 | Cross-family, for Codex-authored work | Opus 5.5 | claude-code | high | Owner, 2026-10-25: Opus 5.5 reviews at high. |
 | Implementer when Claude capacity runs out | Codex | codex, as a bb thread | high | Owner, 2026-10-18. |
 
-- Effort is the control for how much a Claude model thinks; an instruction to think less does not work on Fable 5.2. To make a step cheaper or faster, lower its effort. The vendor guides start Fable 5.2 at `high` and Opus 5.5 at `medium`, and keep `xhigh` and `max` for work where a gain was measured. The `max` on the Opus 5.5 row is the owner's setting, and it has not been compared with `high` on our tasks.
+- Effort is the control for how much a Claude model thinks; an instruction to think less does not work on Fable 5.2. To make a step cheaper or faster, lower its effort. The vendor guides start Fable 5.2 at `high` and Opus 5.5 at `medium`, and keep `xhigh` and `max` for work where a gain was measured. No effort level has been compared on our own tasks yet. Until one is, use the table's levels, and do not raise one without a measurement.
 - A Fable 5.2 thread can stop with a refusal that names a category (`cyber`, `bio`, `frontier_llm`, `reasoning_extraction`). Do not reword the request to get past it. Report the category, and run that step on another model in this table. Do not ask a model to write out its reasoning in a reply: that request is itself refused. Ask for a short explanation of the answer instead.
 - A change to an instruction file, a skill, or a memory reaches new sessions only. Start a fresh thread to check one.
 - Implementer choice for concurrency-heavy Rust follows the owner's private bake-off of 2026-10-24. Ask before routing that work to a model the table does not name.
