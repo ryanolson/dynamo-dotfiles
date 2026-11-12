@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Update the chezmoi source and apply it with no terminal, for a remote caller such as a bb server.
 
+Usage: chezmoi-headless-update        (no arguments: it updates this machine)
+       chezmoi-headless-update --help
+
 stdout carries one JSON report. Child output goes to stderr. Exit status:
   0  updated, and nothing needs a person
   1  the pull failed, and nothing was applied
   2  applied, but something needs a person (see "reasons")
+  64 an argument was given, and nothing was done
 
 The pull is a fetch and a fast-forward merge, not `chezmoi update`. That command runs
 `git pull --autostash --rebase`, and a conflict leaves a rebase and a stash in the source
@@ -23,6 +27,8 @@ import subprocess
 import sys
 
 CONFIG_TEMPLATE_CHANGED = 'config file template has changed'
+# Not a status of the report, so a caller cannot read a mistyped call as an update.
+USAGE_ERROR = 64
 LOG_TAIL_LINES = 40
 
 
@@ -70,7 +76,15 @@ def report(result, code, **fields):
     return code
 
 
-def main():
+def main(argv):
+    # The command has no options. Without this check, any argument, `--help` included, started an update.
+    if argv in (['-h'], ['--help']):
+        sys.stdout.write(__doc__)
+        return 0
+    if argv:
+        sys.stderr.write('chezmoi-headless-update takes no arguments; --help prints its usage\n')
+        return USAGE_ERROR
+
     env = child_env()
     runner = Runner(env)
     chezmoi = shutil.which('chezmoi', path=env['PATH'])
@@ -116,4 +130,4 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))

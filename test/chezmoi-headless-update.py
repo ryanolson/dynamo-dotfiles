@@ -61,6 +61,34 @@ class HeadlessUpdate(unittest.TestCase):
                                 text=True, timeout=60, start_new_session=True)
         return result.returncode, json.loads(result.stdout), result.stderr
 
+    def run_with(self, *args):
+        return subprocess.run([str(SCRIPT), *args], env=self.env, stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, timeout=60, start_new_session=True)
+
+    def assert_nothing_updated(self, before):
+        self.assertEqual(self.git('rev-parse', 'HEAD', cwd=self.source), before)
+        self.assertEqual((self.target('.a'), self.target('.b')), ('a1\n', None))
+
+    def test_help_prints_usage_and_updates_nothing(self):
+        # An agent that checks a command's help must not start an update of the machine.
+        before = self.git('rev-parse', 'HEAD', cwd=self.source)
+        self.push({'dot_a': 'a2\n', 'dot_b': 'b1\n'})
+        for flag in ('--help', '-h'):
+            result = self.run_with(flag)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('Exit status', result.stdout)
+        self.assert_nothing_updated(before)
+
+    def test_an_argument_is_refused_and_updates_nothing(self):
+        # 64 is not one of the report's statuses, so a caller cannot read a typo as an update.
+        before = self.git('rev-parse', 'HEAD', cwd=self.source)
+        self.push({'dot_a': 'a2\n', 'dot_b': 'b1\n'})
+        result = self.run_with('--dry-run')
+        self.assertEqual(result.returncode, 64)
+        self.assertEqual(result.stdout, '')
+        self.assertIn('takes no arguments', result.stderr)
+        self.assert_nothing_updated(before)
+
     def test_clean_update(self):
         before = self.git('rev-parse', 'HEAD', cwd=self.source)
         self.push({'dot_a': 'a2\n', 'dot_b': 'b1\n'})

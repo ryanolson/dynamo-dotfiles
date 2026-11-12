@@ -850,6 +850,9 @@ rustup update
 | 0 | `updated` | The update is complete. Nothing needs a person. |
 | 1 | `pull_failed` | `reasons` is `chezmoi_missing`, `source_missing`, `fetch_failed`, or `merge_failed`. Nothing was applied. |
 | 2 | `needs_attention` | The update was applied. `reasons` contains one or more of `apply_failed`, `status_failed`, `pending`, and `config_template_changed`. |
+| 64 | none | An argument was given. Nothing was done, and there is no report. |
+
+The command takes no arguments, and a call with none starts the update. `--help` prints the usage and changes nothing.
 
 The report also contains `before` and `after` (source commits), `pending` (status and path from `chezmoi status`), and `log_tail` (the last 40 output lines). The command does not regenerate the configuration with `chezmoi init`. If the report contains `config_template_changed`, run `chezmoi init` in a terminal. The `run_onchange` install script uses `sudo` on the `sudo` class, so a headless update on that class needs passwordless `sudo`.
 
