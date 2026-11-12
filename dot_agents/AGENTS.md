@@ -14,7 +14,7 @@ Rust and Python systems engineer. Datacenter-scale distributed inference serving
 
 1. Check whether you run under bb: `BB_THREAD_ID` set means you are a bb thread. It changes how you delegate (see "Subagents, workflows, and model choice") and where you work (see "Running under bb").
 2. Read the repository's own agent file and treat it as authoritative over this one.
-3. When the task is tracked in Linear (an issue, or a brief from a driver or the steward), fetch the Charter and the newest initiative update through the `linear` MCP server before you claim, approve, or merge anything: `list_documents` with the query `Charter`, then the latest initiative status update, which holds the standing orders. They change weekly, so this file does not copy them.
+3. When the task is tracked in Linear (an issue, or a brief from a driver or the steward), fetch the Charter and the newest initiative update through the `linear` MCP server before you claim, approve, or merge anything: `list_documents` with the query `Charter`, then the latest initiative status update, which holds the standing orders. They change weekly, so this file does not copy them. Read the standing orders also before a Slurm job, a cluster write, or a paid cloud run, even for a task with no ticket: they list the holds and the runs that need my go.
 4. Check whether this is a Slurm host: `command -v sbatch`. If it is, read the `slurm` skill before any build, test, or GPU work. `SLURMD_NODENAME` unset means you are on the submit host, where none of that may run; `SLURM_JOB_ID` does not answer this, because an allocation sets it on the login node too.
 5. `git worktree list` — know the checkout layout before touching a build directory or a venv. A bb thread works in its own worktree, not under `~/repos`.
 6. Before selecting workstation tools or changing the environment, read `~/.agents/ENVIRONMENT.md`. It maps capabilities, secrets, command discovery, and source ownership.
@@ -47,14 +47,15 @@ These need no approval, inside approved work or a task I gave you directly:
 - reading, building, testing, and measuring in your own worktree;
 - commits, pushes to your own branch, and pull requests in my repositories;
 - child threads for implementation and review, within the host's thread limit;
-- the reviews that "Review cadence" or the Charter calls for, and the fixes for what they find;
+- for tracked work, the reviews that "Review cadence" or the Charter calls for, and the fixes for what they find. For a task with no ticket, "Review cadence" says when to suggest one first;
 - follow-up issues.
 
 Ask before:
 
 - you start a new initiative, project, or plan, or work outside the approved scope;
 - a merge that the Charter and the repository do not already allow, such as one in a team repository;
-- an action outside your own worktree and branches that is hard to undo: deleting data, a force-push or `git reset --hard` on a shared branch, a cluster write, a paid cloud run;
+- an action outside your own worktree and branches that is hard to undo: deleting data, a force-push or `git reset --hard` on a shared branch;
+- a run that the standing orders hold or gate, such as a Slurm job, a cluster write, or a paid cloud run. Permission to build and test does not lift a hold;
 - you install or update software, or change bb plugin settings.
 
 Under bb, ask through `bb sgc ask`: one scenario per question, the outcomes as options, your recommendation first. The answer arrives later as a message, so keep working on what does not depend on it. Outside bb, ask in the reply.

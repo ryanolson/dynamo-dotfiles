@@ -45,8 +45,9 @@ The Charter's approval gate defines each status and who may move an issue. For f
 
 - Every ticket an agent creates goes to **Triage**, with two exceptions: an item the owner already deferred, or a bare idea with no plan to build it, goes to **Backlog** with the `idea` label.
 - An agent does not move its own ticket to Todo. Send the steward the ticket's identifier and start nothing before approval.
+- A ticket that you cancel or mark as a duplicate gets a comment that says why, or links the duplicate.
 
-A ticket that waits on something outside it (an owner decision, an owner action, another team) gets the waiting label that the standing orders name, on the root of a chain only. A ticket that waits on another ticket uses Linear's blocked-by relation instead, without the label. Remove the label when the wait ends.
+A ticket that waits on something outside it (an owner decision, an owner action, another team) gets the waiting label that the standing orders name, on the root of a chain only. For an owner decision, add an `## Open question` section to the body, with the options. A ticket that waits on another ticket uses Linear's blocked-by relation instead, without the label. Remove the label when the wait ends.
 
 ## Issue body
 
@@ -75,7 +76,7 @@ Write titles in the imperative, under 70 characters: "Seal the crossing marker t
 
 ## Claim the next ticket
 
-Pick and claim as the Charter says ("How to pick work" and "The agent loop"): which projects and labels are open to you, the order, and the `claim:` and `release:` comments. Claim one ticket per agent at a time.
+Pick and claim as the Charter says ("How to pick work" and "The agent loop"): which projects and labels are open to you, the order, and the `claim:` and `release:` comments. In the claim comment, name your model, your branch, and its base commit. Claim one ticket per agent at a time.
 
 ## Spend
 
