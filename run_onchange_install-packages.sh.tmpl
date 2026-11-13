@@ -87,7 +87,7 @@ install_macos_packages() {
         kubectl
         protobuf
         jq tree htop wget
-        rclone age zstd
+        rclone age zstd git-lfs
     )
 
     for package in "${packages[@]}"; do
@@ -251,6 +251,7 @@ PIXI_TOOLS=(
     bat:bat eza:eza ripgrep:rg fd-find:fd zoxide:zoxide dust:dust procs:procs
     helix:hx lazygit:lazygit yazi:yazi broot:broot just:just
     watchexec:watchexec hyperfine:hyperfine tokei:tokei starship:starship socat:socat glab:glab
+    git-lfs:git-lfs
 )
 # nosudo has no apt and no shared uv, so pixi also provides these there.
 NOSUDO_PIXI_TOOLS=(fish:fish nodejs:node git:git uv:uv age:age zstd:zstd)
