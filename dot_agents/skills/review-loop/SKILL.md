@@ -22,15 +22,17 @@ Run this only once the feature mostly works and relevant tests pass.
 2. Rule on each finding before touching code, as `AGENTS.md` "Validating a claim" says: valid, partially valid, or invalid. A finding that repeats an earlier ruling without new evidence stays ruled.
 3. Fix the valid blocker and major findings that are in scope, each with a test that failed first. When a valid finding is a race or a flaky test, the same fix adds or updates its lesson in the repo book's "Coding gotchas" chapter (`AGENTS.md`, "The book"). Record minor findings and out-of-scope suggestions for the next milestone's plan; do not fix them now. Simplification ideas are advisory.
 4. Run the relevant tests under a sized `timeout`.
-5. Start the next pass with a new reviewer, not a reused one.
+5. Send the next pass to the same reviewer thread: the new commit range and its own open findings. It re-checks each open finding as well as the new diff, so it does not re-read the code from scratch. Under the Charter, pass 1 uses a free-tier reviewer and a paid reviewer from another family follows when the Charter calls for one; that is a second reviewer thread, kept the same way.
 
 **Stop** at the earliest of:
 
-- the pass budget: up to 10 passes for code, scaled to the size of the change, and four for a design doc, counted per milestone or document across every run of this skill (read the earlier records). Starting the skill again does not reset the count;
+- the pass budget: 3 passes for code and 2 rounds for a design doc by default, counted per milestone or document across every run of this skill (read the earlier records). Starting the skill again does not reset the count. If serious findings remain and more passes would help, ask me (under BB, `bb sgc ask`): what remains, and how many more passes. Go on only with my yes;
 - a pass with no new valid blocker or major finding;
 - a pass whose only findings repeat earlier rulings.
 
-At pass 6, check that the findings converge before you start pass 7. A fix made after the last pass gets a pass of its own.
+Under the Charter, neither of the last two stops the loop before a required paid review: only the paid reviewer's pass can end it.
+
+A fix made after the last pass gets a narrow pass of its own that checks only that fix.
 
 If a serious finding is still open at the budget, stop and report it with your ruling. Do not start another pass.
 
