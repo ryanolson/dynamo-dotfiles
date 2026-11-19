@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# No --ignore-scripts: opencode-ai gets its platform binary from optional dependencies and its
+# postinstall, so skipping either leaves a launcher with nothing to run.
+export NPM_CONFIG_PREFIX="${NPM_CONFIG_PREFIX:-$HOME/.npm-global}"
+exec npm install -g --include=optional opencode-ai@latest

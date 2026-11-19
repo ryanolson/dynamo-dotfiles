@@ -293,19 +293,24 @@ API keys and tokens are managed via 1Password CLI (`op`) with on-demand injectio
 - `openv <cmd...>` asks `fleet secret get` for each reference on an enrolled machine. `fleet` asks the local `pylon` cache, then the fleet broker. If any value fails, or the machine is not enrolled, `openv` runs `op run --env-file ~/.config/dynamo/dev.env.fleet` instead. A command never gets values from both.
 - `fleet secret flush` empties the `pylon` cache, for example after a rotation in 1Password. On the admin laptop, `fleet secret flush --all` empties it on every enrolled machine through actl (`fleet task secrets-flush --all`; see Fleet tasks through actl).
 - `openv-file <env-file> <cmd...>` does the same for an alternate env-reference file
-- `wcie-codex [args...]` runs `codex -p wcie`, which layers `~/.codex/wcie.config.toml` over the base Codex config. The profile sends requests to OpenRouter. OpenRouter serves Kimi K3 from the NVIDIA endpoint, and GPT-6 Astra from OpenAI. The profile also sends the side work that Codex gives to Luna and Terra (reviews, memories, subagents) to K3. `wcie-codex` sets `OPENROUTER_API_KEY` from `op://Fleet/OpenRouter-WCIE-Limited/credential`: `fleet secret get` first, then `op read` when the machine is not enrolled or the broker fails. The key reaches only the codex process.
-  - On each run, `wcie-codex` writes a model catalog to `~/.cache/wcie-codex/models.json` from `codex debug models` and gives it to codex. The `/model` picker then lists K3 and Astra 6. K3 has the reasoning efforts low to max, and the default is max. K3's context window is 1,048,576 tokens, the window every OpenRouter endpoint serves; codex's default for a model it does not know is 272,000. Codex and bb can change the effort. If `codex debug models` fails, `wcie-codex` uses the last catalog.
-  - `wcie-codex app-server` gives the profile to codex as `-c` overrides, because codex does not accept `--profile` for `app-server`. ACP adapters use this mode through `CODEX_PATH`. This mode reads `~/.codex/wcie.profile.json`, which chezmoi renders from the source profile, so a hand edit to `~/.codex/wcie.config.toml` changes the TUI but not this mode. Codex gives `-c` overrides priority over a repository's `.codex/config.toml`, so in this mode the profile wins over repository settings. With `-p`, the repository settings win.
-  - bb shows the profile as the agent "Codex (WCIE)" (provider `acp-wcie`). The entry is bb server state, not a file in this repository. To add it to a bb server, run this command once in bash:
+- `openrouter-key` prints the OpenRouter key from `op://Fleet/OpenRouter-WCIE-Limited/credential`: `fleet secret get` first, then `op read` when the machine is not enrolled or the broker fails. `openrouter-key CMD [ARGS...]` runs `CMD` with only `OPENROUTER_API_KEY` added. Unlike `openv`, no other fleet secret reaches the command.
+  - OpenCode and Pi serve the OpenRouter models. They replace the WCIE Codex profile, which is gone. The models are `moonshotai/kimi-k3.1-pro`, `deepseek/deepseek-v4.1-flash-1017` and `z-ai/glm-5.3`. Each has a 1,048,576-token context window and `reasoning.effort` levels from OpenRouter's model list: Kimi K3.1 Pro `none`, `low`, `high`, `max` (default `max`); DeepSeek V4.1 Flash `none`, `low`, `high`, `max` (default `high`); GLM 5.3 `low`, `high`, `max` (default `max`; its reasoning cannot be turned off). OpenRouter has no `medium` or `xhigh` for them. Requests are pinned to the `nvidia` provider with no fallbacks, because the key is a BYOK key for that endpoint.
+  - OpenCode reads `~/.config/opencode/opencode.jsonc` (`dot_config/opencode/`). It enables only the `openrouter` provider and lists only the three models, with the efforts as variants. It takes the key from `OPENROUTER_API_KEY`. Run it as `openrouter-key opencode`.
+  - Pi reads `~/.pi/agent/models.json` (`dot_pi/agent/models.json.tmpl`). It adds the provider `wcie` with the same models. Its `apiKey` is `!<home>/.local/bin/openrouter-key`, which Pi runs on each request, so no environment setup is needed and Pi finds the key through the absolute path. Pi's `/thinking` levels map to the OpenRouter efforts; `minimal`, `medium` and `xhigh` are off. Pi writes `settings.json` itself, so chezmoi does not manage it.
+  - bb shows OpenCode as "OpenCode" (provider `acp-opencode`) and Pi as `pi`. The OpenCode entry is bb server state, not a file in this repository. It replaces the OpenCode that bb finds on its own, so every host runs it through `openrouter-key`. The launch command must end in `acp`: bb starts a thread in `accept-edits` mode only then. To add the entry, run this command once in bash. It keeps the other custom agents:
 
     ```bash
-    bb plugin config provider-acp set customAgents "$(cat <<'EOF'
-    [{"id":"wcie","displayName":"Codex (WCIE)","command":"sh","args":["-c","p=$(\"${SHELL:-/bin/sh}\" -lc env 2>/dev/null | sed -n 's/^PATH=//p' | head -n 1); export PATH=\"${p:+$p:}$PATH\"; exec npx -y @agentclientprotocol/codex-acp@2.2.2"],"env":{"CODEX_PATH":"wcie-codex","npm_config_omit":"optional"},"supportsManualCompaction":true}]
-    EOF
-    )"
+    bb plugin config provider-acp --json | python3 -c '
+    import json, subprocess, sys
+    current = json.load(sys.stdin)["values"]["customAgents"]
+    agents = [a for a in json.loads(current or "[]") if a["id"] != "opencode"]
+    script = """p=$("${SHELL:-/bin/sh}" -lc env 2>/dev/null | sed -n '"'"'s/^PATH=//p'"'"' | head -n 1); export PATH="${p:+$p:}$PATH"; exec openrouter-key opencode "$@\""""
+    agents.append({"id": "opencode", "displayName": "OpenCode", "command": "sh", "args": ["-c", script, "sh", "acp"], "dialect": "opencode", "supportsManualCompaction": True})
+    subprocess.run(["bb", "plugin", "config", "provider-acp", "set", "customAgents", json.dumps(agents)], check=True)
+    '
     ```
 
-    bb finds models with the environment of the host daemon. That `PATH` does not have `~/.local/bin`, and on macOS it does not have Homebrew. The `sh -c` wrapper takes `PATH` from the login shell of the user, so it finds `npx`, `wcie-codex`, and `codex`. `npm_config_omit=optional` stops npx from installing the codex binary that the adapter bundles, so the adapter runs the installed codex.
+    The `sh -c` wrapper takes `PATH` from the login shell, because the `PATH` of the bb host daemon does not have `~/.local/bin`. `bb provider models acp-opencode --selected-model openrouter/<model> --json` shows the efforts of one model. bb caches the model list, so a host may show old OpenCode models until the catalog refreshes.
 - No service-account token is stored in `chezmoi` config or auto-exported into every shell
 
 **SSH Agent (1Password):**
@@ -571,7 +576,7 @@ timeout 300 python3 test/test-k8s-guard.py </dev/null
 
 `agy-acp` runs the server for bb. The server chooses the starting model of a session and has no setting for it. After each `session/new`, `agy-acp` sends `session/set_model`, so a new session starts on `gemini-4-argon-high`. bb can still choose another model. If the server rejects the model or does not answer in 10 seconds, the session keeps the server default. All other messages pass through unchanged. `AGY_ACP_DEFAULT_MODEL` selects another model, and an empty value turns the default off.
 
-bb shows the agent as "Antigravity" (provider `acp-antigravity`). As with WCIE, the entry is bb server state, not a file in this repository. The `customAgents` setting holds every custom agent, and `set` replaces the whole list. This command adds or replaces the `antigravity` entry and keeps the other entries:
+bb shows the agent as "Antigravity" (provider `acp-antigravity`). The entry is bb server state, not a file in this repository. The `customAgents` setting holds every custom agent, and `set` replaces the whole list. This command adds or replaces the `antigravity` entry and keeps the other entries:
 
 ```bash
 bb plugin config provider-acp --json | python3 -c '
@@ -584,7 +589,7 @@ subprocess.run(["bb", "plugin", "config", "provider-acp", "set", "customAgents",
 '
 ```
 
-The `sh -c` wrapper takes `PATH` from the login shell, for the reason given for WCIE: the `PATH` of the bb host daemon does not have `~/.local/bin`.
+The `sh -c` wrapper takes `PATH` from the login shell, because the `PATH` of the bb host daemon does not have `~/.local/bin`.
 
 Run `agy-acp login` once on each machine to sign the server in with Google. The server prints a link and waits about five minutes. Open the link and sign in with the Google account that has the Antigravity plan. On a machine without a browser, open the link on another computer. The browser then goes to a `http://127.0.0.1:<port>/?code=...` page that fails to load. Copy that full URL and run `curl -s '<URL>'` on the machine that waits, for example `ssh spark-p "curl -s '<URL>'"`. If `agy` is already signed in on the machine, the server uses that sign-in and needs no link (checked on macOS). The sign-in of the server does not sign in `agy` (checked on spark-p and spark-d): start `agy` to sign in the CLI.
 
@@ -805,6 +810,7 @@ broot               # interactive tree view
 ```bash
 iou_claude
 iou_codex
+iou_opencode
 iou_antigravity
 iou_antigravity_acp
 iou_cursor
@@ -814,7 +820,7 @@ iou_relay
 iou_q
 ```
 
-Claude, Cursor, and Devin use their native installers and update commands. `iou_devin` installs the Devin CLI when `devin` is missing, then runs `devin update`. Antigravity uses its native installer and replaces `agy` after installation succeeds. Codex and Pi use npm and preserve `NPM_CONFIG_PREFIX`, with `~/.npm-global` as the default. On sudo machines, `~/.npmrc` also sets `prefix` to `~/.npm-global`, so a service that runs npm without the shell environment, such as the bb host daemon, updates the same copy. chezmoi changes only the `prefix` line. Pi requires Node.js 22.19 or newer. Cursor refers to Cursor Agent CLI. Pi refers to the coding agent from [pi.dev](https://pi.dev).
+Claude, Cursor, and Devin use their native installers and update commands. `iou_devin` installs the Devin CLI when `devin` is missing, then runs `devin update`. Antigravity uses its native installer and replaces `agy` after installation succeeds. Codex, OpenCode, and Pi use npm and preserve `NPM_CONFIG_PREFIX`, with `~/.npm-global` as the default. On sudo machines, `~/.npmrc` also sets `prefix` to `~/.npm-global`, so a service that runs npm without the shell environment, such as the bb host daemon, updates the same copy. chezmoi changes only the `prefix` line. `iou_opencode` installs `opencode-ai` without `--ignore-scripts`, because the platform binary comes from an optional dependency. Pi requires Node.js 22.19 or newer. Cursor refers to Cursor Agent CLI. Pi refers to the coding agent from [pi.dev](https://pi.dev).
 
 `iou_antigravity_acp` installs the Antigravity server that bb runs. See [Antigravity in bb](#antigravity-in-bb).
 

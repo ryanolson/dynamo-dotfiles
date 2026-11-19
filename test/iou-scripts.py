@@ -106,7 +106,8 @@ fi""")
 
     def test_npm_prefix_and_errors(self):
         self.stub('npm', 'printf "%s|%s\\n" "$NPM_CONFIG_PREFIX" "$*"; exit "${FAIL:-0}"')
-        for name, package in [('codex', '@openai/codex'), ('pi', '@earendil-works/pi-coding-agent')]:
+        for name, package in [('codex', '@openai/codex'), ('pi', '@earendil-works/pi-coding-agent'),
+                              ('opencode', 'opencode-ai')]:
             with self.subTest(name=name):
                 self.env.pop('NPM_CONFIG_PREFIX', None)
                 result = self.run_helper(name)
@@ -118,6 +119,13 @@ fi""")
                 self.env['FAIL'] = '17'
                 self.assertEqual(self.run_helper(name).returncode, 17)
                 del self.env['FAIL']
+
+    def test_opencode_keeps_install_scripts_and_optional_dependencies(self):
+        # opencode-ai gets its platform binary from an optional dependency and its postinstall.
+        self.stub('npm', 'printf "%s\\n" "$*"')
+        out = self.run_helper('opencode').stdout
+        self.assertNotIn('--ignore-scripts', out)
+        self.assertIn('--include=optional', out)
 
     def test_native_install_download_failure_and_update(self):
         for name, command in [('claude', 'claude'), ('cursor', 'cursor-agent')]:

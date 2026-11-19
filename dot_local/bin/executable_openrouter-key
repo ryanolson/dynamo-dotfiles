@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Print the OpenRouter key, or run a command with it in OPENROUTER_API_KEY.
+
+    openrouter-key                 print the key (for pi's models.json "!command" apiKey)
+    openrouter-key CMD [ARGS...]   exec CMD with OPENROUTER_API_KEY set, and nothing else added
+
+The key comes from the fleet broker first, as openv does, and from op when the machine is not
+enrolled or the broker fails. Unlike openv, no other fleet secret reaches the command.
+"""
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+REF = "op://Fleet/OpenRouter-WCIE-Limited/credential"
+
+
+def die(message):
+    print(f"openrouter-key: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def read_key():
+    home = Path.home()
+    state = Path(os.environ.get("XDG_STATE_HOME") or home / ".local/state") / "fleet"
+    sources = []
+    fleet = shutil.which("fleet") or str(home / ".local/bin/fleet")
+    if os.access(fleet, os.X_OK) and (state / "node.crt").is_file():
+        sources.append([fleet, "secret", "get", REF])
+    if shutil.which("op"):
+        sources.append(["op", "read", REF])
+    for command in sources:
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    die(f"could not read {REF} from the fleet broker or 1Password (op)")
+
+
+def main(argv):
+    key = read_key()
+    if not argv:
+        print(key)
+        return
+    env = dict(os.environ, OPENROUTER_API_KEY=key)
+    # Resolve against PATH here, so a missing command is one clear error.
+    exe = shutil.which(argv[0])
+    if exe is None:
+        die(f"no {argv[0]} on PATH")
+    os.execve(exe, argv, env)
+
+
+main(sys.argv[1:])

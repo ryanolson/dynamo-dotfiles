@@ -1,0 +1,191 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "enabled_providers": [
+    "openrouter"
+  ],
+  "provider": {
+    "openrouter": {
+      "name": "OpenRouter (WCIE)",
+      "whitelist": [
+        "moonshotai/kimi-k3.1-pro",
+        "deepseek/deepseek-v4.1-flash-1017",
+        "z-ai/glm-5.3"
+      ],
+      "options": {
+        "extraBody": {
+          "provider": {
+            "only": [
+              "nvidia"
+            ],
+            "allow_fallbacks": false
+          }
+        }
+      },
+      "models": {
+        "moonshotai/kimi-k3.1-pro": {
+          "name": "Kimi K3.1 Pro",
+          "reasoning": true,
+          "tool_call": true,
+          "attachment": true,
+          "limit": {
+            "context": 1048576,
+            "output": 131072
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "video"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "options": {
+            "reasoning": {
+              "effort": "max"
+            }
+          },
+          "variants": {
+            "none": {
+              "reasoning": {
+                "effort": "none"
+              }
+            },
+            "low": {
+              "reasoning": {
+                "effort": "low"
+              }
+            },
+            "high": {
+              "reasoning": {
+                "effort": "high"
+              }
+            },
+            "max": {
+              "reasoning": {
+                "effort": "max"
+              }
+            },
+            "minimal": {
+              "disabled": true
+            },
+            "medium": {
+              "disabled": true
+            },
+            "xhigh": {
+              "disabled": true
+            }
+          }
+        },
+        "deepseek/deepseek-v4.1-flash-1017": {
+          "name": "DeepSeek V4.1 Flash (1017)",
+          "reasoning": true,
+          "tool_call": true,
+          "attachment": true,
+          "limit": {
+            "context": 1048576,
+            "output": 131072
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "options": {
+            "reasoning": {
+              "effort": "high"
+            }
+          },
+          "variants": {
+            "none": {
+              "reasoning": {
+                "effort": "none"
+              }
+            },
+            "low": {
+              "reasoning": {
+                "effort": "low"
+              }
+            },
+            "high": {
+              "reasoning": {
+                "effort": "high"
+              }
+            },
+            "max": {
+              "reasoning": {
+                "effort": "max"
+              }
+            },
+            "minimal": {
+              "disabled": true
+            },
+            "medium": {
+              "disabled": true
+            },
+            "xhigh": {
+              "disabled": true
+            }
+          }
+        },
+        "z-ai/glm-5.3": {
+          "name": "GLM 5.3",
+          "reasoning": true,
+          "tool_call": true,
+          "attachment": false,
+          "limit": {
+            "context": 1048576,
+            "output": 131072
+          },
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "options": {
+            "reasoning": {
+              "effort": "max"
+            }
+          },
+          "variants": {
+            "low": {
+              "reasoning": {
+                "effort": "low"
+              }
+            },
+            "high": {
+              "reasoning": {
+                "effort": "high"
+              }
+            },
+            "max": {
+              "reasoning": {
+                "effort": "max"
+              }
+            },
+            "none": {
+              "disabled": true
+            },
+            "minimal": {
+              "disabled": true
+            },
+            "medium": {
+              "disabled": true
+            },
+            "xhigh": {
+              "disabled": true
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -57,3 +57,10 @@
 .agents/skills/full-code-review
 .agents/skills/thermo-nuclear-code-quality-review
 .agents/skills/wills-mega-review
+
+# The WCIE Codex profile moved to OpenCode and Pi (openrouter-key, ~/.config/opencode, ~/.pi/agent)
+# on 2026-11-19. The cache is the model catalog that wcie-codex wrote.
+.local/bin/wcie-codex
+.codex/wcie.config.toml
+.codex/wcie.profile.json
+.cache/wcie-codex
