@@ -4,7 +4,7 @@ This guide serves Claude, Codex, and q. It describes capabilities provided by th
 
 ## Discover before use
 
-Read this guide once per session. For the current task, read the relevant skill and command help. Use `command -v <name>` to check an executable on the host that will run it. Installed files and PATH entries do not establish authentication or service connectivity.
+Read the section that applies to the current task. Read the relevant skill and command help. Use `command -v <name>` to check an executable on the host that will run it. Installed files and PATH entries do not establish authentication or service connectivity.
 
 Shell aliases and Fish functions are not portable commands. Prefer the executable forms below in agent shells. Do not install or upgrade a missing tool merely to inspect its documentation. Report missing prerequisites when they block the task.
 
@@ -38,9 +38,17 @@ Fish provides convenience functions such as `cc`, `cx`, `ws`, `wnew`, `wrm`, `wc
 
 The `nosudo` machine class excludes `wt`, `agent-spawn`, `agent-status`, and the related Fish shortcuts. Shared instructions and skills still deploy. No-sudo installations can use architecture-specific directories under `~/.local/<arch>/`; do not hardcode one machine's PATH into another.
 
+## Prompting and effort
+
+Keep shared startup instructions for rules that must apply across tasks. Put procedures in the workflow guide, skills, or repository docs. In task briefs, state the outcome, constraints, completion criteria, and evidence needed. Match effort to the difficulty of the task. Use a lower effort for routine work when it meets the criteria.
+
+- [Claude Fable 5.2](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-fable-5-2) covers completion, approval boundaries, and delegation.
+- [Claude Opus 5.5](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-opus-5-5) covers effort calibration and unattended work.
+- [GPT-6.2 Astra and Sol](https://learn.chatgpt.com/guides/prompting-gpt-6-2-astra) covers effort, acceptance criteria, and lean agent files.
+
 ## Model routing
 
-Updated: 2026-11-11. `AGENTS.md` names tiers; this table maps them to models. A model the user names wins. A row more than four weeks old is stale: say so when you use it. The recurring agent instructions review in the source repository (`agent-docs/agent-instructions-review.md`) refreshes this table.
+Updated: 2026-11-11. `WORKFLOWS.md` names tiers; this table maps them to models. A model the user names wins. A row more than four weeks old is stale: say so when you use it. The recurring agent instructions review in the source repository (`agent-docs/agent-instructions-review.md`) refreshes this table.
 
 | Tier | Model | Provider | Effort | Evidence |
 |---|---|---|---|---|
@@ -52,7 +60,7 @@ Updated: 2026-11-11. `AGENTS.md` names tiers; this table maps them to models. A 
 | Implementer when Claude capacity runs out | Codex | codex, as a bb thread | high | Owner, 2026-10-18. |
 
 - Effort is the control for how much a Claude model thinks; an instruction to think less does not work on Fable 5.2. To make a step cheaper or faster, lower its effort. The vendor guides start Fable 5.2 at `high` and Opus 5.5 at `medium`, and keep `xhigh` and `max` for work where a gain was measured. No effort level has been compared on our own tasks yet. Until one is, use the table's levels, and do not raise one without a measurement.
-- A Fable 5.2 thread can stop with a refusal that names a category (`cyber`, `bio`, `frontier_llm`, `reasoning_extraction`). Do not reword the request to get past it. Report the category, and run that step on another model in this table. Do not ask a model to write out its reasoning in a reply: that request is itself refused. Ask for a short explanation of the answer instead.
+- A Fable 5.2 thread can stop with a refusal that names a category (`cyber`, `bio`, `frontier_llm`, `reasoning_extraction`). Report the category and continue any permitted work. Ask for a short explanation of the answer.
 - A change to an instruction file, a skill, or a memory reaches new sessions only. Start a fresh thread to check one.
 - Implementer choice for concurrency-heavy Rust follows the owner's private bake-off of 2026-10-24. Ask before routing that work to a model the table does not name.
 - `phone-a-friend` has no Codex backend. Reach Codex through a bb thread, or the Codex plugin outside bb.
@@ -122,6 +130,7 @@ Discover the active dotfiles source with `chezmoi source-path`. Resolve symlinks
 | Installed surface | Editable source or owner |
 |---|---|
 | `~/.agents/AGENTS.md`, `~/.agents/ENVIRONMENT.md` | `dot_agents/AGENTS.md`, `dot_agents/ENVIRONMENT.md` in the chezmoi repository |
+| `~/.agents/WORKFLOWS.md` | `dot_agents/WORKFLOWS.md` in the chezmoi repository |
 | Rostered `~/.agents/skills/<name>/` | `dot_agents/skills/<name>/`; roster in `.chezmoidata/agent_skills.yaml` |
 | `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, rostered agent-home skill links | `run_onchange_after_link-agent-scaffold.sh.tmpl` creates links to the deployed `~/.agents` tree |
 | The `attribution` key in `~/.claude/settings.json` | `dot_claude/modify_private_settings.json`; Claude Code owns every other key |

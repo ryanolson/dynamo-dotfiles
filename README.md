@@ -116,6 +116,7 @@ One set of instructions and skills, used by both Claude Code and Codex.
 
 ```
 ~/.agents/AGENTS.md              global instructions
+~/.agents/WORKFLOWS.md           on-demand procedures for tests, reviews, and delivery
 ~/.agents/ENVIRONMENT.md         capabilities, discovery, and source-update procedures
 ~/.agents/skills/<name>/SKILL.md a skill
               .../agents/openai.yaml   Codex UI metadata (display name, default prompt)
@@ -184,13 +185,13 @@ timeout 300 python3 test/agent-mcp.py
 
 chezmoi sets one key in `~/.claude/settings.json`: an empty `attribution`, so Claude Code adds no `Co-Authored-By` trailer or PR attribution line. Claude Code owns the rest of that file.
 
-Both agents are instructed to read [the environment guide](dot_agents/ENVIRONMENT.md) once per session. It maps tasks to tools, separates source ownership, and requires validation, scoped apply, commit, and push. Shared changes must work in both agents. See [the evaluation protocol](agent-docs/environment-evaluation.md) for behavioral checks.
+The global instructions point both agents to [workflow procedures](dot_agents/WORKFLOWS.md) and the [environment guide](dot_agents/ENVIRONMENT.md). Agents read the sections their task needs. Shared changes must work in both agents. See [the evaluation protocol](agent-docs/environment-evaluation.md) for behavioral checks.
 
 Verify a machine after the intended scoped apply:
 
 ```bash
 ls -la ~/.claude/skills ~/.codex/skills   # symlinks into ~/.agents/skills
-chezmoi status ~/.agents/AGENTS.md ~/.agents/ENVIRONMENT.md ~/.agents/skills
+chezmoi status ~/.agents/AGENTS.md ~/.agents/WORKFLOWS.md ~/.agents/ENVIRONMENT.md ~/.agents/skills
 # Start fresh sessions in both agents and follow the evaluation protocol.
 ```
 
