@@ -12,6 +12,14 @@ Sort ordered map output or use an ordered collection. Compare sets as sets. Run 
 
 Use plain language and keep Markdown paragraphs and list items on single lines. Use `file_path:line_number` references and diagrams for multi-component behavior. Skip emojis. End the work with the branch and HEAD, commit and push result, merge and mirror result, review passes and record, and open decisions. Report token use when the tool shows it.
 
+### Long Codex workstreams
+
+Keep one thread per outcome. State the outcome, constraints, and completion criteria up front. Keep decisions and evidence in the project's usual records so you can recover details after compaction.
+
+Let Codex compact automatically. If a long thread still serves the same outcome, use `/compact` in Codex or `bb thread compact <id>` when the BB thread is idle. Start a separate thread for independent work.
+
+See [OpenAI's Codex best practices](https://learn.chatgpt.com/guides/best-practices#organize-long-running-chats).
+
 ## Validating a claim
 
 **Write the test first, then rule, then fix.** This applies to review findings, bug reports, hypotheses about behavior, and "I think X is broken" of any kind. A claim confirmed by reading code is an opinion; a claim confirmed by a failing test is a fact, and the same test proves the fix.
