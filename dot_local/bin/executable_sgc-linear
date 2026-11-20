@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""sgc-linear: a small Linear client for agents that have no Linear MCP (Pi, OpenCode).
+
+The key comes from the fleet secret store at run time and never touches disk:
+when LINEAR_API_KEY is unset, the script re-runs itself under
+`fleet secret env LINEAR_API_KEY=<ref> -- ...`. It never prints the key.
+
+  sgc-linear issue STRGT-123 [--comments]
+  sgc-linear issues [--project NAME] [--state NAME] [--label NAME] [--limit N]
+  sgc-linear comment STRGT-123 --body-file FILE|-
+  sgc-linear update STRGT-123 [--state NAME] [--add-label NAME]... [--remove-label NAME]...
+  sgc-linear gql --file FILE|- [--vars JSON]      (any other read or write)
+
+Output is JSON. Exit 1 on an API error, with the error on stderr.
+"""
+import argparse, json, os, sys, urllib.request
+
+REF = "op://Fleet/Linear Stargate Command/credential"
+TEAM = "STRGT"
+
+
+def ensure_key():
+    if os.environ.get("LINEAR_API_KEY"):
+        return
+    if os.environ.get("SGC_LINEAR_REEXEC"):
+        sys.exit("sgc-linear: no LINEAR_API_KEY after fleet secret env")
+    os.environ["SGC_LINEAR_REEXEC"] = "1"
+    os.execvp("fleet", ["fleet", "secret", "env", f"LINEAR_API_KEY={REF}", "--", sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
+
+
+def gql(query, variables=None):
+    req = urllib.request.Request(
+        "https://api.linear.app/graphql",
+        data=json.dumps({"query": query, "variables": variables or {}}).encode(),
+        headers={"Authorization": os.environ["LINEAR_API_KEY"], "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            out = json.load(r)
+    except urllib.error.HTTPError as e:
+        sys.exit(f"sgc-linear: HTTP {e.code}: {e.read()[:500].decode(errors='replace')}")
+    if out.get("errors"):
+        sys.exit("sgc-linear: " + json.dumps(out["errors"])[:800])
+    return out["data"]
+
+
+def read_text(path):
+    return sys.stdin.read() if path == "-" else open(path).read()
+
+
+def issue_id(ident):
+    d = gql("query($id:String!){issue(id:$id){id team{id}}}", {"id": ident})
+    return d["issue"]
+
+
+def team_lookup(team_id, kind, name):
+    field = {"state": "states", "label": "labels"}[kind]
+    d = gql("query($t:String!){team(id:$t){%s(first:250){nodes{id name}}}}" % field, {"t": team_id})
+    for n in d["team"][field]["nodes"]:
+        if n["name"].lower() == name.lower():
+            return n["id"]
+    if kind == "label":  # workspace labels
+        d = gql("query($n:String!){issueLabels(filter:{name:{eqIgnoreCase:$n}}){nodes{id}}}", {"n": name})
+        if d["issueLabels"]["nodes"]:
+            return d["issueLabels"]["nodes"][0]["id"]
+    sys.exit(f"sgc-linear: no {kind} named {name!r}")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="sgc-linear", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    a = sub.add_parser("issue"); a.add_argument("id"); a.add_argument("--comments", action="store_true")
+    a = sub.add_parser("issues"); a.add_argument("--project"); a.add_argument("--state"); a.add_argument("--label"); a.add_argument("--limit", type=int, default=50)
+    a = sub.add_parser("comment"); a.add_argument("id"); a.add_argument("--body-file", required=True)
+    a = sub.add_parser("update"); a.add_argument("id"); a.add_argument("--state"); a.add_argument("--add-label", action="append", default=[]); a.add_argument("--remove-label", action="append", default=[])
+    a = sub.add_parser("gql"); a.add_argument("--file", required=True); a.add_argument("--vars", default="{}")
+    args = p.parse_args()
+    ensure_key()
+
+    if args.cmd == "issue":
+        extra = " comments(first:100){nodes{body createdAt user{name}}}" if args.comments else ""
+        d = gql("query($id:String!){issue(id:$id){identifier title url description estimate priority state{name type} project{name status{name}} labels{nodes{name}} attachments{nodes{url title}}%s}}" % extra, {"id": args.id})
+        out = d["issue"]
+    elif args.cmd == "issues":
+        f = {"team": {"key": {"eq": TEAM}}}
+        if args.project: f["project"] = {"name": {"eqIgnoreCase": args.project}}
+        if args.state: f["state"] = {"name": {"eqIgnoreCase": args.state}}
+        if args.label: f["labels"] = {"some": {"name": {"eqIgnoreCase": args.label}}}
+        d = gql("query($f:IssueFilter,$n:Int){issues(first:$n,filter:$f){nodes{identifier title estimate priority state{name} project{name} labels{nodes{name}} updatedAt}}}", {"f": f, "n": args.limit})
+        out = d["issues"]["nodes"]
+    elif args.cmd == "comment":
+        iss = issue_id(args.id)
+        out = gql("mutation($i:String!,$b:String!){commentCreate(input:{issueId:$i,body:$b}){success comment{id}}}", {"i": iss["id"], "b": read_text(args.body_file)})["commentCreate"]
+    elif args.cmd == "update":
+        iss = issue_id(args.id)
+        inp = {}
+        if args.state: inp["stateId"] = team_lookup(iss["team"]["id"], "state", args.state)
+        if args.add_label: inp["addedLabelIds"] = [team_lookup(iss["team"]["id"], "label", n) for n in args.add_label]
+        if args.remove_label: inp["removedLabelIds"] = [team_lookup(iss["team"]["id"], "label", n) for n in args.remove_label]
+        if not inp: sys.exit("sgc-linear: nothing to update")
+        out = gql("mutation($id:String!,$in:IssueUpdateInput!){issueUpdate(id:$id,input:$in){success issue{identifier state{name} labels{nodes{name}}}}}", {"id": iss["id"], "in": inp})["issueUpdate"]
+    else:
+        out = gql(read_text(args.file), json.loads(args.vars))
+    json.dump(out, sys.stdout, indent=1)
+    print()
+
+
+if __name__ == "__main__":
+    main()
