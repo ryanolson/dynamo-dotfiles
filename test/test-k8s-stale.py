@@ -211,6 +211,13 @@ class Rules(unittest.TestCase):
         self.assertEqual(found[0]['age_hours'], 3.0)
         self.assertNotIn('30.0 days', found[0]['reason'])
 
+    def test_dgd_state_age_uses_the_newest_of_several_condition_changes(self):
+        d = dgd('team-a', 'g1', 'failed', age=ago(days=60))
+        d['status']['conditions'] = [{'type': 'Available', 'lastTransitionTime': ago(days=30)},
+                                     {'type': 'Ready', 'lastTransitionTime': ago(hours=3)},
+                                     {'type': 'Junk', 'lastTransitionTime': 'not a time'}]
+        self.assertEqual(rules.analyze([], [d], {}, NOW)[0]['age_hours'], 3.0)
+
     def test_dgd_failure_without_a_transition_time_says_it_counts_from_creation(self):
         found = rules.analyze([], [dgd('team-a', 'g1', 'failed', age=ago(days=30))], {}, NOW)
         self.assertEqual(found[0]['age_hours'], 720.0)
