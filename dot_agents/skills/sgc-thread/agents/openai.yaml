@@ -1,0 +1,4 @@
+interface:
+  display_name: "SGC thread"
+  short_description: "Start and run a Stargate Command thread"
+  default_prompt: "This is an SGC thread. Use $sgc-thread to start."
