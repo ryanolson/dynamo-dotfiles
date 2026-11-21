@@ -15,12 +15,15 @@ profile or the wrong kubeconfig never reach a cluster. Every kubectl call is a
 read, and carries the bot's kubeconfig and the profile's context explicitly.
 """
 import argparse
+import base64
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import ssl
 import subprocess
 import sys
+import tempfile
 
 # -I drops the script directory from sys.path; the shared parser lives next to this script.
 sys.dont_write_bytecode = True  # keep the deployed skill directory clean
@@ -36,6 +39,8 @@ DEVELOPER_LABEL = 'dynamo.nvidia.com/developer'
 KUBECTL_TIMEOUT = 60
 # The ops team's GPU reaper runs its pods in this namespace on every cluster that has it.
 REAPER_NAMESPACE = 'gpu-reaper'
+# Some Dynamo dev clusters do not serve the SelfSubjectReview API, so `auth whoami` cannot name the caller.
+WHOAMI_NOT_SERVED = 'the selfsubjectreviews API is not enabled'
 
 
 class Refusal(ProfileError):
@@ -76,6 +81,29 @@ class Kubectl:
             return json.loads(out)
         except json.JSONDecodeError:
             raise KubectlError(args, 0, 'output is not JSON')
+
+    def certificate_name(self):
+        """The common name of the client certificate in the sealed, rendered kubeconfig.
+
+        This is the credential every call of this check presents, so it names the caller without
+        a cluster call. It reads the sealed copy, never a file on disk.
+        """
+        try:
+            rendered = json.loads(os.pread(self.fd, os.fstat(self.fd).st_size, 0))
+            data = rendered['users'][0]['user']['client-certificate-data']
+            pem = base64.b64decode(data, validate=True).decode('ascii')
+            with tempfile.NamedTemporaryFile('w', suffix='.pem') as f:  # a public certificate; mode 600
+                f.write(pem)
+                f.flush()
+                # The structured subject: unlike text output, a value cannot fake another field.
+                subject = ssl._ssl._test_decode_cert(f.name)['subject']
+        except (KeyError, IndexError, TypeError, ValueError, OSError, AttributeError, ssl.SSLError) as e:
+            raise Refusal('identity_unreadable', f'the rendered kubeconfig holds no readable client certificate '
+                                                 f'({type(e).__name__}); stop')
+        names = [value for rdn in subject for key, value in rdn if key == 'commonName']
+        if len(names) != 1:
+            raise Refusal('identity_unreadable', f'the client certificate has {len(names)} common names, not one; stop')
+        return names[0]
 
     def can_i(self, verb, resource, namespace=None):
         # can-i exits 0 for "yes" and 1 for "no"; anything else is an error, not an answer.
@@ -153,11 +181,18 @@ def run_check(report, profiles, cluster, want_crd):
     check_kubeconfig(bot)
     kc = Kubectl(bot['kubeconfig'], bot['kubectl_sha256'], prof['context'])
 
-    who = kc.json('auth', 'whoami', '-o', 'json')
-    user = ((who.get('status') or {}).get('userInfo') or {})
-    report['identity'] = {'username': user.get('username'), 'groups': user.get('groups', [])}
-    if user.get('username') != bot['user']:
-        raise Refusal('not_bot', f'identity is {user.get("username")!r}, not the bot {bot["user"]!r}; stop')
+    try:
+        who = kc.json('auth', 'whoami', '-o', 'json')
+        user = ((who.get('status') or {}).get('userInfo') or {})
+        username, groups, source = user.get('username'), user.get('groups', []), 'whoami'
+    except KubectlError as e:
+        # Only the one known answer falls back; any other error is still an error.
+        if WHOAMI_NOT_SERVED not in str(e):
+            raise
+        username, groups, source = kc.certificate_name(), [], 'certificate'
+    report['identity'] = {'username': username, 'groups': groups, 'source': source}
+    if username != bot['user']:
+        raise Refusal('not_bot', f'identity is {username!r}, not the bot {bot["user"]!r}; stop')
 
     ns_list = kc.json('get', 'ns', '-l', f'{DEVELOPER_LABEL}={bot["developer"]}', '-o', 'json')
     ours = []
