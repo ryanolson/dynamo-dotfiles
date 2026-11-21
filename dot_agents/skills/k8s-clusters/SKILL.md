@@ -20,6 +20,25 @@ How the bot works, how to set up a host, what it can and cannot do, the pre-made
 
 One known gap, tested: the bot cannot create namespaces, so `k8s-guard ns create` fails with it. `kubectl auth whoami` is not served on these clusters, so `k8s-check` names the bot from its client certificate instead (the report says `"source": "certificate"`). To check access by hand, use `kubectl --context <ctx> get nodes`.
 
+## Find stale deployments and GPU holds
+
+```bash
+export KUBECONFIG=<bot.kubeconfig from the profiles>
+~/.agents/skills/k8s-clusters/scripts/k8s-stale --text --gpus-only      # every profile that is not `never`
+~/.agents/skills/k8s-clusters/scripts/k8s-stale <cluster> --hold-days 1 # one cluster, tighter threshold
+```
+
+It reads pods, DynamoGraphDeployments and namespaces on each cluster with the bot's kubeconfig and the pinned kubectl, and names the bot as `k8s-check` does. It changes nothing and contacts no one. It lists candidates for release, most GPU-days first, each with cluster, namespace, owner, GPUs and the reason:
+
+- `gpu_hold_old`: a namespace holds GPUs and its oldest pod is older than `--hold-days` (3).
+- `reaper_opt_out`, `reaper_opt_out_expired`: running pods opted out of the GPU reaper, and an opt-out whose expiry has passed.
+- `gpu_pod_not_ready`: a running pod holds GPUs and has not been Ready for `--unready-hours` (1).
+- `dgd_stuck`: a deployment is not in a done state after `--stuck-hours` (2).
+- `dgd_failed`: a deployment is in the failed state. Most hold no GPU; they are clutter.
+- `dgd_old`: a deployment older than `--dgd-days` (14) whose running pods hold GPUs.
+
+The API shows no GPU utilization, so a finding means "could be released", not "is idle". Only running pods count as holding GPUs. One hold can match several rules, so do not add GPU counts across findings. Ask the owner; never delete or scale someone else's work. The rules are in `scripts/k8s_stale_rules.py`.
+
 ## Threat model
 
 `k8s-check` and `k8s-guard` protect against accidental use of credentials other than the bot's: a stray kubeconfig, a kuberc, `KUBECONFIG`, a `tsh` exec plugin, a wrong path, or a file swapped by mistake. They do not protect against a malicious process running as the same Unix user, which could replace `~/.local/bin/tbot` or trace the checker. A wrapper compiled into an allowlisted path counts as replacing tbot or kubectl: out of scope, though the kubectl sha256 pin catches one installed after the pin was taken. The bot's own permissions on the server are the boundary against that.
