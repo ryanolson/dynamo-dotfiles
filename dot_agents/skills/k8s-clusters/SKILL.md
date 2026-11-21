@@ -18,7 +18,7 @@ The source of truth is the Linear document "Runbook: build and run on our Dynamo
 
 How the bot works, how to set up a host, what it can and cannot do, the pre-made namespace, the key rules, and what to do when it fails are in `references/bot.md`. Read it before you set up a host or deploy.
 
-Two known gaps, both tested: the bot cannot create namespaces, so `k8s-guard ns create` fails with it, and `kubectl auth whoami` is not served on these clusters, so `k8s-check` fails its identity step. To check access by hand, use `kubectl --context <ctx> get nodes`.
+One known gap, tested: the bot cannot create namespaces, so `k8s-guard ns create` fails with it. `kubectl auth whoami` is not served on these clusters, so `k8s-check` names the bot from its client certificate instead (the report says `"source": "certificate"`). To check access by hand, use `kubectl --context <ctx> get nodes`.
 
 ## Threat model
 
@@ -39,7 +39,7 @@ export KUBECONFIG=<bot.kubeconfig from the profiles>
 ~/.agents/skills/k8s-clusters/scripts/k8s-check <cluster> [--want-crd v1beta1]
 ```
 
-It runs the runbook's section 5 and prints JSON: the identity, `can-i` inside and outside our namespaces, two probes on a namespace name under our prefix (patch the namespace object; create a ConfigMap in it), the DGD CRD versions served, the operator images, the GPU nodes with their taints and free GPUs, our namespaces, and whether the GPU reaper runs.
+It runs the runbook's section 5 and prints JSON: the identity (from `kubectl auth whoami`; on a cluster that does not serve it, from the common name of the client certificate in the sealed kubeconfig, and any other `whoami` error still fails), `can-i` inside and outside our namespaces, two probes on a namespace name under our prefix (patch the namespace object; create a ConfigMap in it), the DGD CRD versions served, the operator images, the GPU nodes with their taints and free GPUs, our namespaces, and whether the GPU reaper runs.
 
 It exits 1, with a `failures` list of stable codes, when:
 

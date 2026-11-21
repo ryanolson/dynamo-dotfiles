@@ -44,7 +44,7 @@ Tested on the first-choice clusters:
 | Create a Deployment or a DynamoGraphDeployment in the pre-made namespace | Allowed |
 | Create anything in `default` or any other namespace | Denied |
 | Create a Namespace | Denied: `cannot create resource "namespaces" ... at the cluster scope` |
-| `kubectl auth whoami` | Fails: the cluster does not serve the SelfSubjectReview API |
+| `kubectl auth whoami` | Fails: the cluster does not serve the SelfSubjectReview API. `k8s-check` reads the name from the client certificate instead |
 | Write on clusters marked read only in the profile | Denied |
 
 The bot never installs anything cluster-scoped. Everything that writes goes through `scripts/k8s-guard` (see `k8s-guard.md`).
@@ -89,7 +89,7 @@ Images go to the owner's NGC organisation on `nvcr.io`, tagged with the source c
 | Symptom | Likely cause |
 | -- | -- |
 | `Could not complete bound keypair joining` | No `id_bkp` in the storage directory, or the token does not match the key |
-| `selfsubjectreviews API is not enabled` | Expected. Use `get nodes` or `auth can-i` to check access |
+| `selfsubjectreviews API is not enabled` | Expected from `kubectl auth whoami`. `k8s-check` handles it; by hand, use `get nodes` or `auth can-i` |
 | `forbidden ... at the cluster scope` | You asked for something cluster-scoped. The bot cannot |
 | `denied by Teleport` on a write | The namespace is not one of ours, or lacks the two labels |
 | Contexts include a production cluster | `selector_labels` is too wide. Stop `tbot` and fix the block |

@@ -185,6 +185,20 @@ print(json.dumps({'kind': 'ExecCredential', 'apiVersion': 'client.authentication
 '''
 
 
+def real_cert_body(common_name):
+    """The base64 lines of a real X.509 certificate for `common_name`. The fake tbot wraps them in PEM markers."""
+    proc = subprocess.run(['openssl', 'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1',
+                           '-nodes', '-subj', f'/CN={common_name}', '-days', '2', '-keyout', os.devnull],
+                          capture_output=True, text=True, timeout=30)
+    if proc.returncode != 0:
+        raise unittest.SkipTest(f'openssl cannot make a certificate: {proc.stderr.strip()[:200]}')
+    return ''.join(line for line in proc.stdout.splitlines() if line and not line.startswith('-----'))
+
+
+WHOAMI_NOT_SERVED = {'stderr': 'error: the selfsubjectreviews API is not enabled in the cluster '
+                               'or you do not have permission to call it\n', 'exit': 1}
+
+
 GPU_TAINT = {'key': 'nvidia.com/gpu', 'value': 'true', 'effect': 'NoSchedule'}
 RESERVED = {'key': 'example.test/reserved', 'value': 'team-b', 'effect': 'NoSchedule'}
 OUR_NS = 'dyntest-alice-12-smoke'
@@ -372,6 +386,78 @@ class K8sCheck(unittest.TestCase):
         rc, out = self.run_check('lab-arm-a', '--want-crd', 'v1beta1')
         self.assertEqual(rc, 0, out)
         self.assertEqual(out['crd']['want'], 'v1beta1')
+
+    # --- a cluster that does not serve SelfSubjectReview (whoami) ---
+
+    def serve_certificate(self, common_name):
+        """tbot hands out a real certificate for `common_name`; whoami is not served."""
+        (self.bot_kubeconfig.parent / 'identity').write_text(real_cert_body(common_name))
+        self.scenario['auth whoami -o json'] = dict(WHOAMI_NOT_SERVED)
+
+    def test_whoami_not_served_takes_the_identity_from_the_certificate(self):
+        self.serve_certificate(BOT)
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(out['ok'], out)
+        self.assertEqual(out['identity'], {'username': BOT, 'groups': [], 'source': 'certificate'})
+        self.assert_read_only()
+
+    def test_whoami_served_stays_the_source(self):
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out['identity']['source'], 'whoami')
+
+    def test_whoami_not_served_wrong_certificate_name_is_not_the_bot(self):
+        self.serve_certificate('alice@example.test')
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 1, out)
+        self.assertIn('not_bot', self.codes(out))
+        later = [c['key'] for c in self.calls() if c['key'].startswith(('auth can-i', 'get '))]
+        self.assertEqual(later, [], 'the check must stop at the identity step')
+
+    def test_whoami_not_served_unreadable_certificate_fails(self):
+        # The default fake certificate is a name, not an X.509 certificate.
+        self.scenario['auth whoami -o json'] = dict(WHOAMI_NOT_SERVED)
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 1, out)
+        self.assertIn('identity_unreadable', self.codes(out))
+        later = [c['key'] for c in self.calls() if c['key'].startswith(('auth can-i', 'get '))]
+        self.assertEqual(later, [], 'the check must stop at the identity step')
+
+    def test_whoami_not_served_short_form_also_falls_back(self):
+        # Review pass 2: kubectl prints this shorter sentence when the API is absent (NotFound).
+        self.serve_certificate(BOT)
+        self.scenario['auth whoami -o json'] = {
+            'stderr': 'error: the selfsubjectreviews API is not enabled in the cluster\n', 'exit': 1}
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out['identity']['source'], 'certificate')
+
+    def test_mixed_whoami_error_text_does_not_fall_back_to_the_certificate(self):
+        # Review finding: the known sentence inside a longer error (here, a timeout) is not "not served".
+        self.serve_certificate(BOT)
+        self.scenario['auth whoami -o json'] = {
+            'stderr': 'warning: the selfsubjectreviews API is not enabled\n'
+                      'Unable to connect to the server: dial tcp: i/o timeout\n', 'exit': 1}
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 1, out)
+        self.assertIn('kubectl_error', self.codes(out))
+        self.assertNotIn('identity', out)
+
+    def test_the_known_sentence_with_another_exit_status_does_not_fall_back(self):
+        self.serve_certificate(BOT)
+        self.scenario['auth whoami -o json'] = {'stderr': WHOAMI_NOT_SERVED['stderr'], 'exit': 2}
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 1, out)
+        self.assertIn('kubectl_error', self.codes(out))
+
+    def test_other_whoami_errors_do_not_fall_back_to_the_certificate(self):
+        self.serve_certificate(BOT)
+        self.scenario['auth whoami -o json'] = {'stderr': 'Unable to connect to the server: dial tcp: i/o timeout\n', 'exit': 1}
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 1, out)
+        self.assertIn('kubectl_error', self.codes(out))
+        self.assertNotIn('identity', out)
 
     def test_restartable_init_container_reserves_gpus_alongside_main(self):
         workload = pod('team-x', 'with-sidecar', 'node-a', 2, init_gpus=1)
