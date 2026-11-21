@@ -424,6 +424,24 @@ class K8sCheck(unittest.TestCase):
         later = [c['key'] for c in self.calls() if c['key'].startswith(('auth can-i', 'get '))]
         self.assertEqual(later, [], 'the check must stop at the identity step')
 
+    def test_mixed_whoami_error_text_does_not_fall_back_to_the_certificate(self):
+        # Review finding: the known sentence inside a longer error (here, a timeout) is not "not served".
+        self.serve_certificate(BOT)
+        self.scenario['auth whoami -o json'] = {
+            'stderr': 'warning: the selfsubjectreviews API is not enabled\n'
+                      'Unable to connect to the server: dial tcp: i/o timeout\n', 'exit': 1}
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 1, out)
+        self.assertIn('kubectl_error', self.codes(out))
+        self.assertNotIn('identity', out)
+
+    def test_the_known_sentence_with_another_exit_status_does_not_fall_back(self):
+        self.serve_certificate(BOT)
+        self.scenario['auth whoami -o json'] = {'stderr': WHOAMI_NOT_SERVED['stderr'], 'exit': 2}
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 1, out)
+        self.assertIn('kubectl_error', self.codes(out))
+
     def test_other_whoami_errors_do_not_fall_back_to_the_certificate(self):
         self.serve_certificate(BOT)
         self.scenario['auth whoami -o json'] = {'stderr': 'Unable to connect to the server: dial tcp: i/o timeout\n', 'exit': 1}
