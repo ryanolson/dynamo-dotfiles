@@ -14,6 +14,12 @@ The source of truth is the Linear document "Runbook: build and run on our Dynamo
 - Make no write with plain `kubectl`. Writes go through `scripts/k8s-guard` only; its commands and rules are in `references/k8s-guard.md`.
 - Astra changes go through `scripts/astra-guard` only; its commands and rules are in `references/astra-guard.md`.
 
+## The bot
+
+How the bot works, how to set up a host, what it can and cannot do, the pre-made namespace, the key rules, and what to do when it fails are in `references/bot.md`. Read it before you set up a host or deploy.
+
+Two known gaps, both tested: the bot cannot create namespaces, so `k8s-guard ns create` fails with it, and `kubectl auth whoami` is not served on these clusters, so `k8s-check` fails its identity step. To check access by hand, use `kubectl --context <ctx> get nodes`.
+
 ## Threat model
 
 `k8s-check` and `k8s-guard` protect against accidental use of credentials other than the bot's: a stray kubeconfig, a kuberc, `KUBECONFIG`, a `tsh` exec plugin, a wrong path, or a file swapped by mistake. They do not protect against a malicious process running as the same Unix user, which could replace `~/.local/bin/tbot` or trace the checker. A wrapper compiled into an allowlisted path counts as replacing tbot or kubectl: out of scope, though the kubectl sha256 pin catches one installed after the pin was taken. The bot's own permissions on the server are the boundary against that.
