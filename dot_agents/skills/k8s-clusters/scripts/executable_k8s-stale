@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Report stale deployments and GPU holds that could be released, as the agents' bot.
+
+Usage:
+  k8s-stale [cluster ...] [--text] [--top N] [--hold-days D] [--dgd-days D]
+            [--stuck-hours H] [--unready-hours H]
+
+With no cluster it reads every profile that is not marked `never`. Every kubectl call is a
+read (pods, DynamoGraphDeployments, namespaces), made with the bot's kubeconfig and the
+pinned kubectl exactly as k8s-check does. It deletes, scales and contacts no one: it prints
+candidates, and a person decides. The API shows no GPU utilization, so a finding means "could
+be released", not "is idle". The rules are in k8s_stale_rules.py.
+
+JSON on stdout by default: {"checked_at", "clusters", "findings", "errors"}. With --text, a
+ranked table. Exit status: 0 when the run completes (findings are not failures), 1 when a
+cluster could not be read or the bot is not the caller, 2 for a usage error.
+"""
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+import importlib.machinery
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True  # keep the deployed skill directory clean
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import k8s_stale_rules as rules  # noqa: E402
+from k8s_profiles import ProfileError, load_profiles  # noqa: E402
+
+NO_CRD = "doesn't have a resource type"
+# `get pods -A` on a busy cluster is tens of megabytes; k8s-check's 60 s is for its small reads.
+LIST_TIMEOUT = 300
+PODS = ('get', 'pods', '-A', '--field-selector=status.phase!=Succeeded,status.phase!=Failed', '-o', 'json')
+DGDS = ('get', 'dynamographdeployments.nvidia.com', '-A', '-o', 'json')
+NAMESPACES = ('get', 'ns', '-o', 'json')
+
+
+def load_check():
+    """k8s-check as a module, so this script uses its pinned kubectl and kubeconfig rules, not a copy."""
+    for name in ('k8s-check', 'executable_k8s-check'):
+        path = HERE / name
+        if path.exists():
+            loader = importlib.machinery.SourceFileLoader('k8s_check', str(path))
+            module = importlib.util.module_from_spec(importlib.util.spec_from_loader('k8s_check', loader))
+            loader.exec_module(module)
+            module.KUBECTL_TIMEOUT = LIST_TIMEOUT
+            return module
+    raise ProfileError('k8s_check_missing', f'k8s-check is not next to this script ({HERE})')
+
+
+def verify_bot(check, kc, bot):
+    """Stop unless the caller is the bot, the way k8s-check does."""
+    try:
+        who = kc.json('auth', 'whoami', '-o', 'json')
+        name = (((who.get('status') or {}).get('userInfo')) or {}).get('username')
+    except check.KubectlError as e:
+        if not check.whoami_not_served(e):
+            raise
+        name = kc.certificate_name()
+    if name != bot['user']:
+        raise check.Refusal('not_bot', f'identity is {name!r}, not the bot {bot["user"]!r}; stop')
+
+
+def read_cluster(check, profiles, cluster, now, thresholds):
+    prof = profiles['clusters'][cluster]
+    bot = profiles['bot']
+    kc = check.Kubectl(bot['kubeconfig'], bot['kubectl_sha256'], prof['context'])
+    verify_bot(check, kc, bot)
+    pods = kc.json(*PODS).get('items') or []
+    try:
+        dgds = kc.json(*DGDS).get('items') or []
+    except check.KubectlError as e:
+        if NO_CRD not in str(e):
+            raise
+        dgds = []  # a cluster without the Dynamo CRD has no DGDs to be stale
+    namespaces = {(i.get('metadata') or {}).get('name'): (i.get('metadata') or {}).get('labels') or {}
+                  for i in kc.json(*NAMESPACES).get('items') or []}
+    return [{**f, 'cluster': cluster} for f in rules.analyze(pods, dgds, namespaces, now, **thresholds)]
+
+
+def text_table(report, top):
+    rows = report['findings'][:top]
+    lines = [f'{"GPU-DAYS":>8} {"GPUS":>4} {"AGE":>6}  {"CLUSTER":<26} {"NAMESPACE":<38} {"OWNER":<12} REASON']
+    for f in rows:
+        lines.append(f'{f["gpu_hours"] / 24:8.1f} {f["gpus"]:4d} {f["age_hours"] / 24:5.1f}d  {f["cluster"]:<26} '
+                     f'{f["namespace"][:38]:<38} {str(f["owner"])[:12]:<12} {f["kind"]}: {f["reason"]}')
+    if len(report['findings']) > top:
+        lines.append(f'... {len(report["findings"]) - top} more; raise --top, or read the JSON')
+    for e in report['errors']:
+        lines.append(f'ERROR {e["cluster"]}: {e["code"]}: {e["message"]}')
+    lines.append(f'{len(report["findings"])} findings on {len(report["clusters"])} clusters. '
+                 'Candidates only: the API shows no GPU utilization. One hold can match several rules, '
+                 'so the GPU counts overlap; do not add them up.')
+    return '\n'.join(lines)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog='k8s-stale', description=__doc__.split('\n\n')[0])
+    parser.add_argument('clusters', nargs='*', help='clusters to read (default: every profile that is not never)')
+    parser.add_argument('--text', action='store_true', help='print a ranked table instead of JSON')
+    parser.add_argument('--gpus-only', action='store_true', help='keep only findings that hold GPUs')
+    parser.add_argument('--jobs', type=int, default=4, metavar='N', help='clusters read at once (default 4)')
+    parser.add_argument('--top', type=int, default=20, metavar='N', help='rows in the --text table (default 20)')
+    for key, default in rules.DEFAULTS.items():
+        parser.add_argument('--' + key.replace('_', '-'), type=float, default=default, metavar='N',
+                            help=f'default {default:g}')
+    args = parser.parse_args(argv)
+    thresholds = {key: getattr(args, key) for key in rules.DEFAULTS}
+    if any(v <= 0 for v in thresholds.values()) or args.top < 1 or args.jobs < 1:
+        parser.error('thresholds, --top and --jobs must be positive')
+
+    now = datetime.now(timezone.utc)
+    report = {'checked_at': now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'thresholds': thresholds,
+              'clusters': [], 'skipped': [], 'findings': [], 'errors': []}
+    try:
+        profiles = load_profiles()
+        check = load_check()
+        check.check_kubeconfig(profiles['bot'])
+    except ProfileError as e:  # check.Refusal is one
+        report['errors'].append({'cluster': None, 'code': getattr(e, 'code', 'error'), 'message': str(e)})
+        print(json.dumps(report, indent=2))
+        return 1
+
+    wanted = args.clusters or sorted(profiles['clusters'])
+    todo = []
+    for cluster in wanted:
+        prof = profiles['clusters'].get(cluster)
+        if prof is None:
+            parser.error(f'{cluster} has no profile; known: {", ".join(sorted(profiles["clusters"]))}')
+        if prof['allowed'] == 'never':
+            report['skipped'].append({'cluster': cluster, 'reason': 'profile says never'})
+        else:
+            todo.append(cluster)
+
+    def one(cluster):
+        try:
+            return cluster, read_cluster(check, profiles, cluster, now, thresholds), None
+        except ProfileError as e:  # check.Refusal is one
+            return cluster, [], {'cluster': cluster, 'code': e.code, 'message': str(e)}
+        except check.KubectlError as e:
+            return cluster, [], {'cluster': cluster, 'code': 'kubectl_error', 'message': str(e)}
+
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        for cluster, findings, error in pool.map(one, todo):
+            if error:
+                report['errors'].append(error)
+            else:
+                report['clusters'].append(cluster)
+                report['findings'] += findings
+    if args.gpus_only:
+        report['findings'] = [f for f in report['findings'] if f['gpus'] > 0]
+    report['findings'].sort(key=lambda f: (-f['gpu_hours'], -f['age_hours'], f['cluster'], f['namespace'], f['name']))
+    print(text_table(report, args.top) if args.text else json.dumps(report, indent=2))
+    return 1 if report['errors'] else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
