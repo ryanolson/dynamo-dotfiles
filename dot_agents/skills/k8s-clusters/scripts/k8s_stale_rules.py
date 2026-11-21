@@ -45,12 +45,26 @@ def quantity(value):
 
 
 def pod_gpus(pod):
-    """GPUs the pod's containers ask for. Limits count when requests are absent."""
-    total = 0
-    for c in (pod.get('spec') or {}).get('containers') or []:
+    """GPUs the pod holds: the scheduler's rule. Limits count when requests are absent.
+
+    Main containers and restartable init containers (sidecars) run together; a plain init
+    container runs alone with the sidecars before it. The pod needs the larger of the two.
+    """
+    spec = pod.get('spec') or {}
+
+    def req(c):
         res = c.get('resources') or {}
-        total += quantity((res.get('requests') or {}).get(GPU) or (res.get('limits') or {}).get(GPU) or 0)
-    return total
+        return quantity((res.get('requests') or {}).get(GPU) or (res.get('limits') or {}).get(GPU) or 0)
+
+    main = sum(req(c) for c in spec.get('containers') or [])
+    sidecars = peak = 0
+    for c in spec.get('initContainers') or []:
+        if c.get('restartPolicy') == 'Always':
+            sidecars += req(c)
+            peak = max(peak, sidecars)
+        else:
+            peak = max(peak, req(c) + sidecars)
+    return max(main + sidecars, peak)
 
 
 def owner_of(namespace, ns_labels, pod_labels=None):
@@ -77,6 +91,15 @@ def pod_not_ready_hours(pod, now):
         return None
     since = (ready or {}).get('lastTransitionTime') or (pod.get('metadata') or {}).get('creationTimestamp')
     return hours_since(since, now)
+
+
+def dgd_state_age(dgd, now):
+    """(hours, from_transition): hours since the DGD's last condition change, else since creation."""
+    times = [parse_time(c.get('lastTransitionTime')) for c in (dgd.get('status') or {}).get('conditions') or []]
+    times = [t for t in times if t is not None]
+    if times:
+        return max(0.0, (now - max(times)).total_seconds() / 3600), True
+    return hours_since((dgd.get('metadata') or {}).get('creationTimestamp'), now), False
 
 
 def finding(kind, namespace, owner, name, gpus, age_hours, reason):
@@ -118,29 +141,36 @@ def analyze(pods, dgds, namespaces, now, **thresholds):
             found.append(finding('gpu_hold_old', ns, owner, ns, total, oldest,
                                  f'{total} GPUs held, oldest pod {oldest / 24:.1f} days old'))
 
-        opted = [(p, g) for p, g in running
-                 if ((p.get('metadata') or {}).get('annotations') or {}).get(OPT_OUT) == 'true']
-        if opted:
-            opted_gpus = sum(g for _, g in opted)
-            expiries = [parse_time(((p.get('metadata') or {}).get('annotations') or {}).get(OPT_OUT_EXPIRES))
-                        for p, _ in opted]
-            known = [e for e in expiries if e is not None]
-            latest = max(known) if known else None
-            if latest is None:
-                found.append(finding('reaper_opt_out', ns, owner, ns, opted_gpus, oldest,
-                                     f'{opted_gpus} GPUs opted out of the reaper with no readable expiry'))
-            elif latest < now:
-                found.append(finding('reaper_opt_out_expired', ns, owner, ns, opted_gpus, oldest,
-                                     f'{opted_gpus} GPUs: the reaper opt-out ended {latest:%Y-%m-%d}; the reaper may be blind here'))
+        expired = unreadable = active = 0
+        until = None
+        for p, g in running:
+            ann = (p.get('metadata') or {}).get('annotations') or {}
+            if ann.get(OPT_OUT) != 'true':
+                continue
+            when = parse_time(ann.get(OPT_OUT_EXPIRES))
+            if when is None:
+                unreadable += g
+            elif when < now:
+                expired += g
             else:
-                found.append(finding('reaper_opt_out', ns, owner, ns, opted_gpus, oldest,
-                                     f'{opted_gpus} GPUs opted out of the reaper until {latest:%Y-%m-%d}'))
+                active += g
+                until = when if until is None else max(until, when)
+        if expired:
+            found.append(finding('reaper_opt_out_expired', ns, owner, ns, expired, oldest,
+                                 f'{expired} GPUs: the reaper opt-out has ended; the reaper may be blind here'))
+        if active:
+            found.append(finding('reaper_opt_out', ns, owner, ns, active, oldest,
+                                 f'{active} GPUs opted out of the reaper until {until:%Y-%m-%d}'))
+        if unreadable:
+            found.append(finding('reaper_opt_out', ns, owner, ns, unreadable, oldest,
+                                 f'{unreadable} GPUs opted out of the reaper with no readable expiry'))
 
         for pod, gpus in running:
             hours = pod_not_ready_hours(pod, now)
             if hours is not None and hours >= limit['unready_hours']:
                 meta = pod.get('metadata') or {}
-                found.append(finding('gpu_pod_not_ready', ns, owner, meta.get('name', ''), gpus, hours,
+                found.append(finding('gpu_pod_not_ready', ns, owner_of(ns, labels, meta.get('labels')),
+                                     meta.get('name', ''), gpus, hours,
                                      f'holds {gpus} GPUs and has not been Ready for {hours:.1f} hours'))
 
     for dgd in dgds:
@@ -152,13 +182,17 @@ def analyze(pods, dgds, namespaces, now, **thresholds):
         age = hours_since(meta.get('creationTimestamp'), now)
         if age is None:
             continue
+        since, from_transition = dgd_state_age(dgd, now)
         if state == 'failed':
-            found.append(finding('dgd_failed', ns, owner, name, gpus, age,
-                                 f'failed {age / 24:.1f} days ago' + (f' and its pods hold {gpus} GPUs' if gpus else '')))
+            reason = (f'failed, last change {since / 24:.1f} days ago' if from_transition
+                      else f'failed; created {since / 24:.1f} days ago, no change time recorded')
+            if gpus:
+                reason += f'; its pods hold {gpus} GPUs'
+            found.append(finding('dgd_failed', ns, owner, name, gpus, since, reason))
         elif state not in DGD_OK_STATES:
-            if age >= limit['stuck_hours']:
-                found.append(finding('dgd_stuck', ns, owner, name, gpus, age,
-                                     f'state is {state or "unknown"} after {age:.1f} hours'))
+            if since >= limit['stuck_hours']:
+                found.append(finding('dgd_stuck', ns, owner, name, gpus, since,
+                                     f'state is {state or "unknown"} after {since:.1f} hours'))
         elif age >= limit['dgd_days'] * 24 and gpus:
             found.append(finding('dgd_old', ns, owner, name, gpus, age,
                                  f'{age / 24:.1f} days old and holding {gpus} GPUs'))

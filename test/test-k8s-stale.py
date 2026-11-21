@@ -169,6 +169,53 @@ class Rules(unittest.TestCase):
                 'status': {'phase': 'Running'}}
         self.assertEqual(rules.analyze([junk, {}], [{}, {'metadata': {'name': 'g'}}], {}, NOW), [])
 
+    # --- review pass 1 ---
+
+    def test_restartable_init_sidecar_gpus_count(self):
+        p = pod('team-a', 'w1', 0, age=ago(days=9))
+        p['spec']['initContainers'] = [{'name': 's', 'restartPolicy': 'Always',
+                                        'resources': {'requests': {rules.GPU: '4'}}}]
+        found = rules.analyze([p], [], {}, NOW)
+        self.assertEqual([(f['kind'], f['gpus']) for f in found], [('gpu_hold_old', 4)])
+
+    def test_plain_init_container_gpus_do_not_add_to_the_main_containers(self):
+        p = pod('team-a', 'w1', 2, age=ago(days=9))
+        p['spec']['initContainers'] = [{'name': 'i', 'resources': {'requests': {rules.GPU: '8'}}}]
+        self.assertEqual(rules.pod_gpus(p), 8)  # the larger of the init peak and the main total, as the scheduler
+        p['spec']['initContainers'][0]['resources']['requests'][rules.GPU] = '1'
+        self.assertEqual(rules.pod_gpus(p), 2)
+
+    def test_every_container_counts_toward_a_pods_gpus(self):
+        p = pod('team-a', 'w1', 4, age=ago(days=9))
+        p['spec']['containers'].append({'name': 'c2', 'resources': {'requests': {rules.GPU: '4'}}})
+        self.assertEqual(rules.pod_gpus(p), 8)
+
+    def test_an_expired_opt_out_is_not_hidden_by_an_active_one(self):
+        old = {rules.OPT_OUT: 'true', rules.OPT_OUT_EXPIRES: '2026-01-02T00:00:00Z'}
+        live = {rules.OPT_OUT: 'true', rules.OPT_OUT_EXPIRES: '2026-02-01T00:00:00Z'}
+        found = rules.analyze([pod('team-a', 'w1', 4, annotations=old), pod('team-a', 'w2', 8, annotations=live)],
+                              [], {}, NOW)
+        self.assertEqual(sorted((f['kind'], f['gpus']) for f in found),
+                         [('reaper_opt_out', 8), ('reaper_opt_out_expired', 4)])
+
+    def test_each_pod_finding_has_its_own_owner(self):
+        a = pod('team-a', 'w1', 4, labels={'owner': 'alice'})
+        b = pod('team-a', 'w2', 4, ready=False, labels={'owner': 'bob'})
+        found = [f for f in rules.analyze([a, b], [], {}, NOW) if f['kind'] == 'gpu_pod_not_ready']
+        self.assertEqual([(f['name'], f['owner']) for f in found], [('w2', 'bob')])
+
+    def test_dgd_failure_age_counts_from_its_last_state_change(self):
+        d = dgd('team-a', 'g1', 'failed', age=ago(days=30))
+        d['status']['conditions'] = [{'type': 'Ready', 'status': 'False', 'lastTransitionTime': ago(hours=3)}]
+        found = rules.analyze([], [d], {}, NOW)
+        self.assertEqual(found[0]['age_hours'], 3.0)
+        self.assertNotIn('30.0 days', found[0]['reason'])
+
+    def test_dgd_failure_without_a_transition_time_says_it_counts_from_creation(self):
+        found = rules.analyze([], [dgd('team-a', 'g1', 'failed', age=ago(days=30))], {}, NOW)
+        self.assertEqual(found[0]['age_hours'], 720.0)
+        self.assertIn('created', found[0]['reason'])
+
     def test_parse_time(self):
         self.assertEqual(rules.parse_time('2026-01-10T12:00:00Z'), NOW)
         self.assertEqual(rules.parse_time('2026-01-10T12:00:00'), NOW)
