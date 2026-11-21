@@ -424,6 +424,15 @@ class K8sCheck(unittest.TestCase):
         later = [c['key'] for c in self.calls() if c['key'].startswith(('auth can-i', 'get '))]
         self.assertEqual(later, [], 'the check must stop at the identity step')
 
+    def test_whoami_not_served_short_form_also_falls_back(self):
+        # Review pass 2: kubectl prints this shorter sentence when the API is absent (NotFound).
+        self.serve_certificate(BOT)
+        self.scenario['auth whoami -o json'] = {
+            'stderr': 'error: the selfsubjectreviews API is not enabled in the cluster\n', 'exit': 1}
+        rc, out = self.run_check('lab-arm-a')
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out['identity']['source'], 'certificate')
+
     def test_mixed_whoami_error_text_does_not_fall_back_to_the_certificate(self):
         # Review finding: the known sentence inside a longer error (here, a timeout) is not "not served".
         self.serve_certificate(BOT)

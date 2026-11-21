@@ -40,9 +40,11 @@ KUBECTL_TIMEOUT = 60
 # The ops team's GPU reaper runs its pods in this namespace on every cluster that has it.
 REAPER_NAMESPACE = 'gpu-reaper'
 # Some Dynamo dev clusters do not serve the SelfSubjectReview API, so `auth whoami` cannot name the caller.
-# This is the whole of kubectl's stderr then, with exit status 1. A longer text that merely contains the
-# sentence (a timeout after a warning, say) is some other failure and is not this answer.
-WHOAMI_NOT_SERVED = ('error: the selfsubjectreviews API is not enabled in the cluster '
+# kubectl then prints one of these two lines as the whole of its stderr, with exit status 1: the short one when
+# the API is absent, the long one when the call is refused (kubectl v1.35.1, strings in the binary). A longer text
+# that merely contains the sentence (a timeout after a warning, say) is some other failure and is not this answer.
+WHOAMI_NOT_SERVED = ('error: the selfsubjectreviews API is not enabled in the cluster',
+                     'error: the selfsubjectreviews API is not enabled in the cluster '
                      'or you do not have permission to call it')
 
 
@@ -132,7 +134,7 @@ class KubectlError(Exception):
 
 def whoami_not_served(error):
     """True only for kubectl's one answer that the cluster does not serve SelfSubjectReview."""
-    return error.rc == 1 and error.err.strip() == WHOAMI_NOT_SERVED
+    return error.rc == 1 and error.err.strip() in WHOAMI_NOT_SERVED
 
 
 # --- the check --------------------------------------------------------------
