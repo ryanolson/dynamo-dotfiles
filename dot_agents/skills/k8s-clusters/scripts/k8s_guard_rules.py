@@ -381,8 +381,26 @@ def check_gpu_product(after, profile):
                                                       f'{GPU_PRODUCT_LABEL}: {want}, the GPU the lease is for')
 
 
+def check_lease_label(dgds, lease):
+    """Every pod template of a leased write carries exactly that lease, whatever its GPUs, replicas or placement.
+
+    Teardown finds a lease's pods by this label, so a template without it would start pods no teardown
+    waits for. Zero replicas count too: a later scale-up is a patch that never shows the template again.
+    """
+    lid = lease['lease_id']
+    for d in dgds:
+        for c in components(d):
+            if c.labels.get(LEASE_LABEL) != lid:
+                raise Refusal('lease_label_required', f'{c.where}: every pod template needs the label '
+                                                      f'{LEASE_LABEL}={lid}')
+
+
 def check_one_node(after, lease, profile):
-    """Without multi-node approval, every GPU pod must land on one node with the lease's other pods."""
+    """Without multi-node approval, every GPU pod must land on one node with the lease's other pods.
+
+    The lease label itself is check_lease_label's, for every template and both placement modes; only the
+    node count and the affinity depend on single-node placement.
+    """
     if lease['multi_node']:
         return
     lid = lease['lease_id']

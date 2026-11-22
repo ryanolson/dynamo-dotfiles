@@ -43,7 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from k8s_profiles import ProfileError, kubectl_env, load_profiles, prepare_bot_kubeconfig  # noqa: E402
 from k8s_guard_rules import (  # noqa: E402
     DGD_KIND, HOSTNAME_TOPOLOGY, LEASE_LABEL, LEASE_RECORD, NS_UID_LABEL, Refusal, admit, allocation,
-    budget_allocation, check_gpu_product, check_one_node, dgd_gpus, gpu_pod_summary, zero_patch)
+    budget_allocation, check_gpu_product, check_lease_label, check_one_node, dgd_gpus, gpu_pod_summary, zero_patch)
 
 DGD_RESOURCE = 'dynamographdeployments.nvidia.com'
 THREAD_LABEL = 'wcep.agent/thread'
@@ -743,6 +743,7 @@ def cmd_apply(g, a):
                 raise Refusal('one_node_required', f'{total} GPUs do not fit one {g.profile["gpu_type"]} node '
                                                    f'({g.profile["gpus_per_node"]}) without multi-node approval',
                               allocation=total)
+            check_lease_label(new, lease)
             check_one_node(after, lease, g.profile)
             check_gpu_product(after, g.profile)
         confirm_uid(g, ns, view.uid)

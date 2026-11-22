@@ -544,10 +544,12 @@ def one_node(lease_id):
 def component(name, gpus=0, replicas=1, lease_id=None, ctype='worker', **extra):
     spec = {'containers': [container(gpus)]}
     meta = {}
+    if lease_id:
+        # Every pod template of a leased write carries the lease, GPU or not.
+        meta['labels'] = {LEASE_LABEL: lease_id}
     if gpus and lease_id:
         spec['affinity'] = one_node(lease_id)
         spec['nodeSelector'] = {'nvidia.com/gpu.product': 'NVIDIA-GB300'}
-        meta['labels'] = {LEASE_LABEL: lease_id}
     c = {'name': name, 'type': ctype, 'replicas': replicas, 'podTemplate': {'metadata': meta, 'spec': spec}}
     c.update(extra)
     return c
@@ -561,7 +563,7 @@ def dgd(name, *components, **spec_extra):
 
 def gpu_dgd(name, gpus, lease_id, replicas=1):
     """A GPU DGD as `apply` writes it: the DGD itself carries the lease it was applied under."""
-    d = dgd(name, component('Frontend', ctype='frontend'),
+    d = dgd(name, component('Frontend', ctype='frontend', lease_id=lease_id),
             component('decode', gpus=gpus, replicas=replicas, lease_id=lease_id))
     d['metadata'].setdefault('labels', {})[LEASE_LABEL] = lease_id
     return d
@@ -1518,7 +1520,8 @@ class Budget(GuardCase):
         no_label = gpu_dgd('b', 1, lid)
         del no_label['spec']['components'][1]['podTemplate']['metadata']['labels']
         wrong_lease = gpu_dgd('c', 1, 'lse_other0001')
-        wrong_lease['spec']['components'][1]['podTemplate']['metadata']['labels'] = {'wcep.agent/lease': lid}
+        for c in wrong_lease['spec']['components']:  # the labels name the lease; only the affinity names another
+            c['podTemplate']['metadata']['labels'] = {'wcep.agent/lease': lid}
         narrowed = gpu_dgd('d', 1, lid)
         narrowed['spec']['components'][1]['podTemplate']['spec']['affinity']['podAffinity'][
             'requiredDuringSchedulingIgnoredDuringExecution'][0]['labelSelector']['matchLabels']['x'] = 'y'
@@ -1528,7 +1531,9 @@ class Budget(GuardCase):
         for obj in (no_affinity, no_label, wrong_lease, narrowed, zone):
             with self.subTest(dgd=obj['metadata']['name']):
                 rc, body, _ = self.apply(obj)
-                self.assertEqual(body.get('code'), 'one_node_required', body)
+                # A missing label is check_lease_label's refusal, for every template; the rest is placement.
+                want = 'lease_label_required' if obj is no_label else 'one_node_required'
+                self.assertEqual(body.get('code'), want, body)
         self.assertEqual(self.writes(), [])
 
     def test_every_prefix_of_the_apply_must_fit(self):
@@ -1589,6 +1594,43 @@ class Budget(GuardCase):
         self.assertEqual(body.get('code'), 'one_node_required', body)
         self.assertEqual(self.writes(), [])
 
+    def lease_label_refused(self, obj, lid):
+        rc, body, _ = self.apply(obj)
+        self.assertEqual(body.get('code'), 'lease_label_required', body)
+        self.assertEqual(self.writes(), [])
+        return body
+
+    def test_multi_node_template_without_the_lease_label_fails_at_the_guard_v1beta1(self):
+        lid = self.add_lease(gpus=8, multi_node=True)
+        big = gpu_dgd('big', 4, lid)
+        big['spec']['components'][1]['multinode'] = {'nodeCount': 2}
+        del big['spec']['components'][1]['podTemplate']['spec']['affinity']
+        del big['spec']['components'][1]['podTemplate']['metadata']['labels']
+        body = self.lease_label_refused(big, lid)
+        self.assertIn('components[1]', body['error'])
+
+    def test_multi_node_template_without_the_lease_label_fails_at_the_guard_v1alpha1(self):
+        lid = self.add_lease(gpus=8, multi_node=True)
+        alpha = {'apiVersion': 'nvidia.com/v1alpha1', 'kind': 'DynamoGraphDeployment', 'metadata': {'name': 'w'},
+                 'spec': {'services': {'decode': {
+                     'componentType': 'worker', 'replicas': 1, 'multinode': {'nodeCount': 2},
+                     'resources': {'requests': {'cpu': '1', 'memory': '1Gi', 'gpu': '4'},
+                                   'limits': {'cpu': '1', 'memory': '1Gi', 'gpu': '4'}},
+                     'extraPodSpec': {'nodeSelector': {'nvidia.com/gpu.product': 'NVIDIA-GB300'}}}}}}
+        body = self.lease_label_refused(alpha, lid)
+        self.assertIn('services.decode', body['error'])
+        alpha['spec']['services']['decode']['extraPodMetadata'] = {'labels': {LEASE_LABEL: 'lse_other0001'}}
+        self.lease_label_refused(alpha, lid)
+
+    def test_zero_replica_and_cpu_templates_need_the_lease_label_too(self):
+        lid = self.add_lease(gpus=4)
+        stopped = gpu_dgd('stopped', 1, lid, replicas=0)
+        del stopped['spec']['components'][1]['podTemplate']['metadata']['labels']
+        self.lease_label_refused(stopped, lid)  # scaling it up later is a patch the label check never sees
+        cpu = gpu_dgd('cpu', 1, lid)
+        del cpu['spec']['components'][0]['podTemplate']['metadata']['labels']  # the Frontend
+        self.lease_label_refused(cpu, lid)
+
     def test_multi_node_lease_allows_more_than_one_node(self):
         lid = self.add_lease(gpus=8, multi_node=True)
         big = gpu_dgd('big', 4, lid, replicas=2)
@@ -1645,7 +1687,7 @@ class Budget(GuardCase):
 
     def test_leased_namespace_fences_cpu_writes_too(self):
         lid = self.add_lease()
-        self.assertEqual(self.apply(dgd('mocker'))[0], 0)
+        self.assertEqual(self.apply(dgd('mocker', component('Frontend', ctype='frontend', lease_id=lid)))[0], 0)
         self.assertIn(['k8s', 'lease', 'op', 'begin', lid], self.bb_calls())
 
 
