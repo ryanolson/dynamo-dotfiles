@@ -111,23 +111,31 @@ class Reader:
             raise self.check.Refusal('not_bot', f'identity is {name!r}, not the bot {bot["user"]!r}; stop')
 
 
-def read_namespaces(reader, bot, now):
-    """Our namespaces as rows: the developer label and the bot's prefix. Read one namespace at a time."""
+def read_namespaces(reader, bot, now, cluster, errors):
+    """Our namespaces as rows: the developer label and the bot's prefix. Read one namespace at a time.
+
+    A namespace whose reads fail costs only itself: its row is flagged read_failed and gets no
+    enforcement (a missed lease record could hide an extension), and the others go on."""
     prefix, premade = bot['namespace_prefix'], bot.get('premade_namespace')
     listed = reader.json('get', 'namespaces', '-l', f'{rules.DEVELOPER_LABEL}={bot["developer"]}', '-o', 'json')
     ours = [n for n in listed.get('items') or [] if ((n.get('metadata') or {}).get('name') or '').startswith(prefix)]
     rows = []
     for ns in sorted(ours, key=lambda n: n['metadata']['name']):
         name = ns['metadata']['name']
-        pods = reader.json('get', 'pods', '-n', name, '-o', 'json').get('items') or []
         try:
-            dgds = reader.json('get', DGD_RESOURCE, '-n', name, '-o', 'json').get('items') or []
+            pods = reader.json('get', 'pods', '-n', name, '-o', 'json').get('items') or []
+            try:
+                dgds = reader.json('get', DGD_RESOURCE, '-n', name, '-o', 'json').get('items') or []
+            except reader.check.KubectlError as e:
+                if NO_CRD not in str(e):
+                    raise
+                dgds = []  # a cluster without the Dynamo CRD has no DGDs
+            record = None if name == premade else reader.json('get', 'configmap', LEASE_RECORD, '-n', name, '-o',
+                                                              'json', missing=None)
         except reader.check.KubectlError as e:
-            if NO_CRD not in str(e):
-                raise
-            dgds = []  # a cluster without the Dynamo CRD has no DGDs
-        record = None if name == premade else reader.json('get', 'configmap', LEASE_RECORD, '-n', name, '-o', 'json',
-                                                          missing=None)
+            errors.append({'cluster': cluster, 'code': 'kubectl_error', 'message': str(e)})
+            rows.append(rules.unread_row(ns, now, premade, str(e)))
+            continue
         rows.append(rules.namespace_row(ns, record, dgds, pods, now, premade))
     return rows
 
@@ -233,12 +241,17 @@ def enforce(cluster, prof, row, action, uid, now):
     return result, body
 
 
-def lookup(reader, names):
-    """Namespaces read by name: name to UID, or None for NotFound. Only names that could be ours."""
+def lookup(reader, names, cluster, errors):
+    """Namespaces read by name: name to UID, or None for NotFound. Only names that could be ours.
+    A name whose read fails is left out, so nothing is judged on it."""
     out = {}
     for name in sorted(names):
         if DNS_LABEL.match(name) and len(name) <= 63:  # never a value kubectl could take for a flag
-            ns = reader.json('get', 'namespace', name, '-o', 'json', missing=None)
+            try:
+                ns = reader.json('get', 'namespace', name, '-o', 'json', missing=None)
+            except reader.check.KubectlError as e:
+                errors.append({'cluster': cluster, 'code': 'kubectl_error', 'message': str(e)})
+                continue
             out[name] = None if ns is None else (ns.get('metadata') or {}).get('uid')
     return out
 
@@ -247,11 +260,12 @@ def sweep_cluster(check, profiles, cluster, leases, known, entries, args, now, r
     prof, bot = profiles['clusters'][cluster], profiles['bot']
     reader = Reader(check, bot, prof['context'])
     reader.verify_bot(bot)
-    rows = read_namespaces(reader, bot, now)
+    rows = read_namespaces(reader, bot, now, cluster, report['errors'])
     listed = {r['namespace']: r['uid'] for r in rows}
     wanted = {l['namespace'] for l in leases or [] if l['cluster'] == cluster and l['state'] in rules.LIVE}
     wanted |= {e['namespace'] for e in entries if e['cluster'] == cluster and isinstance(e['namespace'], str)}
-    exists = lookup(reader, {n for n in wanted - set(listed) if n.startswith(bot['namespace_prefix'])})
+    exists = lookup(reader, {n for n in wanted - set(listed) if n.startswith(bot['namespace_prefix'])}, cluster,
+                    report['errors'])
     flags = rules.match_leases(cluster, rows, leases, exists)
     for r in rows:
         r['cluster'] = cluster
@@ -278,7 +292,12 @@ def sweep_cluster(check, profiles, cluster, leases, known, entries, args, now, r
     for e in entries:
         if e['cluster'] != cluster:
             continue
-        uid = listed.get(e['namespace'], exists.get(e['namespace']))
+        if e['namespace'] in listed:
+            uid = listed[e['namespace']]
+        elif e['namespace'] in exists:
+            uid = exists[e['namespace']]
+        else:
+            continue  # not read (outside the prefix, or its read failed): not judged
         e['exists'] = uid == e['uid'] if e['kind'] == 'namespace' else uid is not None
     report['namespaces'] += rows
     report['stale_leases'] += [f for f in flags if f['kind'] == 'lease_namespace_gone']

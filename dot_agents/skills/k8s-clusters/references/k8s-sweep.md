@@ -37,8 +37,9 @@ For each namespace it reports the age, `wcep.agent/thread`, the expiry, the GPUs
 | `namespace_recreated` | The ledger or the lease recorded another UID for this name. `--enforce` never touches it. |
 | `uid_unknown` | The namespace is past its expiry, but no ledger line on this host and no live lease records its UID. `--enforce` leaves it. |
 | `expiry_unreadable` | The expiry is not an RFC 3339 time with a time zone. |
+| `read_failed` | The namespace's pods, DGDs or lease record could not be read. Its row has no counts, and `--enforce` leaves it, because a lease record it did not read could hold a later expiry. The other namespaces on the cluster go on, and the run exits 1. |
 
-If bb cannot be read, the run reports `leases_unavailable` and raises no lease flag: a list it could not read is not an empty list. With `--json`, an unreachable bb prints its error envelope on stdout, so the sweep accepts only a JSON list. A stale-lease flag is raised only for a cluster that was read.
+If bb cannot be read, the run reports `leases_unavailable` and raises no lease flag: a list it could not read is not an empty list. With `--json`, an unreachable bb prints its error envelope on stdout, so the sweep accepts only a JSON list. A stale-lease flag is raised only for a cluster that was read, and only for a namespace whose read by name succeeded.
 
 **Open ledger entries** use the guard's own rule (`Guard.ledger_namespaces`). A `Namespace/<ns>` line `up` with `created` opens an entry. A `down` with `deleted` for the same UID closes it. `expire` also writes `down`, but without `deleted`, so it closes nothing. A `Claim/<ns>` line `claim` opens an entry for its lease, and a `Claim/<ns>` `down` for that lease closes it. An entry whose lease the plugin reports `released` or `torn-down` is closed too, because its teardown may have been recorded on another host. `--all` lists only the latest 200 leases, so an entry from an older lease can show as open again. A host keeps each line in its own ledger and in the thread's, so identical lines count once, with both sources named.
 

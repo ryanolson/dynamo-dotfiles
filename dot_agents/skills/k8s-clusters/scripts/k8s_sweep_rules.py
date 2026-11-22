@@ -97,6 +97,14 @@ def namespace_row(ns, record, dgds, pods, now, premade):
     return row
 
 
+def unread_row(ns, now, premade, why):
+    """A namespace whose pods, DGDs or lease record could not be read: no counts, no action."""
+    row = namespace_row(ns, None, [], [], now, premade)
+    row.update(gpus=None, expires_at=None, read_failed=True)
+    row['flags'] = [flag('read_failed', row['namespace'], why[:300])]
+    return row
+
+
 def lease_view(lease):
     return {'lease_id': lease['lease_id'], 'state': lease['state'], 'gpus': lease['gpus']}
 
@@ -162,6 +170,8 @@ def decide(row, known_uid, now, grace=GRACE):
 
     if row['claimed']:
         return none('the pre-made namespace keeps no expiry; only k8s-leases ends a claim')
+    if row.get('read_failed'):
+        return none('its reads failed; a lease record not read could hold a later expiry')
     if known_uid is not None and known_uid != row['uid']:
         return none(f'the namespace was re-created: its UID is {row["uid"]}, the record says {known_uid}; left alone',
                     'namespace_recreated')

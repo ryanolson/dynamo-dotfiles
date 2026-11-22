@@ -745,6 +745,32 @@ class Enforce(SweepCase):
         self.assertFalse([c for c in self.bb_calls() if c[:3] == ['k8s', 'lease', 'release']])
         self.assertIn(NS, self.k8s['namespaces'])
 
+    def test_one_unreadable_namespace_costs_only_that_namespace(self):
+        self.expired_world(0.25)
+        bad = PREFIX + '14-bad'
+        self.add_ns(bad, thread=OTHER, uid='uid-bad', expires_at=G.iso_ms(G.hours_from_now(-5)))
+        with open(self.thread_dir / 'k8s-ledger.jsonl', 'a') as f:  # an open entry whose namespace is read by name
+            f.write(json.dumps({'thread': OTHER, 'cluster': PROFILE, 'namespace': PREFIX + '15-gone', 'uid': 'uid-15',
+                                'object': f'Namespace/{PREFIX}15-gone', 'direction': 'up', 'created': True}) + '\n')
+        self.k8s['forbid'] = [f'get pods -n {bad}', f'get namespace {PREFIX}15-gone']
+        self.bb['unreachable'] = True
+        self.flush()
+        rc, body, p = self.sweep('--enforce', real_guard=True)
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.row(body)['action'], {'action': 'expire', 'result': 'ok'})
+        self.assertEqual([c['replicas'] for c in self.dgd_obj('w')['spec']['components']], [0, 0])
+        row = self.row(body, bad)
+        self.assertEqual([f['kind'] for f in row['flags']], ['read_failed'])
+        self.assertIsNone(row['action'])
+        self.assertIsNone(row['gpus'])
+        self.assertIn(bad, self.k8s['namespaces'])
+        self.assertFalse([c for c in self.writes() if bad in c['argv'] or c['flags'].get('-n') == bad])
+        self.assertEqual(sorted(e['code'] for e in body['errors']),
+                         ['kubectl_error', 'kubectl_error', 'leases_unavailable'])
+        self.assertEqual(body['clusters'], [PROFILE])
+        [gone] = [e for e in body['open_ledger'] if e['namespace'] == PREFIX + '15-gone']
+        self.assertIsNone(gone['exists'])  # its read failed: not judged
+
     def test_premade_and_terminating_namespaces_are_never_enforced(self):
         premade = PREFIX + 'agent'
         self.profiles.write_text(self.profiles.read_text().replace(
@@ -780,6 +806,23 @@ BLOCK = ('  k8s_tbot:\n    name: "tenant-a"\n    proxy_server: "proxy.example.te
          '    selector_labels:\n      environment: "dev"\n')
 TARGETS = {'.config/systemd/user/k8s-sweep.service', '.config/systemd/user/k8s-sweep.timer',
            '.config/systemd/user/k8s-sweep-enforce.service', '.config/systemd/user/k8s-sweep-enforce.timer'}
+
+
+class GuardCommand(unittest.TestCase):
+    def test_the_guard_is_found_next_to_the_sweep_under_either_name(self):
+        for name in ('k8s-guard', 'executable_k8s-guard'):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as d:
+                for f in ('k8s_sweep_rules.py', 'k8s_guard_rules.py', 'k8s_profiles.py'):
+                    shutil.copy(SCRIPTS / f, d)
+                shutil.copy(SWEEP, Path(d) / 'k8s-sweep')
+                (Path(d) / name).write_text('#!/bin/sh\n')
+                loader = importlib.machinery.SourceFileLoader('sweep_under_test', str(Path(d) / 'k8s-sweep'))
+                module = importlib.util.module_from_spec(importlib.util.spec_from_loader('sweep_under_test', loader))
+                loader.exec_module(module)
+                sys.path.remove(d)
+                cmd = module.guard_command()
+                self.assertEqual(cmd[1:], ['-I', str(Path(d).resolve() / name)])
+                self.assertEqual(cmd[0], sys.executable)
 
 
 @unittest.skipUnless(shutil.which('chezmoi'), 'chezmoi not installed')
