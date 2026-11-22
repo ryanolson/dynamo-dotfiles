@@ -11,9 +11,14 @@ Every command prints one JSON object on stdout. A refusal exits non-zero with `{
 | `ns create <purpose> --issue <n> --hours <h>` | a bb thread | Creates `<namespace_prefix><n>-<purpose>-<suffix>`, where the suffix is 10 random letters and digits from the CSPRNG, with the opt-in labels, `owner`, `wcep.agent/thread`, `wcep.agent/issue`, and the annotation `wcep.agent/expires-at`. `h` is at most 4. A name that exists is refused, and a name longer than 63 characters. It records the name and UID in the thread's ledger. Where the bot may not create a namespace (Forbidden at the cluster scope, as on our clusters), it refuses `namespace_create_denied` and names `ns claim`. |
 | `-n <premade> ns claim --gpus <n> --hours <h>` | a bb thread | Claims the profiles' pre-made namespace (`[bot] premade_namespace`) with a `k8s-leases` lease. See "A claimed namespace" below. It writes nothing to the cluster. |
 | `-n <ns> lease acquire --gpus <n> --hours <h>` | the namespace's thread | Calls `bb k8s lease acquire` with the profile name, the namespace UID, the thread, and the profile's GPU type. Writes the lease record (below). Prints the pod label and pod affinity that GPU pods must carry. |
-| `-n <ns> secret hf\|ngc` | the namespace's thread | Creates the Secret from `fleet secret get`, on stdin only, with `kubectl create -f -`: create-only, labelled with the namespace UID and the lease. Prints only the secret's name. |
+| `-n <ns> secret hf\|ngc\|ngc-push` | the namespace's thread | Creates the Secret from `fleet secret get`, on stdin only, with `kubectl create -f -`: create-only, labelled with the namespace UID and the lease. `ngc` is the pull-only key (`op://Fleet/NGC Pull Key/credential`); `ngc-push` is the push credential and is never used for a pull secret. Prints only the secret's name. |
+| `-n <ns> secret git --repo <owner>/<repo>` | the namespace's thread | Creates the read-only deploy key as Secret `git` (key `id_ed25519`) and the pinned GitHub host key as ConfigMap `git-known-hosts`, both from the guard, both lease-labelled. The ref is the convention `op://Fleet/<owner>-<repo> deploy key/private key`. The key is never printed. It refuses `secret_unavailable` when the item is absent; there is no fallback. |
+| `-n <ns> build run --repo <url> --commit <40 hex> --dockerfile <path> --image <name> [--arch amd64\|arm64]` | the namespace's thread, under its live lease (the claim in the pre-made namespace) | Renders one image-build Job from the fixed template (see "Build Jobs"), takes the lease's slot, records one ledger line and prints `{"job": "<name>"}` only. Refuses a commit that is not 40 hex, an image name it cannot tag, an arch that is not the profile's, a forbidden field, a Job without the lease label on its pod template, and a name already taken (`job_exists`). |
+| `-n <ns> build show <job>` | anyone | Read only. Prints the Job's state and the last 200 log lines, with credential-shaped strings redacted. A failed Job exits non-zero with `build_failed`, `tag_exists`, `registry_denied` or `registry_error`. |
+| `-n <ns> build index --commit <40 hex> --image <name>` | the namespace's thread, under its live lease | The manifest-list Job: `crane index append -t ...:<12 hex> -m ...:<12 hex>-amd64 -m ...:<12 hex>-arm64`, then `crane manifest` and `crane digest`. Runs under the still-live amd64 claim. |
+| `-n <ns> build delete <job>` | the namespace's thread, under its live lease | Deletes the Job with `propagationPolicy: Background`, so its Pods go with it. |
 | `-n <ns> apply -f <file>` | the namespace's thread | Applies DGDs, ConfigMaps and ClusterIP Services, after the checks below. |
-| `-n <ns> delete <kind>/<name>` | the namespace's thread | Deletes one DGD, ConfigMap, Service, Secret, PVC or PodCliqueSet, with its UID and `resourceVersion` as preconditions. An object labelled with another lease is refused (`object_not_yours`); in a claimed namespace, so is one without this lease's label. The lease record, the model cache PVC and the pull secret are refused. Like `apply`, it takes the lease's slot, or needs a namespace that holds no GPUs. |
+| `-n <ns> delete <kind>/<name>` | the namespace's thread | Deletes one DGD, Job, ConfigMap, Service, Secret, PVC or PodCliqueSet, with its UID and `resourceVersion` as preconditions. A Job's delete carries `propagationPolicy: Background`. An object labelled with another lease is refused (`object_not_yours`); in a claimed namespace, so is one without this lease's label. The lease record, the model cache PVC and the pull secret are refused. Like `apply`, it takes the lease's slot, or needs a namespace that holds no GPUs. |
 | `down <ns> [--uid <uid>] [--lease <id>]` | the namespace's thread, or anyone with teardown authority | Releases an active lease first (owner only). Deletes each DGD labelled with the lease being torn down: it reads the DGD again, checks that its UID is still the one the list gave and that its lease label still holds, then deletes it under that listed UID and the `resourceVersion` just read. A DGD that changed in between is left (`dgds_kept`), not deleted. Waits, at most `K8S_GUARD_DOWN_WAIT_SECONDS` (300), for every GPU pod in the namespace to go. Then deletes the namespace with its UID as a precondition, whatever is left, and reports `gpu_pods_left`. A namespace already being deleted gets no second delete (`terminating: true`). With no lease id (no `--lease` and no record) it deletes no DGD and says so in `dgds_skipped`. In a claimed namespace it never deletes the namespace: see "A claimed namespace". |
 | `expire <ns> [--uid <uid>] [--lease <id>]` | anyone with teardown authority | Sets every replica count of every DGD labelled with the lease being torn down to 0. With no lease id (no `--lease` and no record) it scales nothing and says so in `dgds_skipped`. |
 | `extend <ns> [--uid <uid>] [--lease <id>]` | anyone | Copies the lease's `expires_at`, unchanged, into the lease record. It only replaces the record `lease acquire` wrote, under the `resourceVersion` it read, and never creates one. The lease must be `active` and match the cluster, the namespace and the UID. It never moves the stored expiry earlier, so a late call cannot undo a newer extension. |
@@ -48,8 +53,8 @@ On our clusters the bot cannot create a namespace. Ops made one per cluster for 
 - Teardown takes only the plugin's word (`revoking` or `releasing`). The namespace keeps no expiry, so there is no offline teardown; with the plugin unreachable, `down` and `expire` refuse `lease_unavailable`.
 - The owner's `down` releases the lease and returns. The plugin then runs `down` on a host, which:
   1. resolves the lease's open write attempts from storage (below);
-  2. scales the lease's DGDs to 0, then deletes each object labelled `wcep.agent/lease=<id>` of the kinds DGD, PodCliqueSet, Service, ConfigMap, Secret and PVC (not the model cache PVC or the pull secret), each with its UID and `resourceVersion` as preconditions;
-  3. reads the lease's labelled objects again, adding pods, PodCliques, Deployments and StatefulSets. Terminating pods count;
+  2. scales the lease's DGDs to 0, then deletes each object labelled `wcep.agent/lease=<id>` of the kinds DGD, Job, PodCliqueSet, Service, ConfigMap, Secret and PVC (not the model cache PVC or the pull secret), each with its UID and `resourceVersion` as preconditions. A Job's delete carries `propagationPolicy: Background`, because a `batch/v1` Job delete otherwise orphans its Pods, which carry the lease label and would hold teardown open for the Job's 24-hour retention;
+  3. reads the lease's labelled objects again, Jobs included, adding pods, PodCliques, Deployments and StatefulSets. Terminating pods count;
   4. reports `complete` only when every attempt is resolved, nothing changed hands, every list was read, and nothing of the lease is left. Otherwise it refuses `teardown_incomplete`, with what it resolved and what is left.
 - `down` never deletes, labels or patches the pre-made namespace. The plugin frees the lease's GPUs only through one transaction conditional on that completion (`k8s-leases` README). Running `down` again after a crash goes on from where it stopped.
 - A pod with the DGD's name label but not the lease label is never selected, waited for or deleted.
@@ -89,6 +94,53 @@ A write whose reply never came can still land. A slot that expired, a client tha
 - **Pod specs:** no `hostPath`, `priorityClassName`, `nodeName`, `schedulerName`, privileged containers, `hostNetwork`, `hostPID` or `hostIPC`, and no toleration with `operator: Exists` and no key. Every container needs `cpu` and `memory` in both requests and limits.
 - **Name:** a DGD name has at most 39 characters. An object may appear only once in a file.
 - **GPU type:** every GPU pod needs `nodeSelector` `nvidia.com/gpu.product` equal to the profile's `gpu_product`, the GPU the lease counts.
+
+## Build Jobs
+
+A build is a Kubernetes `Job` in the claim's namespace, rendered by the guard from one fixed template. No caller writes the manifest, so the fields the plan fixed cannot be chosen: the registry `nvcr.io/goirlvsxnepa/llm_nim`, the pinned images, the Job's deadline and retention, and the resources all come from `scripts/k8s_guard_rules.py`.
+
+`build run` requires this thread's live claim (the pre-made namespace's lease) and the two secrets the Job mounts: `nvcr-push` and, for an ssh source, `git`. It prints the Job's name and nothing else. One Job is:
+
+- **Image and tag.** `<image>:<commit's first 12 hex>-<arch>`, registered under `nvcr.io/goirlvsxnepa/llm_nim`. The clone gets the **full 40-hex** commit and verifies `git rev-parse HEAD`; the build container pushes exactly `type=image,name=<registry>/<image>:<12 hex>-<arch>,push=true`. A tag is never `latest`, and a name already taken is refused (`job_exists`): `build show` it, `build delete` it, then submit again.
+- **Arch.** The profile's `arch`; `--arch` may only name it (`arch_mismatch` otherwise), and the pod's `nodeSelector` is `kubernetes.io/arch: <arch>`. amd64 builds on `dynamo-aks-dev`, arm64 on `dynamo-gcp-dev-02`.
+- **Pod.** `restartPolicy: Never`, `backoffLimit: 0`, `activeDeadlineSeconds: 3600`, `ttlSecondsAfterFinished: 86400`; `runAsUser`/`runAsGroup` 1000 and `fsGroup` 1000; `seccompProfile` and `appArmorProfile` `Unconfined`; `allowPrivilegeEscalation` **not set** (false sets `no_new_privs`, which blocks `newuidmap`). Every container requests and limits `cpu`, `memory` and `ephemeral-storage`.
+- **Init containers, in order.** `tag-check` asks the registry whether the tag exists; `clone` runs `git clone --filter=blob:none "$REPO" /src`, checks out `$COMMIT` and tests `git rev-parse HEAD`. Both run the pinned `moby/buildkit:v0.23.2-rootless` digest, which has `git`, `openssh` and a `user` at UID 1000. The clone sets **its own** `command`: the image's entrypoint is `rootlesskit buildkitd` and would otherwise start a daemon instead of cloning.
+- **The build.** `buildctl-daemonless.sh build --oci-worker-no-process-sandbox --frontend dockerfile.v0 --local context=/src --local dockerfile=/src/<dirname> --output ...`, with BuildKit's state in an `emptyDir` at `/home/user/.local/share/buildkit`.
+- **The push credential.** Secret `nvcr-push` mounted read-only at `/home/user/.docker`, with `items: [{key: .dockerconfigjson, path: config.json}]` (a `dockerconfigjson` Secret's key is `.dockerconfigjson`, and BuildKit reads `config.json`; without the rename it gets a 401). `DOCKER_CONFIG=/home/user/.docker`. No `imagePullSecrets`: the images are public and only the push credential and the git key are secrets.
+
+**The tag check runs inside the cluster** because the host has neither the credential nor a registry client. It is a shell probe in the same pinned builder image, because the pinned `crane` image is distroless and has no shell, and `crane digest` cannot turn "the tag exists" into the failure the init container needs. The probe reads the mounted `auth` from `config.json`, follows the registry's token challenge, and reads the tag's manifest:
+
+| Answer | Marker | Result |
+|---|---|---|
+| the manifest is there | `tag_exists` | the init container fails, so the build never runs |
+| 401 or 403 | `registry_denied` | refused |
+| 404 whose body says `manifest unknown` | (silent) | the clone and the build run |
+| anything else | `registry_error` | refused, rather than guessing |
+
+`build show` reports the marker as the refusal's code. An existing tag is never overwritten: a DGD may already pull it. The first real build confirms the probe's registry flow (`references/bot.md`, section 8 of the runbook).
+
+**The git key and the pinned host key.** `secret git --repo <owner>/<repo>` names the ref by convention, `op://Fleet/<owner>-<repo> deploy key/private key`, fetches it with `fleet secret get` itself (no value passes through a caller, argv, a file or a pipe from outside), and creates:
+
+- Secret `git` with key `id_ed25519` (the 1Password field is `private key`; a Secret key cannot contain a space);
+- ConfigMap `git-known-hosts` with key `known_hosts`, holding GitHub's published ed25519 host key.
+
+For an ssh `--repo`, the Job projects both into one volume at `/home/user/.ssh`, read-only, with `defaultMode: 0400` (the kubelet materializes a group-readable copy for `fsGroup` 1000, which is the mode the clone container actually reads). The clone sets `GIT_SSH_COMMAND` with `-i /home/user/.ssh/id_ed25519`, `IdentitiesOnly=yes`, `UserKnownHostsFile=/home/user/.ssh/known_hosts` and `StrictHostKeyChecking=yes`; there is no `accept-new`, so a changed host key fails the build instead of being trusted. A writable mount, a mount outside `/home/user/.ssh`, any mode but `0400`, a volume that is not projected, a clone that is not the pinned builder image or sets no command, and an ssh option that accepts a new host key are all refused. An `https` source runs the same Job without the mount.
+
+**The charge.** The Job requests no GPU, but its claim charges one (`ns claim` cannot ask for zero). The ledger line records the claim's charge, never the Job's zero.
+
+**Teardown and the index.**
+- `build index` runs the pinned `crane` image as three sequential steps, `crane index append` (both per-arch tags on the commit's tag), `crane manifest` and `crane digest`. It needs the same live claim; the plan runs it under the amd64 claim before that claim is released.
+- A Job delete carries `propagationPolicy: Background`; without it the Job's Pods are orphaned and, carrying the lease label, hold the claim's teardown open. Claimed teardown deletes a lease's Jobs, and its re-read lists them.
+- The push secret exists for the claim's length: it is lease-labelled, claimed teardown deletes it, and the next claim's build creates it again. Run `secret ngc-push` per claim.
+
+**What a caller may not do.** The template refuses, before any write:
+
+- `hostPath`, `priorityClassName`, `nodeName`, `schedulerName` (the server's own `default-scheduler` is accepted on the dry-run answer only), `hostNetwork`, `hostPID`, `hostIPC`, privileged containers and `allowPrivilegeEscalation`;
+- any container without `cpu`, `memory` and `ephemeral-storage` in both requests and limits;
+- an image without `@sha256:` digest;
+- a pod-template label without the lease (`lease_label_required`);
+- a Job whose output tag is not the commit's `<12 hex>-<arch>`, or does not push (`invalid_tag`);
+- an arch other than the profile's (`arch_mismatch`), a commit that is not 40 hex (`invalid_commit`), an image name it cannot tag (`invalid_image`).
 
 ## Budget
 
@@ -169,7 +221,12 @@ The tests use fakes. The first run on a cluster must confirm these, and run `sel
 - `kubectl get <resource> -l wcep.agent/lease=<id>` works for each kind the claimed teardown lists, and a resource the server does not serve fails with `doesn't have a resource type`;
 - `kubectl label --local` writes both stamps in one call, and the server dry run returns them on every object;
 - the API server accepts the `DeleteOptions` body that `kubectl delete --raw <path> -f -` sends without a `Content-Type`;
-- the dry run of a stock DGD adds no field the guard refuses.
+- the dry run of a stock DGD adds no field the guard refuses;
+- on a Job's server dry run, the API server defaults `schedulerName: default-scheduler` on the pod template (the guard admits that one value on the dry-run answer, and no other);
+- the tag-check probe's registry flow on `nvcr.io`: the token challenge in the form the probe expects, and `wget` over TLS in the pinned builder image (Wolfi busybox, whose `wget` runs the `ssl_client` applet). A 404 for a missing tag contains `manifest unknown`;
+- the Crane image at `v0.20.3` by digest: `v0.20.2`, named by the plan, is no longer served by `gcr.io/go-containerregistry/crane`;
+- every container's `ephemeral-storage` request and limit are accepted together with the node's allocatable storage;
+- the bot may `create jobs.batch` in the pre-made namespace.
 
 ## Tests
 

@@ -5,8 +5,15 @@ Usage (every command takes --context <kube context>; -n may come anywhere):
   k8s-guard ns create <purpose> --issue <n> --hours <h>      a new namespace, never an existing one
   k8s-guard -n <premade> ns claim --gpus <n> --hours <h>      claim the profile's pre-made namespace
   k8s-guard -n <ns> lease acquire --gpus <n> --hours <h>      a k8s-leases lease for the namespace
-  k8s-guard -n <ns> secret hf|ngc                              a secret piped from `fleet secret get`
+  k8s-guard -n <ns> secret hf|ngc|ngc-push                    a secret piped from `fleet secret get`
+  k8s-guard -n <ns> secret git --repo <owner>/<repo>           the read-only deploy key and the pinned host key
   k8s-guard -n <ns> apply -f <file>                            DGDs, ConfigMaps, ClusterIP Services
+  k8s-guard -n <ns> build run --repo <url> --commit <40 hex> --dockerfile <path> --image <name> [--arch ...]
+                                                               one image-build Job, from the fixed template
+  k8s-guard -n <ns> build show <job>                           its state and the last 200 log lines, read only
+  k8s-guard -n <ns> build index --commit <40 hex> --image <name>
+                                                               the manifest-list Job over both per-arch tags
+  k8s-guard -n <ns> build delete <job>                         end a Job now, Pods included
   k8s-guard -n <ns> delete <kind>/<name>                       one object
   k8s-guard down <ns> [--uid <uid>] [--lease <id>]             delete the lease's DGDs, then the namespace
   k8s-guard expire <ns> [--uid <uid>] [--lease <id>]           scale the lease's DGDs to 0
@@ -43,15 +50,18 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from k8s_profiles import ProfileError, kubectl_env, load_profiles, prepare_bot_kubeconfig  # noqa: E402
 from k8s_guard_rules import (  # noqa: E402
-    DGD_KIND, HOSTNAME_TOPOLOGY, LEASE_LABEL, LEASE_RECORD, NS_UID_LABEL, Refusal, admit, allocation,
-    budget_allocation, check_gpu_product, check_lease_label, check_one_node, dgd_gpus, gpu_pod_summary, zero_patch)
+    ATTEMPT_ANNOTATION, DGD_KIND, GIT_SECRET, GITHUB_KNOWN_HOSTS, HOSTNAME_TOPOLOGY, KNOWN_HOSTS_CONFIGMAP,
+    LEASE_LABEL, LEASE_RECORD, NS_UID_LABEL, PUSH_SECRET, Refusal, admit, allocation, arch_arg,
+    budget_allocation, build_job, build_verdict, check_gpu_product, check_job, check_lease_label, check_one_node,
+    commit_arg, dgd_gpus, dockerfile_arg, git_secret_spec, gpu_pod_summary, image_arg, index_job, job_state,
+    redact_build_log, repo_arg, repo_is_ssh, zero_patch)
 
 DGD_RESOURCE = 'dynamographdeployments.nvidia.com'
 THREAD_LABEL = 'wcep.agent/thread'
 ISSUE_LABEL = 'wcep.agent/issue'
 EXPIRES_ANNOTATION = 'wcep.agent/expires-at'
-# Every write under a lease carries the id of its attempt, recorded in k8s-leases before the write is sent.
-ATTEMPT_ANNOTATION = 'wcep.agent/attempt'
+# Every write under a lease carries the id of its attempt, recorded in k8s-leases before the write is sent
+# (ATTEMPT_ANNOTATION, in k8s_guard_rules).
 DEVELOPER_LABEL = 'dynamo.nvidia.com/developer'
 AGENT_RBAC_LABEL = 'dynamo.nvidia.com/developer-agent-rbac'
 MAX_NS_HOURS = 4
@@ -69,8 +79,11 @@ FLEET_TIMEOUT = 30
 
 SECRETS = {
     'hf': {'ref': 'op://Fleet/HuggingFace/credential', 'name': 'hf-token-secret', 'key': 'HF_TOKEN'},
-    'ngc': {'ref': 'op://Fleet/NGC NIM Operations PAT/credential', 'name': 'nvcr-pull',
+    # The pull-only key Ryan makes; never the push-capable PAT, which is a separate secret.
+    'ngc': {'ref': 'op://Fleet/NGC Pull Key/credential', 'name': 'nvcr-pull',
             'key': '.dockerconfigjson', 'type': 'kubernetes.io/dockerconfigjson'},
+    'ngc-push': {'ref': 'op://Fleet/NGC NIM Operations PAT/credential', 'name': PUSH_SECRET,
+                 'key': '.dockerconfigjson', 'type': 'kubernetes.io/dockerconfigjson'},
 }
 
 DELETABLE = {  # alias -> (kubectl resource, kind)
@@ -84,6 +97,7 @@ DELETABLE = {  # alias -> (kubectl resource, kind)
     # Leftovers a DGD delete can leave behind (runbook section 10).
     **dict.fromkeys(('pcs', 'podcliqueset', 'podcliquesets', 'podcliquesets.grove.io'),
                     ('podcliquesets.grove.io', 'PodCliqueSet')),
+    **dict.fromkeys(('job', 'jobs', 'jobs.batch'), ('jobs.batch', 'Job')),
 }
 
 # kind -> (kubectl resource, REST plural): the objects the guard writes, deletes or inventories by name.
@@ -94,6 +108,7 @@ KINDS = {
     'Secret': ('secrets', 'secrets'),
     'PersistentVolumeClaim': ('persistentvolumeclaims', 'persistentvolumeclaims'),
     'PodCliqueSet': ('podcliquesets.grove.io', 'podcliquesets'),
+    'Job': ('jobs.batch', 'jobs'),
 }
 # The kinds `apply` admits (k8s_guard_rules.admit decides the details).
 APPLY_KINDS = {(DGD_KIND, 'nvidia.com/v1alpha1'), (DGD_KIND, 'nvidia.com/v1beta1'), ('ConfigMap', 'v1'), ('Service', 'v1')}
@@ -913,8 +928,13 @@ def delete_owned(g, ns, obj, still_ours, timeout=KUBECTL_TIMEOUT, attempts=None)
                                               f'{live["metadata"].get("uid")}, {LEASE_LABEL}='
                                               f'{labels_of(live).get(LEASE_LABEL) or "none"}); left alone')
         version = live['metadata']['resourceVersion']
-        body = json.dumps({'kind': 'DeleteOptions', 'apiVersion': 'v1',
-                           'preconditions': {'uid': listed_uid, 'resourceVersion': version}})
+        options = {'kind': 'DeleteOptions', 'apiVersion': 'v1',
+                   'preconditions': {'uid': listed_uid, 'resourceVersion': version}}
+        if kind == 'Job':
+            # Otherwise the Job's Pods are orphaned; they carry the lease label, so teardown would wait
+            # for the Job's 24-hour retention before the namespace could be called done.
+            options['propagationPolicy'] = 'Background'
+        body = json.dumps(options)
 
         def send(body=body):
             rc, out, err = g.kc.run('delete', '--raw', rest_path(obj, ns), '-f', '-', input=body, timeout=timeout)
@@ -1137,8 +1157,15 @@ def cmd_lease_acquire(g, a):
 
 def cmd_secret(g, a):
     g.require_writable()
+    if a.which == 'git':
+        if not a.repo:
+            raise Refusal('usage', 'secret git needs --repo <owner>/<repo>', status=2)
+        spec = git_secret_spec(a.repo)
+    else:
+        if a.repo:
+            raise Refusal('usage', f'--repo is only for `secret git`, not `secret {a.which}`', status=2)
+        spec = SECRETS[a.which]
     ns, view = g.owned()
-    spec = SECRETS[a.which]
 
     def body(lease, slot):
         if lease is None and allocation(g.dgds(ns), g.pods(ns)) > 0:
@@ -1153,7 +1180,7 @@ def cmd_secret(g, a):
             remember_secret(value)
         if p.returncode != 0 or not value:
             raise Refusal('secret_unavailable', f'fleet secret get exited {p.returncode}: {clip(p.stderr, 200)}')
-        if a.which == 'ngc':
+        if a.which in ('ngc', 'ngc-push'):
             auth = base64.b64encode(f'$oauthtoken:{value}'.encode()).decode()
             payload = json.dumps({'auths': {'nvcr.io': {'username': '$oauthtoken', 'password': value, 'auth': auth}}})
             remember_secret(payload)
@@ -1161,30 +1188,46 @@ def cmd_secret(g, a):
             payload = value
         labels = {NS_UID_LABEL: view.uid, **({LEASE_LABEL: lease['lease_id']} if lease else {})}
         attempt = new_attempt_id() if slot else None
+        metadata = {'namespace': ns, 'labels': labels,
+                    **({'annotations': {ATTEMPT_ANNOTATION: attempt}} if attempt else {})}
         obj = {'apiVersion': 'v1', 'kind': 'Secret', 'type': spec.get('type', 'Opaque'),
-               'metadata': {'name': spec['name'], 'namespace': ns, 'labels': labels,
-                            **({'annotations': {ATTEMPT_ANNOTATION: attempt}} if attempt else {})},
+               'metadata': {'name': spec['name'], **metadata},
                'stringData': {spec['key']: payload}}
+        # The pinned host key travels beside the key: the clone's UserKnownHostsFile needs it, and ssh
+        # refuses a host it cannot verify.
+        known_hosts = {'apiVersion': 'v1', 'kind': 'ConfigMap',
+                       'metadata': {'name': KNOWN_HOSTS_CONFIGMAP, **metadata},
+                       'data': {'known_hosts': GITHUB_KNOWN_HOSTS}} if a.which == 'git' else None
         confirm_uid(g, ns, view.uid)
         if slot:
             slot.check()
 
-        def send():
-            # Create, never apply: the server refuses a name that exists. The value goes on stdin only.
-            rc, out, err = g.kc.run('create', '-f', '-', '-n', ns, '-o', 'json', input=json.dumps(obj))
-            if rc != 0:
-                if 'AlreadyExists' in err:
-                    e = Refusal('secret_exists', f'secret {spec["name"]} already exists in {ns}')
-                    e.raw = err
-                    raise e
-                raise kubectl_error(('create', 'secret', spec['name']), rc, err)
+        def create(item, attempt_id):
+            def send():
+                # Create, never apply: the server refuses a name that exists. The value goes on stdin only.
+                rc, out, err = g.kc.run('create', '-f', '-', '-n', ns, '-o', 'json', input=json.dumps(item))
+                if rc != 0:
+                    if 'AlreadyExists' in err:
+                        code = 'secret_exists' if item['kind'] == 'Secret' else 'object_exists'
+                        e = Refusal(code, f'{item["kind"].lower()} {item["metadata"]["name"]} already exists '
+                                          f'in {ns}')
+                        e.raw = err
+                        raise e
+                    raise kubectl_error(('create', item['kind'].lower(), item['metadata']['name']), rc, err)
+            if attempt_id:
+                slot.attempts.run(attempt_id, 'create', item['kind'], item['metadata']['name'], None, None, send)
+            else:
+                send()
 
-        if attempt:
-            slot.attempts.run(attempt, 'create', 'Secret', spec['name'], None, None, send)
-        else:
-            send()
+        create(obj, attempt)
         g.record(ns, f'Secret/{spec["name"]}', 0, 'up', uid=view.uid, lease=view.lease_id, issue=view.issue)
-        return {'secret': spec['name'], 'namespace': ns}
+        result = {'secret': spec['name'], 'namespace': ns}
+        if known_hosts is not None:
+            create(known_hosts, new_attempt_id() if slot else None)
+            g.record(ns, f'ConfigMap/{KNOWN_HOSTS_CONFIGMAP}', 0, 'up', uid=view.uid, lease=view.lease_id,
+                     issue=view.issue)
+            result['known_hosts'] = KNOWN_HOSTS_CONFIGMAP
+        return result
 
     return fenced(g, view, body)
 
@@ -1496,7 +1539,7 @@ def cmd_expire(g, a):
 
 
 # Teardown of a claimed namespace: the roots it deletes, and everything it reads again before it says complete.
-ROOT_KINDS = (DGD_KIND, 'PodCliqueSet', 'Service', 'ConfigMap', 'Secret', 'PersistentVolumeClaim')
+ROOT_KINDS = (DGD_KIND, 'Job', 'PodCliqueSet', 'Service', 'ConfigMap', 'Secret', 'PersistentVolumeClaim')
 CHILD_RESOURCES = ('pods', 'podcliques.grove.io', 'deployments.apps', 'statefulsets.apps')
 
 
@@ -1883,6 +1926,161 @@ def cmd_selftest_fences(g, a):
     return fenced(g, view, body)
 
 
+# --- build Jobs ------------------------------------------------------------------------
+#
+# One Job rendered from the fixed template in k8s_guard_rules, under this thread's claim: the tag
+# check, the clone, the build and its push, then (for a multi-arch image) an index Job that appends
+# both per-arch tags. Every check runs on the rendered object and again on the server's dry-run
+# answer, so a webhook cannot add a field the guard did not render. No caller-supplied manifest.
+
+def create_job(g, ns, job, dry, timeout=KUBECTL_TIMEOUT):
+    args = ['create', '-f', '-', '-n', ns, '-o', 'json'] + (['--dry-run=server'] if dry else [])
+    rc, out, err = g.kc.run(*args, input=json.dumps(job), timeout=timeout)
+    if rc != 0:
+        if 'AlreadyExists' in err:
+            e = Refusal('job_exists', f'{job["kind"]}/{job["metadata"]["name"]} already exists in {ns}; '
+                                      '`k8s-guard build show` it, then `build delete` it')
+            e.raw = err
+            raise e
+        raise kubectl_error(('create', 'job', job['metadata']['name']), rc, err)
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        raise Refusal('kubectl_error', f'kubectl create Job/{job["metadata"]["name"]} printed no JSON')
+
+
+def submit_job(g, ns, view, lease, slot, job, expect, charge):
+    """Dry-run, admit, create as an attempt under the slot, and append one ledger line."""
+    name = job['metadata']['name']
+    lid = lease['lease_id']
+    if get_object(g, ns, 'Job', name) is not None:
+        raise Refusal('job_exists', f'Job/{name} exists; `k8s-guard build show {name}` it, then `build delete` '
+                                    'it before another build of the same commit and arch')
+    check_job(job, lid, expect, rendered=True)
+    confirm_uid(g, ns, view.uid)
+    if slot:
+        slot.check()
+    check_job(create_job(g, ns, job, dry=True), lid, expect)
+    confirm_uid(g, ns, view.uid)
+    if slot:
+        slot.check()
+    attempt = job['metadata']['annotations'][ATTEMPT_ANNOTATION]
+
+    def send():
+        return create_job(g, ns, job, dry=False, timeout=slot.timeout() if slot else APPLY_REQUEST_TIMEOUT + 15)
+
+    if slot:
+        slot.attempts.run(attempt, 'create', 'Job', name, None, None, send)
+    else:
+        send()
+    # The Job requests no GPU; the claim is what costs one, so the ledger records the claim's charge.
+    g.record(ns, f'Job/{name}', charge, 'up', uid=view.uid, lease=view.lease_id, issue=view.issue)
+    return name
+
+
+def build_prerequisites(g, ns, lease, ssh):
+    if lease is None:
+        raise Refusal('lease_required', f'{ns} has no live lease; a build Job runs under this thread\'s claim')
+    if ssh and get_object(g, ns, 'Secret', GIT_SECRET) is None:
+        raise Refusal('secret_unavailable', f'the ssh source needs Secret/{GIT_SECRET}; run `k8s-guard -n {ns} '
+                                            'secret git --repo <owner>/<repo>` first')
+    if get_object(g, ns, 'Secret', PUSH_SECRET) is None:
+        raise Refusal('secret_unavailable', f'the build pushes with Secret/{PUSH_SECRET}; run `k8s-guard -n {ns} '
+                                            'secret ngc-push` first')
+
+
+def cmd_build_run(g, a):
+    g.require_writable()
+    commit = commit_arg(a.commit)
+    image = image_arg(a.image)
+    dockerfile = dockerfile_arg(a.dockerfile)
+    repo = repo_arg(a.repo)
+    arch = arch_arg(a.arch, g.profile)
+    ssh = repo_is_ssh(repo)
+    ns, view = g.owned()
+
+    def body(lease, slot):
+        build_prerequisites(g, ns, lease, ssh)
+        attempt = new_attempt_id()
+        job = build_job(ns, view.uid, lease['lease_id'], attempt, repo, commit, dockerfile, image, arch, ssh)
+        expect = {'kind': 'run', 'image': image, 'commit': commit, 'arch': arch, 'repo': repo, 'ssh': ssh}
+        return {'job': submit_job(g, ns, view, lease, slot, job, expect, max(int(lease['gpus']), 1))}
+
+    return fenced(g, view, body)
+
+
+def cmd_build_index(g, a):
+    g.require_writable()
+    commit = commit_arg(a.commit)
+    image = image_arg(a.image)
+    arch = arch_arg(None, g.profile)
+    ns, view = g.owned()
+
+    def body(lease, slot):
+        build_prerequisites(g, ns, lease, ssh=False)
+        attempt = new_attempt_id()
+        job = index_job(ns, view.uid, lease['lease_id'], attempt, image, commit, arch)
+        expect = {'kind': 'index', 'image': image, 'commit': commit, 'arch': arch, 'uid': 65532}
+        return {'job': submit_job(g, ns, view, lease, slot, job, expect, max(int(lease['gpus']), 1))}
+
+    return fenced(g, view, body)
+
+
+def cmd_build_show(g, a):
+    """Read only: the Job's state and the last 200 log lines, with the credential's shapes redacted."""
+    ns = g.ns_name()
+    name = a.name or ''
+    if not DNS_SUBDOMAIN.match(name) or len(name) > 63:
+        raise Refusal('usage', f'{name!r} is not a Job name', status=2)
+    job = get_object(g, ns, 'Job', name)
+    if job is None:
+        raise Refusal('not_found', f'Job/{name} not found in {ns}')
+    state = job_state(job)
+    # --all-containers so the tag-check and clone initContainers' lines are in the tail too.
+    rc, out, _ = g.kc.run('logs', f'job/{name}', '-n', ns, '--tail=200', '--all-containers=true')
+    tail = redact_build_log(out if rc == 0 else '')
+    if state == 'failed':
+        code = build_verdict(tail)
+        detail = next((line for line in reversed(tail.splitlines()) if line.strip()), '')
+        raise Refusal(code, f'build {name} failed' + (f': {detail}' if detail else ''), build=name, state=state,
+                      tail=tail)
+    return {'build': name, 'state': state, 'tail': tail}
+
+
+def cmd_build_delete(g, a):
+    g.require_writable()
+    ns, view = g.owned()
+    name = a.name or ''
+    if not DNS_SUBDOMAIN.match(name) or len(name) > 63:
+        raise Refusal('usage', f'{name!r} is not a Job name', status=2)
+
+    def body(lease, slot):
+        if lease is None and allocation(g.dgds(ns), g.pods(ns)) > 0:
+            raise Refusal('lease_required', f'{ns} holds GPUs but has no lease; use `k8s-guard down`')
+        lease_id = lease['lease_id'] if lease else None
+        obj = get_object(g, ns, 'Job', name)
+        if obj is None:
+            raise Refusal('not_found', f'Job/{name} not found in {ns}')
+
+        def mine(live):
+            return owns(live, lease_id, view.uid, view.claimed, unstamped=True)[0]
+
+        if not mine(obj):
+            raise Refusal('object_not_yours', f'Job/{name} is not this lease\'s '
+                                              f'({LEASE_LABEL}={labels_of(obj).get(LEASE_LABEL) or "none"}); '
+                                              'left alone')
+        confirm_uid(g, ns, view.uid)
+        if slot:
+            slot.check()
+        if delete_owned(g, ns, obj, mine, timeout=slot.timeout() if slot else KUBECTL_TIMEOUT,
+                        attempts=slot.attempts if slot else None) == 'gone':
+            raise Refusal('not_found', f'Job/{name} not found in {ns}')
+        g.record(ns, f'Job/{name}', 0, 'down', uid=view.uid, lease=view.lease_id, issue=view.issue)
+        return {'deleted': f'Job/{name}', 'namespace': ns}
+
+    return fenced(g, view, body)
+
+
 # --- argv ----------------------------------------------------------------------------
 
 class Parser(argparse.ArgumentParser):
@@ -1905,7 +2103,13 @@ COMMANDS = {
     ('ns', 'claim'): (cmd_ns_claim, ((('--gpus',), {'required': True}), (('--hours',), {'required': True}))),
     ('lease', 'acquire'): (cmd_lease_acquire, ((('--gpus',), {'required': True}),
                                                (('--hours',), {'required': True}))),
-    ('secret',): (cmd_secret, ((('which',), {'choices': sorted(SECRETS)}),)),
+    ('secret',): (cmd_secret, ((('which',), {'choices': sorted(SECRETS) + ['git']}), (('--repo',), {}))),
+    ('build', 'run'): (cmd_build_run, ((('--repo',), {'required': True}), (('--commit',), {'required': True}),
+                                       (('--dockerfile',), {'required': True}), (('--image',), {'required': True}),
+                                       (('--arch',), {}))),
+    ('build', 'index'): (cmd_build_index, ((('--commit',), {'required': True}), (('--image',), {'required': True}))),
+    ('build', 'show'): (cmd_build_show, ((('name',), {}),)),
+    ('build', 'delete'): (cmd_build_delete, ((('name',), {}),)),
     ('apply',): (cmd_apply, ((('-f', '--filename'), {'required': True}),)),
     ('delete',): (cmd_delete, ((('target',), {}),)),
     ('down',): (cmd_down, TEARDOWN),

@@ -19,6 +19,8 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
+import re
+import shlex
 import subprocess
 import tempfile
 import time
@@ -71,7 +73,7 @@ STATE = os.environ['FAKE_K8S_STATE']
 argv = sys.argv[1:]
 VALUED = {'--kubeconfig', '--context', '-n', '--namespace', '-o', '--output', '-f', '--filename', '--type',
           '-p', '--patch', '--raw', '--request-timeout', '--from-file', '--dry-run', '--field-selector', '-l',
-          '--selector', '--wait'}
+          '--selector', '--wait', '--tail'}
 flags, pos, i = {}, [], 0
 while i < len(argv):
     a = argv[i]
@@ -145,7 +147,8 @@ def key(obj):
 RESOURCES = {DGD_LIST_NAME: 'DynamoGraphDeployment', 'configmaps': 'ConfigMap', 'services': 'Service',
              'secrets': 'Secret', 'persistentvolumeclaims': 'PersistentVolumeClaim',
              'podcliquesets.grove.io': 'PodCliqueSet', 'podcliques.grove.io': 'PodClique',
-             'deployments.apps': 'Deployment', 'statefulsets.apps': 'StatefulSet'}
+             'deployments.apps': 'Deployment', 'statefulsets.apps': 'StatefulSet',
+             'jobs.batch': 'Job'}
 PLURALS = {r.split('.', 1)[0]: k for r, k in RESOURCES.items()}
 
 
@@ -458,7 +461,12 @@ if cmd == 'delete' and '--raw' in flags:
         st.setdefault('delete_conflicts', []).append(name); save()
         fail('Error from server (Conflict): Operation cannot be fulfilled: Precondition failed: ResourceVersion in '
              'precondition: %s, ResourceVersion in object meta: %s' % (want_rv, o['metadata'].get('resourceVersion')))
+    st.setdefault('raw_delete_bodies', []).append({'path': flags['--raw'], 'body': body})
     del st['objects'][ns][k]
+    if kind == 'Job':
+        # Background propagation: the Job goes at once, its Pods with it (the garbage collector's work).
+        st['pods'][ns] = [p for p in st['pods'].get(ns, [])
+                          if p['metadata'].get('labels', {}).get('job-name') != name]
     if kind == 'DynamoGraphDeployment':
         pods = st['pods'].get(ns, [])
         if st.get('terminate_pods_on_delete', True):
@@ -469,6 +477,14 @@ if cmd == 'delete' and '--raw' in flags:
                     p['metadata']['deletionTimestamp'] = now_iso()
     save(); emit({'kind': 'Status', 'status': 'Success'})
     fail('fake kubectl: no handler for raw delete ' + flags['--raw'], 97)
+
+if cmd == 'logs':
+    # kubectl logs job/<name> --tail=200: the fake's logs come from the test's job_logs map.
+    st.setdefault('logs_calls', []).append({'argv': argv, 'pos': pos, 'flags': flags})
+    save()
+    key = pos[1] if len(pos) > 1 else ''
+    sys.stdout.write(st.get('job_logs', {}).get(key, ''))
+    sys.exit(0)
 
 if cmd == 'delete':
     fail('fake kubectl: k8s-guard sent a delete without UID and resourceVersion preconditions', 96)
@@ -665,6 +681,7 @@ sys.exit(97)
 FAKE_FLEET = '''#!/bin/sh
 echo "$@" >> "$FAKE_FLEET_LOG"
 [ "$1 $2" = "secret get" ] || exit 97
+if [ -n "$FAKE_FLEET_FAIL" ]; then echo "no item found" >&2; exit 1; fi
 printf '%s\\n' "$FAKE_SECRET"
 '''
 
@@ -865,11 +882,11 @@ class GuardCase(unittest.TestCase):
         self.k8s = json.loads(self.k8s_state.read_text())
         self.bb = json.loads(self.bb_state.read_text())
 
-    def add_ns(self, name=NS, thread=ME, uid='uid-ns-1', expires_at=None, ledger=True):
+    def add_ns(self, name=NS, thread=ME, uid='uid-ns-1', expires_at=None, ledger=True, cluster=PROFILE):
         if ledger:
             # As `ns create` records it in the creating thread's ledger. Marked so ledger() skips it.
             with open(self.storage / 'k8s-ledger.jsonl', 'a') as f:
-                f.write(json.dumps({'thread': thread, 'cluster': PROFILE, 'namespace': name, 'uid': uid,
+                f.write(json.dumps({'thread': thread, 'cluster': cluster, 'namespace': name, 'uid': uid,
                                     'object': f'Namespace/{name}', 'direction': 'up', 'created': True,
                                     'seed': True}) + '\n')
         self.k8s['namespaces'][name] = namespace(name, thread, uid, expires_at)
@@ -919,7 +936,7 @@ class GuardCase(unittest.TestCase):
         self.profiles.write_text(re.sub(r'kubectl_sha256 = "[0-9a-f]*"', f'kubectl_sha256 = "{pin}"',
                                         self.profiles.read_text()))
 
-    def env(self, thread=ME, host_entry=False, kubeconfig=None, storage=True):
+    def env(self, thread=ME, host_entry=False, kubeconfig=None, storage=True, fleet_fail=False):
         self.pin_kubectl()
         env = {'PATH': f'{self.bin}:/usr/bin:/bin', 'HOME': str(self.home),
                'K8S_CLUSTERS_PROFILES': str(self.profiles),
@@ -929,6 +946,7 @@ class GuardCase(unittest.TestCase):
                'FAKE_BB_STATE': str(self.bb_state), 'FAKE_BB_LOG': str(self.bb_log),
                'FAKE_FLEET_LOG': str(self.fleet_log), 'FAKE_TSH_LOG': str(self.tsh_log),
                'FAKE_SECRET': SECRET, 'K8S_GUARD_DOWN_WAIT_SECONDS': '0', 'K8S_GUARD_POLL_SECONDS': '0',
+               'FAKE_FLEET_FAIL': '1' if fleet_fail else '',
                'FAKE_PW_DIR': str(self.home), 'FAKE_KUBECTL': str(self.kubectl_path),
                'FAKE_TBOT_LOG': str(self.tbot_log),
                # The caller's kubectl settings must never reach kubectl.
@@ -1015,6 +1033,15 @@ class GuardCase(unittest.TestCase):
 
     def dgd_obj(self, name, ns=NS):
         return self.k8s['objects'][ns].get('DynamoGraphDeployment/' + name)
+
+    def assert_no_leak(self, p):
+        self.assertNotIn(SECRET, p.stdout)
+        self.assertNotIn(SECRET, p.stderr)
+        if self.kubectl_log.exists():
+            self.assertNotIn(SECRET, self.kubectl_log.read_text())
+        for path in (self.storage / 'k8s-ledger.jsonl', self.state_home / 'k8s-guard/ledger.jsonl'):
+            if path.exists():
+                self.assertNotIn(SECRET, path.read_text())
 
 
 # --- rule 1: identity ------------------------------------------------------
@@ -2720,14 +2747,6 @@ class Inspect(GuardCase):
 # --- secrets ---------------------------------------------------------------
 
 class Secrets(GuardCase):
-    def assert_no_leak(self, p):
-        self.assertNotIn(SECRET, p.stdout)
-        self.assertNotIn(SECRET, p.stderr)
-        self.assertNotIn(SECRET, self.kubectl_log.read_text())
-        for path in (self.storage / 'k8s-ledger.jsonl', self.state_home / 'k8s-guard/ledger.jsonl'):
-            if path.exists():
-                self.assertNotIn(SECRET, path.read_text())
-
     def test_hf_secret_piped_never_printed(self):
         self.add_ns()
         rc, body, p = self.guard('--context', CTX, '-n', NS, 'secret', 'hf')
@@ -3798,6 +3817,812 @@ class SelftestFences(GuardCase):
         self.flush()
         self.refused('selftest_needs_dgd', '--context', CTX, '-n', NS, 'selftest', 'fences')
         self.assertEqual(self.writes(), [])
+
+
+# --- build Jobs -------------------------------------------------------------
+
+COMMIT = 'a1' * 20
+TAG = COMMIT[:12]
+REGISTRY = 'nvcr.io/goirlvsxnepa/llm_nim'
+BUILDKIT = ('mirror.gcr.io/moby/buildkit:v0.23.2-rootless'
+            '@sha256:cab936745de5d673465948f1e93ff4d6e372bbe33f218afd3314eba45a6f85a9')
+CRANE = ('gcr.io/go-containerregistry/crane:v0.20.3'
+         '@sha256:fc86bcad43a000c2a1ca926a1e167db26c053cebc3fa5d14285c72773fb8c11d')
+GITHUB_KEY = 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl'
+PULL_REF = 'op://Fleet/NGC Pull Key/credential'
+PUSH_REF = 'op://Fleet/NGC NIM Operations PAT/credential'
+
+
+def build_argv(arch=None, **over):
+    a = {'repo': 'git@github.com:owner/repo.git', 'commit': COMMIT,
+         'dockerfile': 'crates/gdl-operator/Dockerfile', 'image': 'gdl-operator'}
+    a.update(over)
+    out = ['--repo', a['repo'], '--commit', a['commit'], '--dockerfile', a['dockerfile'], '--image', a['image']]
+    if arch:
+        out += ['--arch', arch]
+    return out
+
+
+def pod_of(job):
+    return job['spec']['template']['spec']
+
+
+def named(items, name):
+    return next(c for c in items if c['name'] == name)
+
+
+class BuildCase(GuardCase):
+    """A namespace the guard created, with one lease: enough for every build write except a claim."""
+
+    ctx, cluster, gpu_type, arch = CTX, PROFILE, 'gb300', 'arm64'
+
+    def setUp(self):
+        super().setUp()
+        self.add_ns(thread=ME, cluster=self.cluster)
+        self.lid = self.add_lease(cluster=self.cluster, gpu_type=self.gpu_type, gpus=1)
+        rc, body, p = self.guard('--context', self.ctx, '-n', NS, 'secret', 'ngc-push')
+        self.assertEqual(rc, 0, f'{body} {p.stderr}')
+
+    def run_argv(self, **over):
+        over.setdefault('arch', self.arch)
+        return build_argv(**over)
+
+    def build_guard(self, *rest, **env_kw):
+        return self.guard('--context', self.ctx, '-n', NS, 'build', *rest, **env_kw)
+
+    def ensure_git(self):
+        if 'Secret/git' not in self.k8s['objects'].get(NS, {}):
+            rc, body, p = self.guard('--context', self.ctx, '-n', NS, 'secret', 'git', '--repo', 'owner/repo')
+            self.assertEqual(rc, 0, f'{body} {p.stderr}')
+
+    def built(self, **over):
+        repo = over.get('repo', 'git@github.com:owner/repo.git')
+        if repo.startswith('git@'):
+            self.ensure_git()
+        rc, body, p = self.build_guard('run', *self.run_argv(**over))
+        self.assertEqual(rc, 0, f'{body} {p.stderr}')
+        return body
+
+    def job(self, name, ns=NS):
+        return self.k8s['objects'][ns].get('Job/' + name)
+
+    def rendered(self, **over):
+        """A Job the guard really made, lifted out of the store so a test can mutate one piece of it."""
+        self.k8s.pop('mutate', None)
+        self.flush()
+        body = self.built(**over)
+        job = copy.deepcopy(self.job(body['job']))
+        del self.k8s['objects'][NS]['Job/' + body['job']]
+        self.flush()
+        return job
+
+    def refused_render(self, extra, code, **over):
+        if 'repo' not in over:
+            self.ensure_git()
+        self.k8s['mutate'] = {'Job': extra}
+        self.flush()
+        before = len(self.writes())
+        body = self.refused(code, '--context', self.ctx, '-n', NS, 'build', 'run', *self.run_argv(**over))
+        self.assertEqual(len(self.writes()), before, body)
+        return body
+
+    def jobs(self):
+        return [o for o in self.k8s['objects'].get(NS, {}).values() if o['kind'] == 'Job']
+
+
+class BuildAmd64(BuildCase):
+    ctx, cluster, gpu_type, arch = CTX_B200, 'lab-b200', 'b200', 'amd64'
+
+
+class BuildRun(BuildCase):
+    def test_build_submission_records_one_ledger_line_and_names_the_job(self):
+        body = self.built()
+
+        self.assertEqual(body, {'job': f'build-{TAG}-{self.arch}'})
+        [line] = [l for l in self.ledger() if l['object'].startswith('Job/')]
+        self.assertEqual((line['object'], line['gpus'], line['thread'], line['cluster'], line['namespace'],
+                          line['direction']),
+                         (f'Job/build-{TAG}-{self.arch}', 1, ME, self.cluster, NS, 'up'))
+
+    def test_the_job_is_the_pinned_template(self):
+        job = self.job(self.built()['job'])
+
+        self.assertEqual((job['apiVersion'], job['kind']), ('batch/v1', 'Job'))
+        spec = job['spec']
+        self.assertEqual((spec['backoffLimit'], spec['activeDeadlineSeconds'], spec['ttlSecondsAfterFinished']),
+                         (0, 3600, 86400))
+        pod = pod_of(job)
+        self.assertEqual(pod['restartPolicy'], 'Never')
+        self.assertEqual(pod['nodeSelector'], {'kubernetes.io/arch': self.arch})
+        self.assertEqual(pod['securityContext'], {
+            'runAsUser': 1000, 'runAsGroup': 1000, 'fsGroup': 1000,
+            'seccompProfile': {'type': 'Unconfined'}, 'appArmorProfile': {'type': 'Unconfined'}})
+        self.assertEqual(job['metadata']['labels'][LEASE_LABEL], self.lid)
+        self.assertEqual(job['metadata']['labels'][NS_UID], 'uid-ns-1')
+        self.assertEqual(job['spec']['template']['metadata']['labels'], {LEASE_LABEL: self.lid})
+        self.assertNotIn('imagePullSecrets', pod)
+        for c in pod['containers'] + pod['initContainers']:
+            self.assertNotIn('allowPrivilegeEscalation', c.get('securityContext') or {}, c['name'])
+            self.assertEqual(set(c['resources']), {'requests', 'limits'}, c['name'])
+            for section in ('requests', 'limits'):
+                self.assertLessEqual({'cpu', 'memory', 'ephemeral-storage'}, set(c['resources'][section]), c['name'])
+            self.assertRegex(c['image'], r'@sha256:[0-9a-f]{64}$')
+        # The push credential is a Secret's dockerconfigjson mounted as the file BuildKit reads.
+        cfg = named(pod['volumes'], 'docker-config')
+        self.assertEqual(cfg['secret']['secretName'], 'nvcr-push')
+        self.assertEqual(cfg['secret']['items'], [{'key': '.dockerconfigjson', 'path': 'config.json'}])
+        build = named(pod['containers'], 'build')
+        self.assertEqual(build['image'], BUILDKIT)
+        self.assertEqual(build['command'],
+                         ['buildctl-daemonless.sh', 'build', '--oci-worker-no-process-sandbox',
+                          '--frontend', 'dockerfile.v0',
+                          '--local', 'context=/src',
+                          '--local', 'dockerfile=/src/crates/gdl-operator',
+                          '--output', f'type=image,name={REGISTRY}/gdl-operator:{TAG}-{self.arch},push=true'])
+        self.assertEqual({e['name']: e['value'] for e in build['env']}['DOCKER_CONFIG'], '/home/user/.docker')
+        cfg_mount = named(build['volumeMounts'], 'docker-config')
+        self.assertEqual((cfg_mount['mountPath'], cfg_mount['readOnly']), ('/home/user/.docker', True))
+        # The tag check runs first, in the same pinned image, and carries the plan's three answers.
+        check = named(pod['initContainers'], 'tag-check')
+        self.assertEqual(check['image'], BUILDKIT)
+        script = check['command'][-1]
+        for marker in ('tag_exists', 'registry_denied', 'manifest*unknown', 'exit 0'):
+            self.assertIn(marker, script)
+        # The clone passes the whole commit and verifies the checkout is exactly it.
+        clone = named(pod['initContainers'], 'clone')
+        self.assertEqual(clone['image'], BUILDKIT)
+        self.assertEqual({e['name']: e['value'] for e in clone['env']}['COMMIT'], COMMIT)
+        self.assertIn('git rev-parse HEAD', clone['command'][-1])
+        self.assertIn('git clone --filter=blob:none', clone['command'][-1])
+
+    def test_the_evidence_init_containers_run_in_this_order(self):
+        job = self.job(self.built()['job'])
+        self.assertEqual([c['name'] for c in pod_of(job)['initContainers']], ['tag-check', 'clone'])
+
+    def test_build_without_a_lease_is_refused(self):
+        self.k8s['objects'][NS].pop('ConfigMap/' + LEASE_CM)
+        self.flush()
+        before = len(self.writes())
+
+        self.refused('lease_required', '--context', self.ctx, '-n', NS, 'build', 'run', *self.run_argv())
+        self.assertEqual(len(self.writes()), before)
+
+    def test_commit_must_be_40_hex(self):
+        before = len(self.writes())
+        for commit in ('a1' * 19, 'a1' * 21, 'A1' * 20, 'g' * 40, ''):
+            with self.subTest(commit=commit):
+                self.refused('invalid_commit', '--context', self.ctx, '-n', NS, 'build', 'run',
+                             *self.run_argv(commit=commit))
+        self.assertEqual(len(self.writes()), before)
+
+    def test_bad_values_refused_before_any_call(self):
+        before = len(self.writes())
+        cases = [('image', 'Bad Name', 'invalid_image'), ('image', '', 'invalid_image'),
+                 ('dockerfile', '/etc/passwd', 'usage'), ('dockerfile', '../Dockerfile', 'usage'),
+                 ('repo', 'https://example.test/a;rm -rf /', 'usage'), ('repo', 'not a url', 'usage')]
+        for key, value, code in cases:
+            with self.subTest(field=key, value=value):
+                self.refused(code, '--context', self.ctx, '-n', NS, 'build', 'run',
+                             *self.run_argv(**{key: value}))
+        self.assertEqual(len(self.writes()), before)
+
+    def test_arch_comes_from_the_profile(self):
+        self.assertEqual(self.built(arch=None)['job'], f'build-{TAG}-{self.arch}')
+        other = 'amd64' if self.arch == 'arm64' else 'arm64'
+        before = len(self.writes())
+        self.refused('arch_mismatch', '--context', self.ctx, '-n', NS, 'build', 'run', *self.run_argv(arch=other))
+        self.assertEqual(len(self.writes()), before)
+
+    def test_a_job_whose_name_is_taken_is_refused_and_says_how(self):
+        self.built()
+        before = len(self.writes())
+        body = self.refused('job_exists', '--context', self.ctx, '-n', NS, 'build', 'run', *self.run_argv())
+        self.assertIn('build delete', body['error'])
+        self.assertEqual(len(self.writes()), before)
+
+    def test_a_forbidden_field_is_refused_with_its_code(self):
+        pod = pod_of(self.rendered())
+
+        host = copy.deepcopy(pod)
+        host['volumes'] = pod['volumes'] + [{'name': 'h', 'hostPath': {'path': '/'}}]
+        privileged = copy.deepcopy(pod)
+        privileged['containers'][0]['securityContext'] = {'privileged': True}
+        node_name = copy.deepcopy(pod)
+        node_name['nodeName'] = 'gpu-node-a'
+        priority = copy.deepcopy(pod)
+        priority['priorityClassName'] = 'high'
+        host_network = copy.deepcopy(pod)
+        host_network['hostNetwork'] = True
+        scheduler = copy.deepcopy(pod)
+        scheduler['schedulerName'] = 'some-scheduler'
+        pull = copy.deepcopy(pod)
+        pull['imagePullSecrets'] = [{'name': 'nvcr-pull'}]
+        no_storage = copy.deepcopy(pod)
+        no_storage['containers'][0]['resources']['limits'].pop('ephemeral-storage')
+        no_digest = copy.deepcopy(pod)
+        no_digest['containers'][0]['image'] = 'registry.example.test/x:latest'
+        wrong_arch = copy.deepcopy(pod)
+        wrong_arch['nodeSelector'] = {'kubernetes.io/arch': 'amd64' if self.arch == 'arm64' else 'arm64'}
+        cases = {
+            'hostPath': (host, 'field_refused'),
+            'privileged': (privileged, 'field_refused'),
+            'nodeName': (node_name, 'field_refused'),
+            'priorityClassName': (priority, 'field_refused'),
+            'hostNetwork': (host_network, 'field_refused'),
+            'schedulerName': (scheduler, 'field_refused'),
+            'imagePullSecrets': (pull, 'field_refused'),
+            'ephemeral-storage limit': (no_storage, 'resources_required'),
+            'image without a digest': (no_digest, 'field_refused'),
+            'arch nodeSelector': (wrong_arch, 'arch_mismatch'),
+        }
+        for label, (mutated, code) in cases.items():
+            with self.subTest(case=label):
+                self.refused_render({'spec': {'template': {'spec': mutated}}}, code)
+
+    def test_tag_names_the_commit_and_never_latest(self):
+        pod = pod_of(self.rendered())
+        build = named(pod['containers'], 'build')
+        for tag in ('latest', f'{TAG}0', 'main'):
+            with self.subTest(tag=tag):
+                mutated = copy.deepcopy(build)
+                mutated['command'] = [f'type=image,name={REGISTRY}/gdl-operator:{tag},push=true'
+                                      if a.startswith('type=image') else a for a in build['command']]
+                self.refused_render({'spec': {'template': {'spec': {'containers': [mutated]}}}}, 'invalid_tag')
+        # A build that does not push has not produced the tag the index names.
+        mutated = copy.deepcopy(build)
+        mutated['command'] = [f'type=image,name={REGISTRY}/gdl-operator:{TAG}-{self.arch}'
+                              if a.startswith('type=image') else a for a in build['command']]
+        self.refused_render({'spec': {'template': {'spec': {'containers': [mutated]}}}}, 'invalid_tag')
+
+    def test_a_job_without_the_lease_label_on_its_pod_template_is_refused(self):
+        body = self.refused_render({'spec': {'template': {'metadata': {'labels': None}}}},
+                                   'lease_label_required')
+        self.assertIn(LEASE_LABEL, body['error'])
+
+
+class BuildIndex(BuildCase):
+    def index(self, **over):
+        a = {'image': 'gdl-operator', 'commit': COMMIT}
+        a.update(over)
+        return self.build_guard('index', '--image', a['image'], '--commit', a['commit'])
+
+    def test_index_names_both_jobs(self):
+        rc, body, p = self.index()
+        self.assertEqual(rc, 0, f'{body} {p.stderr}')
+        self.assertEqual(body, {'job': f'index-{TAG}'})
+        job = self.job(body['job'])
+        pod = pod_of(job)
+        steps = [c['args'] for c in pod['initContainers'] + pod['containers']]
+        self.assertEqual(steps, [
+            ['index', 'append', '-t', f'{REGISTRY}/gdl-operator:{TAG}',
+             '-m', f'{REGISTRY}/gdl-operator:{TAG}-amd64', '-m', f'{REGISTRY}/gdl-operator:{TAG}-arm64'],
+            ['manifest', f'{REGISTRY}/gdl-operator:{TAG}'],
+            ['digest', f'{REGISTRY}/gdl-operator:{TAG}'],
+        ])
+        for c in pod['initContainers'] + pod['containers']:
+            self.assertEqual(c['image'], CRANE)
+            self.assertEqual(c['command'], ['/ko-app/crane'])
+            self.assertEqual(named(c['volumeMounts'], 'docker-config')['mountPath'], '/home/user/.docker')
+            self.assertEqual({e['name']: e['value'] for e in c['env']}['DOCKER_CONFIG'], '/home/user/.docker')
+        self.assertEqual(job['metadata']['labels'][LEASE_LABEL], self.lid)
+        [line] = [l for l in self.ledger() if l['object'].startswith('Job/')]
+        self.assertEqual((line['object'], line['gpus']), (f'Job/index-{TAG}', 1))
+
+    def test_index_step_order_is_append_manifest_digest(self):
+        job = self.job(self.index()[1]['job'])
+        self.assertEqual([c['name'] for c in pod_of(job)['initContainers']], ['index-append', 'index-manifest'])
+        self.assertEqual([c['name'] for c in pod_of(job)['containers']], ['index-digest'])
+
+    def test_index_argv_refuses_a_changed_step(self):
+        pod = pod_of(self.rendered_index())
+        append = dict(named(pod['initContainers'], 'index-append'))
+        append['args'] = ['index', 'append', '-t', f'{REGISTRY}/gdl-operator:latest',
+                          '-m', f'{REGISTRY}/gdl-operator:{TAG}-amd64']
+        self.k8s['mutate'] = {'Job': {'spec': {'template': {'spec': {'initContainers': [
+            append, named(pod['initContainers'], 'index-manifest')]}}}}}
+        self.flush()
+        before = len(self.writes())
+        self.refused('invalid_tag', '--context', self.ctx, '-n', NS, 'build', 'index',
+                     '--image', 'gdl-operator', '--commit', COMMIT)
+        self.assertEqual(len(self.writes()), before)
+
+    def rendered_index(self):
+        body = self.job(self.index()[1]['job'])
+        job = copy.deepcopy(body)
+        del self.k8s['objects'][NS]['Job/' + job['metadata']['name']]
+        self.flush()
+        return job
+
+
+class BuildShow(BuildCase):
+    def failed_job(self, logs, name=None):
+        name = name or f'build-{TAG}-{self.arch}'
+        job = {'apiVersion': 'batch/v1', 'kind': 'Job',
+               'metadata': {'name': name, 'labels': {LEASE_LABEL: self.lid}},
+               'spec': {'template': {'metadata': {'labels': {LEASE_LABEL: self.lid}},
+                                     'spec': {'containers': [{'name': 'build', 'image': BUILDKIT}]}}},
+               'status': {'conditions': [{'type': 'Failed', 'status': 'True', 'reason': 'BackoffLimitExceeded'}]}}
+        self.add_obj(job)
+        self.k8s['job_logs'] = {f'job/{name}': logs}
+        self.flush()
+        return name
+
+    def test_a_failed_build_is_reported_with_its_reason_and_the_tail(self):
+        name = self.failed_job('step 1/2\nnvcr.io: DENIED\nnvapi-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345\n'
+                               '"auth": "YWJjZGVm"\n')
+
+        rc, body, p = self.build_guard('show', name)
+
+        self.assertNotEqual(rc, 0)
+        self.assertEqual((body.get('code'), body.get('state'), body.get('build')),
+                         ('build_failed', 'failed', name))
+        self.assertIn('DENIED', body['tail'])
+        self.assertNotIn('nvapi-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345', json.dumps(body))
+        self.assertNotIn('YWJjZGVm', json.dumps(body))
+        self.assertIn('[secret]', body['tail'])
+        logs = [c for c in self.kubectl_calls() if c['pos'][:1] == ['logs']]
+        self.assertTrue(logs and '--all-containers=true' in logs[0]['pos'], logs)
+        self.assertEqual([c for c in self.writes() if c['pos'][:1] == ['delete']], [])
+
+    def test_the_tag_check_answers_become_the_refusal_codes(self):
+        cases = {'tag_exists': 'tag_exists', 'registry_denied': 'registry_denied',
+                 'registry_error: connection reset': 'registry_error'}
+        for line, code in cases.items():
+            with self.subTest(answer=line):
+                name = self.failed_job(line + '\n')
+                rc, body, _ = self.build_guard('show', name)
+                self.assertNotEqual(rc, 0)
+                self.assertEqual(body.get('code'), code, body)
+
+    def test_a_succeeded_build_prints_its_tail_and_exits_zero(self):
+        name = f'build-{TAG}-{self.arch}'
+        self.add_obj({'apiVersion': 'batch/v1', 'kind': 'Job', 'metadata': {'name': name},
+                      'spec': {}, 'status': {'conditions': [{'type': 'Complete', 'status': 'True'}],
+                                             'succeeded': 1}})
+        self.k8s['job_logs'] = {f'job/{name}': 'exporting to nvcr.io\n'}
+        self.flush()
+
+        rc, body, _ = self.build_guard('show', name)
+
+        self.assertEqual(rc, 0, body)
+        self.assertEqual((body['build'], body['state']), (name, 'succeeded'))
+        self.assertIn('exporting', body['tail'])
+
+    def test_show_of_a_missing_job_is_not_found(self):
+        self.refused('not_found', '--context', self.ctx, '-n', NS, 'build', 'show', 'build-nope')
+
+
+class BuildDelete(BuildCase):
+    def test_delete_of_a_job_propagates_to_its_pods(self):
+        name = self.built()['job']
+        pod = {'metadata': {'name': name + '-0', 'labels': {LEASE_LABEL: self.lid, 'job-name': name}},
+               'spec': {'containers': [container(0)]}, 'status': {'phase': 'Running'}}
+        self.add_pod(pod)
+
+        body = self.ok('--context', self.ctx, '-n', NS, 'build', 'delete', name)
+
+        self.assertEqual(body, {'deleted': f'Job/{name}', 'namespace': NS})
+        self.assertIsNone(self.job(name))
+        self.assertEqual(self.k8s['pods'][NS], [])
+        [delete] = [b for b in self.k8s['raw_delete_bodies'] if '/jobs/' in b['path']]
+        self.assertEqual(delete['body']['propagationPolicy'], 'Background')
+        self.assertEqual(self.ledger()[-1]['direction'], 'down')
+
+    def test_the_plain_delete_alias_knows_jobs(self):
+        name = self.built()['job']
+
+        body = self.ok('--context', self.ctx, '-n', NS, 'delete', f'job/{name}')
+
+        self.assertEqual(body['deleted'], f'Job/{name}')
+        self.assertIsNone(self.job(name))
+        [delete] = [b for b in self.k8s['raw_delete_bodies'] if '/jobs/' in b['path']]
+        self.assertEqual(delete['body']['propagationPolicy'], 'Background')
+
+    def test_delete_of_another_leases_job_is_refused(self):
+        job = {'apiVersion': 'batch/v1', 'kind': 'Job',
+               'metadata': {'name': 'build-theirs', 'labels': {LEASE_LABEL: 'lse_someone9999'}},
+               'spec': {'template': {'metadata': {'labels': {LEASE_LABEL: 'lse_someone9999'}}}}}
+        self.add_obj(job)
+        self.refused('object_not_yours', '--context', self.ctx, '-n', NS, 'build', 'delete', 'build-theirs')
+        self.assertIsNotNone(self.job('build-theirs'))
+
+
+class BuildAttempts(BuildCase):
+    def test_a_timed_out_job_create_leaves_an_attempt_and_refuses(self):
+        self.ensure_git()
+        name = f'build-{TAG}-{self.arch}'
+        self.k8s['stall_create'] = [f'Job/{name}']
+        self.flush()
+
+        rc, body, _ = self.build_guard('run', *self.run_argv())
+        self.assertEqual(body.get('code'), 'write_unresolved', body)
+        [a] = [a for a in self.bb['leases'][self.lid]['attempts'] if a['kind'] == 'Job']
+        self.assertEqual((a['verb'], a['name'], a['outcome']), ('create', name, None))
+
+        before = len(self.writes())
+        rc, body, _ = self.build_guard('run', *self.run_argv(image='other'))
+        self.assertEqual(body.get('code'), 'attempt_unresolved', body)
+        self.assertEqual(len(self.writes()), before)
+        self.assertNotIn(['k8s', 'lease', 'op', 'begin', self.lid], self.bb_calls()[-2:])
+
+
+class GitBuild(BuildCase):
+    """The git secret and the mount the clone initContainer reads it through."""
+
+    REPO = 'owner/repo'
+    SSH = 'git@github.com:owner/repo.git'
+    REF = 'op://Fleet/owner-repo deploy key/private key'
+
+    def secret_git(self, repo=REPO, **env_kw):
+        return self.guard('--context', self.ctx, '-n', NS, 'secret', 'git', '--repo', repo, **env_kw)
+
+    def made(self):
+        rc, body, p = self.secret_git()
+        self.assertEqual(rc, 0, f'{body} {p.stderr}')
+
+    def test_secret_git_builds_the_convention_ref_and_never_prints_the_key(self):
+        rc, body, p = self.secret_git()
+
+        self.assertEqual(rc, 0, f'{body} {p.stderr}')
+        self.assertEqual([l for l in self.fleet_log.read_text().splitlines() if 'deploy key' in l],
+                         ['secret get ' + self.REF])
+        stored = self.k8s['objects'][NS]['Secret/git']
+        self.assertEqual(stored['stringData'], {'id_ed25519': SECRET})
+        self.assertEqual(stored['metadata']['labels'], {NS_UID: 'uid-ns-1', LEASE_LABEL: self.lid})
+        cm = self.k8s['objects'][NS]['ConfigMap/git-known-hosts']
+        self.assertEqual(cm['data'], {'known_hosts': GITHUB_KEY})
+        self.assertEqual(cm['metadata']['labels'], {NS_UID: 'uid-ns-1', LEASE_LABEL: self.lid})
+        self.assertEqual(body, {'secret': 'git', 'namespace': NS, 'known_hosts': 'git-known-hosts'})
+        self.assert_no_leak(p)
+
+    def test_the_clone_mounts_the_key_and_known_hosts_read_only_for_user_1000(self):
+        self.made()
+
+        job = self.job(self.built(repo=self.SSH)['job'])
+        pod = pod_of(job)
+        self.assertEqual(pod['securityContext']['fsGroup'], 1000)
+        self.assertEqual(pod['securityContext']['runAsUser'], 1000)
+        volume = named(pod['volumes'], 'git-ssh')
+        self.assertEqual(volume['projected']['defaultMode'], 0o400)
+        self.assertEqual(volume['projected']['sources'], [
+            {'secret': {'name': 'git', 'items': [{'key': 'id_ed25519', 'path': 'id_ed25519'}]}},
+            {'configMap': {'name': 'git-known-hosts',
+                           'items': [{'key': 'known_hosts', 'path': 'known_hosts'}]}},
+        ])
+        clone = named(pod['initContainers'], 'clone')
+        self.assertEqual(clone['image'], BUILDKIT)
+        self.assertEqual(clone['securityContext']['runAsUser'], 1000)
+        mount = named(clone['volumeMounts'], 'git-ssh')
+        self.assertEqual((mount['mountPath'], mount['readOnly']), ('/home/user/.ssh', True))
+        options = shlex.split({e['name']: e['value'] for e in clone['env']}['GIT_SSH_COMMAND'])
+        self.assertEqual(options, ['ssh', '-i', '/home/user/.ssh/id_ed25519', '-o', 'IdentitiesOnly=yes',
+                                   '-o', 'UserKnownHostsFile=/home/user/.ssh/known_hosts',
+                                   '-o', 'StrictHostKeyChecking=yes'])
+        self.assertNotIn('accept-new', options)
+        # The clone container overrides the image entrypoint (rootlesskit buildkitd) with its own command.
+        self.assertEqual(clone['command'][:2], ['sh', '-c'])
+        self.assertIn('git clone --filter=blob:none', clone['command'][-1])
+        self.assertIn('git checkout', clone['command'][-1])
+        self.assertNotIn('alpine/git', json.dumps(job))
+
+    def test_an_ssh_repo_without_the_secret_is_refused_before_any_write(self):
+        before = len(self.writes())
+        body = self.refused('secret_unavailable', '--context', self.ctx, '-n', NS, 'build', 'run',
+                            *self.run_argv(repo=self.SSH))
+        self.assertIn('secret git', body['error'])
+        self.assertEqual(len(self.writes()), before)
+
+    def test_a_public_repo_needs_no_mount(self):
+        job = self.job(self.built(repo='https://github.com/owner/repo.git')['job'])
+        self.assertNotIn('git-ssh', [v['name'] for v in pod_of(job)['volumes']])
+
+    def ssh_mutation(self, pod_change, code):
+        pod = pod_of(self.rendered(repo=self.SSH))
+        changed = copy.deepcopy(pod)
+        pod_change(changed)
+        self.refused_render({'spec': {'template': {'spec': changed}}}, code)
+
+    def test_a_writable_misplaced_or_loose_key_is_refused(self):
+        def writable(pod):
+            named(named(pod['initContainers'], 'clone')['volumeMounts'], 'git-ssh')['readOnly'] = False
+
+        def outside(pod):
+            named(named(pod['initContainers'], 'clone')['volumeMounts'], 'git-ssh')['mountPath'] = '/root/.ssh'
+
+        def loose(pod):
+            named(pod['volumes'], 'git-ssh')['projected']['defaultMode'] = 0o600
+
+        def plain_secret(pod):
+            volume = named(pod['volumes'], 'git-ssh')
+            self.assertIn('projected', volume)
+            volume['secret'] = {'secretName': 'git', 'defaultMode': 0o400}
+            del volume['projected']
+
+        def no_known_hosts(pod):
+            volume = named(pod['volumes'], 'git-ssh')
+            volume['projected']['sources'] = volume['projected']['sources'][:1]
+
+        for label, change in (('writable', writable), ('outside', outside), ('mode 0600', loose),
+                              ('plain secret', plain_secret), ('no known_hosts', no_known_hosts)):
+            with self.subTest(case=label):
+                self.ssh_mutation(change, 'ssh_mount_refused')
+
+    def test_a_clone_that_is_not_the_pinned_image_or_sets_no_command_is_refused(self):
+        def other_image(pod):
+            named(pod['initContainers'], 'clone')['image'] = 'alpine/git:2.45'
+
+        def no_command(pod):
+            named(pod['initContainers'], 'clone').pop('command')
+
+        def accept_new(pod):
+            clone = named(pod['initContainers'], 'clone')
+            for env in clone['env']:
+                if env['name'] == 'GIT_SSH_COMMAND':
+                    env['value'] = env['value'].replace('StrictHostKeyChecking=yes',
+                                                        'StrictHostKeyChecking=accept-new')
+
+        for label, change in (('image', other_image), ('no command', no_command), ('accept-new', accept_new)):
+            with self.subTest(case=label):
+                self.ssh_mutation(change, 'field_refused')
+
+    def test_bad_repos_and_missing_items_are_refused(self):
+        before = len(self.writes())
+        for repo in ('owner', 'owner/repo/extra', '../repo', 'owner/re po', 'owner/repo;id', ''):
+            with self.subTest(repo=repo):
+                rc, body, _ = self.secret_git(repo=repo)
+                self.assertNotEqual(rc, 0, body)
+                self.assertEqual(body.get('code'), 'usage', body)
+        self.assertEqual(len(self.writes()), before)
+        self.assertFalse(any('deploy key' in l for l in self.fleet_log.read_text().splitlines()))
+
+        rc, body, p = self.secret_git(fleet_fail=True)
+        self.assertEqual(body.get('code'), 'secret_unavailable', body)
+        self.assertNotIn('Secret/git', self.k8s['objects'][NS])
+        self.assertNotIn('ConfigMap/git-known-hosts', self.k8s['objects'][NS])
+        self.assert_no_leak(p)
+
+    def test_repo_is_only_for_git(self):
+        before = self.fleet_log.read_text() if self.fleet_log.exists() else ''
+        self.refused('usage', '--context', self.ctx, '-n', NS, 'secret', 'hf', '--repo', self.REPO)
+        self.assertEqual(self.fleet_log.read_text() if self.fleet_log.exists() else '', before)
+
+
+class ClaimedBuild(ClaimedCase):
+    def claimed_build(self, **over):
+        over.setdefault('arch', 'arm64')
+        for which, extra in (('ngc-push', ()), ('git', ('--repo', 'owner/repo'))):
+            if f'Secret/{which}' not in self.k8s['objects'].get(PREMADE, {}):
+                rc, body, p = self.guard('--context', CTX, '-n', PREMADE, 'secret', which, *extra)
+                self.assertEqual(rc, 0, f'{body} {p.stderr}')
+        return self.guard('--context', CTX, '-n', PREMADE, 'build', 'run', *build_argv(**over))
+
+    def test_no_claim_no_build(self):
+        self.bb['claims'] = 'off'
+        self.flush()
+
+        self.refused('namespace_not_claimed', '--context', CTX, '-n', PREMADE, 'build', 'run',
+                     *build_argv(arch='arm64'))
+        self.assertEqual(self.writes(), [])
+
+    def test_the_ledger_records_the_claim_charge_not_the_jobs_zero(self):
+        lid = self.claimed(gpus=1)
+        rc, body, p = self.claimed_build()
+        self.assertEqual(rc, 0, f'{body} {p.stderr}')
+        [line] = [l for l in self.ledger() if l['object'].startswith('Job/')]
+        self.assertEqual((line['object'], line['gpus'], line['thread'], line['cluster'], line['namespace']),
+                         (f'Job/build-{TAG}-arm64', 1, ME, PROFILE, PREMADE))
+        pod = pod_of(self.k8s['objects'][PREMADE][f'Job/{body["job"]}'])
+        for c in pod['containers'] + pod['initContainers']:
+            self.assertNotIn('nvidia.com/gpu', c['resources']['requests'])
+            self.assertNotIn('nvidia.com/gpu', c['resources']['limits'])
+        self.assertIn('Job', [a['kind'] for a in self.bb['leases'][lid]['attempts']])
+
+    def test_claimed_teardown_deletes_jobs_with_background_propagation_and_lists_them_again(self):
+        lid = self.claimed(state='releasing')
+        name = f'build-{TAG}-arm64'
+        job = {'apiVersion': 'batch/v1', 'kind': 'Job',
+               'metadata': {'name': name, 'labels': {LEASE_LABEL: lid}},
+               'spec': {'template': {'metadata': {'labels': {LEASE_LABEL: lid}},
+                                     'spec': {'containers': [{'name': 'build', 'image': BUILDKIT}]}}}}
+        self.add_obj(job, ns=PREMADE)
+        self.add_pod({'metadata': {'name': name + '-0', 'labels': {LEASE_LABEL: lid, 'job-name': name}},
+                      'spec': {'containers': [container(0)]}, 'status': {'phase': 'Running'}}, ns=PREMADE)
+
+        body = self.ok('--context', CTX, 'down', PREMADE, '--uid', 'uid-premade-1', '--lease', lid, host_entry=True)
+
+        self.assertTrue(body['complete'], body)
+        self.assertIn(f'Job/{name}', body['deleted'])
+        self.assertIsNone(self.k8s['objects'][PREMADE].get(f'Job/{name}'))
+        self.assertEqual(self.k8s['pods'][PREMADE], [])
+        [delete] = [b for b in self.k8s['raw_delete_bodies'] if '/jobs/' in b['path']]
+        self.assertEqual(delete['body']['propagationPolicy'], 'Background')
+        self.assertTrue(any(c['pos'][:2] == ['get', 'jobs.batch']
+                            and c['flags'].get('-l') == f'{LEASE_LABEL}={lid}'
+                            for c in self.kubectl_calls()), 'the teardown re-read did not list Jobs')
+
+    def test_a_timed_out_job_create_blocks_writes_and_teardown_until_it_lands(self):
+        lid = self.claimed()
+        name = f'build-{TAG}-arm64'
+        self.k8s['stall_create'] = [f'Job/{name}']
+        self.flush()
+
+        rc, body, _ = self.claimed_build()
+        self.assertEqual(body.get('code'), 'write_unresolved', body)
+        self.bb['leases'][lid].update(slot=None, state='revoking')
+        self.flush()
+
+        rc, body, _ = self.teardown('down', lid)
+        self.assertEqual(body.get('code'), 'teardown_incomplete', body)
+        self.assertIn('unresolved', json.dumps(body))
+
+        self.land_pending()
+        body = self.ok('--context', CTX, 'down', PREMADE, '--uid', 'uid-premade-1', '--lease', lid, host_entry=True)
+        self.assertTrue(body['complete'], body)
+        self.assertEqual([r['outcome'] for r in body['resolutions']], ['committed'])
+        self.assertIsNone(self.k8s['objects'][PREMADE].get(f'Job/{name}'))
+
+    def test_nvcr_push_lives_only_as_long_as_the_claim(self):
+        lid = self.claimed(gpus=1)
+        rc, body, p = self.guard('--context', CTX, '-n', PREMADE, 'secret', 'ngc-push')
+        self.assertEqual(rc, 0, f'{body} {p.stderr}')
+        stored = self.k8s['objects'][PREMADE]['Secret/nvcr-push']
+        self.assertEqual(stored['metadata']['labels'][LEASE_LABEL], lid)
+        self.assertEqual(self.fleet_log.read_text().splitlines(), ['secret get ' + PUSH_REF])
+        self.assert_no_leak(p)
+
+        self.bb['leases'][lid]['state'] = 'releasing'
+        self.flush()
+        body = self.ok('--context', CTX, 'down', PREMADE, '--uid', 'uid-premade-1', '--lease', lid, host_entry=True)
+        self.assertTrue(body['complete'], body)
+        self.assertNotIn('Secret/nvcr-push', self.k8s['objects'][PREMADE])
+        self.assertIn('Secret/nvcr-push', body['deleted'])
+
+        lid = self.claimed(gpus=1)
+        rc, body, p = self.guard('--context', CTX, '-n', PREMADE, 'secret', 'ngc-push')
+        self.assertEqual(rc, 0, f'{body} {p.stderr}')
+        self.assertEqual(self.k8s['objects'][PREMADE]['Secret/nvcr-push']['metadata']['labels'][LEASE_LABEL], lid)
+
+
+class BuildSecrets(GuardCase):
+    def setUp(self):
+        super().setUp()
+        self.add_ns()
+        self.lid = self.add_lease(gpus=1)
+
+    def test_push_secret_is_piped_and_never_printed(self):
+        rc, body, p = self.guard('--context', CTX, '-n', NS, 'secret', 'ngc-push')
+
+        self.assertEqual(rc, 0, f'{body} {p.stderr}')
+        self.assertEqual(body, {'secret': 'nvcr-push', 'namespace': NS})
+        stored = self.k8s['objects'][NS]['Secret/nvcr-push']
+        self.assertEqual((stored['type'], stored['metadata']['labels'][LEASE_LABEL]),
+                         ('kubernetes.io/dockerconfigjson', self.lid))
+        cfg = json.loads(stored['stringData']['.dockerconfigjson'])
+        self.assertEqual((cfg['auths']['nvcr.io']['username'], cfg['auths']['nvcr.io']['password']),
+                         ('$oauthtoken', SECRET))
+        self.assertEqual(self.fleet_log.read_text().splitlines(), ['secret get ' + PUSH_REF])
+        self.assert_no_leak(p)
+        self.assertEqual(self.ledger()[0]['object'], 'Secret/nvcr-push')
+
+    def test_pull_secret_uses_the_pull_only_item_and_never_falls_back(self):
+        rc, body, p = self.guard('--context', CTX, '-n', NS, 'secret', 'ngc')
+        self.assertEqual(rc, 0, f'{body} {p.stderr}')
+        self.assertEqual(self.fleet_log.read_text().splitlines(), ['secret get ' + PULL_REF])
+
+        rc, body, p = self.guard('--context', CTX, '-n', NS, 'secret', 'ngc', fleet_fail=True)
+        self.assertEqual(body.get('code'), 'secret_unavailable', body)
+        self.assertIn('Secret/nvcr-pull', self.k8s['objects'][NS])  # the first one is still the only one
+        self.assertEqual(self.fleet_log.read_text().splitlines(),
+                         ['secret get ' + PULL_REF, 'secret get ' + PULL_REF])
+        self.assertNotIn('NGC NIM Operations PAT', self.fleet_log.read_text())
+        self.assert_no_leak(p)
+
+    def test_no_secret_shaped_string_is_committed(self):
+        for path in sorted((SKILL / 'scripts').glob('*')):
+            if not path.is_file():
+                continue
+            with self.subTest(path=path.name):
+                self.assertIsNone(re.search(r'nv(?:api|cf|pr)-[A-Za-z0-9_-]{16,}', path.read_text()),
+                                  f'{path} carries a secret-shaped string')
+
+
+# --- the tag-check probe ----------------------------------------------------
+
+FAKE_WGET = r'''#!/usr/bin/env python3
+"""Fake wget for the tag-check probe: a token challenge, then the status the test names."""
+import json, os, sys
+
+argv = [a for a in sys.argv[1:] if not a.startswith('-')]
+with open(os.environ['FAKE_WGET_LOG'], 'a') as log:
+    log.write(json.dumps(sys.argv[1:]) + '\n')
+url = argv[-1] if argv else ''
+if url.endswith('/v2/'):
+    sys.stderr.write('  HTTP/1.1 401 Unauthorized\n'
+                     '  Www-Authenticate: Bearer realm="https://auth.example.test/token",'
+                     'service="registry.example.test"\n')
+    sys.exit(0)
+if url.startswith('https://auth.example.test/token'):
+    sys.stdout.write(json.dumps({'token': 'made-up-token'}))
+    sys.exit(0)
+status = int(os.environ.get('FAKE_WGET_STATUS', '200'))
+sys.stderr.write(f'  HTTP/1.1 {status} Something\n')
+sys.stdout.write(os.environ.get('FAKE_WGET_BODY', ''))
+sys.exit(8 if status >= 400 else 0)
+'''
+
+
+class TagCheckScript(GuardCase):
+    """The probe the tag-check initContainer runs, against a fake wget: the plan's three answers, no cluster.
+
+    It runs in the pinned builder image because the crane image has no shell; its answers are the ones
+    crane gives: the tag is there (tag_exists), 401/403 (registry_denied), and only a manifest unknown
+    lets the build run.
+    """
+
+    def setUp(self):
+        super().setUp()
+        import sys
+        sys.path.insert(0, str(SKILL / 'scripts'))
+        from k8s_guard_rules import TAG_CHECK_SCRIPT
+        self.script = self.tmp / 'tag-check.sh'
+        self.script.write_text(TAG_CHECK_SCRIPT)
+        (self.bin / 'wget').write_text(FAKE_WGET)
+        (self.bin / 'wget').chmod(0o755)
+        self.config = self.tmp / 'config.json'
+        self.config.write_text(json.dumps({'auths': {'registry.example.test': {
+            'username': '$oauthtoken', 'password': 'made-up', 'auth': 'bWFkZS11cA=='}}}))
+        self.wget_log = self.tmp / 'wget.log'
+
+    def probe(self, status, body=''):
+        env = {'PATH': f'{self.bin}:/usr/bin:/bin', 'FAKE_WGET_LOG': str(self.wget_log),
+               'FAKE_WGET_STATUS': str(status), 'FAKE_WGET_BODY': body,
+               'REGISTRY': 'registry.example.test', 'REPO_PATH': 'goirlvsxnepa/llm_nim/gdl-operator',
+               'TAG': f'{TAG}-amd64', 'DOCKER_CONFIG': str(self.tmp)}
+        p = subprocess.run(['/bin/sh', str(self.script)], env=env, capture_output=True, text=True, timeout=20,
+                           stdin=subprocess.DEVNULL)
+        return p.returncode, (p.stdout + p.stderr).strip()
+
+    def test_the_tag_that_exists_refuses(self):
+        rc, out = self.probe(200)
+        self.assertEqual((rc, out), (1, 'tag_exists'))
+
+    def test_a_denied_registry_refuses(self):
+        for status in (401, 403):
+            with self.subTest(status=status):
+                rc, out = self.probe(status)
+                self.assertEqual(rc, 1)
+                self.assertIn('registry_denied', out)
+
+    def test_only_manifest_unknown_lets_the_build_run(self):
+        missing = json.dumps({'errors': [{'code': 'MANIFEST_UNKNOWN', 'message': 'manifest unknown'}]})
+        rc, out = self.probe(404, missing)
+        self.assertEqual((rc, out), (0, ''))
+        for body in (json.dumps({'errors': [{'code': 'DENIED'}]}), 'not found', ''):
+            with self.subTest(body=body):
+                rc, out = self.probe(404, body)
+                self.assertEqual(rc, 1)
+                self.assertIn('registry_error', out)
+
+    def test_any_other_answer_refuses(self):
+        for status in (500, 502):
+            with self.subTest(status=status):
+                rc, out = self.probe(status)
+                self.assertEqual(rc, 1)
+                self.assertIn('registry_error', out)
+
+    def test_the_probe_sends_the_mounted_basic_auth_and_the_pinned_tag(self):
+        self.probe(200)
+        calls = [json.loads(line) for line in self.wget_log.read_text().splitlines()]
+        self.assertTrue(any(a == '--header=Authorization: Basic bWFkZS11cA==' for c in calls for a in c), calls)
+        self.assertTrue(any('https://auth.example.test/token' in a for c in calls for a in c), calls)
+        self.assertTrue(any(f'manifests/{TAG}-amd64' in a for c in calls for a in c), calls)
+
+    def test_no_auth_in_the_mount_refuses_without_a_request(self):
+        self.config.write_text('{}')
+        rc, out = self.probe(200)
+        self.assertEqual(rc, 1)
+        self.assertIn('registry_error', out)
+        self.assertFalse(self.wget_log.exists())
 
 
 if __name__ == '__main__':
