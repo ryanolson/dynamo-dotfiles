@@ -140,6 +140,47 @@ def key(obj):
     return obj['kind'] + '/' + obj['metadata']['name']
 
 
+# kubectl resource names and REST plurals, to kinds.
+RESOURCES = {DGD_LIST_NAME: 'DynamoGraphDeployment', 'configmaps': 'ConfigMap', 'services': 'Service',
+             'secrets': 'Secret', 'persistentvolumeclaims': 'PersistentVolumeClaim',
+             'podcliquesets.grove.io': 'PodCliqueSet', 'podcliques.grove.io': 'PodClique',
+             'deployments.apps': 'Deployment', 'statefulsets.apps': 'StatefulSet'}
+PLURALS = {r.split('.', 1)[0]: k for r, k in RESOURCES.items()}
+
+
+def kind_of(res):
+    if res.startswith('dynamographdeployments.'):
+        return 'DynamoGraphDeployment'
+    return RESOURCES.get(res) or PLURALS.get(res.split('.', 1)[0])
+
+
+def labelled(items):
+    if not flags.get('-l'):
+        return items
+    lk, lv = flags['-l'].split('=', 1)
+    return [o for o in items if (o['metadata'].get('labels') or {}).get(lk) == lv]
+
+
+def interfere(k, when):
+    """Another writer acts on object k just before the guard's request reaches the server."""
+    o = st['objects'].get(ns_flag, {}).get(k)
+    for hook in st.get('interfere', []):
+        if hook['key'] != k or hook['when'] != when or hook.get('times', 1) == 0:
+            continue
+        hook['times'] = hook.get('times', 1) - 1
+        if hook['what'] == 'bump' and o is not None:
+            o['metadata']['resourceVersion'] = rv()
+            o.setdefault('metadata', {}).setdefault('annotations', {})['other-writer'] = o['metadata']['resourceVersion']
+        elif hook['what'] == 'relabel' and o is not None:
+            o['metadata'].setdefault('labels', {})['wcep.agent/lease'] = 'lse_someone9999'
+            o['metadata']['resourceVersion'] = rv()
+        elif hook['what'] in ('replace', 'create'):
+            new = copy.deepcopy(hook['object'])
+            new['metadata'].update(namespace=ns_flag, uid=next_uid(new['metadata']['name']), resourceVersion=rv())
+            st['objects'].setdefault(ns_flag, {})[k] = new
+        save()
+
+
 def ptr(path):
     return [p.replace('~1', '/').replace('~0', '~') for p in path.lstrip('/').split('/')]
 
@@ -206,7 +247,12 @@ if cmd == 'get':
             save()
         emit({'kind': 'List', 'apiVersion': 'v1', 'items': items})
     if what == 'pods':
-        emit({'kind': 'List', 'apiVersion': 'v1', 'items': st['pods'].get(ns_flag, [])})
+        emit({'kind': 'List', 'apiVersion': 'v1', 'items': labelled(st['pods'].get(ns_flag, []))})
+    if what in RESOURCES:
+        if what in st.get('missing_resources', []):
+            fail(f'error: the server doesn\'t have a resource type "{what}"')
+        items = [o for o in st['objects'].get(ns_flag, {}).values() if o['kind'] == RESOURCES[what]]
+        emit({'kind': 'List', 'apiVersion': 'v1', 'items': labelled(items)})
     if what == 'configmap':
         o = st['objects'].get(ns_flag, {}).get('ConfigMap/' + pos[2])
         if o is None:
@@ -214,8 +260,7 @@ if cmd == 'get':
         emit(o)
     if '/' in what:
         res, name = what.split('/', 1)
-        kind = {'dynamographdeployments.nvidia.com': 'DynamoGraphDeployment'}.get(res)
-        o = st['objects'].get(ns_flag, {}).get(f'{kind}/{name}')
+        o = st['objects'].get(ns_flag, {}).get(f'{kind_of(res)}/{name}')
         if o is None:
             fail(f'Error from server (NotFound): {res} "{name}" not found')
         emit(o)
@@ -237,8 +282,28 @@ if cmd == 'create' and len(pos) == 1:
     ns = obj['metadata'].get('namespace') or ns_flag
     if ns not in st['namespaces']:
         fail(f'Error from server (NotFound): namespaces "{ns}" not found')
+    dry = flags.get('--dry-run')
+    if dry not in (None, 'server'):
+        fail('fake kubectl: only server dry runs', 97)
+    if obj['metadata'].get('namespace', ns_flag) != ns_flag:
+        fail('error: the namespace from the provided object does not match the namespace')
+    if not dry:
+        interfere(key(obj), 'create')
+        if st.get('apply_fail'):
+            if st['apply_fail'] is not True:
+                st['apply_fail'] -= 1  # a count: only the first writes fail
+                save()
+            fail('Error from server (InternalError): fake write failure')
     if key(obj) in st['objects'][ns]:
         fail(f'Error from server (AlreadyExists): {obj["kind"].lower()}s "{obj["metadata"]["name"]}" already exists')
+    if obj.get('kind') == 'Service':
+        obj.setdefault('spec', {}).setdefault('type', 'ClusterIP')
+    for kind, extra in st.get('mutate', {}).items():
+        if kind == obj.get('kind'):
+            deep_merge(obj, extra)
+    if dry:
+        obj['metadata'].update(namespace=ns, uid='dry-run-uid')
+        emit(obj)
     obj['metadata'].update(namespace=ns, uid=next_uid(obj['metadata']['name']), resourceVersion=rv())
     st['objects'][ns][key(obj)] = obj; save(); emit(obj)
 
@@ -271,6 +336,9 @@ if cmd == 'apply':
     dry = flags.get('--dry-run')
     if dry not in (None, 'server'):
         fail('fake kubectl: only server dry runs', 97)
+    if not dry:
+        # A merge patch omits an unchanged resourceVersion, so apply is no concurrency fence: never a write.
+        fail('fake kubectl: k8s-guard sent a write with kubectl apply', 96)
     if not dry and st.get('apply_fail'):
         fail('Error from server (InternalError): fake apply failure')
     if ns_flag not in st['namespaces']:
@@ -307,17 +375,31 @@ if cmd == 'patch':
     if target.startswith('namespace'):
         fail('Error from server (Forbidden): namespaces is forbidden: cannot patch resource "namespaces"')
     res, name = target.split('/', 1)
-    if not res.startswith('dynamographdeployments.') or flags.get('--type') != 'json':
+    kind = kind_of(res)
+    if kind is None or flags.get('--type') != 'json':
         fail('fake kubectl: no handler for patch ' + target, 97)
-    o = st['objects'].get(ns_flag, {}).get('DynamoGraphDeployment/' + name)
+    dry = flags.get('--dry-run')
+    k = f'{kind}/{name}'
+    if not dry:
+        interfere(k, 'patch')
+        if st.get('apply_fail'):
+            if st['apply_fail'] is not True:
+                st['apply_fail'] -= 1  # a count: only the first writes fail
+                save()
+            fail('Error from server (InternalError): fake write failure')
+    o = st['objects'].get(ns_flag, {}).get(k)
     if o is None:
-        fail(f'Error from server (NotFound): dynamographdeployments "{name}" not found')
-    if st.get('strip_lease_on_patch'):
+        fail(f'Error from server (NotFound): {res} "{name}" not found')
+    if st.get('strip_lease_on_patch') and not dry:
         # Another writer changes the object between the guard's read and its patch.
         o['metadata'].get('labels', {}).pop('wcep.agent/lease', None)
+        o['metadata']['resourceVersion'] = rv()
+        save()
     o = copy.deepcopy(o); json_patch(o, json.loads(flags.get('-p') or flags.get('--patch')))
+    if dry:
+        emit(o)
     o['metadata']['resourceVersion'] = rv()
-    st['objects'][ns_flag]['DynamoGraphDeployment/' + name] = o; save(); emit(o)
+    st['objects'][ns_flag][k] = o; save(); emit(o)
 
 if cmd == 'delete' and '--raw' in flags:
     body = json.loads(stdin)
@@ -335,27 +417,37 @@ if cmd == 'delete' and '--raw' in flags:
         del st['namespaces'][parts[3]]; st['objects'].pop(parts[3], None); st['pods'].pop(parts[3], None)
         st.setdefault('deleted_namespaces', []).append(parts[3]); save()
         emit({'kind': 'Status', 'status': 'Success'})
-    if parts[0] == 'apis' and parts[3] == 'namespaces' and parts[5] == 'dynamographdeployments':
-        ns, name = parts[4], parts[6]
-        o = st['objects'].get(ns, {}).get('DynamoGraphDeployment/' + name)
-        if o is None:
-            fail(f'Error from server (NotFound): dynamographdeployments "{name}" not found')
-        if want is None:
-            fail('fake kubectl: DGD delete without a UID precondition', 96)
-        want_rv = (body.get('preconditions') or {}).get('resourceVersion')
-        if st.get('strip_lease_before_delete') and not st.get('stripped_lease'):
-            # The label goes after the guard's read of the object, before its delete lands.
-            st['stripped_lease'] = True
-            o['metadata'].get('labels', {}).pop('wcep.agent/lease', None)
-            o['metadata']['resourceVersion'] = rv()
-            save()
-        if o['metadata']['uid'] != want:
-            fail('Error from server (Conflict): Precondition failed')
-        if want_rv is not None and o['metadata'].get('resourceVersion') != want_rv:
-            st.setdefault('delete_conflicts', []).append(name); save()
-            fail('Error from server (Conflict): Precondition failed: ResourceVersion in precondition: '
-                 + want_rv + ', ResourceVersion in object meta: ' + str(o['metadata'].get('resourceVersion')))
-        del st['objects'][ns]['DynamoGraphDeployment/' + name]
+    if parts[:2] == ['api', 'v1'] and len(parts) == 6 and parts[2] == 'namespaces':
+        ns, plural, name = parts[3], parts[4], parts[5]
+    elif parts[0] == 'apis' and len(parts) == 7 and parts[3] == 'namespaces':
+        ns, plural, name = parts[4], parts[5], parts[6]
+    else:
+        fail('fake kubectl: no handler for raw delete ' + flags['--raw'], 97)
+    kind = PLURALS.get(plural)
+    k = f'{kind}/{name}'
+    ns_flag = ns
+    interfere(k, 'delete')
+    o = st['objects'].get(ns, {}).get(k)
+    if o is None:
+        fail(f'Error from server (NotFound): {plural} "{name}" not found')
+    want_rv = (body.get('preconditions') or {}).get('resourceVersion')
+    if want is None or want_rv is None:
+        fail(f'fake kubectl: {kind} delete without UID and resourceVersion preconditions', 96)
+    if kind == 'DynamoGraphDeployment' and st.get('strip_lease_before_delete') and not st.get('stripped_lease'):
+        # The label goes after the guard's read of the object, before its delete lands.
+        st['stripped_lease'] = True
+        o['metadata'].get('labels', {}).pop('wcep.agent/lease', None)
+        o['metadata']['resourceVersion'] = rv()
+        save()
+    if o['metadata']['uid'] != want:
+        fail('Error from server (Conflict): Operation cannot be fulfilled: Precondition failed: UID in precondition: '
+             '%s, UID in object meta: %s' % (want, o['metadata']['uid']))
+    if o['metadata'].get('resourceVersion') != want_rv:
+        st.setdefault('delete_conflicts', []).append(name); save()
+        fail('Error from server (Conflict): Operation cannot be fulfilled: Precondition failed: ResourceVersion in '
+             'precondition: %s, ResourceVersion in object meta: %s' % (want_rv, o['metadata'].get('resourceVersion')))
+    del st['objects'][ns][k]
+    if kind == 'DynamoGraphDeployment':
         pods = st['pods'].get(ns, [])
         if st.get('terminate_pods_on_delete', True):
             st['pods'][ns] = [p for p in pods if p['metadata'].get('labels', {}).get(DGD_LABEL) != name]
@@ -363,10 +455,11 @@ if cmd == 'delete' and '--raw' in flags:
             for p in pods:
                 if p['metadata'].get('labels', {}).get(DGD_LABEL) == name:
                     p['metadata']['deletionTimestamp'] = now_iso()
-        save(); emit({'kind': 'Status', 'status': 'Success'})
+    save(); emit({'kind': 'Status', 'status': 'Success'})
     fail('fake kubectl: no handler for raw delete ' + flags['--raw'], 97)
 
 if cmd == 'delete':
+    fail('fake kubectl: k8s-guard sent a delete without UID and resourceVersion preconditions', 96)
     res, name = pos[1].split('/', 1)
     kinds = {'dynamographdeployments.nvidia.com': 'DynamoGraphDeployment', 'configmaps': 'ConfigMap',
              'services': 'Service', 'secrets': 'Secret', 'persistentvolumeclaims': 'PersistentVolumeClaim',
@@ -1290,13 +1383,15 @@ class Kinds(GuardCase):
         self.assertEqual(self.writes(), [])
         self.assertNotIn('ConfigMap/good', self.k8s['objects'][NS])
 
-    def test_same_bytes_dry_run_and_apply(self):
-        self.assertEqual(self.apply(dgd('mocker'))[0], 0)
-        calls = [c for c in self.kubectl_calls() if c['pos'][:1] == ['apply']]
-        self.assertEqual([c['flags'].get('--dry-run') for c in calls], ['server', None])
-        for c in calls:
-            self.assertEqual(c['flags'].get('-f'), '-')
-            self.assertEqual(c['flags'].get('-n'), NS)
+    def test_same_request_dry_run_and_write(self):
+        self.add_obj(dgd('present'))
+        self.assertEqual(self.apply(dgd('mocker'), dgd('present'))[0], 0)
+        for verb in ('create', 'patch'):
+            calls = [c for c in self.kubectl_calls() if c['pos'][:1] == [verb] and c['flags'].get('-n') == NS]
+            self.assertEqual([c['flags'].get('--dry-run') for c in calls], ['server', None], verb)
+            dry, real = ([a for a in c['argv'] if not a.startswith(('--dry-run', '--request-timeout'))]
+                         for c in calls)
+            self.assertEqual(dry, real, 'the dry run is not the request that is sent')
 
 
 # --- rule 6: manifest checks on the server dry run ------------------------
@@ -1561,11 +1656,11 @@ class Budget(GuardCase):
 
     def test_namespace_recreated_before_the_apply_refused(self):
         lid = self.add_lease(gpus=4)
-        hook = """if cmd == 'apply':
+        hook = """if cmd == 'create' and len(pos) == 1:
     if flags.get('--dry-run') == 'server':
         st['namespaces'][ns_flag]['metadata']['uid'] = 'uid-recreated'
         save()"""
-        fake = FAKE_KUBECTL.replace("if cmd == 'apply':", hook, 1)
+        fake = FAKE_KUBECTL.replace("if cmd == 'create' and len(pos) == 1:", hook, 1)
         self.assertNotEqual(fake, FAKE_KUBECTL)
         self.kubectl_path.write_text(fake.replace(hook, hook + "\n    st = json.load(open(STATE))", 1))
         rc, body, _ = self.apply(gpu_dgd('w', 1, lid))
@@ -1678,7 +1773,7 @@ class Budget(GuardCase):
         # A timed-out apply may have landed: a revoked lease is undone whatever the apply reported.
         lid = self.add_lease(gpus=4)
         self.add_obj(gpu_dgd('w', 2, lid))
-        self.k8s['apply_fail'] = True
+        self.k8s['apply_fail'] = 1  # the apply's write fails; expire's patch after it does not
         self.bb['op_end_state'] = 'revoking'
         self.flush()
         rc, body, _ = self.apply(gpu_dgd('w', 2, lid))
@@ -2224,9 +2319,9 @@ class DownClassificationRaces(GuardCase):
         replacement = gpu_dgd('shared', 2, 'lse_previous01')
         replacement['metadata'].update(namespace=NS, uid='uid-foreign-dgd', resourceVersion='1000',
                                        labels={NS_UID: 'uid-deleted-ns'})
-        anchor = "        del st['objects'][ns]['DynamoGraphDeployment/' + name]\n"
-        hook = anchor + "        st['objects'][ns]['DynamoGraphDeployment/' + name] = REPLACEMENT\n" \
-                        "        st['pods'][ns].append(FOREIGN_POD)\n"
+        anchor = "    del st['objects'][ns][k]\n"
+        hook = anchor + "    st['objects'][ns][k] = REPLACEMENT\n" \
+                        "    st['pods'][ns].append(FOREIGN_POD)\n"
         foreign_pod = pod('shared', 2, name='foreign-running')
         hook = hook.replace('REPLACEMENT', repr(replacement)).replace('FOREIGN_POD', repr(foreign_pod))
         self.assertEqual(FAKE_KUBECTL.count(anchor), 1)
@@ -2254,10 +2349,10 @@ class DownClassificationRaces(GuardCase):
         self.k8s['replacement_dgd'] = replacement
         self.k8s['replacement_pod'] = foreign_pod
         self.flush()
-        anchor = "        save(); emit({'kind': 'Status', 'status': 'Success'})\n    fail('fake kubectl: no handler for raw delete '"
-        hook = """        st['pods_after_owned_delete'] = copy.deepcopy(st['pods'][ns])
-        st['objects'][ns]['DynamoGraphDeployment/' + name] = st['replacement_dgd']
-        st['pods'][ns] = [st['replacement_pod']]
+        anchor = "    save(); emit({'kind': 'Status', 'status': 'Success'})\n    fail('fake kubectl: no handler for raw delete '"
+        hook = """    st['pods_after_owned_delete'] = copy.deepcopy(st['pods'][ns])
+    st['objects'][ns][k] = st['replacement_dgd']
+    st['pods'][ns] = [st['replacement_pod']]
 """ + anchor
         self.assertEqual(FAKE_KUBECTL.count(anchor), 1)
         self.kubectl_path.write_text(FAKE_KUBECTL.replace(anchor, hook, 1))
@@ -2286,9 +2381,9 @@ class DownClassificationRaces(GuardCase):
         self.k8s['terminate_pods_on_delete'] = False
         self.flush()
         # A late foreign apply reuses the DGD name after its delete, while its owned pod still runs.
-        anchor = "        del st['objects'][ns]['DynamoGraphDeployment/' + name]\n"
-        hook = anchor + """        st['objects'][ns]['DynamoGraphDeployment/' + name] = st['replacement_dgd']
-        st['owned_pods_after_dgd_delete'] = copy.deepcopy(st['pods'][ns])
+        anchor = "    del st['objects'][ns][k]\n"
+        hook = anchor + """    st['objects'][ns][k] = st['replacement_dgd']
+    st['owned_pods_after_dgd_delete'] = copy.deepcopy(st['pods'][ns])
 """
         self.assertEqual(FAKE_KUBECTL.count(anchor), 1)
         self.kubectl_path.write_text(FAKE_KUBECTL.replace(anchor, hook, 1))
@@ -2550,7 +2645,7 @@ class Secrets(GuardCase):
 
     def test_kubectl_error_echoing_the_value_is_scrubbed(self):
         self.add_ns()
-        self.k8s['forbid'] = ['create secret']
+        self.k8s['forbid'] = ['create -f -']  # the Secret create
         self.flush()
         # Make the fake's error text carry the value, as a worst case.
         leaky = FAKE_KUBECTL.replace("fail(f'Error from server (Forbidden): fake forbids \"{needle}\"')",
@@ -2563,7 +2658,7 @@ class Secrets(GuardCase):
 
     def test_secret_crossing_error_truncation_boundary_is_scrubbed(self):
         self.add_ns()
-        self.k8s['forbid'] = ['create secret']
+        self.k8s['forbid'] = ['create -f -']  # the Secret create
         self.flush()
         # Truncating before redaction leaves a credential prefix that no full-value match can find.
         leaky = FAKE_KUBECTL.replace(
@@ -2642,6 +2737,147 @@ class Delete(GuardCase):
         for target in ('pvc/scratch', 'podcliqueset/w-pcs', 'svc/s'):
             with self.subTest(target=target):
                 self.ok('--context', CTX, '-n', NS, 'delete', target)
+
+
+# --- ownership tested on the mutation itself ------------------------------------
+
+class MutationOwnership(GuardCase):
+    """Every write carries its ownership checks to the server: create-only POST on absence, JSON Patch with
+    tests for UID, resourceVersion and the lease label on presence, and DeleteOptions preconditions with
+    both UID and resourceVersion. A client-side read alone proves nothing: the object can change after it."""
+
+    def setUp(self):
+        super().setUp()
+        self.add_ns()
+        self.lid = self.add_lease(gpus=4)
+
+    def interfere(self, key, when, what, times=1, obj=None):
+        hook = {'key': key, 'when': when, 'what': what, 'times': times}
+        if obj is not None:
+            hook['object'] = obj
+        self.k8s.setdefault('interfere', []).append(hook)
+        self.flush()
+
+    def mutations(self):
+        """Writes the server received, dry runs excluded, with their stdin bodies where the guard sent one."""
+        return [c for c in self.writes()]
+
+    def test_live_version_changed_between_get_and_patch_is_refused_and_unchanged(self):
+        self.add_obj(gpu_dgd('w', 1, self.lid))
+        before = copy.deepcopy(self.dgd_obj('w'))
+        # Another writer bumps the version before every patch the guard sends.
+        self.interfere('DynamoGraphDeployment/w', 'patch', 'bump', times=99)
+        rc, body, _ = self.apply(gpu_dgd('w', 2, self.lid))
+        self.assertEqual(body.get('code'), 'write_conflict', body)
+        after = self.dgd_obj('w')
+        self.assertEqual(after['spec'], before['spec'], 'a patch landed over a changed version')
+        self.assertEqual(after['metadata']['labels'], before['metadata']['labels'])
+        patches = [c for c in self.writes() if c['pos'][0] == 'patch']
+        self.assertTrue(patches, body)
+        for c in patches:
+            ops = json.loads(c['flags']['-p'])
+            tested = {op['path'] for op in ops if op['op'] == 'test'}
+            self.assertLessEqual({'/metadata/uid', '/metadata/resourceVersion',
+                                  '/metadata/labels/wcep.agent~1lease'}, tested, ops)
+            self.assertEqual([op['op'] for op in ops][:3], ['test'] * 3, 'the tests come before the edits')
+
+    def test_one_conflict_rereads_and_rechecks_before_the_retry(self):
+        self.add_obj(gpu_dgd('w', 1, self.lid))
+        self.interfere('DynamoGraphDeployment/w', 'patch', 'bump', times=1)
+        rc, body, _ = self.apply(gpu_dgd('w', 2, self.lid))
+        self.assertEqual(rc, 0, body)
+        self.assertEqual(self.dgd_obj('w')['spec']['components'][1]['podTemplate']['spec']['containers'][0]
+                         ['resources']['limits']['nvidia.com/gpu'], '2')
+        calls = self.kubectl_calls()
+        patches = [i for i, c in enumerate(calls) if c['pos'][0] == 'patch' and c['flags'].get('--dry-run') is None]
+        self.assertEqual(len(patches), 2, [c['pos'] for c in calls])
+        between = calls[patches[0] + 1:patches[1]]
+        self.assertIn(['get', 'dynamographdeployments.nvidia.com/w'], [c['pos'][:2] for c in between])
+        self.assertIn('server', [c['flags'].get('--dry-run') for c in between], 'admission ran again')
+
+    def test_absent_object_is_a_create_only_post(self):
+        rc, body, _ = self.apply(gpu_dgd('w', 1, self.lid), {'apiVersion': 'v1', 'kind': 'ConfigMap',
+                                                            'metadata': {'name': 'cfg'}, 'data': {'a': '1'}})
+        self.assertEqual(rc, 0, body)
+        verbs = [c['pos'][0] for c in self.writes()]
+        self.assertEqual(verbs, ['create', 'create'], [c['argv'] for c in self.writes()])
+        self.assertEqual(self.k8s['objects'][NS]['ConfigMap/cfg']['metadata']['labels'][LEASE_LABEL], self.lid)
+
+    def test_competing_create_gets_already_exists_and_is_left_alone(self):
+        foreign = dgd('w')  # someone else's object, same name, made between the guard's read and its create
+        self.interfere('DynamoGraphDeployment/w', 'create', 'create', obj=foreign)
+        self.interfere('DynamoGraphDeployment/w', 'apply', 'create', obj=foreign)
+        rc, body, _ = self.apply(gpu_dgd('w', 1, self.lid))
+        self.assertNotEqual(rc, 0, body)
+        self.assertEqual(body.get('code'), 'object_not_yours', body)
+        self.assertEqual(self.dgd_obj('w')['spec'], foreign['spec'], 'the guard merged into a foreign object')
+        self.assertNotIn(LEASE_LABEL, self.dgd_obj('w')['metadata'].get('labels') or {})
+
+    def test_present_object_of_another_lease_is_not_yours(self):
+        self.add_obj(gpu_dgd('w', 1, 'lse_someone9999'))
+        before = copy.deepcopy(self.dgd_obj('w'))
+        rc, body, _ = self.apply(gpu_dgd('w', 1, self.lid))
+        self.assertEqual(body.get('code'), 'object_not_yours', body)
+        self.assertEqual(self.dgd_obj('w'), before)
+        self.assertEqual(self.writes(), [])
+
+    def test_relabel_defeats_a_stale_owner_delete(self):
+        self.add_obj(gpu_dgd('w', 1, self.lid))
+        self.interfere('DynamoGraphDeployment/w', 'delete', 'relabel')
+        rc, body, _ = self.guard('--context', CTX, '-n', NS, 'delete', 'dgd/w')
+        self.assertNotEqual(rc, 0, body)
+        self.assertEqual(body.get('code'), 'object_not_yours', body)
+        self.assertIsNotNone(self.dgd_obj('w'), 'a stale delete removed a relabelled object')
+
+    def test_replacement_defeats_a_stale_owner_delete(self):
+        self.add_obj(gpu_dgd('w', 1, self.lid))
+        self.interfere('DynamoGraphDeployment/w', 'delete', 'replace', obj=dgd('w'))
+        rc, body, _ = self.guard('--context', CTX, '-n', NS, 'delete', 'dgd/w')
+        self.assertNotEqual(rc, 0, body)
+        self.assertIn(body.get('code'), ('object_not_yours', 'not_found'), body)
+        self.assertIsNotNone(self.dgd_obj('w'), 'a stale delete removed the replacement')
+
+    def test_owner_delete_carries_uid_and_version_preconditions(self):
+        self.add_obj({'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': 'cfg', 'labels': {
+            LEASE_LABEL: self.lid}}, 'data': {}})
+        self.ok('--context', CTX, '-n', NS, 'delete', 'configmap/cfg')
+        [write] = self.writes()
+        self.assertEqual(write['pos'][0], 'delete')
+        self.assertEqual(write['flags'].get('--raw'), f'/api/v1/namespaces/{NS}/configmaps/cfg')
+
+    def test_owner_delete_of_an_object_of_another_lease_refused(self):
+        self.add_obj({'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': 'cfg', 'labels': {
+            LEASE_LABEL: 'lse_someone9999'}}, 'data': {}})
+        self.refused('object_not_yours', '--context', CTX, '-n', NS, 'delete', 'configmap/cfg')
+        self.assertEqual(self.writes(), [])
+
+    def test_scale_to_zero_tests_the_version_and_rechecks_on_conflict(self):
+        self.bb['leases'][self.lid]['state'] = 'revoking'
+        self.flush()
+        self.add_obj(gpu_dgd('w', 1, self.lid))
+        self.interfere('DynamoGraphDeployment/w', 'patch', 'bump', times=99)
+        rc, body, _ = self.guard('--context', CTX, 'expire', NS, '--uid', 'uid-ns-1', '--lease', self.lid,
+                                 host_entry=True)
+        self.assertNotEqual(rc, 0, body)
+        self.assertEqual(self.dgd_obj('w')['spec']['components'][1]['replicas'], 1)
+        for c in (c for c in self.writes() if c['pos'][0] == 'patch'):
+            self.assertIn('/metadata/resourceVersion', {op['path'] for op in json.loads(c['flags']['-p'])
+                                                         if op['op'] == 'test'})
+
+    def test_secret_is_created_once_with_the_lease(self):
+        rc, body, p = self.guard('--context', CTX, '-n', NS, 'secret', 'hf')
+        self.assertEqual(rc, 0, body)
+        stored = self.k8s['objects'][NS]['Secret/hf-token-secret']
+        self.assertEqual(stored['metadata']['labels'].get(LEASE_LABEL), self.lid)
+        self.assertEqual(stored['metadata']['labels'].get(NS_UID), 'uid-ns-1')
+        [write] = self.writes()
+        self.assertEqual((write['pos'], write['flags'].get('-f')), (['create'], '-'))
+
+    def test_no_write_uses_kubectl_apply(self):
+        self.add_obj(gpu_dgd('old', 1, self.lid))
+        rc, body, _ = self.apply(gpu_dgd('old', 2, self.lid), gpu_dgd('new', 1, self.lid))
+        self.assertEqual(rc, 0, body)
+        self.assertEqual(sorted(c['pos'][0] for c in self.writes()), ['create', 'patch'])
 
 
 # --- environment the k8s-leases host entry gives -----------------------------
@@ -2843,23 +3079,20 @@ def logical_now():
             st['elapsed_seconds'] = 79
         save()""", 1)
         # The first two writes land at 93s and 107s. Another guard gets the expired slot at 121s.
-        hook = """    for obj in docs(stdin):
-        if not dry and obj['metadata']['name'] in ('first', 'second', 'late'):
-            st['elapsed_seconds'] += 14
+        hook = """    if not dry and obj['metadata']['name'] in ('first', 'second', 'late'):
+        st['elapsed_seconds'] += 14
+        save()
+        if obj['metadata']['name'] == 'late':
+            other = subprocess.run(CONCURRENT_ARGV, env=dict(os.environ, KUBECONFIG=BOT_KUBECONFIG),
+                                   capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+            st = json.load(open(STATE))
+            st['concurrent_rc'] = other.returncode
+            st['concurrent_result'] = json.loads(other.stdout)
             save()
-            if obj['metadata']['name'] == 'late':
-                other = subprocess.run(CONCURRENT_ARGV, env=dict(os.environ, KUBECONFIG=BOT_KUBECONFIG),
-                                       capture_output=True,
-                                       text=True, timeout=60, stdin=subprocess.DEVNULL)
-                st = json.load(open(STATE))
-                st['concurrent_rc'] = other.returncode
-                st['concurrent_result'] = json.loads(other.stdout)
-                save()
 """.replace('CONCURRENT_ARGV', repr(concurrent_argv)).replace('BOT_KUBECONFIG', repr(str(self.bot_kubeconfig)))
-        fake = fake.replace("    for obj in docs(stdin):\n        meta = obj.setdefault",
-                            hook + "        meta = obj.setdefault", 1)
-        fake = fake.replace("            st['objects'][ns_flag][key(merged)] = merged",
-                            "            st['objects'][ns_flag][key(merged)] = merged\n            save()", 1)
+        anchor = "    if not dry:\n        interfere(key(obj), 'create')\n"
+        self.assertEqual(fake.count(anchor), 1)
+        fake = fake.replace(anchor, hook + anchor, 1)
         self.assertNotEqual(fake, FAKE_KUBECTL)
         self.kubectl_path.write_text(fake)
         manifest = self.manifest(*(gpu_dgd(name, 1, lid) for name in ('first', 'second', 'late')))
@@ -2908,7 +3141,8 @@ class SelftestFences(GuardCase):
         self.assertTrue(body['all_held'], body)
         self.assertEqual(body['dgd'], 'smoke')  # the lease's DGD, not the UID-only one listed first
         self.assertEqual([p['fence'] for p in body['probes']], [
-            'patch: wrong DGD UID', 'patch: wrong lease label', 'delete DGD: wrong UID precondition',
+            'patch: wrong DGD UID', 'patch: stale resourceVersion', 'patch: wrong lease label',
+            'delete DGD: wrong UID precondition', 'delete DGD: stale resourceVersion precondition',
             'delete namespace: wrong UID precondition', 'replace lease record: stale resourceVersion'])
         self.assertTrue(all(p['refused'] for p in body['probes']), body)
         self.assertEqual(self.k8s['namespaces'], before['namespaces'])
@@ -2935,13 +3169,15 @@ class SelftestFences(GuardCase):
 
     def test_a_server_that_ignores_a_fence_is_reported(self):
         # A fake server that ignores the UID precondition on a DGD delete.
-        fake = FAKE_KUBECTL.replace("        if o['metadata']['uid'] != want:\n            fail('Error from server (Conflict): Precondition failed')",
-                                    "        pass", 1)
+        anchor = "    if o['metadata']['uid'] != want:\n        fail("
+        self.assertEqual(FAKE_KUBECTL.count(anchor), 1)
+        fake = FAKE_KUBECTL.replace(anchor, "    if False:\n        fail(", 1)
         self.assertNotEqual(fake, FAKE_KUBECTL)
         self.kubectl_path.write_text(fake)
         body = self.refused('fence_failed', '--context', CTX, '-n', NS, 'selftest', 'fences')
         self.assertFalse(body['all_held'])
-        self.assertEqual([p['refused'] for p in body['probes']], [True, True, False, True, True])
+        self.assertEqual([p['refused'] for p in body['probes']], [True, True, True, False, True, True, True])
+        self.assertFalse(body['probes'][3]['held'])
 
     def test_another_threads_namespace_refused(self):
         self.refused('not_your_namespace', '--context', CTX, '-n', NS, 'selftest', 'fences', thread=OTHER)

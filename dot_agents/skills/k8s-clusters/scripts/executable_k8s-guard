@@ -81,6 +81,20 @@ DELETABLE = {  # alias -> (kubectl resource, kind)
                     ('podcliquesets.grove.io', 'PodCliqueSet')),
 }
 
+# kind -> (kubectl resource, REST plural): the objects the guard writes, deletes or inventories by name.
+KINDS = {
+    DGD_KIND: (DGD_RESOURCE, 'dynamographdeployments'),
+    'ConfigMap': ('configmaps', 'configmaps'),
+    'Service': ('services', 'services'),
+    'Secret': ('secrets', 'secrets'),
+    'PersistentVolumeClaim': ('persistentvolumeclaims', 'persistentvolumeclaims'),
+    'PodCliqueSet': ('podcliquesets.grove.io', 'podcliquesets'),
+}
+# The kinds `apply` admits (k8s_guard_rules.admit decides the details).
+APPLY_KINDS = {(DGD_KIND, 'nvidia.com/v1alpha1'), (DGD_KIND, 'nvidia.com/v1beta1'), ('ConfigMap', 'v1'), ('Service', 'v1')}
+# How many times a write that met a changed object is planned again, from fresh reads, before the guard stops.
+WRITE_ROUNDS = 3
+
 DNS_LABEL = re.compile(r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
 DNS_SUBDOMAIN = re.compile(r'^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$')
 LABEL_VALUE = re.compile(r'^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$')
@@ -396,6 +410,8 @@ class NsView:
 
     def __init__(self, g, ns):
         self.name = ns
+        # A claimed namespace is the profile's pre-made one: the bot cannot label or delete it.
+        self.claimed = False
         self.obj = g.get_namespace(ns)
         meta = self.obj.get('metadata') or {}
         self.uid = meta.get('uid')
@@ -536,6 +552,182 @@ def check_uid(view, uid_arg):
         raise Refusal('uid_mismatch', f'{view.name} has UID {view.uid}, not {uid_arg}: it was re-created')
 
 
+
+# --- writes that carry their ownership checks ------------------------------------------
+#
+# A read before a write proves nothing about the object the write reaches: it can change in between.
+# So every write carries its checks to the server (references/k8s-guard.md, "Ownership on the mutation"):
+# absence is a create-only POST, which the server refuses with AlreadyExists if anything took the name;
+# presence is a JSON Patch whose first operations test the UID, the resourceVersion and the identity
+# label read; a delete carries both UID and resourceVersion in DeleteOptions.preconditions. kubectl
+# apply is never a write: its merge patch omits an unchanged resourceVersion, so it fences nothing.
+
+class WriteConflict(Refusal):
+    """The server refused a write because the object is no longer the one read. Re-read and re-check."""
+
+    def __init__(self, what, err):
+        super().__init__('write_conflict', f'{what} changed under the write: {clip(err, 300)}')
+
+
+CONFLICTS = ('AlreadyExists', 'Conflict', 'testing value', 'test operation', 'the object has been modified',
+             'Precondition failed')
+
+
+def is_conflict(err):
+    return any(m in err for m in CONFLICTS) or is_not_found(err)
+
+
+def esc(name):
+    return str(name).replace('~', '~0').replace('/', '~1')
+
+
+def get_object(g, ns, kind, name):
+    resource = KINDS[kind][0]
+    obj = g.kc.json('get', f'{resource}/{name}', '-n', ns, '-o', 'json', not_found=MISSING)
+    return None if obj is MISSING else obj
+
+
+def rest_path(obj, ns):
+    plural = KINDS[obj['kind']][1]
+    api = obj.get('apiVersion') or 'v1'
+    base = '/api/v1' if api == 'v1' else f'/apis/{api}'
+    return f'{base}/namespaces/{ns}/{plural}/{obj["metadata"]["name"]}'
+
+
+def patch_target(obj):
+    plural = KINDS[obj['kind']][1]
+    api = obj.get('apiVersion') or 'v1'
+    if api == 'v1':
+        return f'{plural}/{obj["metadata"]["name"]}'
+    group, _, version = api.partition('/')
+    return f'{plural}.{version}.{group}/{obj["metadata"]["name"]}'
+
+
+def labels_of(obj):
+    return (obj.get('metadata') or {}).get('labels') or {}
+
+
+def owns(live, lease_id, uid, claimed, unstamped=False):
+    """Whether the live object is one this write may change, and the label its patch tests to prove it.
+
+    In a claimed namespace only an object stamped with this lease is ours. In a namespace the guard
+    created, an object stamped with this lease, or with this namespace instance and no lease. With
+    `unstamped` (owner deletes in a namespace the guard created, for the leftovers a DGD delete leaves),
+    also an object with no stamp at all. A patch never adopts an unstamped object: a controller may own it.
+    """
+    labels = labels_of(live)
+    have = labels.get(LEASE_LABEL)
+    if claimed or (lease_id and have is not None):
+        return (have == lease_id, LEASE_LABEL)
+    if have is not None:
+        return (False, LEASE_LABEL)
+    if NS_UID_LABEL in labels:
+        return (labels[NS_UID_LABEL] == uid, NS_UID_LABEL)
+    return (unstamped, None)
+
+
+def identity_tests(live, label):
+    meta = live['metadata']
+    ops = [{'op': 'test', 'path': '/metadata/uid', 'value': meta['uid']},
+           {'op': 'test', 'path': '/metadata/resourceVersion', 'value': meta['resourceVersion']}]
+    if label is not None:
+        ops.append({'op': 'test', 'path': '/metadata/labels/' + esc(label), 'value': labels_of(live)[label]})
+    return ops
+
+
+def edit_ops(live, item):
+    """The patch's edits: every label and annotation the manifest names, and each field it gives.
+
+    Under spec, each top-level field is replaced on its own, so fields the server assigned (a Service's
+    clusterIP) stay. Fields the manifest drops are not removed.
+    """
+    ops = []
+    meta = item.get('metadata') or {}
+    for section in ('labels', 'annotations'):
+        want = meta.get(section) or {}
+        have = (live.get('metadata') or {}).get(section)
+        if not want:
+            continue
+        if not isinstance(have, dict):
+            ops.append({'op': 'add', 'path': f'/metadata/{section}', 'value': want})
+            continue
+        ops += [{'op': 'add', 'path': f'/metadata/{section}/{esc(k)}', 'value': v} for k, v in want.items()]
+    for field, value in item.items():
+        if field in ('apiVersion', 'kind', 'metadata', 'status'):
+            continue
+        if field == 'spec' and isinstance(value, dict) and isinstance(live.get('spec'), dict):
+            ops += [{'op': 'add', 'path': f'/spec/{esc(k)}', 'value': v} for k, v in value.items()]
+        else:
+            ops.append({'op': 'add', 'path': f'/{esc(field)}', 'value': value})
+    return ops
+
+
+class Write:
+    """One planned write: a create of `item`, or a patch of `live` with `ops`."""
+
+    def __init__(self, item, live, ops):
+        self.item, self.live, self.ops = item, live, ops
+        self.name = f'{item["kind"]}/{item["metadata"]["name"]}'
+
+    def args(self, ns, dry):
+        extra = ['--dry-run=server'] if dry else [f'--request-timeout={APPLY_REQUEST_TIMEOUT}s']
+        if self.live is None:
+            return ['create', '-f', '-', '-n', ns, '-o', 'json', *extra], json.dumps(self.item)
+        return (['patch', patch_target(self.live), '-n', ns, '--type=json', '-p', json.dumps(self.ops), '-o', 'json',
+                 *extra], None)
+
+    def send(self, g, ns, dry, timeout=KUBECTL_TIMEOUT):
+        args, body = self.args(ns, dry)
+        rc, out, err = g.kc.run(*args, input=body, timeout=timeout)
+        if rc != 0:
+            if is_conflict(err):
+                raise WriteConflict(self.name, err)
+            raise kubectl_error(tuple(args[:2]) + (self.name,), rc, err)
+        try:
+            return json.loads(out)
+        except json.JSONDecodeError:
+            raise Refusal('kubectl_error', f'kubectl {args[0]} {self.name} printed no JSON')
+
+
+def plan_write(g, ns, item, lease_id, uid, claimed):
+    live = get_object(g, ns, item['kind'], item['metadata']['name'])
+    if live is None:
+        return Write(item, None, None)
+    ok, label = owns(live, lease_id, uid, claimed)
+    if not ok:
+        raise Refusal('object_not_yours', f'{item["kind"]}/{item["metadata"]["name"]} exists and is not this '
+                                          f'lease\'s ({LEASE_LABEL}={labels_of(live).get(LEASE_LABEL) or "none"}); '
+                                          'left alone')
+    return Write(item, live, identity_tests(live, label) + edit_ops(live, item))
+
+
+def delete_owned(g, ns, obj, still_ours, timeout=KUBECTL_TIMEOUT):
+    """Delete `obj` under its UID and resourceVersion. On a conflict, re-read: retry while still_ours(live).
+
+    Returns 'deleted', 'gone' (someone else deleted it), or raises object_not_yours when it changed hands.
+    """
+    kind, name = obj['kind'], obj['metadata']['name']
+    for _ in range(WRITE_ROUNDS):
+        meta = obj['metadata']
+        body = json.dumps({'kind': 'DeleteOptions', 'apiVersion': 'v1',
+                           'preconditions': {'uid': meta['uid'], 'resourceVersion': meta['resourceVersion']}})
+        rc, out, err = g.kc.run('delete', '--raw', rest_path(obj, ns), '-f', '-', input=body, timeout=timeout)
+        if rc == 0:
+            return 'deleted'
+        if is_not_found(err):
+            return 'gone'
+        if not is_conflict(err):
+            raise kubectl_error(('delete', kind, name), rc, err)
+        live = get_object(g, ns, kind, name)
+        if live is None:
+            return 'gone'
+        if live['metadata'].get('uid') != meta['uid'] or not still_ours(live):
+            raise Refusal('object_not_yours', f'{kind}/{name} changed hands before the delete reached it '
+                                              f'({clip(err, 200)}); left alone')
+        obj = live
+    raise Refusal('write_conflict', f'{kind}/{name} changed under every delete; try again')
+
+
 # --- commands -----------------------------------------------------------------------
 
 def cmd_inspect(g, a):
@@ -660,13 +852,15 @@ def cmd_secret(g, a):
             remember_secret(payload)
         else:
             payload = value
-        args = ['create', 'secret', 'generic', spec['name'], '-n', ns, f'--from-file={spec["key"]}=/dev/stdin']
-        if spec.get('type'):
-            args.append(f'--type={spec["type"]}')
+        labels = {NS_UID_LABEL: view.uid, **({LEASE_LABEL: lease['lease_id']} if lease else {})}
+        obj = {'apiVersion': 'v1', 'kind': 'Secret', 'type': spec.get('type', 'Opaque'),
+               'metadata': {'name': spec['name'], 'namespace': ns, 'labels': labels},
+               'stringData': {spec['key']: payload}}
         confirm_uid(g, ns, view.uid)
         if slot:
             slot.check()
-        rc, out, err = g.kc.run(*args, input=payload)
+        # Create, never apply: the server refuses a name that exists. The value goes on stdin only.
+        rc, out, err = g.kc.run('create', '-f', '-', '-n', ns, '-o', 'json', input=json.dumps(obj))
         if rc != 0:
             if 'AlreadyExists' in err:
                 raise Refusal('secret_exists', f'secret {spec["name"]} already exists in {ns}')
@@ -711,17 +905,61 @@ def cmd_apply(g, a):
         raise Refusal('usage', f'cannot read {a.filename}: {e}', status=2)
     ns, view = g.owned()
 
-    def body(lease, slot):
-        # kubectl, run locally, parses the file and stamps every object with the namespace's UID and
-        # the lease it is written under; teardown of that lease selects by the lease label. The same
-        # JSON goes to the dry run and to the apply, and the checks run on what the server returned.
-        lease_id = lease['lease_id'] if lease else None
-        stamped = stamp(g, manifest, view.uid, lease_id)
-        result = g.kc.json('apply', '-f', '-', '-n', ns, '--dry-run=server', '-o', 'json', input=stamped)
-        objects = result.get('items') if result.get('kind') == 'List' else [result]
+    def plan(lease_id):
+        """Read each object, plan its write, dry-run that exact request, and admit what the server returned."""
+        writes, objects = [], []
+        for item in json.loads(stamp(g, manifest, view.uid, lease_id))['items']:
+            meta = item.setdefault('metadata', {})
+            where = f'{item.get("kind")}/{meta.get("name")}'
+            if meta.get('namespace', ns) != ns:
+                raise Refusal('kind_refused', f'{where} is not a namespaced object in {ns}')
+            if (item.get('kind'), item.get('apiVersion')) not in APPLY_KINDS:
+                raise Refusal('kind_refused', f'{where} ({item.get("apiVersion")}) is not an admitted kind; admitted: '
+                                              'DynamoGraphDeployment, ConfigMap, ClusterIP Service')
+            if not isinstance(meta.get('name'), str) or not DNS_SUBDOMAIN.match(meta['name']):
+                raise Refusal('usage', f'{where} has no valid name', status=2)
+            meta['namespace'] = ns
+            w = plan_write(g, ns, item, lease_id, view.uid, view.claimed)
+            writes.append(w)
+            objects.append(w.send(g, ns, dry=True))
         if not objects:
             raise Refusal('usage', f'{a.filename} holds no objects', status=2)
-        new = admit(objects, ns, view.uid, lease_id)
+        return writes, admit(objects, ns, view.uid, lease_id)
+
+    def body(lease, slot):
+        # kubectl, run locally, parses the file and stamps every object with the namespace's UID and the
+        # lease it is written under; teardown of that lease selects by the lease label. Each object's write
+        # is planned from a fresh read (create when absent, a tested JSON Patch when present), that same
+        # request is dry-run on the server, and the checks run on what the server returned.
+        lease_id = lease['lease_id'] if lease else None
+        names = []
+        for _ in range(WRITE_ROUNDS):
+            writes, new = plan(lease_id)
+            total = budget(lease, writes, new)
+            confirm_uid(g, ns, view.uid)
+            # One request per object, each started only with time left in the slot and stopped before it
+            # ends. Any subset may land: the budget counts every subset.
+            try:
+                for w in writes:
+                    if slot:
+                        slot.check()
+                    w.send(g, ns, dry=False, timeout=slot.timeout() if slot else APPLY_REQUEST_TIMEOUT + 15)
+                    gpus = dgd_gpus(w.item) if w.item.get('kind') == DGD_KIND else 0
+                    g.record(ns, w.name, gpus, 'up', uid=view.uid, lease=lease_id, issue=view.issue)
+                    if w.name not in names:
+                        names.append(w.name)
+            except WriteConflict:
+                continue  # something changed an object after its read: read again, admit again, budget again
+            except Refusal as e:
+                if names:
+                    e.extra.setdefault('applied', names)
+                    e.args = (f'{e}; already applied: {", ".join(names)}',)
+                raise
+            return {'applied': names, 'namespace': ns, 'allocation': total, 'lease': lease_id}
+        raise Refusal('write_conflict', f'an object changed under each of {WRITE_ROUNDS} tries; nothing more was '
+                                        'written', applied=names)
+
+    def budget(lease, writes, new):
         current = g.dgds(ns)
         pods = g.pods(ns)
         # kubectl writes the objects one at a time and goes on after a failure, so any subset of the
@@ -746,28 +984,7 @@ def cmd_apply(g, a):
             check_lease_label(new, lease)
             check_one_node(after, lease, g.profile)
             check_gpu_product(after, g.profile)
-        confirm_uid(g, ns, view.uid)
-        # One request per object, each started only with time left in the slot and stopped before
-        # it ends. A whole file in one kubectl run could keep writing long after the slot expired.
-        # Any subset may land: the budget above already counts every subset.
-        names = []
-        for item in json.loads(stamped)['items']:
-            name = f'{item.get("kind")}/{(item.get("metadata") or {}).get("name")}'
-            try:
-                if slot:
-                    slot.check()
-                g.kc.json('apply', '-f', '-', '-n', ns, '-o', 'json',
-                          f'--request-timeout={APPLY_REQUEST_TIMEOUT}s', input=json.dumps(item),
-                          timeout=slot.timeout() if slot else APPLY_REQUEST_TIMEOUT + 15)
-            except Refusal as e:
-                if names:
-                    e.extra.setdefault('applied', names)
-                    e.args = (f'{e}; already applied: {", ".join(names)}',)
-                raise
-            gpus = dgd_gpus(item) if item.get('kind') == DGD_KIND else 0
-            g.record(ns, name, gpus, 'up', uid=view.uid, lease=view.lease_id, issue=view.issue)
-            names.append(name)
-        return {'applied': names, 'namespace': ns, 'allocation': total, 'lease': view.lease_id}
+        return total
 
     return fenced(g, view, body)
 
@@ -794,20 +1011,24 @@ def cmd_delete(g, a):
         # Teardown of a namespace without that is `down` or `expire`, under their own authority.
         if lease is None and allocation(g.dgds(ns), g.pods(ns)) > 0:
             raise Refusal('lease_required', f'{ns} holds GPUs but has no lease; use `k8s-guard down`')
-        gpus = 0
-        if kind == DGD_KIND:
-            obj = g.kc.json('get', f'{resource}/{name}', '-n', ns, '-o', 'json', not_found=MISSING)
-            if obj is MISSING:
-                raise Refusal('not_found', f'{kind}/{name} not found in {ns}')
-            gpus = dgd_gpus(obj)
+        lease_id = lease['lease_id'] if lease else None
+        obj = get_object(g, ns, kind, name)
+        if obj is None:
+            raise Refusal('not_found', f'{kind}/{name} not found in {ns}')
+        obj.setdefault('kind', kind)
+
+        def mine(live):
+            return owns(live, lease_id, view.uid, view.claimed, unstamped=True)[0]
+
+        if not mine(obj):
+            raise Refusal('object_not_yours', f'{kind}/{name} is not this lease\'s '
+                                              f'({LEASE_LABEL}={labels_of(obj).get(LEASE_LABEL) or "none"}); left alone')
+        gpus = dgd_gpus(obj) if kind == DGD_KIND else 0
         confirm_uid(g, ns, view.uid)
         if slot:
             slot.check()
-        rc, out, err = g.kc.run('delete', f'{resource}/{name}', '-n', ns, '--wait=false')
-        if rc != 0:
-            if is_not_found(err):
-                raise Refusal('not_found', f'{kind}/{name} not found in {ns}')
-            raise kubectl_error(('delete', f'{resource}/{name}'), rc, err)
+        if delete_owned(g, ns, obj, mine, timeout=slot.timeout() if slot else KUBECTL_TIMEOUT) == 'gone':
+            raise Refusal('not_found', f'{kind}/{name} not found in {ns}')
         g.record(ns, f'{kind}/{name}', gpus, 'down', uid=view.uid, lease=view.lease_id, issue=view.issue)
         return {'deleted': f'{kind}/{name}', 'namespace': ns}
 
@@ -886,17 +1107,8 @@ def do_expire(g, ns, uid, lease_id):
             before += dgd_gpus(d)
         except Refusal:
             pass  # scale it down even when it cannot be counted
-        ops = zero_patch(d, lease_id)
-        if ops is None:
-            continue
-        group, _, version = d['apiVersion'].partition('/')
-        res = f'dynamographdeployments.{version}.{group}/{d["metadata"]["name"]}'
-        rc, out, err = g.kc.run('patch', res, '-n', ns, '--type=json', '-p', json.dumps(ops))
-        if rc != 0 and not is_not_found(err):
-            if 'testing value' in err or 'test operation' in err:
-                raise Refusal('uid_mismatch', f'{res} is no longer the object the guard read: {clip(err, 200)}')
-            raise kubectl_error(('patch', res), rc, err)
-        scaled.append(d['metadata']['name'])
+        if scale_to_zero(g, ns, d, lease_id):
+            scaled.append(d['metadata']['name'])
     _, left = gpu_pod_summary(g.pods(ns))
     g.record(ns, f'Namespace/{ns}', before, 'down', uid=uid, lease=lease_id)
     result = {'namespace': ns, 'scaled': scaled, 'gpu_pods_left': left}
@@ -904,6 +1116,35 @@ def do_expire(g, ns, uid, lease_id):
         # Nothing could be selected: say so, so an empty `scaled` is not read as success.
         result['dgds_skipped'] = why_none
     return result
+
+
+def scale_to_zero(g, ns, d, lease_id):
+    """Patch every replica count of `d` to 0 under its UID, version and lease label. True if a patch landed.
+
+    A version change alone is re-read and retried; a DGD that lost the lease label or was replaced is
+    no longer this lease's, and the server's refusal stands.
+    """
+    name = d['metadata']['name']
+    for _ in range(WRITE_ROUNDS):
+        ops = zero_patch(d, lease_id)
+        if ops is None:
+            return False
+        group, _, version = d['apiVersion'].partition('/')
+        res = f'dynamographdeployments.{version}.{group}/{name}'
+        rc, out, err = g.kc.run('patch', res, '-n', ns, '--type=json', '-p', json.dumps(ops))
+        if rc == 0:
+            return True
+        if is_not_found(err):
+            return False
+        if not is_conflict(err):
+            raise kubectl_error(('patch', res), rc, err)
+        live = get_object(g, ns, DGD_KIND, name)
+        if live is None:
+            return False
+        if live['metadata'].get('uid') != d['metadata']['uid'] or labels_of(live).get(LEASE_LABEL) != lease_id:
+            raise Refusal('uid_mismatch', f'{res} is no longer the object the guard read: {clip(err, 200)}')
+        d = live
+    raise Refusal('write_conflict', f'DGD {name} changed under every scale-to-zero; try again')
 
 
 def cmd_expire(g, a):
@@ -1066,6 +1307,8 @@ def cmd_extend(g, a):
 
 
 WRONG_UID = '00000000-0000-4000-8000-000000000000'
+# A resourceVersion no live object has: etcd revisions this low were compacted long ago.
+STALE_VERSION = '1'
 # What the API server says when each fence refuses a request. Any other error (Forbidden, an
 # unsupported media type, a timeout) says nothing about the fence, so it does not count as held.
 FENCE_REFUSALS = {
@@ -1110,19 +1353,33 @@ def cmd_selftest_fences(g, a):
         else:
             raise Refusal('selftest_needs_dgd', f'DGD {name} has no component to write back')
         noop = {'op': 'add', 'path': path, 'value': current}
+        dgd_rv = d['metadata']['resourceVersion']
+        uid_test = {'op': 'test', 'path': '/metadata/uid', 'value': dgd_uid}
+        rv_test = {'op': 'test', 'path': '/metadata/resourceVersion', 'value': dgd_rv}
+
+        def delete_options(uid, version):
+            return json.dumps({'kind': 'DeleteOptions', 'apiVersion': 'v1',
+                               'preconditions': {'uid': uid, 'resourceVersion': version}})
+
         probes = [
             ('patch: wrong DGD UID', 'patch test', ('patch', res, '-n', ns, '--type=json', '-p', json.dumps(
-                [{'op': 'test', 'path': '/metadata/uid', 'value': WRONG_UID}, noop])), None),
+                [{'op': 'test', 'path': '/metadata/uid', 'value': WRONG_UID}, rv_test, noop])), None),
+            ('patch: stale resourceVersion', 'patch test', ('patch', res, '-n', ns, '--type=json', '-p', json.dumps(
+                [uid_test, {'op': 'test', 'path': '/metadata/resourceVersion', 'value': STALE_VERSION}, noop])),
+             None),
             ('patch: wrong lease label', 'patch test', ('patch', res, '-n', ns, '--type=json', '-p', json.dumps(
-                [{'op': 'test', 'path': '/metadata/uid', 'value': dgd_uid},
-                 {'op': 'test', 'path': label_path, 'value': WRONG_UID}, noop])), None),
+                [uid_test, rv_test, {'op': 'test', 'path': label_path, 'value': WRONG_UID}, noop])), None),
             ('delete DGD: wrong UID precondition', 'delete precondition',
-             ('delete', '--raw', dgd_path(d, ns), '-f', '-'),
-             json.dumps({'kind': 'DeleteOptions', 'apiVersion': 'v1', 'preconditions': {'uid': WRONG_UID}})),
-            ('delete namespace: wrong UID precondition', 'delete precondition',
-             ('delete', '--raw', f'/api/v1/namespaces/{ns}', '-f', '-'),
-             json.dumps({'kind': 'DeleteOptions', 'apiVersion': 'v1', 'preconditions': {'uid': WRONG_UID}})),
+             ('delete', '--raw', dgd_path(d, ns), '-f', '-'), delete_options(WRONG_UID, dgd_rv)),
+            ('delete DGD: stale resourceVersion precondition', 'delete precondition',
+             ('delete', '--raw', dgd_path(d, ns), '-f', '-'), delete_options(dgd_uid, STALE_VERSION)),
         ]
+        if not view.claimed:
+            # A claimed namespace gets no Namespace request at all, not even one that must fail.
+            probes.append(('delete namespace: wrong UID precondition', 'delete precondition',
+                           ('delete', '--raw', f'/api/v1/namespaces/{ns}', '-f', '-'),
+                           json.dumps({'kind': 'DeleteOptions', 'apiVersion': 'v1',
+                                       'preconditions': {'uid': WRONG_UID}})))
         if view.record is not None:
             stale = copy.deepcopy(view.record)
             stale['metadata']['resourceVersion'] = '1'

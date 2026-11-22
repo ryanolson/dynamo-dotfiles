@@ -430,11 +430,12 @@ def esc(name):
 def zero_patch(dgd, lease_id):
     """A JSON patch that sets every replica count to 0.
 
-    Its test operations make the server refuse it unless the object is still the one read (its UID),
-    still carries the lease label of the teardown being run, and every component index still names
-    the same component.
+    Its test operations make the server refuse it unless the object is still the one read (its UID and
+    resourceVersion), still carries the lease label of the teardown being run, and every component index
+    still names the same component.
     """
     ops = [{'op': 'test', 'path': '/metadata/uid', 'value': dgd['metadata']['uid']},
+           {'op': 'test', 'path': '/metadata/resourceVersion', 'value': dgd['metadata']['resourceVersion']},
            {'op': 'test', 'path': '/metadata/labels/' + esc(LEASE_LABEL), 'value': lease_id}]
     spec = dgd.get('spec') or {}
     changed = False
