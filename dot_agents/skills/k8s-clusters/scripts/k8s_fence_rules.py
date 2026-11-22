@@ -162,7 +162,8 @@ def fence_verdict(canary_rc, canary_err, mode_rc, mode_err):
 
 
 def armed(verdict):
-    """Armed: both entries answered (or are in place with the engine down) and the main one refuses the mode Pod."""
+    """Armed: the canary refused by the canary policy's own entry and the mode Pod refused by the main policy's own
+    entry, or a `failed calling webhook` on one of our entries. An outage proves one of our entries, not both."""
     return (verdict.get('canary') in ('finegrained', 'engine_unavailable')
             and (verdict.get('mode') == 'engine_unavailable'
                  or (verdict.get('mode') == 'enforcing' and verdict.get('mode_entry') == 'finegrained')))
@@ -181,6 +182,10 @@ def cause(verdict):
         return 'the main policy did not answer: it is gone or its entry is missing'
     if canary == 'disarmed':
         return 'the canary policy did not answer: it is gone or its entry is missing'
+    other = re.search(r'failed calling webhook "([^"]+)"', f'{verdict.get("canary_text")} {verdict.get("mode_text")}')
+    if other:
+        return (f'Kyverno did not answer another of its webhooks ({other[1]}), so ours were not reached: the engine '
+                'is likely down')
     return 'a probe was refused for a reason that proves nothing (see the texts)'
 
 

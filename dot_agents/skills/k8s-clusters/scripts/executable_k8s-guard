@@ -143,6 +143,9 @@ CLAIM_REFUSALS = {
 # read, and how often it probes the fence meanwhile (references/k8s-guard.md, "The fence policy").
 FENCE_DRAIN_SECONDS = 120
 FENCE_PROBE_SECONDS = 5
+# How far the span from one probe's start to the next probe's end may pass the interval: the probe's own two
+# dry-run calls. A longer span is time nobody watched, so it reads as not armed. The plugin holds its own limit.
+FENCE_PROBE_SLACK = 3
 # What the API server answers when it refused a write outright: the write did not happen. Any other failure
 # (a timeout, a lost connection, an internal error) leaves the outcome unknown.
 DEFINITE = ('(AlreadyExists)', '(Conflict)', '(NotFound)', '(Invalid)', '(BadRequest)', '(Forbidden)',
@@ -1068,6 +1071,18 @@ def require_open_gate(g, view, lease):
     return gate
 
 
+def carries_probe_label(node):
+    """Whether any labels map in an object (its own, or a Pod template's) carries the fence probe's label."""
+    if isinstance(node, dict):
+        labels = node.get('labels')
+        if isinstance(labels, dict) and fence.PROBE_LABEL in labels:
+            return True
+        return any(carries_probe_label(v) for v in node.values())
+    if isinstance(node, list):
+        return any(carries_probe_label(v) for v in node)
+    return False
+
+
 def trial_refusal(e):
     return Refusal(e.code, str(e))
 
@@ -1457,6 +1472,10 @@ def cmd_apply(g, a):
                                               'DynamoGraphDeployment, ConfigMap, ClusterIP Service')
             if not isinstance(meta.get('name'), str) or not DNS_SUBDOMAIN.match(meta['name']):
                 raise Refusal('usage', f'{where} has no valid name', status=2)
+            if carries_probe_label(item):
+                raise Refusal('fence_probe_label_refused', f'{where} carries the label {fence.PROBE_LABEL}: only the '
+                                                           'fence probe\'s dry-run Pods carry it, and the Pod rule '
+                                                           'skips a Pod labelled canary')
             if item.get('kind') == 'ConfigMap' and meta['name'] == FENCE_RECORD:
                 raise Refusal('fence_protected', f'{where} is the lease fence\'s gate; only ns claim and teardown '
                                                  'write it')
@@ -1760,19 +1779,37 @@ def claimed_teardown(g, view, lease_id, lease, retired=None):
     drain = env_seconds('K8S_GUARD_FENCE_DRAIN_SECONDS', FENCE_DRAIN_SECONDS)
     every = env_seconds('K8S_GUARD_FENCE_PROBE_SECONDS', FENCE_PROBE_SECONDS)
     trial = lease.get('trial') is True
-    probes, failed = [], []
+    limit = every + FENCE_PROBE_SLACK
+    probes, failed, spans = [], [], []  # spans: (start, end) of each probe, on the monotonic clock
 
     def probe():
-        """One probe; False when the fence is not as this teardown needs it."""
+        """One probe; False when the fence is not as this teardown needs it, or the last one is too long ago.
+
+        The cadence is checked, not assumed: the span from the previous probe's start to this one's end is time
+        in which a fence state could come and go unseen, whatever the cluster calls in between cost.
+        """
         if retired:
             return True
+        start = time.monotonic()
         v = probe_fence(g, ns)
+        end = time.monotonic()
+        if spans and end - spans[-1][0] > limit and not failed:
+            failed.append({'canary': v['canary'], 'mode': v['mode'], 'scope': v['scope'], 'armed': False,
+                           'cause': f'probes were {end - spans[-1][0]:.1f} s apart, more than the {limit:g} s limit: '
+                                    'a fence state between them went unseen'})
+        spans.append((start, end))
         probes.append(v)
         ok = v['armed'] or (trial and v['canary'] == 'finegrained' and v['mode'] == 'audit')
         if not ok and not failed:
             failed.append({k: v[k] for k in ('canary', 'mode', 'scope', 'armed', 'cause', 'canary_text', 'mode_text')
                            if k in v})
-        return ok
+        return ok and not failed
+
+    def due():
+        """Probe now if the interval has passed since the last probe started: inside the delete and inventory
+        loops as well as the drain, so slow cluster calls never stretch the gap unseen."""
+        if not retired and not failed and spans and time.monotonic() - spans[-1][0] >= every:
+            probe()
 
     probe()  # before the close
     # Step 0: close the gate for this lease and seq, whatever it held below, and read it back.
@@ -1796,11 +1833,13 @@ def claimed_teardown(g, view, lease_id, lease, retired=None):
         return labels_of(live).get(LEASE_LABEL) == lease_id
 
     for kind in ROOT_KINDS:
+        due()
         items = labelled(g, ns, KINDS[kind][0], lease_id)
         if items is None:
             unreadable.append(KINDS[kind][0])
             continue
         for obj in items:
+            due()
             obj.setdefault('kind', kind)
             name = obj['metadata']['name']
             if (kind, name) in protected:
@@ -1819,19 +1858,19 @@ def claimed_teardown(g, view, lease_id, lease, retired=None):
     # The drain: a create admitted while the gate was open may still land. Wait `drain` seconds of monotonic time
     # from this run's own read of closing, probing at least every `every` seconds. A probe that fails ends the
     # wait: this run cannot complete, and the next one starts with a new close read and a new drain.
-    last_probe = closed_at
     while closed and not failed:
         elapsed = time.monotonic() - closed_at
         if elapsed >= drain:
             break
-        time.sleep(max(0.0, min(last_probe + every - time.monotonic(), drain - elapsed)) if every else drain - elapsed)
-        last_probe = time.monotonic()
+        last = spans[-1][0] if spans else closed_at
+        time.sleep(max(0.0, min(last + every - time.monotonic(), drain - elapsed)) if every else drain - elapsed)
         if every or time.monotonic() - closed_at >= drain:
             probe()
     drained = time.monotonic() - closed_at
 
     left = {}
     for resource in [KINDS[k][0] for k in ROOT_KINDS] + list(CHILD_RESOURCES):
+        due()
         items = labelled(g, ns, resource, lease_id)
         if items is None:
             if resource not in unreadable:
@@ -1847,7 +1886,10 @@ def claimed_teardown(g, view, lease_id, lease, retired=None):
     g.record(ns, f'Claim/{ns}', 0, 'down', uid=view.uid, lease=lease_id, deleted=deleted)
     report = {'fence': {'lease_id': gate['lease_id'], 'seq': gate['seq'], 'state': gate['state']} if gate else None,
               'drain_monotonic_seconds': round(drained, 3), 'lease_fence': view.labels.get(FENCE_LABEL),
-              'probes': len(probes)}
+              'probes': len(probes),
+              # None with fewer than two probes (or a retired fence): the plugin then frees nothing on it.
+              'max_probe_gap_seconds': max([round(b[1] - a[0], 3) for a, b in zip(spans, spans[1:])] or [None],
+                                           key=lambda x: -1 if x is None else x)}
     if retired:
         report['fence_retired_proof'] = retired
     if unresolved or changed_hands or unreadable or left or not closed or failed or drained < drain:
@@ -2424,7 +2466,7 @@ def cmd_fence_record(g, a):
                 f.write(json.dumps(r) + '\n')
     # The tally: the probes this host sent, each one a canary and a mode Pod (references/k8s-guard.md).
     host_ledger = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'k8s-guard/ledger.jsonl'
-    probes = 0
+    canary_counted = pod_counted = 0
     if host_ledger.exists():
         for line in host_ledger.read_text().splitlines():
             try:
@@ -2438,9 +2480,12 @@ def cmd_fence_record(g, a):
                     continue
             except Refusal:
                 continue
-            probes += 1
+            # Only a probe Kyverno evaluated moves its counter: not one sent in an outage, with the entries
+            # emptied, or refused for another reason.
+            canary_counted += l.get('canary') in ('finegrained', 'shared')
+            pod_counted += l.get('mode') in ('audit', 'enforcing')
     return {'namespace': ns, 'new_rows': len(new), 'total_rows': len(seen) + len(new), 'file': str(path),
-            'probes_sent': {fence.CANARY_RULE: probes, fence.POD_RULE: probes}, 'since': a.since}
+            'probes_sent': {fence.CANARY_RULE: canary_counted, fence.POD_RULE: pod_counted}, 'since': a.since}
 
 
 def cmd_fence_trial(g, a):

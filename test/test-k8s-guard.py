@@ -106,6 +106,12 @@ FENCE_ANSWERS = {
     'engine_unavailable': {'canary': ENGINE_DOWN.format(entry=FINE, policy='agent-lease-fence'),
                            'mode': ENGINE_DOWN.format(entry=CANARY_FINE, policy='agent-lease-fence-canary')},
     'main_absent': {'canary': canary_denial(), 'mode': None},
+    # A cluster whose mutating Kyverno policy covers every Pod create: in an outage that webhook fails first.
+    'mutate_down': {'canary': ENGINE_DOWN.format(entry='mutate.kyverno.svc-fail', policy='mutate'),
+                    'mode': ENGINE_DOWN.format(entry='mutate.kyverno.svc-fail', policy='mutate')},
+    # An outage where the API server called the same one of our entries first for both Pods.
+    'one_entry_down': {'canary': ENGINE_DOWN.format(entry=FINE, policy='agent-lease-fence'),
+                       'mode': ENGINE_DOWN.format(entry=FINE, policy='agent-lease-fence')},
     'canary_absent': {'canary': None, 'mode': kyverno_denial(FINE, 'pods-need-the-open-lease', MODE_MESSAGE)},
     # Refused, but not by our entry with our canary rule: proves nothing.
     'other_webhook': {'canary': kyverno_denial('validate.kyverno.svc-fail-finegrained-someone-else', 'probe-canary',
@@ -4863,6 +4869,23 @@ guard = runpy.run_path(sys.argv[0])
 clock = Clock()
 g = guard['main'].__globals__
 g['time'] = clock
+# Slow cluster calls, which the Clock alone never shows: the deletes after the close, or each inventory list.
+slow_after_close = float(os.environ.get('FENCE_TEST_SLOW_AFTER_CLOSE', '0'))
+slow_list = float(os.environ.get('FENCE_TEST_SLOW_LIST', '0'))
+real_confirm, real_labelled, calls = g['confirm_uid'], g['labelled'], {'confirm': 0}
+
+def confirm_uid(*args, **kw):
+    calls['confirm'] += 1
+    if calls['confirm'] == 3:  # the first confirm after the gate's close (NsView, move_gate, then this one)
+        clock.elapsed += slow_after_close
+    return real_confirm(*args, **kw)
+
+def labelled(*args, **kw):
+    clock.elapsed += slow_list
+    return real_labelled(*args, **kw)
+
+g['confirm_uid'] = confirm_uid
+g['labelled'] = labelled
 real_now = g['now']
 g['now'] = lambda: real_now() + timedelta(days=1)  # a wall-clock step: must not end the drain
 status = guard['main']()
@@ -4928,6 +4951,8 @@ class FenceProbe(FenceCase):
         'main_shared': ('finegrained', 'enforcing', 'shared', False),
         'engine_unavailable': ('engine_unavailable', 'engine_unavailable', 'finegrained', True),
         'main_absent': ('finegrained', 'absent', 'finegrained', False),
+        'mutate_down': ('probe_failed', 'probe_failed', 'unknown', False),
+        'one_entry_down': ('engine_unavailable', 'engine_unavailable', 'finegrained', True),
         'canary_absent': ('disarmed', 'enforcing', 'finegrained', False),
         'other_webhook': ('probe_failed', 'probe_failed', 'unknown', False),
         'other_rule': ('probe_failed', 'enforcing', 'finegrained', False),
@@ -4954,6 +4979,16 @@ class FenceProbe(FenceCase):
         self.assertFalse(body['armed'])
         self.assertIn('scaled to 0 replicas', body['cause'])
         self.assertIn('policies or the namespace label are gone', body['cause'])
+
+    def test_another_kyverno_webhook_failing_first_names_itself_in_the_cause(self):
+        # T3 F3: on a cluster whose mutating Kyverno webhook covers every Pod create, an outage reads not armed,
+        # and the cause says ours were never reached, not that the probe proved nothing.
+        self.k8s['fence'] = 'mutate_down'
+        self.flush()
+        body = self.ok('--context', CTX, 'fence', 'probe', PREMADE, host_entry=True)
+        self.assertFalse(body['armed'])
+        self.assertIn('mutate.kyverno.svc-fail', body['cause'])
+        self.assertIn('ours were not reached', body['cause'])
 
     def test_the_probe_pods_are_dry_runs_that_request_no_gpu(self):
         self.ok('--context', CTX, 'fence', 'probe', PREMADE, host_entry=True)
@@ -5079,6 +5114,20 @@ class FenceGate(FenceCase):
         rc, body, _ = self.apply(dgd('cpu', component('Frontend', ctype='frontend', lease_id=lid)), ns=PREMADE)
         self.assertEqual(rc, 0, body)
 
+    def test_a_manifest_carrying_the_probe_label_is_refused(self):
+        # T3 F2: the main Pod rule excludes the canary-labelled Pod, so a workload carrying that label would
+        # skip the fence. Only the probe may carry it, and the probe is a dry run.
+        lid = self.claimed()
+        for value in ('canary', 'mode'):
+            with self.subTest(value=value):
+                c = component('Frontend', ctype='frontend', lease_id=lid)
+                c['podTemplate']['metadata']['labels']['wcep.agent/fence-probe'] = value
+                rc, body, _ = self.apply(dgd('sneaky', c), ns=PREMADE)
+                self.assertEqual(body.get('code'), 'fence_probe_label_refused', body)
+        cm = {'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': 'x', 'labels': {'wcep.agent/fence-probe': 'canary'}}}
+        rc, body, _ = self.apply(cm, ns=PREMADE)
+        self.assertEqual(body.get('code'), 'fence_probe_label_refused', body)
+
     def test_the_gate_is_never_applied_or_deleted(self):
         lid = self.claimed()
         rc, body, _ = self.apply({'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': 'wcep-agent-fence'},
@@ -5136,6 +5185,39 @@ class FenceArmed(FenceCase):
         self.assertEqual(body['probes'], 26, 'before the close, every 5 s through 120 s, after the final read')
         self.assertTrue(all(s <= 5 for s in self.k8s['clock_sleeps']), self.k8s['clock_sleeps'])
         self.assertEqual(self.probes_sent(), ['canary', 'mode'] * 26)
+
+    def test_a_slow_delete_phase_with_no_probe_in_it_keeps_the_charge(self):
+        # T3 F1: the deletes after the close take 130 s, longer than the drain. Before the fix the run reported
+        # complete, armed: continuous, with 2 probes and none in the drain. A gap between probes longer than the
+        # interval plus its slack is a span nobody watched: not armed.
+        lid = self.claimed(state='releasing')
+        rc, body = self.clocked_down(lid, {'FENCE_TEST_SLOW_AFTER_CLOSE': '130'})
+        self.assertEqual(body.get('code'), 'teardown_incomplete', body)
+        self.assertTrue(body.get('fence_disarmed'), body)
+        self.assertGreaterEqual(body['max_probe_gap_seconds'], 130)
+        self.assertIn('apart', body['probe']['cause'])
+
+    def test_slow_inventory_reads_are_probed_through(self):
+        # Each of the 11 inventory lists takes 3 s: the guard probes between them whenever one is due, so the
+        # gap stays within the interval plus slack and the run completes.
+        lid = self.claimed(state='releasing')
+        rc, body = self.clocked_down(lid, {'FENCE_TEST_SLOW_LIST': '3'})
+        self.assertEqual(rc, 0, body)
+        self.assertLessEqual(body['max_probe_gap_seconds'], 8)
+        self.assertGreater(body['probes'], 26, 'probes between the slow lists, too')
+
+    def test_one_inventory_read_slower_than_the_gap_limit_keeps_the_charge(self):
+        lid = self.claimed(state='releasing')
+        rc, body = self.clocked_down(lid, {'FENCE_TEST_SLOW_LIST': '20'})
+        self.assertEqual(body.get('code'), 'teardown_incomplete', body)
+        self.assertTrue(body.get('fence_disarmed'), body)
+        self.assertGreater(body['max_probe_gap_seconds'], 8)
+
+    def test_the_gap_is_reported_and_bounded_on_a_normal_run(self):
+        lid = self.claimed(state='releasing')
+        rc, body = self.clocked_down(lid)
+        self.assertEqual(rc, 0, body)
+        self.assertLessEqual(body['max_probe_gap_seconds'], 5)
 
     def test_a_wall_clock_step_does_not_end_the_drain(self):
         # The runner moves wall time a day ahead; only monotonic time, moved by sleep, may end the drain.
@@ -5294,13 +5376,26 @@ class FenceRecord(FenceCase):
         ledger = self.state_home / 'k8s-guard/ledger.jsonl'
         ledger.parent.mkdir(parents=True, exist_ok=True)
         ledger.write_text(json.dumps({'time': '2026-01-01T00:00:00Z', 'cluster': PROFILE, 'namespace': PREMADE,
-                                      'object': f'FenceProbe/{PREMADE}', 'direction': 'probe'}) + '\n')
+                                      'object': f'FenceProbe/{PREMADE}', 'direction': 'probe', 'canary': 'finegrained',
+                                      'mode': 'enforcing', 'armed': True}) + '\n')
         self.probe()
         self.assertEqual(self.record()['probes_sent']['probe-canary'], 2)
         body = self.ok('--context', CTX, 'fence', 'record', '--since', '2026-06-01T00:00:00Z', host_entry=True)
         self.assertEqual(body['probes_sent'], {'probe-canary': 1, 'pods-need-the-open-lease': 1}, body)
         self.assertEqual(body['since'], '2026-06-01T00:00:00Z')
         self.refused('invalid_time', '--context', CTX, 'fence', 'record', '--since', 'yesterday', host_entry=True)
+
+    def test_the_tally_counts_only_probes_that_reached_the_policy(self):
+        # T3 F4: a probe during an outage, with the entries emptied, or refused for another reason never moves
+        # Kyverno's counter; counting it would reset the window for nothing.
+        self.probe()                                   # armed: both rules counted
+        for state in ('engine_unavailable', 'disarmed', 'forbidden', 'audit', 'canary_absent'):
+            self.k8s['fence'] = state
+            self.flush()
+            self.probe()
+        body = self.record()
+        # canary counted for armed and audit; the Pod rule for armed, audit and canary_absent (enforcing).
+        self.assertEqual(body['probes_sent'], {'probe-canary': 2, 'pods-need-the-open-lease': 3}, body)
 
     def test_the_ledger_counts_the_probes_it_sent_by_rule(self):
         self.probe()
