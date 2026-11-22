@@ -198,6 +198,12 @@ if cmd == 'get':
         if flags.get('-l'):
             lk, lv = flags['-l'].split('=', 1)
             items = [o for o in items if (o['metadata'].get('labels') or {}).get(lk) == lv]
+        if st.get('strip_lease_after_list'):
+            # Another writer takes the label off after the guard's list, changing the object in place.
+            for o in items:
+                o['metadata'].get('labels', {}).pop('wcep.agent/lease', None)
+                o['metadata']['resourceVersion'] = rv()
+            save()
         emit({'kind': 'List', 'apiVersion': 'v1', 'items': items})
     if what == 'pods':
         emit({'kind': 'List', 'apiVersion': 'v1', 'items': st['pods'].get(ns_flag, [])})
@@ -333,8 +339,19 @@ if cmd == 'delete' and '--raw' in flags:
             fail(f'Error from server (NotFound): dynamographdeployments "{name}" not found')
         if want is None:
             fail('fake kubectl: DGD delete without a UID precondition', 96)
+        want_rv = (body.get('preconditions') or {}).get('resourceVersion')
+        if st.get('strip_lease_before_delete') and not st.get('stripped_lease'):
+            # The label goes after the guard's read of the object, before its delete lands.
+            st['stripped_lease'] = True
+            o['metadata'].get('labels', {}).pop('wcep.agent/lease', None)
+            o['metadata']['resourceVersion'] = rv()
+            save()
         if o['metadata']['uid'] != want:
             fail('Error from server (Conflict): Precondition failed')
+        if want_rv is not None and o['metadata'].get('resourceVersion') != want_rv:
+            st.setdefault('delete_conflicts', []).append(name); save()
+            fail('Error from server (Conflict): Precondition failed: ResourceVersion in precondition: '
+                 + want_rv + ', ResourceVersion in object meta: ' + str(o['metadata'].get('resourceVersion')))
         del st['objects'][ns]['DynamoGraphDeployment/' + name]
         pods = st['pods'].get(ns, [])
         if st.get('terminate_pods_on_delete', True):
@@ -1950,10 +1967,12 @@ class SharedNamespaceTeardown(GuardCase):
                          component('decode', gpus=2, lease_id='lse_earlier01')))
 
     def dgd_writes(self):
+        """Every request whose target is a DGD: a raw delete, a named delete, or a patch."""
         out = []
         for c in self.writes():
-            if 'dynamographdeployments' in c['flags'].get('--raw', '') or (
-                    c['pos'][:1] == ['patch'] and c['pos'][1].startswith('dynamographdeployments.')):
+            named = c['pos'][1] if len(c['pos']) > 1 else ''
+            if ('dynamographdeployments' in c['flags'].get('--raw', '')
+                    or (c['pos'][:1] in (['delete'], ['patch']) and named.startswith('dynamographdeployments.'))):
                 out.append(c)
         return out
 
@@ -2008,6 +2027,48 @@ class SharedNamespaceTeardown(GuardCase):
         self.assertEqual(body.get('code'), 'uid_mismatch', body)
         self.assertEqual(self.replicas('current'), [1, 1])
 
+    def test_down_leaves_a_dgd_that_lost_its_lease_label(self):
+        # The label can go after the list, as another writer could take it. A delete can test only the
+        # UID and resourceVersion, so the guard reads the DGD again and does not send the delete at all.
+        self.k8s['strip_lease_after_list'] = True
+        self.flush()
+        rc, body, p = self.teardown('down')
+        self.assertEqual(rc, 0, f'{body} {p.stderr}')
+        self.assertEqual(self.dgd_writes(), [])
+        self.assertEqual(body['dgds_deleted'], [])
+        self.assertEqual(body['dgds_kept'], ['current'])
+
+    def test_down_refuses_a_dgd_that_changes_after_its_read(self):
+        # A change between the guard's read and its delete fails the resourceVersion precondition; the
+        # guard reads again, sees the label gone, and stops.
+        self.k8s['strip_lease_before_delete'] = True
+        self.flush()
+        rc, body, p = self.teardown('down')
+        self.assertEqual(rc, 0, f'{body} {p.stderr}')
+        self.assertEqual(self.k8s.get('delete_conflicts'), ['current'])
+        self.assertEqual(len(self.dgd_writes()), 1)  # one delete sent, refused by the server
+        self.assertEqual(body['dgds_kept'], ['current'])
+
+    def test_teardown_uses_the_given_lease_without_a_record(self):
+        # The plugin passes --lease from its own state; the record is only the guard's copy. With the
+        # ConfigMap gone the lease id still selects the DGD, so nothing is skipped.
+        for command in ('down', 'expire'):
+            with self.subTest(command=command):
+                self.k8s = {'namespaces': {}, 'objects': {}, 'pods': {}}
+                self.bb = {'leases': {}}
+                self.kubectl_log.unlink(missing_ok=True)
+                self.add_ns(thread=OTHER)
+                self.add_lease(thread=OTHER, state='revoking', cm=False)
+                self.add_obj(gpu_dgd('current', 2, self.lid))
+                rc, body, p = self.teardown(command)
+                self.assertEqual(rc, 0, f'{body} {p.stderr}')
+                self.assertNotIn('dgds_skipped', body)
+                if command == 'down':
+                    self.assertEqual(self.raw_deletes(),
+                                     [f'/apis/nvidia.com/v1beta1/namespaces/{NS}/dynamographdeployments/current'])
+                else:
+                    self.assertEqual(body['scaled'], ['current'])
+
     def lease_less_world(self):
         self.k8s = {'namespaces': {}, 'objects': {}, 'pods': {}}
         self.bb = {'leases': {}, 'unreachable': True}
@@ -2026,7 +2087,7 @@ class SharedNamespaceTeardown(GuardCase):
                 rc, body, p = self.guard('--context', CTX, command, NS, '--uid', 'uid-ns-1', host_entry=True)
                 self.assertEqual(rc, 0, f'{body} {p.stderr}')
                 self.assertEqual(self.dgd_writes(), [])
-                self.assertIn('no lease record', body['dgds_skipped'])
+                self.assertIn('no lease id', body['dgds_skipped'])
                 if command == 'down':
                     self.assertEqual(body['dgds_deleted'], [])
                     self.assertNotIn(NS, self.k8s['namespaces'])  # the namespace takes the DGD with it
@@ -2778,12 +2839,17 @@ class SelftestFences(GuardCase):
         super().setUp()
         self.add_ns()
         self.lid = self.add_lease(gpus=4)
+        # An earlier task's DGD, stamped with the shared UID only, listed first: a selector on the UID
+        # would probe it instead of the lease's DGD.
+        self.add_obj(dgd('earlier', component('Frontend', ctype='frontend'),
+                         component('decode', gpus=1, lease_id='lse_earlier01')))
         self.add_obj(gpu_dgd('smoke', 1, self.lid))
 
     def test_every_fence_holds_and_nothing_changes(self):
         before = copy.deepcopy(self.k8s)
         body = self.ok('--context', CTX, '-n', NS, 'selftest', 'fences')
         self.assertTrue(body['all_held'], body)
+        self.assertEqual(body['dgd'], 'smoke')  # the lease's DGD, not the UID-only one listed first
         self.assertEqual([p['fence'] for p in body['probes']], [
             'patch: wrong DGD UID', 'patch: wrong lease label', 'delete DGD: wrong UID precondition',
             'delete namespace: wrong UID precondition', 'replace lease record: stale resourceVersion'])

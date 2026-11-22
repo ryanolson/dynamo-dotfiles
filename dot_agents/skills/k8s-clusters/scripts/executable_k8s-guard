@@ -57,6 +57,8 @@ KUBECTL_TIMEOUT = 60
 APPLY_REQUEST_TIMEOUT = 30
 # The apply must finish inside the lease's operation slot: refuse unless this much of it is left.
 SLOT_MARGIN = APPLY_REQUEST_TIMEOUT + 10
+# Reads of one DGD and its delete, when the object keeps changing under a teardown.
+DGD_DELETE_ATTEMPTS = 3
 BB_TIMEOUT = 30
 FLEET_TIMEOUT = 30
 
@@ -822,11 +824,45 @@ def lease_dgds(g, ns, lease_id):
     The namespace UID is never a selector: in a long-lived namespace it is the same for every task
     that ever applied there, so selecting by it picks up a colleague's DGD as well. The UID stays an
     instance check (confirm_uid), and each DGD's own UID is the fence its delete or patch carries.
+
+    The lease id is the effective one: what the caller passed, else what the namespace's record says.
+    The plugin's own lease state is the authority; the record is the guard's copy of it.
     """
     if not lease_id:
-        return [], (f'{ns} has no lease record, so no object carries {LEASE_LABEL}: teardown selects no DGD')
+        return [], (f'{ns} has no lease id (no --lease and no lease record), so teardown selects no DGD')
     query = ['get', DGD_RESOURCE, '-n', ns, '-l', f'{LEASE_LABEL}={lease_id}', '-o', 'json']
     return g.kc.json(*query).get('items') or [], None
+
+
+def delete_lease_dgd(g, ns, lease_id, dgd):
+    """Delete one DGD of this lease, and say whether it is gone.
+
+    DeleteOptions can test only the object's UID and resourceVersion, not a label. So the object is
+    read again, the lease label is checked, and only then is the delete sent, fenced by the UID and
+    the resourceVersion just read: a label removed or a replacement between the list and now is
+    refused rather than sent, and a change in between fails the precondition. On a conflict the
+    object is read and checked again, a bounded number of times, so an unrelated status write does
+    not stop a teardown that is still this lease's.
+
+    False means the object changed into something else. `down` leaves it, and the namespace delete
+    ends it with the rest.
+    """
+    name = dgd['metadata']['name']
+    for _ in range(DGD_DELETE_ATTEMPTS):
+        fresh = g.kc.json('get', f'{DGD_RESOURCE}/{name}', '-n', ns, '-o', 'json', not_found=MISSING)
+        if fresh is MISSING:
+            return True
+        meta = fresh.get('metadata') or {}
+        if (meta.get('labels') or {}).get(LEASE_LABEL) != lease_id:
+            return False
+        pre = {'uid': meta['uid'], 'resourceVersion': meta['resourceVersion']}
+        body = {'kind': 'DeleteOptions', 'apiVersion': 'v1', 'preconditions': pre}
+        rc, out, err = g.kc.run('delete', '--raw', dgd_path(fresh, ns), '-f', '-', input=json.dumps(body))
+        if rc == 0 or is_not_found(err):
+            return True
+        if 'Precondition failed' not in err and 'Conflict' not in err:
+            raise kubectl_error(('delete', 'dgd', name), rc, err)
+    return False
 
 
 def do_expire(g, ns, uid, lease_id):
@@ -913,14 +949,13 @@ def cmd_down(g, a):
             before += dgd_gpus(d)
         except Refusal:
             pass
+    deleted, kept = [], []
     for d in dgds:
-        body = json.dumps({'kind': 'DeleteOptions', 'apiVersion': 'v1', 'preconditions': {'uid': d['metadata']['uid']}})
-        rc, out, err = g.kc.run('delete', '--raw', dgd_path(d, ns), '-f', '-', input=body)
-        if rc != 0 and not is_not_found(err):
-            if 'Precondition failed' in err or 'Conflict' in err:
-                raise Refusal('uid_mismatch', f'DGD {d["metadata"]["name"]} is no longer the one the guard read')
-            raise kubectl_error(('delete', 'dgd', d['metadata']['name']), rc, err)
-    dgds_deleted = [d['metadata']['name'] for d in dgds]
+        name = d['metadata']['name']
+        if delete_lease_dgd(g, ns, lease_id, d):
+            deleted.append(name)
+        else:
+            kept.append(name)
     wait = float(os.environ.get('K8S_GUARD_DOWN_WAIT_SECONDS', '300'))
     poll = float(os.environ.get('K8S_GUARD_POLL_SECONDS', '5'))
     give_up = time.monotonic() + wait
@@ -939,11 +974,7 @@ def cmd_down(g, a):
         # Already being deleted (an earlier down): a second delete would only be refused.
         g.record(ns, f'Namespace/{ns}', before, 'down', uid=view.uid, lease=lease_id, issue=view.issue,
                  gpu_pods_left=left)
-        result = {'namespace': ns, 'deleted': True, 'terminating': True, 'authority': why, 'gpu_pods_left': left,
-                  'dgds_deleted': dgds_deleted}
-        if why_none:
-            result['dgds_skipped'] = why_none
-        return result
+        return down_result(ns, deleted, kept, why, left, why_none, terminating=True)
     body = json.dumps({'kind': 'DeleteOptions', 'apiVersion': 'v1', 'preconditions': {'uid': view.uid}})
     rc, out, err = g.kc.run('delete', '--raw', f'/api/v1/namespaces/{ns}', '-f', '-', input=body)
     if rc != 0 and not is_not_found(err):
@@ -952,10 +983,17 @@ def cmd_down(g, a):
         raise kubectl_error(('delete', 'namespace', ns), rc, err)
     g.record(ns, f'Namespace/{ns}', before, 'down', uid=view.uid, lease=lease_id, issue=view.issue, deleted=True,
              gpu_pods_left=left)
-    result = {'namespace': ns, 'deleted': True, 'terminating': bool(left), 'authority': why, 'gpu_pods_left': left,
-              'dgds_deleted': dgds_deleted}
+    return down_result(ns, deleted, kept, why, left, why_none)
+
+
+def down_result(ns, deleted, kept, why, left, why_none, terminating=False):
+    """What `down` reports. `kept` names DGDs that changed away from the lease, which the namespace
+    delete ends with the rest; `dgds_skipped` names why nothing was selected at all."""
+    result = {'namespace': ns, 'deleted': True, 'terminating': terminating or bool(left), 'authority': why,
+              'gpu_pods_left': left, 'dgds_deleted': deleted}
+    if kept:
+        result['dgds_kept'] = kept
     if why_none:
-        # Everything in the namespace still goes with it; the DGD phase selected nothing of its own.
         result['dgds_skipped'] = why_none
     return result
 
