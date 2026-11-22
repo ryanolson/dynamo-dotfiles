@@ -1,0 +1,76 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: attribution
+policies: [policy.yaml]
+resources: [resources.yaml]
+variables: values.yaml
+userinfo: userinfo.yaml
+# kyverno test skips a test that has checks and no results, so the failing rules are listed here too. Its
+# expected `fail` alone proves nothing in v1.15.2 (see test/test-k8s-fence.py); the checks below assert the status.
+results:
+  - {policy: agent-lease-fence, rule: pods-need-the-open-lease, kind: Pod, resources: [no-lease-label, gate-missing, gate-unreadable], result: fail}
+  - {policy: agent-lease-fence-canary, rule: probe-canary, kind: Pod, resources: [canary], result: fail}
+  - {policy: agent-lease-fence, rule: bot-roots-need-the-open-lease-and-an-attempt, kind: DynamoGraphDeployment, resources: [bot-dgd-no-attempt], result: fail}
+  - {policy: agent-lease-fence, rule: gate-is-the-bots-and-moves-forward, kind: ConfigMap, resources: [wcep-agent-fence], result: fail}
+# Every rule's message names the policy, the owner, the contact and where the off-switch is written. A
+# missing gate and an unreadable gate read differently.
+checks:
+  - match:
+      resource: {kind: Pod, metadata: {name: no-lease-label}}
+      rule: {name: pods-need-the-open-lease}
+    assert:
+      status: fail
+      "(contains(message, 'agent-lease-fence'))": true
+      "(contains(message, 'owner alice-example'))": true
+      "(contains(message, 'contact example-contact'))": true
+      "(contains(message, 'off-switch'))": true
+  - match:
+      resource: {kind: Pod, metadata: {name: gate-missing}}
+      rule: {name: pods-need-the-open-lease}
+    assert:
+      status: fail
+      "(contains(message, 'agent-lease-fence'))": true
+      "(contains(message, 'owner alice-example'))": true
+      "(contains(message, 'contact example-contact'))": true
+      "(contains(message, 'off-switch'))": true
+      "(contains(message, 'Gate: missing'))": true
+  - match:
+      resource: {kind: Pod, metadata: {name: gate-unreadable}}
+      rule: {name: pods-need-the-open-lease}
+    assert:
+      status: fail
+      "(contains(message, 'agent-lease-fence'))": true
+      "(contains(message, 'owner alice-example'))": true
+      "(contains(message, 'contact example-contact'))": true
+      "(contains(message, 'off-switch'))": true
+      "(contains(message, 'Gate: unreadable'))": true
+      "(contains(message, 'the policy is broken, not the lease'))": true
+  - match:
+      resource: {kind: Pod, metadata: {name: canary}}
+      rule: {name: probe-canary}
+    assert:
+      status: fail
+      "(contains(message, 'agent-lease-fence'))": true
+      "(contains(message, 'owner alice-example'))": true
+      "(contains(message, 'contact example-contact'))": true
+      "(contains(message, 'off-switch'))": true
+      "(contains(message, 'canary'))": true
+  - match:
+      resource: {kind: DynamoGraphDeployment, metadata: {name: bot-dgd-no-attempt}}
+      rule: {name: bot-roots-need-the-open-lease-and-an-attempt}
+    assert:
+      status: fail
+      "(contains(message, 'agent-lease-fence'))": true
+      "(contains(message, 'owner alice-example'))": true
+      "(contains(message, 'contact example-contact'))": true
+      "(contains(message, 'off-switch'))": true
+  - match:
+      resource: {kind: ConfigMap, metadata: {name: wcep-agent-fence}}
+      rule: {name: gate-is-the-bots-and-moves-forward}
+    assert:
+      status: fail
+      "(contains(message, 'agent-lease-fence'))": true
+      "(contains(message, 'owner alice-example'))": true
+      "(contains(message, 'contact example-contact'))": true
+      "(contains(message, 'off-switch'))": true

@@ -1,0 +1,112 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: open-ok
+  namespace: dyntest-alice-agent
+  labels: {wcep.agent/lease: lse_test0001}
+  ownerReferences: [{apiVersion: apps/v1, kind: ReplicaSet, name: w-abc, uid: 00000000-0000-4000-8000-000000000001, controller: true}]
+spec: {containers: [{name: main, image: registry.example.test/app:1}]}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: other-lease
+  namespace: dyntest-alice-agent
+  labels: {wcep.agent/lease: lse_other0002}
+  ownerReferences: [{apiVersion: apps/v1, kind: ReplicaSet, name: w-abc, uid: 00000000-0000-4000-8000-000000000001, controller: true}]
+spec: {containers: [{name: main, image: registry.example.test/app:1}]}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: no-lease-label
+  namespace: dyntest-alice-agent
+  labels: {}
+  ownerReferences: [{apiVersion: apps/v1, kind: ReplicaSet, name: w-abc, uid: 00000000-0000-4000-8000-000000000001, controller: true}]
+spec: {containers: [{name: main, image: registry.example.test/app:1}]}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: no-owner
+  namespace: dyntest-alice-agent
+  labels: {wcep.agent/lease: lse_test0001}
+spec: {containers: [{name: main, image: registry.example.test/app:1}]}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: owner-not-controller
+  namespace: dyntest-alice-agent
+  labels: {wcep.agent/lease: lse_test0001}
+  ownerReferences: [{apiVersion: apps/v1, kind: ReplicaSet, name: w-abc, uid: 00000000-0000-4000-8000-000000000001, controller: false}]
+spec: {containers: [{name: main, image: registry.example.test/app:1}]}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gate-closing
+  namespace: dyntest-alice-agent
+  labels: {wcep.agent/lease: lse_test0001}
+  ownerReferences: [{apiVersion: apps/v1, kind: ReplicaSet, name: w-abc, uid: 00000000-0000-4000-8000-000000000001, controller: true}]
+spec: {containers: [{name: main, image: registry.example.test/app:1}]}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gate-missing
+  namespace: dyntest-alice-agent
+  labels: {wcep.agent/lease: lse_test0001}
+  ownerReferences: [{apiVersion: apps/v1, kind: ReplicaSet, name: w-abc, uid: 00000000-0000-4000-8000-000000000001, controller: true}]
+spec: {containers: [{name: main, image: registry.example.test/app:1}]}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gate-unreadable
+  namespace: dyntest-alice-agent
+  labels: {wcep.agent/lease: lse_test0001}
+  ownerReferences: [{apiVersion: apps/v1, kind: ReplicaSet, name: w-abc, uid: 00000000-0000-4000-8000-000000000001, controller: true}]
+spec: {containers: [{name: main, image: registry.example.test/app:1}]}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: canary
+  namespace: dyntest-alice-agent
+  labels: {wcep.agent/fence-probe: canary}
+spec: {containers: [{name: main, image: registry.example.test/app:1}]}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mode-probe
+  namespace: dyntest-alice-agent
+  labels: {wcep.agent/lease: lse_fenceprobe0, wcep.agent/fence-probe: mode}
+spec: {containers: [{name: main, image: registry.example.test/app:1}]}
+---
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: bot-dgd-no-attempt
+  namespace: dyntest-alice-agent
+  labels: {wcep.agent/lease: lse_test0001}
+spec: {components: []}
+---
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: bot-dgd-ok
+  namespace: dyntest-alice-agent
+  labels: {wcep.agent/lease: lse_test0001}
+  annotations: {wcep.agent/attempt: att_0123456789abcdef}
+spec: {components: []}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bot-job-closed-gate
+  namespace: dyntest-alice-agent
+  labels: {wcep.agent/lease: lse_test0001}
+  annotations: {wcep.agent/attempt: att_0123456789abcdee}
+spec: {template: {spec: {restartPolicy: Never, containers: [{name: main, image: registry.example.test/app:1}]}}}

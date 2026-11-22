@@ -1,0 +1,214 @@
+# The agent lease fence: two Kyverno 1.15 ClusterPolicies that ops install, rendered by `k8s-guard fence render`.
+# Placeholders in angle brackets: <premade>, <prefix>, <bot user>, <owner>, <contact>, <runbook section>.
+# The reasons for each rule are in references/k8s-guard.md, "The fence policy". This file is public: names
+# only through the placeholders.
+#
+# The canary is its own policy. On a policy's own (finegrained) webhook Kyverno 1.15.2 evaluates the whole
+# policy with the first rule-level failure action it finds, so one always-enforcing rule would make every rule
+# of the same policy enforce from install, and there would be no audit window (measured on kind).
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: agent-lease-fence
+  annotations:
+    pod-policies.kyverno.io/autogen-controllers: none
+    policies.kyverno.io/title: Agent lease fence (owner <owner>)
+    policies.kyverno.io/description: >-
+      Owner: <owner>; contact: <contact>. Admits Pods and agent-bot roots in <premade> only
+      under the agent lease named in ConfigMap wcep-agent-fence. Off-switch, in this order:
+      (1) set this policy to Audit, (2) remove the label dynamo.nvidia.com/agent-lease-fence
+      from <premade>, (3) delete this policy and agent-lease-fence-canary. Each stops denials;
+      each keeps a live lease's GPUs charged until <owner> is told. Scaling the Kyverno
+      admission controller to 0 deletes every Kyverno webhook and disarms this policy too.
+      Runbook: <runbook section>.
+spec:
+  background: false
+  # Audit through the audit window, then Enforce. No rule sets its own failure action (see the top).
+  validationFailureAction: Audit
+  emitWarning: true
+  webhookConfiguration:
+    failurePolicy: Fail
+    timeoutSeconds: 10
+    matchConditions:
+      # has(request.name): the namespace controller's bulk delete of a Terminating namespace carries no name
+      # at all, and a bare request.name would be an error, which fails closed and leaves the namespace stuck
+      # Terminating (measured on kind). Do not drop has(), and do not tighten this to the object's name.
+      - name: only-enrolled-namespaces
+        expression: >-
+          request.namespace in ['<premade>'] &&
+          (request.resource.resource != 'configmaps' || (has(request.name) && request.name == 'wcep-agent-fence'))
+  rules:
+    - name: pods-need-the-open-lease
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              operations: [CREATE]
+              namespaces: ['<prefix>*']
+              namespaceSelector:
+                matchLabels:
+                  dynamo.nvidia.com/agent-lease-fence: "true"
+      exclude:
+        any:
+          - resources:
+              selector:
+                matchLabels:
+                  wcep.agent/fence-probe: canary
+      context:
+        - name: gate
+          apiCall:
+            urlPath: "/api/v1/namespaces/{{ request.namespace }}/configmaps?fieldSelector=metadata.name%3Dwcep-agent-fence"
+            jmesPath: 'items[0].data || `{"state":"missing","lease_id":"","seq":"0"}`'
+            default:
+              state: unreadable
+              lease_id: ""
+              seq: "0"
+      validate:
+        message: >-
+          agent-lease-fence (owner <owner>, contact <contact>; off-switch in the policy's description):
+          {{ request.namespace }} admits a Pod only under its open agent lease, with a controller owner.
+          Gate: {{ gate.state }} for '{{ gate.lease_id }}' ('unreadable' means the policy could not
+          read its gate: the policy is broken, not the lease). Pod lease label:
+          '{{ request.object.metadata.labels."wcep.agent/lease" || '' }}'.
+        deny:
+          conditions:
+            any:
+              - key: "{{ gate.state }}"
+                operator: NotEquals
+                value: active
+              - key: "{{ gate.lease_id }}"
+                operator: Equals
+                value: ""
+              - key: "{{ request.object.metadata.labels.\"wcep.agent/lease\" || '' }}"
+                operator: NotEquals
+                value: "{{ gate.lease_id }}"
+              - key: "{{ length(request.object.metadata.ownerReferences[?controller] || `[]`) }}"
+                operator: Equals
+                value: 0
+    - name: bot-roots-need-the-open-lease-and-an-attempt
+      match:
+        any:
+          - resources:
+              kinds: [DynamoGraphDeployment, Job, PodCliqueSet, Deployment, StatefulSet]
+              operations: [CREATE]
+              namespaces: ['<prefix>*']
+              namespaceSelector:
+                matchLabels:
+                  dynamo.nvidia.com/agent-lease-fence: "true"
+            subjects:
+              - kind: User
+                name: '<bot user>'
+      context:
+        - name: gate
+          apiCall:
+            urlPath: "/api/v1/namespaces/{{ request.namespace }}/configmaps?fieldSelector=metadata.name%3Dwcep-agent-fence"
+            jmesPath: 'items[0].data || `{"state":"missing","lease_id":"","seq":"0"}`'
+            default:
+              state: unreadable
+              lease_id: ""
+              seq: "0"
+      validate:
+        message: >-
+          agent-lease-fence (owner <owner>, contact <contact>; off-switch in the policy's description):
+          the agent bot creates a root only under the open lease ({{ gate.state }} '{{ gate.lease_id }}')
+          with a guard attempt stamp.
+        deny:
+          conditions:
+            any:
+              - key: "{{ gate.state }}"
+                operator: NotEquals
+                value: active
+              - key: "{{ request.object.metadata.labels.\"wcep.agent/lease\" || '' }}"
+                operator: NotEquals
+                value: "{{ gate.lease_id }}"
+              - key: "{{ request.object.metadata.annotations.\"wcep.agent/attempt\" || '' }}"
+                operator: Equals
+                value: ""
+    - name: gate-is-the-bots-and-moves-forward
+      match:
+        any:
+          - resources:
+              kinds: [ConfigMap]
+              names: [wcep-agent-fence]
+              # Not DELETE: Kyverno 1.15.2 never denies a DELETE on a policy's own webhook (measured on kind).
+              # The guard never deletes the gate, and a deleted gate reads missing, which denies every Pod.
+              operations: [CREATE, UPDATE]
+              namespaces: ['<prefix>*']
+              namespaceSelector:
+                matchLabels:
+                  dynamo.nvidia.com/agent-lease-fence: "true"
+      validate:
+        message: >-
+          agent-lease-fence (owner <owner>, contact <contact>; off-switch in the policy's description):
+          wcep-agent-fence is written only by the agent bot, and its seq only rises.
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.userInfo.username }}"
+                operator: NotEquals
+                value: '<bot user>'
+              - key: "{{ !contains(['active', 'closing'], request.object.data.state || '') }}"
+                operator: Equals
+                value: true
+              # CREATE or UPDATE: a numeric seq and a lease id; seq is compared only as a number.
+              - key: "{{ to_number(request.object.data.seq || '') == `null` || (request.object.data.lease_id || '') == '' }}"
+                operator: Equals
+                value: true
+              - key: "{{ request.operation == 'UPDATE' && to_number(request.object.data.seq || '') < to_number(request.oldObject.data.seq || '') }}"
+                operator: Equals
+                value: true
+              - key: "{{ request.operation == 'UPDATE' && to_number(request.object.data.seq || '') == to_number(request.oldObject.data.seq || '') && (request.object.data.lease_id || '') != (request.oldObject.data.lease_id || '') }}"
+                operator: Equals
+                value: true
+              - key: "{{ request.operation == 'UPDATE' && to_number(request.object.data.seq || '') == to_number(request.oldObject.data.seq || '') && request.object.data.state == 'active' && (request.oldObject.data.state || '') != 'active' }}"
+                operator: Equals
+                value: true
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: agent-lease-fence-canary
+  annotations:
+    pod-policies.kyverno.io/autogen-controllers: none
+    policies.kyverno.io/title: Agent lease fence canary (owner <owner>)
+    policies.kyverno.io/description: >-
+      Owner: <owner>; contact: <contact>. Refuses only the dry-run probe Pods labelled
+      wcep.agent/fence-probe=canary in <premade>, never a workload, so the agent lease fence's probe
+      can prove which webhook answered. It enforces from install. Delete it together with
+      agent-lease-fence. Runbook: <runbook section>.
+spec:
+  background: false
+  # Always Enforce: it refuses only probe Pods, never a workload.
+  validationFailureAction: Enforce
+  emitWarning: false
+  webhookConfiguration:
+    failurePolicy: Fail
+    timeoutSeconds: 10
+    matchConditions:
+      # has(request.name): the namespace controller's bulk delete of a Terminating namespace carries no name
+      # at all, and a bare request.name would be an error, which fails closed and leaves the namespace stuck
+      # Terminating (measured on kind). Do not drop has(), and do not tighten this to the object's name.
+      - name: only-enrolled-namespaces
+        expression: >-
+          request.namespace in ['<premade>'] &&
+          (request.resource.resource != 'configmaps' || (has(request.name) && request.name == 'wcep-agent-fence'))
+  rules:
+    # The probe's canary: refused by this policy's own webhook, in Audit as in Enforce.
+    - name: probe-canary
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              operations: [CREATE]
+              namespaces: ['<prefix>*']
+              namespaceSelector:
+                matchLabels:
+                  dynamo.nvidia.com/agent-lease-fence: "true"
+              selector:
+                matchLabels:
+                  wcep.agent/fence-probe: canary
+      validate:
+        message: >-
+          agent-lease-fence canary (owner <owner>, contact <contact>; off-switch in the policy's
+          description): this probe Pod is always refused; it is not a workload.
+        deny: {}

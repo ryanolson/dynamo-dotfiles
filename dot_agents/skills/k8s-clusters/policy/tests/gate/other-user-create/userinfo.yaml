@@ -1,0 +1,6 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: UserInfo
+metadata:
+  name: writer
+userInfo:
+  username: system:serviceaccount:team-x:someone

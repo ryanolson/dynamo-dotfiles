@@ -1,0 +1,8 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller-deployment
+  namespace: dyntest-alice-agent
+spec:
+  selector: {matchLabels: {app: x}}
+  template: {metadata: {labels: {app: x}}, spec: {containers: [{name: main, image: registry.example.test/app:1}]}}

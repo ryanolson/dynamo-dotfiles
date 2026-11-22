@@ -1,0 +1,6 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: UserInfo
+metadata:
+  name: controller
+userInfo:
+  username: system:serviceaccount:dynamo-system:dynamo-operator

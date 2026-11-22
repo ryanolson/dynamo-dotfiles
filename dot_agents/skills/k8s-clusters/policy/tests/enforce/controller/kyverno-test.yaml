@@ -1,0 +1,10 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: enforce-controller
+policies: [policy.yaml]
+resources: [resources.yaml]
+variables: values.yaml
+userinfo: userinfo.yaml
+results:
+  - {policy: agent-lease-fence, rule: bot-roots-need-the-open-lease-and-an-attempt, kind: Deployment, resources: [controller-deployment], result: skip}

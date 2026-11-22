@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: no-lease-label
+  namespace: dyntest-alice-agent
+  labels: {}
+  ownerReferences: [{apiVersion: apps/v1, kind: ReplicaSet, name: w-abc, uid: 00000000-0000-4000-8000-000000000001, controller: true}]
+spec: {containers: [{name: main, image: registry.example.test/app:1}]}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gate-missing
+  namespace: dyntest-alice-agent
+  labels: {wcep.agent/lease: lse_test0001}
+  ownerReferences: [{apiVersion: apps/v1, kind: ReplicaSet, name: w-abc, uid: 00000000-0000-4000-8000-000000000001, controller: true}]
+spec: {containers: [{name: main, image: registry.example.test/app:1}]}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gate-unreadable
+  namespace: dyntest-alice-agent
+  labels: {wcep.agent/lease: lse_test0001}
+  ownerReferences: [{apiVersion: apps/v1, kind: ReplicaSet, name: w-abc, uid: 00000000-0000-4000-8000-000000000001, controller: true}]
+spec: {containers: [{name: main, image: registry.example.test/app:1}]}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: canary
+  namespace: dyntest-alice-agent
+  labels: {wcep.agent/fence-probe: canary}
+spec: {containers: [{name: main, image: registry.example.test/app:1}]}
+---
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: bot-dgd-no-attempt
+  namespace: dyntest-alice-agent
+  labels: {wcep.agent/lease: lse_test0001}
+spec: {components: []}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: wcep-agent-fence, namespace: dyntest-alice-agent}
+data: {lease_id: lse_test0001, state: open, seq: "7", uid: 00000000-0000-4000-8000-0000000000aa}

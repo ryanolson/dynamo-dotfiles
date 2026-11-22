@@ -1,0 +1,20 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: scope
+policies: [policy.yaml]
+resources: [resources.yaml]
+variables: values.yaml
+results:
+  # The enrolled namespace: prefix and label. An unlabelled Pod fails.
+  - policy: agent-lease-fence
+    rule: pods-need-the-open-lease
+    kind: Pod
+    resources: [in-enrolled]
+    result: fail
+  # Prefix, no label; no prefix, no label; label, outside the prefix: never matched.
+  - policy: agent-lease-fence
+    rule: pods-need-the-open-lease
+    kind: Pod
+    resources: [in-prefix-unlabelled, in-team-x, in-team-x-fenced]
+    result: skip

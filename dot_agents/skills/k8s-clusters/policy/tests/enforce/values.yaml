@@ -1,0 +1,23 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Values
+metadata:
+  name: values
+namespaceSelector:
+  - name: dyntest-alice-agent
+    labels: {dynamo.nvidia.com/agent-lease-fence: "true"}
+policies:
+  - name: agent-lease-fence
+    resources:
+      - {name: open-ok, values: {gate: {state: active, lease_id: lse_test0001, seq: "7"}}}
+      - {name: other-lease, values: {gate: {state: active, lease_id: lse_test0001, seq: "7"}}}
+      - {name: no-lease-label, values: {gate: {state: active, lease_id: lse_test0001, seq: "7"}}}
+      - {name: no-owner, values: {gate: {state: active, lease_id: lse_test0001, seq: "7"}}}
+      - {name: owner-not-controller, values: {gate: {state: active, lease_id: lse_test0001, seq: "7"}}}
+      - {name: gate-closing, values: {gate: {state: closing, lease_id: lse_test0001, seq: "7"}}}
+      - {name: gate-missing, values: {gate: {state: missing, lease_id: "", seq: "0"}}}
+      - {name: gate-unreadable, values: {gate: {state: unreadable, lease_id: "", seq: "0"}}}
+      - {name: canary, values: {gate: {state: active, lease_id: lse_test0001, seq: "7"}}}
+      - {name: mode-probe, values: {gate: {state: active, lease_id: lse_test0001, seq: "7"}}}
+      - {name: bot-dgd-no-attempt, values: {gate: {state: active, lease_id: lse_test0001, seq: "7"}}}
+      - {name: bot-dgd-ok, values: {gate: {state: active, lease_id: lse_test0001, seq: "7"}}}
+      - {name: bot-job-closed-gate, values: {gate: {state: closing, lease_id: lse_test0001, seq: "7"}}}

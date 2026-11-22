@@ -1,0 +1,20 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Values
+metadata:
+  name: values
+namespaceSelector:
+  - name: dyntest-alice-agent
+    labels: {dynamo.nvidia.com/agent-lease-fence: "true"}
+  - name: dyntest-alice-other
+    labels: {}
+  - name: team-x
+    labels: {}
+  - name: team-x-fenced
+    labels: {dynamo.nvidia.com/agent-lease-fence: "true"}
+policies:
+  - name: agent-lease-fence
+    resources:
+      - {name: in-enrolled, values: {gate: {state: active, lease_id: lse_test0001, seq: "7"}}}
+      - {name: in-prefix-unlabelled, values: {gate: {state: active, lease_id: lse_test0001, seq: "7"}}}
+      - {name: in-team-x, values: {gate: {state: active, lease_id: lse_test0001, seq: "7"}}}
+      - {name: in-team-x-fenced, values: {gate: {state: active, lease_id: lse_test0001, seq: "7"}}}

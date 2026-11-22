@@ -1,0 +1,10 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: gate-create-lease-empty
+policies: [policy.yaml]
+resources: [resources.yaml]
+variables: values.yaml
+userinfo: userinfo.yaml
+results:
+  - {policy: agent-lease-fence, rule: gate-is-the-bots-and-moves-forward, kind: ConfigMap, resources: [wcep-agent-fence], result: fail}

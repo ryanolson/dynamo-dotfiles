@@ -1,0 +1,12 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Values
+metadata:
+  name: values
+namespaceSelector:
+  - name: dyntest-alice-agent
+    labels: {dynamo.nvidia.com/agent-lease-fence: "true"}
+policies:
+  - name: agent-lease-fence
+    resources:
+      - name: wcep-agent-fence
+        values: {request.operation: UPDATE, request.oldObject.data.lease_id: "lse_test0001", request.oldObject.data.state: "closing", request.oldObject.data.seq: "7"}

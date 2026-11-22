@@ -1,0 +1,12 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: gate-delete
+policies: [policy.yaml]
+resources: [resources.yaml]
+variables: values.yaml
+userinfo: userinfo.yaml
+# Not covered: Kyverno 1.15.2 never denies a DELETE on a policy's own webhook, so the rule matches only
+# CREATE and UPDATE. The guard never deletes the gate; a deleted gate reads missing and denies every Pod.
+results:
+  - {policy: agent-lease-fence, rule: gate-is-the-bots-and-moves-forward, kind: ConfigMap, resources: [wcep-agent-fence], result: skip}

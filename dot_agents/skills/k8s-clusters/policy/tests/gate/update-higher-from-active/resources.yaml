@@ -1,0 +1,4 @@
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: wcep-agent-fence, namespace: dyntest-alice-agent}
+data: {lease_id: "lse_next0002", state: "closing", seq: "8", uid: 00000000-0000-4000-8000-0000000000aa}

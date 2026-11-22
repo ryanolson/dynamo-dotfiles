@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Pod
+metadata: {name: in-enrolled, namespace: dyntest-alice-agent}
+spec: {containers: [{name: main, image: registry.example.test/app:1}]}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: in-prefix-unlabelled, namespace: dyntest-alice-other}
+spec: {containers: [{name: main, image: registry.example.test/app:1}]}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: in-team-x, namespace: team-x}
+spec: {containers: [{name: main, image: registry.example.test/app:1}]}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: in-team-x-fenced, namespace: team-x-fenced}
+spec: {containers: [{name: main, image: registry.example.test/app:1}]}

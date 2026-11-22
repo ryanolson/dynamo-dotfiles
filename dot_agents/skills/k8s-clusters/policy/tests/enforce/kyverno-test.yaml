@@ -1,0 +1,23 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: enforce
+policies: [policy.yaml]
+resources: [resources.yaml]
+variables: values.yaml
+userinfo: userinfo.yaml
+results:
+  - {policy: agent-lease-fence, rule: pods-need-the-open-lease, kind: Pod, resources: [open-ok], result: pass}
+  - policy: agent-lease-fence
+    rule: pods-need-the-open-lease
+    kind: Pod
+    resources: [other-lease, no-lease-label, no-owner, owner-not-controller, gate-closing, gate-missing, gate-unreadable, mode-probe]
+    result: fail
+  # The canary policy always refuses its probe (it enforces from install; the kind fixture proves it in
+  # Audit), and the Pod rule never sees it.
+  - {policy: agent-lease-fence-canary, rule: probe-canary, kind: Pod, resources: [canary], result: fail}
+  - {policy: agent-lease-fence, rule: pods-need-the-open-lease, kind: Pod, resources: [canary], result: skip}
+  - {policy: agent-lease-fence-canary, rule: probe-canary, kind: Pod, resources: [open-ok, mode-probe], result: skip}
+  - {policy: agent-lease-fence, rule: bot-roots-need-the-open-lease-and-an-attempt, kind: DynamoGraphDeployment, resources: [bot-dgd-no-attempt], result: fail}
+  - {policy: agent-lease-fence, rule: bot-roots-need-the-open-lease-and-an-attempt, kind: DynamoGraphDeployment, resources: [bot-dgd-ok], result: pass}
+  - {policy: agent-lease-fence, rule: bot-roots-need-the-open-lease-and-an-attempt, kind: Job, resources: [bot-job-closed-gate], result: fail}

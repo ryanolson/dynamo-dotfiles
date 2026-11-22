@@ -1,0 +1,16 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Values
+metadata:
+  name: values
+namespaceSelector:
+  - name: dyntest-alice-agent
+    labels: {dynamo.nvidia.com/agent-lease-fence: "true"}
+policies:
+  - name: agent-lease-fence
+    resources:
+      - {name: no-lease-label, values: {gate: {state: active, lease_id: lse_test0001, seq: "7"}}}
+      - {name: gate-missing, values: {gate: {state: missing, lease_id: "", seq: "0"}}}
+      - {name: gate-unreadable, values: {gate: {state: unreadable, lease_id: "", seq: "0"}}}
+      - {name: canary, values: {gate: {state: active, lease_id: lse_test0001, seq: "7"}}}
+      - {name: bot-dgd-no-attempt, values: {gate: {state: active, lease_id: lse_test0001, seq: "7"}}}
+      - {name: wcep-agent-fence, values: {request.operation: CREATE}}
