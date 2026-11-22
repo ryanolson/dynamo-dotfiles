@@ -504,12 +504,14 @@ DIGEST_IMAGE = re.compile(r'@sha256:[0-9a-f]{64}$')
 
 # The tag-check initContainer runs crane under the debug image's busybox shell. `crane digest` sends
 # every manifest Accept type itself, so a 404 is a missing tag and not an unaccepted OCI index; its
-# error text carries MANIFEST_UNKNOWN for an absent tag. Only that string lets the build run: 401/403
-# refuse, and any other failure refuses rather than guessing. Its test is TagCheckScript.
+# error text carries MANIFEST_UNKNOWN for an absent tag, or NAME_UNKNOWN for a repository that does not
+# exist yet (which cannot hold the tag either, so nothing can be overwritten). Only those two codes let
+# the build run: 401/403 refuse, and any other failure refuses rather than guessing. Its test is
+# TagCheckScript.
 TAG_CHECK_SCRIPT = r'''set -u
 out=$("$CRANE" digest "$REF" 2>&1) && { echo tag_exists; exit 1; }
 case "$out" in
-  *MANIFEST_UNKNOWN*|*"manifest unknown"*) exit 0 ;;
+  *MANIFEST_UNKNOWN*|*"manifest unknown"*|*NAME_UNKNOWN*|*"name unknown"*) exit 0 ;;
   *UNAUTHORIZED*|*DENIED*|*"401"*|*"403"*) echo registry_denied; exit 1 ;;
   *) echo "registry_error: $out"; exit 1 ;;
 esac

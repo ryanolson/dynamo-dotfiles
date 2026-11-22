@@ -4644,14 +4644,16 @@ class TagCheckScript(GuardCase):
                 self.assertEqual(rc, 1)
                 self.assertIn('registry_denied', out)
 
-    def test_only_manifest_unknown_lets_the_build_run(self):
+    def test_only_an_unknown_tag_or_repository_lets_the_build_run(self):
+        # A repository that does not exist yet cannot hold the tag, so it is absent in the same way.
         for err in ('Error: GET https://nvcr.io/...: MANIFEST_UNKNOWN: Failed to fetch "x"',
-                    'Error: manifest unknown'):
+                    'Error: manifest unknown',
+                    'Error: GET https://nvcr.io/...: NAME_UNKNOWN: repository name not known to registry',
+                    'Error: name unknown'):
             with self.subTest(err=err):
                 rc, out = self.probe(1, err=err)
                 self.assertEqual((rc, out), (0, ''))
-        for err in ('Error: GET https://nvcr.io/...: NAME_UNKNOWN: repository name not known',
-                    'Error: unexpected status code 404 Not Found', ''):
+        for err in ('Error: unexpected status code 404 Not Found', ''):
             with self.subTest(err=err):
                 rc, out = self.probe(1, err=err)
                 self.assertEqual(rc, 1)

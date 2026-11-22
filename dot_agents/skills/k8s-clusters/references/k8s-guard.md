@@ -108,13 +108,13 @@ A build is a Kubernetes `Job` in the claim's namespace, rendered by the guard fr
 - **The build.** `buildctl-daemonless.sh build --oci-worker-no-process-sandbox --frontend dockerfile.v0 --local context=/src --local dockerfile=/src/<dirname> --output ...`, with BuildKit's state in an `emptyDir` at `/home/user/.local/share/buildkit`.
 - **The push credential.** Secret `nvcr-push`, made with `secret ngc-push --exposure-accepted`, mounted read-only at `/home/user/.docker`, with `items: [{key: .dockerconfigjson, path: config.json}]` (a `dockerconfigjson` Secret's key is `.dockerconfigjson`, and BuildKit reads `config.json`; without the rename it gets a 401). `DOCKER_CONFIG=/home/user/.docker`. No `imagePullSecrets`: the images are public and only the push credential and the git key are secrets.
 
-**The tag check runs inside the cluster** because the host has neither the credential nor a registry client. It is the plan's pinned crane, in its `:debug` variant: `gcr.io/go-containerregistry/crane/debug:v0.20.3` is the same binary as the release image plus a busybox shell at `/busybox`, which the probe needs to turn crane's answer into the init container's. `crane digest` sends every manifest `Accept` type itself - the OCI index, the OCI manifest, the Docker list and Docker v2 - so a 404 means the tag is missing, not that an OCI index went unaccepted; its stderr carries `MANIFEST_UNKNOWN` for a missing tag. The probe reads the push credential from `DOCKER_CONFIG` and maps crane's answer:
+**The tag check runs inside the cluster** because the host has neither the credential nor a registry client. It is the plan's pinned crane, in its `:debug` variant: `gcr.io/go-containerregistry/crane/debug:v0.20.3` is the same binary as the release image plus a busybox shell at `/busybox`, which the probe needs to turn crane's answer into the init container's. `crane digest` sends every manifest `Accept` type itself - the OCI index, the OCI manifest, the Docker list and Docker v2 - so a 404 means the tag is missing, not that an OCI index went unaccepted; its stderr carries `MANIFEST_UNKNOWN` for a missing tag, or `NAME_UNKNOWN` for a repository that does not exist yet, which cannot hold the tag either. The probe reads the push credential from `DOCKER_CONFIG` and maps crane's answer:
 
 | crane's answer | Marker | Result |
 |---|---|---|
 | exit 0: the tag is there | `tag_exists` | the init container fails, so the build never runs |
 | the error says `UNAUTHORIZED`, `DENIED`, 401 or 403 | `registry_denied` | refused |
-| the error says `MANIFEST_UNKNOWN` | (silent) | the clone and the build run |
+| the error says `MANIFEST_UNKNOWN` or `NAME_UNKNOWN` | (silent) | the clone and the build run |
 | anything else, including no answer at all | `registry_error` | refused, rather than guessing |
 
 `build show` reports the marker as the refusal's code. An existing tag is never overwritten: a DGD may already pull it. The first real build confirms the probe's registry flow (`references/bot.md`, section 8 of the runbook).
@@ -226,7 +226,7 @@ The tests use fakes. The first run on a cluster must confirm these, and run `sel
 - the dry run of a stock DGD adds no field the guard refuses;
 - on a Job's server dry run, the API server defaults `schedulerName: default-scheduler` on the pod template (the guard admits that one value on the dry-run answer, and no other);
 - the crane debug image at `v0.20.3` by digest exists in both architectures and its `/busybox/sh` runs the probe;
-- `crane digest` on `nvcr.io` answers a missing tag with `MANIFEST_UNKNOWN` on stderr and exit 1, and an existing one with exit 0; `v0.20.2`, named by the plan, is no longer served by `gcr.io/go-containerregistry/crane`;
+- `crane digest` on `nvcr.io` answers a missing tag with `MANIFEST_UNKNOWN` on stderr and exit 1, and an existing one with exit 0; a missing repository answers `NAME_UNKNOWN` or `MANIFEST_UNKNOWN`, and both are absent; `v0.20.2`, named by the plan, is no longer served by `gcr.io/go-containerregistry/crane`;
 - every container's `ephemeral-storage` request and limit are accepted together with the node's allocatable storage;
 - the bot may `create jobs.batch` in the pre-made namespace.
 
