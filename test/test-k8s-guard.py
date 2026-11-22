@@ -1972,6 +1972,9 @@ class SharedNamespaceTeardown(GuardCase):
         self.assertEqual(rc, 0, f'{body} {p.stderr}')
         self.assertEqual(self.raw_deletes(),
                          [f'/apis/nvidia.com/v1beta1/namespaces/{NS}/dynamographdeployments/current'])
+        # One DGD-directed request in the whole log: no other route (a plain delete, a patch) reaches
+        # the neighbour either.
+        self.assertEqual(len(self.dgd_writes()), 1)
 
     def test_down_leaves_another_leases_dgd_alone(self):
         self.add_obj(gpu_dgd('colleague', 2, 'lse_other0001'))
@@ -1979,6 +1982,7 @@ class SharedNamespaceTeardown(GuardCase):
         self.assertEqual(rc, 0, f'{body} {p.stderr}')
         self.assertEqual(self.raw_deletes(),
                          [f'/apis/nvidia.com/v1beta1/namespaces/{NS}/dynamographdeployments/current'])
+        self.assertEqual(len(self.dgd_writes()), 1)
 
     def test_expire_scales_only_the_lease_dgd(self):
         rc, body, p = self.teardown('expire')
