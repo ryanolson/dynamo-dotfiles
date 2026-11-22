@@ -2706,7 +2706,9 @@ class NamespaceWriteWindows(GuardCase):
                     self.bb['leases'][lid]['expires_at'] = iso_ms(hours_from_now(3))
                     self.flush()
                 self.add_obj(gpu_dgd('w', 2, lid))
-                replacement = gpu_dgd('w', 2, 'lse_new000001')
+                # A late apply stamps the old namespace's lease, so the label alone cannot tell the
+                # replacement apart; only its UID can.
+                replacement = gpu_dgd('w', 2, lid)
                 replacement['metadata'].update(namespace=NS, uid='uid-new-dgd', resourceVersion='1000')
                 hook = """if what == 'namespace':
         st['namespace_reads'] = st.get('namespace_reads', 0) + 1

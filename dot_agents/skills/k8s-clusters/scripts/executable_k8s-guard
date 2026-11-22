@@ -838,24 +838,27 @@ def delete_lease_dgd(g, ns, lease_id, dgd):
     """Delete one DGD of this lease, and say whether it is gone.
 
     DeleteOptions can test only the object's UID and resourceVersion, not a label. So the object is
-    read again, the lease label is checked, and only then is the delete sent, fenced by the UID and
-    the resourceVersion just read: a label removed or a replacement between the list and now is
-    refused rather than sent, and a change in between fails the precondition. On a conflict the
+    read again, its UID is checked against the one the list gave (a replacement with the same name is
+    not this object, whatever its labels), its lease label is checked, and only then is the delete
+    sent, under that listed UID and the resourceVersion just read. A label removed, a replacement, or
+    a change between the read and the delete is refused rather than taking effect. On a conflict the
     object is read and checked again, a bounded number of times, so an unrelated status write does
     not stop a teardown that is still this lease's.
 
     False means the object changed into something else. `down` leaves it, and the namespace delete
     ends it with the rest.
     """
-    name = dgd['metadata']['name']
+    name, listed_uid = dgd['metadata']['name'], dgd['metadata']['uid']
     for _ in range(DGD_DELETE_ATTEMPTS):
         fresh = g.kc.json('get', f'{DGD_RESOURCE}/{name}', '-n', ns, '-o', 'json', not_found=MISSING)
         if fresh is MISSING:
             return True
         meta = fresh.get('metadata') or {}
+        if meta.get('uid') != listed_uid:
+            return False
         if (meta.get('labels') or {}).get(LEASE_LABEL) != lease_id:
             return False
-        pre = {'uid': meta['uid'], 'resourceVersion': meta['resourceVersion']}
+        pre = {'uid': listed_uid, 'resourceVersion': meta['resourceVersion']}
         body = {'kind': 'DeleteOptions', 'apiVersion': 'v1', 'preconditions': pre}
         rc, out, err = g.kc.run('delete', '--raw', dgd_path(fresh, ns), '-f', '-', input=json.dumps(body))
         if rc == 0 or is_not_found(err):
