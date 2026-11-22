@@ -49,7 +49,7 @@ BB_TIMEOUT = 30
 GUARD_TIMEOUT = 900
 LEDGER_GLOBS = ('~/.bb-machines/*/thread-storage/*/k8s-ledger.jsonl',)
 # Guard answers that mean the backstop itself failed, not that the guard refused on its rules.
-GUARD_FAILURES = ('guard_no_json', 'guard_timeout', 'internal_error', 'kubectl_error')
+GUARD_FAILURES = ('guard_no_json', 'guard_timeout', 'guard_error', 'internal_error', 'kubectl_error')
 
 
 def load_check():

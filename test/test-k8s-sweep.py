@@ -848,10 +848,9 @@ class Enforce(SweepCase):
         rc, body, p = self.guard_answers('echo \'{"error": "boom", "code": "internal_error"}\'\nexit 1\n')
         self.assert_enforce_failed(body, rc, 'internal_error')
 
-    def test_a_guard_that_exits_nonzero_without_a_code_is_not_ok(self):
+    def test_a_guard_that_exits_nonzero_without_a_code_fails_the_run(self):
         rc, body, p = self.guard_answers('echo \'{"namespace": "x"}\'\nexit 1\n')
-        self.assertEqual(self.row(body)['action'], {'action': 'down', 'result': 'guard_error'})
-        self.assertEqual(self.ledger(host=True)[-1]['result'], 'guard_error')
+        self.assert_enforce_failed(body, rc, 'guard_error')
 
     def test_a_guard_that_hangs_fails_the_run(self):
         rc, body, p = self.guard_answers('exec sleep 30\n', guard_timeout=1)

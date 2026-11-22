@@ -75,7 +75,7 @@ Each run replaces `${XDG_STATE_HOME:-~/.local/state}/k8s-sweep/report.json` and 
 
 Each host writes its own table. A stale `checked_at` means that host's timer has stopped.
 
-Exit status: 0 when the run completes, since flags are not failures. 1 when a cluster, the lease list or a ledger could not be read, or when an enforcement call failed (the guard printed no JSON, timed out, or failed with `internal_error` or `kubectl_error`). 2 for a usage error.
+Exit status: 0 when the run completes, since flags are not failures. 1 when a cluster, the lease list or a ledger could not be read, or when an enforcement call failed (the guard printed no JSON, timed out, exited non-zero without a code (`guard_error`), or failed with `internal_error` or `kubectl_error`). 2 for a usage error.
 
 ## Timers
 
