@@ -243,6 +243,8 @@ def open_ledger(pairs, ended):
             elif direction == 'down' and line.get('deleted'):
                 opened.pop(key, None)
         elif obj == f'Claim/{ns}' and lease:
+            # The guard writes every claim with its lease. A line without one (hand-edited, truncated, or
+            # from another writer) would open an entry keyed on no lease, which no `down` could close.
             key = ('claim', cluster, ns, lease)
             if direction == 'claim':
                 opened[key] = dict(entry, kind='claim', lease=lease)

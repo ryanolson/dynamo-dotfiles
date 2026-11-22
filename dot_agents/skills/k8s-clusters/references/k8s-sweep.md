@@ -98,6 +98,12 @@ systemctl --user enable --now k8s-sweep.timer k8s-sweep-enforce.timer
 timeout 300 python3 test/test-k8s-sweep.py </dev/null
 ```
 
+After a change to the rules or the script, run the mutation check too. It breaks each risky branch in turn, runs the suite against it, and restores the files byte for byte. It exits 1 if a mutation survives, meaning no test needs that branch: add a test, or delete the branch.
+
+```bash
+timeout 1500 python3 test/k8s-sweep-mutations.py </dev/null
+```
+
 The tests run the rules on made-up JSON, and run the script against the fakes of `test-k8s-guard.py`, with the real guard for `--enforce`. They render the units with chezmoi. Run the guard's suite too after a change to the shared fakes. Use the system `python3`: the profile renderer needs `os.memfd_create`, which uv's managed Python 3.14 lacks.
 
 ## Not proven without a cluster
