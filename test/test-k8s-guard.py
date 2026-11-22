@@ -65,6 +65,61 @@ reaper = true
 operator_namespace = "dynamo-system"
 '''
 
+# What the API server answers the fence probe's two dry-run Pod creates, by the "cluster's" fence state. The
+# refusal texts are the kind fixture's (test/kind-fence.sh, Kyverno v1.15.2 on kind): kubectl's prefix, the
+# webhook that answered, and Kyverno's block message with the policy and the rule. None means admitted.
+FINE = 'validate.kyverno.svc-fail-finegrained-agent-lease-fence'
+CANARY_FINE = 'validate.kyverno.svc-fail-finegrained-agent-lease-fence-canary'
+
+
+def kyverno_denial(webhook, rule, message, policy='agent-lease-fence'):
+    return (f'Error from server: error when creating "STDIN": admission webhook "{webhook}" denied the request: '
+            f'\n\nresource Pod/{{ns}}/{{name}} was blocked due to the following policies \n\n{policy}:\n'
+            f"  {rule}: '{message}'\n")
+
+
+def canary_denial(webhook=CANARY_FINE):
+    return kyverno_denial(webhook, 'probe-canary', CANARY_MESSAGE, 'agent-lease-fence-canary')
+
+
+CANARY_MESSAGE = ("agent-lease-fence canary (owner alice, contact alice; off-switch in the policy''s description): this "
+                  "probe Pod is always refused; it is not a workload.")
+MODE_MESSAGE = ("agent-lease-fence (owner alice, contact alice; off-switch in the policy''s description): {ns} admits "
+                "a Pod only under its open agent lease, with a controller owner. Gate: missing for " + "''" * 2 +
+                " (''unreadable'' means the policy could not read its gate: the policy is broken, not the lease). Pod "
+                "lease label: ''lse_fenceprobe0''.")
+# Whichever of our two entries the API server called first names the failure.
+ENGINE_DOWN = ('Error from server (InternalError): error when creating "STDIN": Internal error occurred: failed calling '
+               'webhook "{entry}": failed to call webhook: Post "https://kyverno-svc.kyverno.svc:443/validate/fail/'
+               'finegrained/{policy}?timeout=10s": dial tcp 10.96.61.105:443: connect: connection refused\n')
+AUDIT_WARNING = 'Warning: policy agent-lease-fence.pods-need-the-open-lease: ' + MODE_MESSAGE.replace("''", "'") + '\n'
+FENCE_ANSWERS = {
+    'armed': {'canary': canary_denial(), 'mode': kyverno_denial(FINE, 'pods-need-the-open-lease', MODE_MESSAGE)},
+    # Admitted with Kyverno's warning on stderr: the main policy in Audit.
+    'audit': {'canary': canary_denial(), 'mode': AUDIT_WARNING},
+    # Both admitted, no warning: no entry of ours answered (policies gone, label gone, or Kyverno at 0 replicas).
+    'disarmed': {'canary': None, 'mode': None},
+    'shared': {'canary': canary_denial('validate.kyverno.svc-fail'),
+               'mode': kyverno_denial('validate.kyverno.svc-fail', 'pods-need-the-open-lease', MODE_MESSAGE)},
+    'main_shared': {'canary': canary_denial(),
+                    'mode': kyverno_denial('validate.kyverno.svc-fail', 'pods-need-the-open-lease', MODE_MESSAGE)},
+    'engine_unavailable': {'canary': ENGINE_DOWN.format(entry=FINE, policy='agent-lease-fence'),
+                           'mode': ENGINE_DOWN.format(entry=CANARY_FINE, policy='agent-lease-fence-canary')},
+    'main_absent': {'canary': canary_denial(), 'mode': None},
+    'canary_absent': {'canary': None, 'mode': kyverno_denial(FINE, 'pods-need-the-open-lease', MODE_MESSAGE)},
+    # Refused, but not by our entry with our canary rule: proves nothing.
+    'other_webhook': {'canary': kyverno_denial('validate.kyverno.svc-fail-finegrained-someone-else', 'probe-canary',
+                                               CANARY_MESSAGE),
+                      'mode': kyverno_denial('validate.kyverno.svc-fail-finegrained-someone-else',
+                                             'pods-need-the-open-lease', MODE_MESSAGE)},
+    'other_rule': {'canary': kyverno_denial(CANARY_FINE, 'pods-need-the-open-lease', MODE_MESSAGE,
+                                            'agent-lease-fence-canary'),
+                   'mode': kyverno_denial(FINE, 'pods-need-the-open-lease', MODE_MESSAGE)},
+    'forbidden': {'canary': 'Error from server (Forbidden): pods is forbidden: User "bot-example-agent" cannot create '
+                            'resource "pods"\n',
+                  'mode': 'Error from server (Forbidden): pods is forbidden\n'},
+}
+
 FAKE_KUBECTL = r'''#!/usr/bin/env python3
 """Stateful fake kubectl. State: FAKE_K8S_STATE. Log: FAKE_KUBECTL_LOG (argv only, never stdin)."""
 import copy, json, os, sys, time
@@ -155,6 +210,7 @@ RESOURCES = {DGD_LIST_NAME: 'DynamoGraphDeployment', 'configmaps': 'ConfigMap', 
              'deployments.apps': 'Deployment', 'statefulsets.apps': 'StatefulSet',
              'jobs.batch': 'Job'}
 PLURALS = {r.split('.', 1)[0]: k for r, k in RESOURCES.items()}
+PLURALS['pods'] = 'Pod'
 
 
 def kind_of(res):
@@ -263,6 +319,14 @@ if cmd == 'get':
         emit({'kind': 'List', 'apiVersion': 'v1', 'items': items})
     if what == 'pods':
         emit({'kind': 'List', 'apiVersion': 'v1', 'items': labelled(st['pods'].get(ns_flag, []))})
+    if what.startswith('pods/'):
+        name = what.split('/', 1)[1]
+        for p_ in st['pods'].get(ns_flag, []):
+            if p_['metadata']['name'] == name:
+                emit(dict(p_, kind='Pod', apiVersion='v1'))
+        fail(f'Error from server (NotFound): pods "{name}" not found')
+    if what in ('policyreports.wgpolicyk8s.io', 'events'):
+        emit({'kind': 'List', 'apiVersion': 'v1', 'items': st.get(what, {}).get(ns_flag, [])})
     if what in RESOURCES:
         if what in st.get('missing_resources', []):
             fail(f'error: the server doesn\'t have a resource type "{what}"')
@@ -283,6 +347,24 @@ if cmd == 'get':
 
 if cmd == 'create' and len(pos) == 1:
     obj = json.loads(stdin)
+    if obj.get('kind') == 'Pod':
+        # The fence probe: two server dry runs. Which answer the "cluster" gives comes from the test:
+        # st['fence'] for every probe, or st['fence_seq'] consumed one probe (canary, then mode) at a time.
+        which = (obj['metadata'].get('labels') or {}).get('wcep.agent/fence-probe')
+        if flags.get('--dry-run') != 'server' or which not in ('canary', 'mode'):
+            fail('fake kubectl: k8s-guard sent a Pod create that is not a fence probe dry run', 96)
+        st.setdefault('probe_bodies', []).append(obj)
+        if which == 'canary':
+            seq = st.get('fence_seq') or []
+            st['fence_now'] = seq.pop(0) if seq else st.get('fence', 'armed')
+        answer = FENCE_ANSWERS[st.get('fence_now') or st.get('fence', 'armed')][which]
+        save()
+        if answer is None:
+            emit(obj)
+        if answer.startswith('Warning:'):
+            sys.stderr.write(answer)
+            emit(obj)
+        fail(answer.replace('{ns}', obj['metadata']['namespace']).replace('{name}', obj['metadata']['name']))
     if obj['kind'] == 'Namespace':
         if st.get('forbid_namespace_create'):
             fail('Error from server (Forbidden): namespaces is forbidden: User "bot-example-agent" cannot create '
@@ -456,6 +538,20 @@ if cmd == 'delete' and '--raw' in flags:
     kind = PLURALS.get(plural)
     k = f'{kind}/{name}'
     ns_flag = ns
+    if kind == 'Pod':
+        want_rv = (body.get('preconditions') or {}).get('resourceVersion')
+        pods_ = st['pods'].get(ns, [])
+        hit = [p_ for p_ in pods_ if p_['metadata']['name'] == name]
+        if not hit:
+            fail(f'Error from server (NotFound): pods "{name}" not found')
+        m_ = hit[0]['metadata']
+        if want is None or want_rv is None:
+            fail('fake kubectl: Pod delete without UID and resourceVersion preconditions', 96)
+        if m_.get('uid') != want or m_.get('resourceVersion') != want_rv:
+            fail('Error from server (Conflict): Operation cannot be fulfilled: Precondition failed: UID in precondition')
+        st['pods'][ns] = [p_ for p_ in pods_ if p_ is not hit[0]]
+        st.setdefault('deleted_pods', []).append(name)
+        save(); emit({'kind': 'Status', 'status': 'Success'})
     interfere(k, 'delete')
     o = st['objects'].get(ns, {}).get(k)
     if o is None:
@@ -514,7 +610,8 @@ if cmd == 'delete':
     sys.stdout.write(f'{res}/{name} deleted\n'); sys.exit(0)
 
 fail('fake kubectl: no handler for: ' + ' '.join(pos), 97)
-'''.replace('DGD_LIST_NAME', repr(DGD_LIST)).replace('DGD_LABEL', repr(DGD_NAME_LABEL))
+'''.replace('DGD_LIST_NAME', repr(DGD_LIST)).replace('DGD_LABEL', repr(DGD_NAME_LABEL)).replace(
+    'FENCE_ANSWERS', 'json.loads(' + repr(json.dumps(FENCE_ANSWERS)) + ')')
 
 FAKE_BB = r'''#!/usr/bin/env python3
 """Fake bb: the k8s-leases commands the guard may call. State: FAKE_BB_STATE. Log: FAKE_BB_LOG."""
@@ -585,7 +682,10 @@ def kubectl_writes():
 
 
 if argv[:4] == ['k8s', 'lease', 'acquire', '--claim']:
-    o = {argv[i][2:]: argv[i + 1] for i in range(4, len(argv) - 1, 2)}
+    trial = '--audit-trial' in argv
+    o = {a[2:]: b for a, b in zip(*[iter([x for x in argv[4:] if x != '--audit-trial'])] * 2)}
+    if st.get('claim_refuse'):
+        err(st['claim_refuse'], 'refused by the fake plugin (the fence probe)')
     ledger = os.path.join(os.environ.get('BB_THREAD_STORAGE', '/nonexistent'), 'k8s-ledger.jsonl')
     st.setdefault('claim_calls', []).append({'request': o['request'], 'replaces': o['replaces'],
                                              'uid': o['uid'],
@@ -599,7 +699,14 @@ if argv[:4] == ['k8s', 'lease', 'acquire', '--claim']:
         err('internal', 'the claim failed before it committed')
     for l in st['leases'].values():
         if l.get('request') == o['request']:
-            out({'lease_id': l['lease_id'], 'expires_at': l['expires_at'], 'state': l['state']})
+            out({'lease_id': l['lease_id'], 'expires_at': l['expires_at'], 'state': l['state'],
+                 'seq': l.get('claim_seq'), 'trial': l.get('trial', False)})
+    for l in st['leases'].values():
+        # The same owner adopts its own matching active claim (the plugin's adopt-or-replace).
+        if (l['namespace'] == o['namespace'] and l['state'] == 'active' and l.get('mode') == 'claimed'
+                and l['thread'] == os.environ.get('BB_THREAD_ID') and l['uid'] == o['uid']):
+            out({'lease_id': l['lease_id'], 'expires_at': l['expires_at'], 'state': l['state'],
+                 'seq': l.get('claim_seq'), 'trial': l.get('trial', False), 'adopted': True})
     ns_uid = live_uid(o['namespace'])
     if ns_uid is not None and ns_uid != o['uid']:
         err('uid_mismatch', f'{o["namespace"]} has UID {ns_uid}, not {o["uid"]}.')
@@ -612,7 +719,9 @@ if argv[:4] == ['k8s', 'lease', 'acquire', '--claim']:
     st['leases'][lid] = {'lease_id': lid, 'state': 'active', 'cluster': o['cluster'], 'namespace': o['namespace'],
                          'uid': o['uid'], 'thread': os.environ.get('BB_THREAD_ID'), 'gpu_type': o['gpu-type'],
                          'gpus': int(o['gpus']), 'expires_at': iso(now + timedelta(hours=float(o['hours']))),
-                         'multi_node': False, 'mode': 'claimed', 'request': o['request']}
+                         'multi_node': False, 'mode': 'claimed', 'request': o['request'], 'trial': trial,
+                         'claim_seq': 1 + max([x.get('claim_seq') or 0 for x in st['leases'].values()
+                                               if x['namespace'] == o['namespace']] + [st.get('seq_floor', 0)])}
     st.setdefault('latest', {})[o['namespace']] = lid
     save()
     if st.get('claim_error_after_commit'):
@@ -624,7 +733,14 @@ if argv[:4] == ['k8s', 'lease', 'acquire', '--claim']:
         save()
         sys.stderr.write('Cannot connect to BB server.\n')
         sys.exit(1)
-    out({'lease_id': lid, 'expires_at': st['leases'][lid]['expires_at'], 'state': 'active'})
+    out({'lease_id': lid, 'expires_at': st['leases'][lid]['expires_at'], 'state': 'active',
+         'seq': st['leases'][lid]['claim_seq'], 'trial': trial})
+if argv[:4] == ['k8s', 'lease', 'fence-retired', argv[3] if len(argv) > 3 else '']:
+    l = lease(argv[3])
+    if os.environ.get('BB_THREAD_ID'):
+        err('not_from_thread', 'A retired fence is recorded from a host, not a bb thread.')
+    l['fence_retired_proof'] = argv[argv.index('--proof') + 1]
+    save(); out({'lease_id': argv[3], 'fence_retired_proof': l['fence_retired_proof']})
 if argv[:2] == ['k8s', 'leases'] and '--json' in argv:
     # As the plugin's showJson prints a row; live leases unless --all.
     rows = []
@@ -979,6 +1095,8 @@ class GuardCase(unittest.TestCase):
                'FAKE_FLEET_LOG': str(self.fleet_log), 'FAKE_TSH_LOG': str(self.tsh_log),
                'FAKE_SECRET': SECRET if secret is None else secret,
                'K8S_GUARD_DOWN_WAIT_SECONDS': '0', 'K8S_GUARD_POLL_SECONDS': '0',
+               # The fence's drain and probe interval; FenceArmed's Clock tests run the real defaults.
+               'K8S_GUARD_FENCE_DRAIN_SECONDS': '0', 'K8S_GUARD_FENCE_PROBE_SECONDS': '0',
                'FAKE_FLEET_FAIL': '1' if fleet_fail else '',
                'FAKE_PW_DIR': str(self.home), 'FAKE_KUBECTL': str(self.kubectl_path),
                'FAKE_TBOT_LOG': str(self.tbot_log),
@@ -3063,6 +3181,8 @@ class ClaimedCase(GuardCase):
             f'namespace_prefix = "dyntest-alice-"\npremade_namespace = "{PREMADE}"', 1))
         ns = namespace(PREMADE, None, 'uid-premade-1')
         del ns['metadata']['labels']['wcep.agent/thread']
+        # Enrolled in the lease fence: ops set this label; a claim refuses without it.
+        ns['metadata']['labels']['dynamo.nvidia.com/agent-lease-fence'] = 'true'
         del ns['metadata']['annotations']
         self.k8s['namespaces'][PREMADE] = ns
         self.k8s['objects'][PREMADE] = {}
@@ -3144,7 +3264,11 @@ class NamespaceClaim(ClaimedCase):
         self.assertEqual(call['replaces'], 'none')
         argv = next(c for c in self.bb_calls() if c[:4] == ['k8s', 'lease', 'acquire', '--claim'])
         self.assertNotIn('--thread', argv, 'the owner is the calling thread, not an argument')
-        self.assertEqual(self.writes(), [])
+        # Its one cluster write is the fence's gate, opened for this lease; never the Namespace.
+        [gate] = self.writes()
+        self.assertEqual((gate['pos'][:1], gate['flags'].get('-n')), (['create'], PREMADE))
+        self.assertEqual(self.k8s['objects'][PREMADE]['ConfigMap/wcep-agent-fence']['data']['lease_id'], body['lease_id'])
+        self.assertEqual(self.namespace_writes(), [])
         self.assertEqual(body['pod_label'], {LEASE_LABEL: body['lease_id']})
 
     def test_a_lost_reply_is_retried_with_the_same_request(self):
@@ -3273,9 +3397,10 @@ class ClaimedWrites(ClaimedCase):
         lid = self.claimed()
         self.bb['leases'][lid]['thread'] = OTHER  # the plugin's row says another thread owns it
         self.flush()
+        before = len(self.writes())  # the claim's own gate write
         rc, body, _ = self.apply(gpu_dgd('w', 1, lid), ns=PREMADE)
         self.assertEqual(body.get('code'), 'lease_mismatch', body)
-        self.assertEqual(self.writes(), [])
+        self.assertEqual(len(self.writes()), before)
 
     def test_every_write_is_an_attempt_recorded_before_it_is_sent_and_stamped(self):
         lid = self.claimed()
@@ -3285,7 +3410,8 @@ class ClaimedWrites(ClaimedCase):
         attempts = self.bb['leases'][lid]['attempts']
         self.assertEqual([(a['verb'], a['kind'], a['name'], a['outcome']) for a in attempts],
                          [('create', 'DynamoGraphDeployment', 'w', 'committed'), ('create', 'ConfigMap', 'cfg', 'committed')])
-        self.assertEqual([a['writes_before'] for a in attempts], [0, 1], 'an attempt must be recorded before its write')
+        # The claim wrote the gate first (one write); each attempt is recorded before its own write.
+        self.assertEqual([a['writes_before'] for a in attempts], [1, 2], 'an attempt must be recorded before its write')
         for a in attempts:
             obj = self.k8s['objects'][PREMADE][f'{a["kind"]}/{a["name"]}']
             self.assertEqual(obj['metadata']['annotations']['wcep.agent/attempt'], a['attempt'])
@@ -3339,7 +3465,9 @@ class ClaimedTeardown(ClaimedCase):
         self.leased(lid)
         body = self.ok('--context', CTX, 'down', PREMADE, '--uid', 'uid-premade-1', '--lease', lid, host_entry=True)
         self.assertEqual((body['complete'], body['namespace_kept']), (True, True), body)
-        self.assertEqual(self.k8s['objects'][PREMADE], {})
+        # Everything of the lease is gone; the fence's gate stays, closed for it, and is never deleted.
+        self.assertEqual(list(self.k8s['objects'][PREMADE]), ['ConfigMap/wcep-agent-fence'])
+        self.assertEqual(self.k8s['objects'][PREMADE]['ConfigMap/wcep-agent-fence']['data']['state'], 'closing')
         self.assertIn(PREMADE, self.k8s['namespaces'])
         self.assertEqual(self.namespace_writes(), [])
         for c in self.writes():
@@ -3509,11 +3637,12 @@ class ClaimedTeardown(ClaimedCase):
         self.add_obj(gpu_dgd('w', 1, lid), ns=PREMADE)
         self.bb['unreachable'] = True
         self.flush()
+        before = len(self.writes())  # the claim's own gate write
         for verb in ('expire', 'down'):
             with self.subTest(verb=verb):
                 self.refused('lease_unavailable', '--context', CTX, verb, PREMADE, '--uid', 'uid-premade-1', '--lease',
                              lid, host_entry=True)
-        self.assertEqual(self.writes(), [])
+        self.assertEqual(len(self.writes()), before)
 
     def test_expire_scales_the_lease_dgds_with_the_plugins_word(self):
         lid = self.claimed(state='revoking')
@@ -3540,6 +3669,11 @@ class ClaimedTeardown(ClaimedCase):
         self.assertNotIn('delete namespace: wrong UID precondition', [p['fence'] for p in body['probes']])
         self.assertFalse(any('/namespaces/' + PREMADE == (c['flags'].get('--raw') or '')[-len('/namespaces/' + PREMADE):]
                              for c in self.kubectl_calls()), 'a Namespace request was sent')
+        # The fence's gate gets its own stale patch: refused for its version, and the gate unchanged.
+        [gate] = [p for p in body['probes'] if p['fence'] == 'patch gate: stale resourceVersion']
+        self.assertTrue(gate['held'], gate)
+        self.assertEqual(body['unchanged']['gate'], True)
+        self.assertEqual(self.k8s['objects'][PREMADE]['ConfigMap/wcep-agent-fence']['data']['state'], 'active')
 
 
 # --- environment the k8s-leases host entry gives -----------------------------
@@ -4703,6 +4837,573 @@ class TagCheckScript(GuardCase):
         self.probe(0)
         [call] = [json.loads(line) for line in self.crane_log.read_text().splitlines()]
         self.assertEqual(call, ['digest', self.ref])
+
+# --- the lease fence (references/k8s-guard.md, "The fence policy") ------------------------------------------
+
+FENCE_LABEL = 'dynamo.nvidia.com/agent-lease-fence'
+GATE = 'ConfigMap/wcep-agent-fence'
+# The clock the drain uses, patched in: monotonic time moves only by sleep, and wall time jumps a day ahead.
+CLOCK_RUNNER = r'''
+import json
+from datetime import timedelta
+from pathlib import Path
+
+class Clock:
+    elapsed = 0.0
+    sleeps = []
+
+    def monotonic(self):
+        return self.elapsed
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.elapsed += seconds
+
+guard = runpy.run_path(sys.argv[0])
+clock = Clock()
+g = guard['main'].__globals__
+g['time'] = clock
+real_now = g['now']
+g['now'] = lambda: real_now() + timedelta(days=1)  # a wall-clock step: must not end the drain
+status = guard['main']()
+state_path = Path(os.environ['FAKE_K8S_STATE'])
+state = json.loads(state_path.read_text())
+state['clock_elapsed'] = clock.elapsed
+state['clock_sleeps'] = clock.sleeps
+state_path.write_text(json.dumps(state))
+sys.exit(status)
+'''
+
+
+class FenceCase(ClaimedCase):
+    """The pre-made namespace enrolled in the fence (ops set the label), with the fence armed by default."""
+
+    def setUp(self):
+        super().setUp()
+        self.k8s['namespaces'][PREMADE]['metadata']['labels'][FENCE_LABEL] = 'true'
+        self.flush()
+
+    def gate(self):
+        cm = self.k8s['objects'][PREMADE].get(GATE)
+        return None if cm is None else (cm['data']['lease_id'], cm['data']['state'], cm['data']['seq'])
+
+    def set_gate(self, lease_id, state, seq):
+        self.k8s['objects'][PREMADE][GATE] = {
+            'apiVersion': 'v1', 'kind': 'ConfigMap',
+            'metadata': {'name': 'wcep-agent-fence', 'namespace': PREMADE, 'uid': 'uid-gate', 'resourceVersion': '77'},
+            'data': {'lease_id': lease_id, 'state': state, 'seq': str(seq), 'uid': 'uid-premade-1'}}
+        self.flush()
+
+    def gate_writes(self):
+        return [c for c in self.writes() if 'wcep-agent-fence' in ' '.join(c['argv'])
+                or (c['pos'][:2] == ['create', '-f'] and c['flags'].get('-o') == 'json'
+                    and 'wcep-agent-fence' in json.dumps(self.k8s['objects'][PREMADE].get(GATE)))]
+
+    def probe(self, **kw):
+        return self.guard('--context', CTX, 'fence', 'probe', PREMADE, host_entry=True, **kw)
+
+    def clocked_down(self, lid, env_extra=None):
+        """Claimed teardown on a host with the Clock: real defaults unless env_extra sets them."""
+        self.runner.write_text(RUNNER.replace("runpy.run_path(sys.argv[0], run_name='__main__')", CLOCK_RUNNER, 1))
+        env = self.env(host_entry=True)
+        env.pop('K8S_GUARD_FENCE_DRAIN_SECONDS', None)
+        env.pop('K8S_GUARD_FENCE_PROBE_SECONDS', None)
+        env.update(env_extra or {})
+        p = subprocess.run(['python3', '-I', str(self.runner), str(GUARD), '--context', CTX, 'down', PREMADE, '--uid',
+                            'uid-premade-1', '--lease', lid], env=env, capture_output=True, text=True, timeout=60,
+                           stdin=subprocess.DEVNULL)
+        self.reload()
+        return p.returncode, json.loads(p.stdout)
+
+    def probes_sent(self):
+        return [b['metadata']['labels']['wcep.agent/fence-probe'] for b in self.k8s.get('probe_bodies', [])]
+
+
+class FenceProbe(FenceCase):
+    EXPECT = {  # state: (canary, mode, scope, armed)
+        'armed': ('finegrained', 'enforcing', 'finegrained', True),
+        'audit': ('finegrained', 'audit', 'finegrained', False),
+        'disarmed': ('disarmed', 'absent', 'unknown', False),
+        'shared': ('shared', 'enforcing', 'shared', False),
+        'main_shared': ('finegrained', 'enforcing', 'shared', False),
+        'engine_unavailable': ('engine_unavailable', 'engine_unavailable', 'finegrained', True),
+        'main_absent': ('finegrained', 'absent', 'finegrained', False),
+        'canary_absent': ('disarmed', 'enforcing', 'finegrained', False),
+        'other_webhook': ('probe_failed', 'probe_failed', 'unknown', False),
+        'other_rule': ('probe_failed', 'enforcing', 'finegrained', False),
+        'forbidden': ('probe_failed', 'probe_failed', 'unknown', False),
+    }
+
+    def test_each_server_answer_maps_to_its_verdict(self):
+        for state, (canary, mode, scope, armed) in self.EXPECT.items():
+            with self.subTest(state=state):
+                self.k8s['fence'] = state
+                self.flush()
+                body = self.ok('--context', CTX, 'fence', 'probe', PREMADE, host_entry=True)
+                self.assertEqual((body['canary'], body['mode'], body['scope'], body['armed']),
+                                 (canary, mode, scope, armed), body)
+                self.assertEqual(body['lease_fence'], 'true')
+                self.assertEqual('cause' in body, not armed, body)
+
+    def test_a_removed_policy_is_never_armed_and_says_why(self):
+        # The steward's negative case: with the policy (or its entry) gone, both probe Pods are admitted. That
+        # must read as a fence state with its causes, the 0-replica controller among them, never as armed.
+        self.k8s['fence'] = 'disarmed'
+        self.flush()
+        body = self.ok('--context', CTX, 'fence', 'probe', PREMADE, host_entry=True)
+        self.assertFalse(body['armed'])
+        self.assertIn('scaled to 0 replicas', body['cause'])
+        self.assertIn('policies or the namespace label are gone', body['cause'])
+
+    def test_the_probe_pods_are_dry_runs_that_request_no_gpu(self):
+        self.ok('--context', CTX, 'fence', 'probe', PREMADE, host_entry=True)
+        creates = [c for c in self.kubectl_calls() if c['pos'][:1] == ['create']]
+        self.assertEqual(len(creates), 2)
+        for c in creates:
+            self.assertEqual(c['flags'].get('--dry-run'), 'server')
+        self.assertEqual(self.writes(), [])
+        bodies = self.k8s['probe_bodies']
+        self.assertEqual([b['metadata']['labels']['wcep.agent/fence-probe'] for b in bodies], ['canary', 'mode'])
+        self.assertEqual(bodies[1]['metadata']['labels'][LEASE_LABEL], 'lse_fenceprobe0')
+        self.assertNotIn('nvidia.com/gpu', json.dumps(bodies))
+
+    def test_each_probe_is_counted_in_the_host_ledger(self):
+        self.ok('--context', CTX, 'fence', 'probe', PREMADE, host_entry=True)
+        [line] = [l for l in self.ledger(host=True) if l['object'] == f'FenceProbe/{PREMADE}']
+        self.assertEqual((line['direction'], line['canary'], line['mode'], line['armed']),
+                         ('probe', 'finegrained', 'enforcing', True))
+
+    def test_inspect_reports_the_fence_label(self):
+        body = self.ok('--context', CTX, 'inspect', PREMADE, host_entry=True)
+        self.assertEqual(body['lease_fence'], 'true')
+
+
+class FenceGate(FenceCase):
+    def test_an_unenrolled_claim_refuses_without_asking_the_plugin(self):
+        del self.k8s['namespaces'][PREMADE]['metadata']['labels'][FENCE_LABEL]
+        self.flush()
+        rc, body, _ = self.claim()
+        self.assertEqual(body.get('code'), 'namespace_not_enrolled', body)
+        self.assertEqual(self.bb.get('claim_calls', []), [])
+        self.assertEqual(self.writes(), [])
+
+    def test_a_claim_opens_the_gate_once_and_a_replay_changes_nothing(self):
+        rc, body, _ = self.claim()
+        self.assertEqual(rc, 0, body)
+        lid = body['lease_id']
+        self.assertEqual(self.gate(), (lid, 'active', '1'))
+        self.assertEqual((body['seq'], body['fence']['state']), (1, 'active'), body)
+        [write] = self.writes()
+        self.assertEqual((write['pos'][:1], write['flags'].get('-f')), (['create'], '-'), 'the first open is a create-only POST')
+        rc, again, _ = self.claim()
+        self.assertEqual((rc, again['lease_id'], again['seq']), (0, lid, 1), again)
+        self.assertEqual(len(self.writes()), 1, 'a replay over an open gate writes nothing')
+
+    def test_a_replay_that_returns_released_writes_no_gate(self):
+        self.bb['lose_claim_reply'] = True
+        self.flush()
+        rc, body, _ = self.claim()
+        self.assertEqual(body.get('code'), 'lease_unavailable', body)
+        [lid] = self.bb['leases']
+        self.bb['leases'][lid]['state'] = 'released'
+        self.flush()
+        rc, body, _ = self.claim()
+        self.assertEqual((body['lease_id'], body['state']), (lid, 'released'), body)
+        self.assertIsNone(self.gate())
+        self.assertEqual(self.writes(), [])
+
+    def test_a_gate_teardown_closed_is_never_reopened(self):
+        lid = self.claimed()
+        self.set_gate(lid, 'closing', 1)
+        rc, body, _ = self.claim()
+        self.assertEqual(rc, 0, body)
+        self.assertEqual(body['fence']['state'], 'closing', body)
+        self.assertEqual(self.gate(), (lid, 'closing', '1'))
+        self.assertEqual([w for w in self.writes() if w['pos'][:1] == ['patch']], [])
+        rc, body, _ = self.apply(dgd('cpu', component('Frontend', ctype='frontend', lease_id=lid)), ns=PREMADE)
+        self.assertEqual(body.get('code'), 'fence_not_open', body)
+
+    def test_a_gate_above_this_claims_seq_refuses_fence_mismatch(self):
+        self.set_gate('lse_later0001', 'active', 5)
+        rc, body, _ = self.claim()
+        self.assertEqual(body.get('code'), 'fence_mismatch', body)
+        self.assertEqual(self.gate(), ('lse_later0001', 'active', '5'))
+
+    def test_a_new_claim_moves_the_gate_up_over_an_older_lease(self):
+        self.k8s['objects'][PREMADE]  # an earlier claim's gate, closed
+        self.set_gate('lse_earlier001', 'closing', 1)
+        self.bb['seq_floor'] = 1
+        self.flush()
+        rc, body, _ = self.claim()
+        self.assertEqual(rc, 0, body)
+        self.assertEqual(self.gate(), (body['lease_id'], 'active', '2'))
+        [patch] = [w for w in self.writes() if w['pos'][:1] == ['patch']]
+        tests = [op for op in json.loads(patch['flags']['-p']) if op['op'] == 'test']
+        self.assertEqual({t['path'] for t in tests},
+                         {'/metadata/uid', '/metadata/resourceVersion', '/data/seq', '/data/lease_id', '/data/state'})
+
+    def test_a_kill_after_commit_before_the_gate_then_teardown_completes(self):
+        for before in (None, ('lse_earlier001', 'active', 0)):
+            with self.subTest(gate_before=before):
+                self.setUp()
+                if before:
+                    self.set_gate(*before)
+                # The claim commits, but its reply is an error, so no gate is written in that run.
+                self.bb['claim_error_after_commit'] = True
+                self.flush()
+                rc, body, _ = self.claim()
+                self.assertEqual(body.get('code'), 'internal', body)
+                [lid] = [l for l in self.bb['leases'] if l != 'lse_earlier001']
+                self.bb['leases'][lid]['state'] = 'releasing'
+                self.flush()
+                body = self.ok('--context', CTX, 'down', PREMADE, '--uid', 'uid-premade-1', '--lease', lid,
+                               host_entry=True)
+                self.assertTrue(body['complete'], body)
+                self.assertEqual(body['fence'], {'lease_id': lid, 'seq': 1, 'state': 'closing'})
+                self.assertEqual(self.gate(), (lid, 'closing', '1'))
+                # The late open, a replay of the pending request, now meets an ended lease: it writes nothing.
+                self.bb['leases'][lid]['state'] = 'released'
+                self.flush()
+                rc, body, _ = self.claim()
+                self.assertEqual(self.gate(), (lid, 'closing', '1'))
+
+    def test_claimed_writes_refuse_until_the_gate_is_open(self):
+        lid = self.claimed()
+        del self.k8s['objects'][PREMADE][GATE]
+        self.flush()
+        rc, body, _ = self.apply(dgd('cpu', component('Frontend', ctype='frontend', lease_id=lid)), ns=PREMADE)
+        self.assertEqual(body.get('code'), 'fence_not_open', body)
+        self.assertNotIn(['k8s', 'lease', 'op', 'begin', lid], self.bb_calls())
+        rc, body, _ = self.claim()
+        self.assertEqual(rc, 0, body)
+        rc, body, _ = self.apply(dgd('cpu', component('Frontend', ctype='frontend', lease_id=lid)), ns=PREMADE)
+        self.assertEqual(rc, 0, body)
+
+    def test_the_gate_is_never_applied_or_deleted(self):
+        lid = self.claimed()
+        rc, body, _ = self.apply({'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': 'wcep-agent-fence'},
+                                  'data': {'lease_id': lid, 'state': 'active', 'seq': '9'}}, ns=PREMADE)
+        self.assertEqual(body.get('code'), 'fence_protected', body)
+        body = self.refused('fence_protected', '--context', CTX, '-n', PREMADE, 'delete', 'cm/wcep-agent-fence')
+        self.assertEqual(self.gate(), (lid, 'active', '1'))
+
+    def test_teardown_leaves_the_gate_in_place_closing(self):
+        lid = self.claimed(state='releasing')
+        body = self.ok('--context', CTX, 'down', PREMADE, '--uid', 'uid-premade-1', '--lease', lid, host_entry=True)
+        self.assertTrue(body['complete'], body)
+        self.assertEqual(self.gate(), (lid, 'closing', '1'))
+        self.assertNotIn('wcep-agent-fence', json.dumps(body['deleted']))
+
+
+class FenceArmed(FenceCase):
+    def test_a_complete_teardown_reports_the_fence_the_drain_and_armed(self):
+        lid = self.claimed(state='releasing')
+        body = self.ok('--context', CTX, 'down', PREMADE, '--uid', 'uid-premade-1', '--lease', lid, host_entry=True)
+        self.assertEqual((body['complete'], body['armed'], body['lease_fence']), (True, 'continuous', 'true'), body)
+        self.assertEqual(body['fence'], {'lease_id': lid, 'seq': 1, 'state': 'closing'})
+        self.assertIn('drain_monotonic_seconds', body)
+        self.assertGreaterEqual(body['probes'], 2, 'before the close and after the final read')
+
+    def test_a_probe_that_is_not_armed_keeps_the_charge(self):
+        for state in ('disarmed', 'audit', 'shared', 'main_shared', 'main_absent', 'canary_absent', 'other_webhook'):
+            for when in ('before the close', 'after the final read'):
+                with self.subTest(state=state, when=when):
+                    self.setUp()
+                    lid = self.claimed(state='releasing')
+                    self.k8s['fence_seq'] = [state] if when == 'before the close' else ['armed', state]
+                    self.flush()
+                    rc, body, _ = self.teardown('down', lid)
+                    self.assertEqual(body.get('code'), 'teardown_incomplete', body)
+                    self.assertTrue(body.get('fence_disarmed'), body)
+                    self.assertEqual(body['probe']['canary'], FenceProbe.EXPECT[state][0], body)
+                    self.assertIn('cause', body['probe'])
+
+    def test_a_removed_policy_never_completes_however_often_teardown_runs(self):
+        lid = self.claimed(state='releasing')
+        self.k8s['fence'] = 'disarmed'
+        self.flush()
+        for _ in range(3):
+            rc, body, _ = self.teardown('down', lid)
+            self.assertEqual(body.get('code'), 'teardown_incomplete', body)
+            self.assertNotIn('complete', body)
+        self.assertEqual(self.gate(), (lid, 'closing', '1'), 'the gate is closed anyway')
+
+    def test_the_drain_waits_120_monotonic_seconds_and_probes_every_5(self):
+        lid = self.claimed(state='releasing')
+        rc, body = self.clocked_down(lid)
+        self.assertEqual(rc, 0, body)
+        self.assertEqual(body['drain_monotonic_seconds'], 120)
+        self.assertEqual(body['probes'], 26, 'before the close, every 5 s through 120 s, after the final read')
+        self.assertTrue(all(s <= 5 for s in self.k8s['clock_sleeps']), self.k8s['clock_sleeps'])
+        self.assertEqual(self.probes_sent(), ['canary', 'mode'] * 26)
+
+    def test_a_wall_clock_step_does_not_end_the_drain(self):
+        # The runner moves wall time a day ahead; only monotonic time, moved by sleep, may end the drain.
+        lid = self.claimed(state='releasing')
+        rc, body = self.clocked_down(lid)
+        self.assertEqual(self.k8s['clock_elapsed'], 120, body)
+
+    def test_a_disarmed_probe_in_the_drain_keeps_the_charge(self):
+        lid = self.claimed(state='releasing')
+        self.k8s['fence_seq'] = ['armed'] * 5 + ['disarmed']
+        self.flush()
+        rc, body = self.clocked_down(lid)
+        self.assertEqual(body.get('code'), 'teardown_incomplete', body)
+        self.assertTrue(body['fence_disarmed'])
+        self.assertLess(self.k8s['clock_elapsed'], 120, 'a disarmed probe ends the wait: it cannot complete anyway')
+
+    def test_an_open_attempt_keeps_teardown_incomplete_long_after_the_drain(self):
+        lid = self.claimed()
+        self.bb['leases'][lid]['attempts'] = [{'attempt': 'att_0123456789ab', 'verb': 'create', 'kind': 'DynamoGraphDeployment',
+                                               'name': 'w', 'uid': None, 'rv': None, 'outcome': None}]
+        self.bb['leases'][lid]['state'] = 'releasing'
+        self.flush()
+        rc, body = self.clocked_down(lid)
+        self.assertEqual(body.get('code'), 'teardown_incomplete', body)
+        self.assertGreaterEqual(self.k8s['clock_elapsed'], 120)
+        self.assertEqual(len(body['unresolved']), 1)
+
+    def test_a_rerun_waits_the_drain_again_from_its_own_close(self):
+        lid = self.claimed()
+        self.bb['leases'][lid]['attempts'] = [{'attempt': 'att_0123456789ab', 'verb': 'create', 'kind': 'DynamoGraphDeployment',
+                                               'name': 'w', 'uid': None, 'rv': None, 'outcome': None}]
+        self.bb['leases'][lid]['state'] = 'releasing'
+        self.flush()
+        self.clocked_down(lid)
+        self.bb['leases'][lid]['attempts'] = []
+        self.flush()
+        rc, body = self.clocked_down(lid)
+        self.assertEqual(rc, 0, body)
+        self.assertEqual((body['drain_monotonic_seconds'], self.k8s['clock_elapsed']), (120, 120))
+
+    def test_the_drain_env_is_for_tests_and_the_default_is_120(self):
+        lid = self.claimed(state='releasing')
+        rc, body = self.clocked_down(lid, {'K8S_GUARD_FENCE_DRAIN_SECONDS': '10', 'K8S_GUARD_FENCE_PROBE_SECONDS': '5'})
+        self.assertEqual((rc, body['drain_monotonic_seconds'], body['probes']), (0, 10, 4), body)
+
+    def test_a_retired_fence_needs_no_label_and_a_disarmed_canary(self):
+        lid = self.claimed(state='releasing')
+        before = len(self.writes())
+        url = 'https://example.test/proof/1'
+        body = self.refused('fence_not_retired', '--context', CTX, 'down', PREMADE, '--uid', 'uid-premade-1', '--lease',
+                            lid, '--fence-retired', url, host_entry=True)
+        self.assertIn('label', body['error'])
+        del self.k8s['namespaces'][PREMADE]['metadata']['labels'][FENCE_LABEL]
+        self.flush()
+        body = self.refused('fence_not_retired', '--context', CTX, 'down', PREMADE, '--uid', 'uid-premade-1', '--lease',
+                            lid, '--fence-retired', url, host_entry=True)
+        self.assertIn('canary', body['error'])
+        self.assertEqual(len(self.writes()), before, 'a refused retire writes nothing')
+
+    def test_a_retired_fence_completes_and_records_the_proof(self):
+        lid = self.claimed(state='releasing')
+        del self.k8s['namespaces'][PREMADE]['metadata']['labels'][FENCE_LABEL]
+        self.k8s['fence'] = 'disarmed'
+        self.flush()
+        url = 'https://example.test/proof/1'
+        body = self.ok('--context', CTX, 'down', PREMADE, '--uid', 'uid-premade-1', '--lease', lid, '--fence-retired',
+                       url, host_entry=True)
+        self.assertEqual((body['complete'], body['armed'], body['lease_fence']), (True, 'retired', None), body)
+        self.assertEqual(body['fence_retired_proof'], url)
+        self.assertEqual(self.bb['leases'][lid]['fence_retired_proof'], url)
+        self.assertIn(['k8s', 'lease', 'fence-retired', lid, '--proof', url], self.bb_calls())
+
+
+# A v1.15.2 PolicyReport and a v1.15.2 Event, in the shapes of Kyverno's own test data at v1.15.2:
+# test/conformance/chainsaw/webhook-configurations/match-conditions-standard/report-assert.yaml (the report)
+# and test/conformance/chainsaw/events/policy/policy-violation/event-assert.yaml (the event), with the
+# resource-violation message pkg/event/events.go NewResourceViolationEvent builds and the kind fixture saw.
+REPORT = {'apiVersion': 'wgpolicyk8s.io/v1alpha2', 'kind': 'PolicyReport',
+          'metadata': {'namespace': PREMADE, 'name': 'uid-pod-1',
+                       'ownerReferences': [{'apiVersion': 'v1', 'kind': 'Pod', 'name': 'someones-pod'}]},
+          'scope': {'apiVersion': 'v1', 'kind': 'Pod', 'name': 'someones-pod', 'namespace': PREMADE, 'uid': 'uid-pod-1'},
+          'summary': {'error': 0, 'fail': 1, 'pass': 0, 'skip': 0, 'warn': 0},
+          'results': [{'policy': 'agent-lease-fence', 'rule': 'pods-need-the-open-lease', 'result': 'fail',
+                       'message': 'agent-lease-fence (owner alice ...): Gate: missing', 'source': 'kyverno',
+                       'scored': True, 'timestamp': {'nanos': 0, 'seconds': 1795400000}}]}
+
+
+def event(name, uid, message, count=1, last='2026-11-22T21:00:00Z'):
+    return {'apiVersion': 'v1', 'kind': 'Event', 'metadata': {'name': f'{name}.18', 'uid': f'ev-{name}-{count}'},
+            'involvedObject': {'apiVersion': 'v1', 'kind': 'Pod', 'name': name, 'namespace': PREMADE, 'uid': uid},
+            'type': 'Warning', 'reason': 'PolicyViolation', 'reportingComponent': 'kyverno-admission',
+            'message': message, 'count': count, 'firstTimestamp': '2026-11-22T20:59:00Z', 'lastTimestamp': last}
+
+
+VIOLATION = 'policy agent-lease-fence/pods-need-the-open-lease fail: agent-lease-fence (owner alice ...): Gate: missing'
+
+
+class FenceRecord(FenceCase):
+    def record(self):
+        return self.ok('--context', CTX, 'fence', 'record', host_entry=True)  # the pre-made namespace by default
+
+    def rows(self):
+        path = self.state_home / f'k8s-fence/{PROFILE}.jsonl'
+        return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+
+    def test_rows_come_from_the_report_and_the_event_shapes_only(self):
+        self.k8s['policyreports.wgpolicyk8s.io'] = {PREMADE: [REPORT]}
+        self.k8s['events'] = {PREMADE: [event('someones-pod', 'uid-pod-1', VIOLATION)]}
+        self.flush()
+        body = self.record()
+        self.assertEqual(body['new_rows'], 2, body)
+        report_row, event_row = self.rows()
+        self.assertEqual((report_row['source'], report_row['name'], report_row['rule'], report_row['result']),
+                         ('report', 'someones-pod', 'pods-need-the-open-lease', 'fail'))
+        self.assertEqual((event_row['source'], event_row['name'], event_row['reason']),
+                         ('event', 'someones-pod', 'PolicyViolation'))
+        for row in self.rows():
+            self.assertNotIn('user', row)
+            self.assertNotIn('operation', row)
+
+    def test_rows_are_appended_once_across_runs(self):
+        self.k8s['events'] = {PREMADE: [event('someones-pod', 'uid-pod-1', VIOLATION)]}
+        self.flush()
+        self.record()
+        self.assertEqual(self.record()['new_rows'], 0)
+        self.k8s['events'] = {PREMADE: [event('someones-pod', 'uid-pod-1', VIOLATION, count=2,
+                                              last='2026-11-22T21:10:00Z')]}
+        self.flush()
+        self.assertEqual(self.record()['new_rows'], 1, 'the same Event seen again with a new count is new')
+        self.assertEqual(len(self.rows()), 2)
+
+    def test_probe_rows_are_left_out(self):
+        self.k8s['events'] = {PREMADE: [
+            event('wcep-fence-probe-mode', 'uid-x', VIOLATION),
+            event('wcep-fence-probe-canary', 'uid-y', 'policy agent-lease-fence-canary/probe-canary fail: ...'),
+            event('someones-pod', 'uid-pod-1', VIOLATION)]}
+        self.flush()
+        self.record()
+        self.assertEqual([r['name'] for r in self.rows()], ['someones-pod'])
+
+    def test_the_ledger_counts_the_probes_it_sent_by_rule(self):
+        self.probe()
+        self.probe()
+        body = self.record()
+        self.assertEqual(body['probes_sent'], {'probe-canary': 2, 'pods-need-the-open-lease': 2}, body)
+
+
+class TrialClaim(FenceCase):
+    def trial(self, gpus='1'):
+        self.bb['claims'] = 'on'
+        self.flush()
+        return self.guard('--context', CTX, '-n', PREMADE, 'ns', 'claim', '--gpus', gpus, '--hours', '1',
+                          '--audit-trial')
+
+    def test_a_trial_asks_with_audit_trial_and_only_one_gpu(self):
+        rc, body, _ = self.trial(gpus='2')
+        self.assertEqual(body.get('code'), 'usage', body)
+        rc, body, _ = self.trial()
+        self.assertEqual((rc, body['trial']), (0, True), body)
+        argv = next(c for c in self.bb_calls() if c[:4] == ['k8s', 'lease', 'acquire', '--claim'])
+        self.assertIn('--audit-trial', argv)
+
+    def test_a_gpu_manifest_under_a_trial_refuses(self):
+        rc, body, _ = self.trial()
+        lid = body['lease_id']
+        rc, body, _ = self.apply(gpu_dgd('w', 1, lid), ns=PREMADE)
+        self.assertEqual(body.get('code'), 'trial_gpu_refused', body)
+        rc, body, _ = self.apply(dgd('mocker', component('Frontend', ctype='frontend', lease_id=lid)), ns=PREMADE)
+        self.assertEqual(rc, 0, body)
+
+    def test_a_build_under_a_trial_refuses(self):
+        rc, body, _ = self.trial()
+        body = self.refused('trial_build_refused', '--context', CTX, '-n', PREMADE, 'build', 'run', '--repo',
+                            'https://github.com/example/repo', '--commit', 'a' * 40, '--dockerfile', 'Dockerfile',
+                            '--image', 'img', '--arch', 'arm64')
+
+    def test_the_trial_steps_refuse_outside_a_trial(self):
+        lid = self.claimed()
+        self.refused('trial_only', '--context', CTX, '-n', PREMADE, 'fence', 'trial', 'close')
+        self.refused('trial_only', '--context', CTX, '-n', PREMADE, 'fence', 'trial', 'delete-pod', 'w-decode')
+        self.assertEqual(self.gate(), (lid, 'active', '1'))
+
+    def test_the_trial_closes_the_gate_and_deletes_only_its_own_pod(self):
+        rc, body, _ = self.trial()
+        lid = body['lease_id']
+        mine = pod('mocker', 0, name='mocker-0')
+        mine['metadata'].update(uid='uid-mocker-0', resourceVersion='41', labels={LEASE_LABEL: lid})
+        other = pod('mocker', 0, name='other-0')
+        other['metadata'].update(uid='uid-other-0', resourceVersion='42', labels={LEASE_LABEL: 'lse_someone9999'})
+        self.add_pod(mine, ns=PREMADE)
+        self.add_pod(other, ns=PREMADE)
+        body = self.ok('--context', CTX, '-n', PREMADE, 'fence', 'trial', 'close')
+        self.assertEqual(self.gate(), (lid, 'closing', '1'))
+        self.refused('object_not_yours', '--context', CTX, '-n', PREMADE, 'fence', 'trial', 'delete-pod', 'other-0')
+        body = self.ok('--context', CTX, '-n', PREMADE, 'fence', 'trial', 'delete-pod', 'mocker-0')
+        self.assertEqual(self.k8s['deleted_pods'], ['mocker-0'])
+        [a] = self.bb['leases'][lid]['attempts']
+        self.assertEqual((a['verb'], a['kind'], a['name'], a['outcome']), ('delete', 'Pod', 'mocker-0', 'committed'))
+
+    def test_a_trial_teardown_completes_under_audit_as_trial(self):
+        rc, body, _ = self.trial()
+        lid = body['lease_id']
+        self.bb['leases'][lid]['state'] = 'releasing'
+        self.k8s['fence'] = 'audit'
+        self.flush()
+        body = self.ok('--context', CTX, 'down', PREMADE, '--uid', 'uid-premade-1', '--lease', lid, host_entry=True)
+        self.assertEqual((body['complete'], body['armed']), (True, 'trial'), body)
+
+    def test_a_trial_teardown_with_the_policy_gone_keeps_the_charge(self):
+        rc, body, _ = self.trial()
+        lid = body['lease_id']
+        self.bb['leases'][lid]['state'] = 'releasing'
+        self.k8s['fence'] = 'disarmed'
+        self.flush()
+        rc, body, _ = self.teardown('down', lid)
+        self.assertEqual(body.get('code'), 'teardown_incomplete', body)
+
+
+class FenceRender(GuardCase):
+    def test_render_fills_the_template_from_the_profiles_and_needs_no_cluster(self):
+        self.profiles.write_text(self.profiles.read_text().replace(
+            'namespace_prefix = "dyntest-alice-"', f'namespace_prefix = "dyntest-alice-"\npremade_namespace = "{PREMADE}"', 1))
+        body = self.ok('--context', CTX, 'fence', 'render', '--owner', 'alice-example', '--contact', 'example-contact',
+                       '--runbook', 'runbook section 10')
+        self.assertIn("request.namespace in ['dyntest-alice-agent']", body['policy'])
+        self.assertIn("name: 'bot-example-agent'", body['policy'])
+        self.assertIn('name: agent-lease-fence-canary', body['policy'])
+        self.assertEqual(self.kubectl_calls(), [], 'render talks to no cluster')
+
+
+class FenceVerdictMutants(unittest.TestCase):
+    """armed() needs both entries: the canary refused by its own policy's entry, and the mode Pod refused by the
+    main policy's entry (the Pod rule excludes the canary-labelled Pod, so neither entry can stand in for the
+    other). A verdict that drops either half must disagree with FenceProbe.EXPECT on the fakes' answers."""
+
+    RULES = SKILL / 'scripts/k8s_fence_rules.py'
+    MUTANTS = {
+        'the canary half is dropped': ("return (verdict.get('canary') in ('finegrained', 'engine_unavailable')\n"
+                                       "            and (", "return (True\n            and ("),
+        'the main-entry half is dropped': ("or (verdict.get('mode') == 'enforcing' and verdict.get('mode_entry') == "
+                                           "'finegrained'))", "or verdict.get('mode') in ('enforcing', 'absent', 'audit'))"),
+    }
+
+    def verdicts(self, source):
+        module = {'__name__': 'k8s_fence_rules_mutant'}
+        exec(compile(source, str(self.RULES), 'exec'), module)
+        out = {}
+        for state, answers in FENCE_ANSWERS.items():
+            def answer(which):
+                a = answers[which]
+                if a is None or a.startswith('Warning:'):
+                    return 0, a or ''
+                return 1, a.replace('{ns}', PREMADE).replace('{name}', f'wcep-fence-probe-{which}')
+            out[state] = module['fence_verdict'](*answer('canary'), *answer('mode'))['armed']
+        return out
+
+    def test_the_real_verdict_matches_the_table(self):
+        got = self.verdicts(self.RULES.read_text())
+        self.assertEqual(got, {k: v[3] for k, v in FenceProbe.EXPECT.items()})
+
+    def test_each_half_of_armed_is_load_bearing(self):
+        source = self.RULES.read_text()
+        want = {k: v[3] for k, v in FenceProbe.EXPECT.items()}
+        for what, (old, new) in self.MUTANTS.items():
+            with self.subTest(mutant=what):
+                self.assertEqual(source.count(old), 1, old)
+                self.assertNotEqual(self.verdicts(source.replace(old, new)), want, f'{what}: no row noticed')
+
 
 if __name__ == '__main__':
     unittest.main()

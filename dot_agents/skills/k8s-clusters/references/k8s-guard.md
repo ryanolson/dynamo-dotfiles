@@ -9,7 +9,7 @@ Every command prints one JSON object on stdout. A refusal exits non-zero with `{
 | Command | Who may run it | What it does |
 |---|---|---|
 | `ns create <purpose> --issue <n> --hours <h>` | a bb thread | Creates `<namespace_prefix><n>-<purpose>-<suffix>`, where the suffix is 10 random letters and digits from the CSPRNG, with the opt-in labels, `owner`, `wcep.agent/thread`, `wcep.agent/issue`, and the annotation `wcep.agent/expires-at`. `h` is at most 4. A name that exists is refused, and a name longer than 63 characters. It records the name and UID in the thread's ledger. Where the bot may not create a namespace (Forbidden at the cluster scope, as on our clusters), it refuses `namespace_create_denied` and names `ns claim`. |
-| `-n <premade> ns claim --gpus <n> --hours <h>` | a bb thread | Claims the profiles' pre-made namespace (`[bot] premade_namespace`) with a `k8s-leases` lease. See "A claimed namespace" below. It writes nothing to the cluster. |
+| `-n <premade> ns claim --gpus <n> --hours <h> [--audit-trial]` | a bb thread | Claims the profiles' pre-made namespace (`[bot] premade_namespace`) with a `k8s-leases` lease, then opens the fence's gate for it. Refuses `namespace_not_enrolled` without the fence label. `--audit-trial` (with `--gpus 1`) asks for a trial claim. See "A claimed namespace" and "The fence policy" below. |
 | `-n <ns> lease acquire --gpus <n> --hours <h>` | the namespace's thread | Calls `bb k8s lease acquire` with the profile name, the namespace UID, the thread, and the profile's GPU type. Writes the lease record (below). Prints the pod label and pod affinity that GPU pods must carry. |
 | `-n <ns> secret hf\|ngc\|ngc-push` | the namespace's thread | Creates the Secret from `fleet secret get`, on stdin only, with `kubectl create -f -`: create-only, labelled with the namespace UID and the lease. `ngc` is the pull-only key (`op://Fleet/NGC Pull Key/credential`); `ngc-push` is the push credential and is never used for a pull secret. `ngc-push` also needs `--exposure-accepted`, and refuses `push_not_approved` without it: the value is readable by everyone in the access group once it is in the namespace. The flag is a stated step, not an authority check. Prints only the secret's name. |
 | `-n <ns> secret git --repo <owner>/<repo>` | the namespace's thread | Creates the read-only deploy key as Secret `git` (key `id_ed25519`, stored with one trailing newline) and the pinned GitHub host key as ConfigMap `git-known-hosts`, both from the guard, both lease-labelled. The ref is the convention `op://Fleet/<owner>-<repo> deploy key/private key`; the item's `private key` field must be the OpenSSH key form. The key is never printed. It refuses `secret_unavailable` when the item is absent; there is no fallback. |
@@ -19,11 +19,15 @@ Every command prints one JSON object on stdout. A refusal exits non-zero with `{
 | `-n <ns> build delete <job>` | the namespace's thread, under its live lease | Deletes the Job with `propagationPolicy: Background`, so its Pods go with it. |
 | `-n <ns> apply -f <file>` | the namespace's thread | Applies DGDs, ConfigMaps and ClusterIP Services, after the checks below. |
 | `-n <ns> delete <kind>/<name>` | the namespace's thread | Deletes one DGD, Job, ConfigMap, Service, Secret, PVC or PodCliqueSet, with its UID and `resourceVersion` as preconditions. A Job's delete carries `propagationPolicy: Background`. An object labelled with another lease is refused (`object_not_yours`); in a claimed namespace, so is one without this lease's label. The lease record, the model cache PVC and the pull secret are refused. Like `apply`, it takes the lease's slot, or needs a namespace that holds no GPUs. |
-| `down <ns> [--uid <uid>] [--lease <id>]` | the namespace's thread, or anyone with teardown authority | Releases an active lease first (owner only). Deletes each DGD labelled with the lease being torn down: it reads the DGD again, checks that its UID is still the one the list gave and that its lease label still holds, then deletes it under that listed UID and the `resourceVersion` just read. A DGD that changed in between is left (`dgds_kept`), not deleted. Waits, at most `K8S_GUARD_DOWN_WAIT_SECONDS` (300), for every GPU pod in the namespace to go. Then deletes the namespace with its UID as a precondition, whatever is left, and reports `gpu_pods_left`. A namespace already being deleted gets no second delete (`terminating: true`). With no lease id (no `--lease` and no record) it deletes no DGD and says so in `dgds_skipped`. In a claimed namespace it never deletes the namespace: see "A claimed namespace". |
+| `down <ns> [--uid <uid>] [--lease <id>] [--fence-retired <url>]` | the namespace's thread, or anyone with teardown authority | Releases an active lease first (owner only). Deletes each DGD labelled with the lease being torn down: it reads the DGD again, checks that its UID is still the one the list gave and that its lease label still holds, then deletes it under that listed UID and the `resourceVersion` just read. A DGD that changed in between is left (`dgds_kept`), not deleted. Waits, at most `K8S_GUARD_DOWN_WAIT_SECONDS` (300), for every GPU pod in the namespace to go. Then deletes the namespace with its UID as a precondition, whatever is left, and reports `gpu_pods_left`. A namespace already being deleted gets no second delete (`terminating: true`). With no lease id (no `--lease` and no record) it deletes no DGD and says so in `dgds_skipped`. In a claimed namespace it never deletes the namespace: see "A claimed namespace". `--fence-retired` is exit 2 of "The fence policy". |
 | `expire <ns> [--uid <uid>] [--lease <id>]` | anyone with teardown authority | Sets every replica count of every DGD labelled with the lease being torn down to 0. With no lease id (no `--lease` and no record) it scales nothing and says so in `dgds_skipped`. |
 | `extend <ns> [--uid <uid>] [--lease <id>]` | anyone | Copies the lease's `expires_at`, unchanged, into the lease record. It only replaces the record `lease acquire` wrote, under the `resourceVersion` it read, and never creates one. The lease must be `active` and match the cluster, the namespace and the UID. It never moves the stored expiry earlier, so a late call cannot undo a newer extension. |
 | `-n <ns> selftest fences` | the namespace's thread | For the first run on a cluster. On the first DGD the guard applied, it sends each teardown fence once with a wrong UID, a stale `resourceVersion` or a wrong lease label: three JSON patches, two DGD deletes, a namespace delete (not in a claimed namespace, which gets no Namespace request at all), and a lease record replace. Each payload changes nothing even if the server ignored its fence. It prints each server response and reads the objects again. It fails with `fence_failed` unless every request was refused for its fence's own reason (`testing value`, `Precondition failed`, `the object has been modified`) and nothing changed. Another error, such as Forbidden, proves nothing. |
-| `inspect <ns>` | anyone | Read only. Prints `uid`, `thread`, `expires_at`, `dgd_gpus`, `pod_gpus`, `gpu_type`, `gpu_pods_left`, and also `allocation`, `lease_id`, `developer` and `agent_rbac` (the Namespace's two opt-in labels). A missing namespace gives code `not_found`; any other failure gives another code. |
+| `fence probe [<premade>]` | anyone | Read only: two server dry-run Pods. Prints `canary`, `mode`, `scope`, `armed`, the matched texts, `lease_fence`, and the `cause` when not armed. See "The fence policy". |
+| `fence render --owner <o> --contact <c> --runbook <r> [--bot-user <u>]` | anyone | Local, no cluster call: the two fence policies for ops, filled from the profiles. |
+| `fence record [<premade>]` | anyone | Read only: appends the audit window's new rows from PolicyReports and Kyverno Events. See "The recorder". |
+| `-n <premade> fence trial close` / `fence trial delete-pod <pod>` | the trial claim's thread | A trial claim's two trial-only steps; refused outside a trial (`trial_only`). |
+| `inspect <ns>` | anyone | Read only. Prints `uid`, `thread`, `expires_at`, `dgd_gpus`, `pod_gpus`, `gpu_type`, `gpu_pods_left`, and also `allocation`, `lease_id`, `developer` and `agent_rbac` (the Namespace's two opt-in labels), and `lease_fence` (the fence label). A missing namespace gives code `not_found`; any other failure gives another code. |
 
 Every command needs `--context`. `-n` can come anywhere.
 
@@ -52,16 +56,96 @@ On our clusters the bot cannot create a namespace. Ops made one per cluster for 
 - Every owner command in the pre-made namespace needs this thread's claim, and the plugin's lease must be `active` and name this thread, cluster, namespace, UID and GPU type. The ledger line only points at the lease. With no claim there are no writes, CPU-only included (`namespace_not_claimed`). `wcep.agent/thread` is never read there.
 - Teardown takes only the plugin's word (`revoking` or `releasing`). The namespace keeps no expiry, so there is no offline teardown; with the plugin unreachable, `down` and `expire` refuse `lease_unavailable`.
 - The owner's `down` releases the lease and returns. The plugin then runs `down` on a host, which:
+  0. probes the fence, closes its gate for this lease and `seq`, and reads it back ("The fence policy");
   1. resolves the lease's open write attempts from storage (below);
   2. scales the lease's DGDs to 0, then deletes each object labelled `wcep.agent/lease=<id>` of the kinds DGD, Job, PodCliqueSet, Service, ConfigMap, Secret and PVC (not the model cache PVC or the pull secret), each with its UID and `resourceVersion` as preconditions. A Job's delete carries `propagationPolicy: Background`, because a `batch/v1` Job delete otherwise orphans its Pods, which carry the lease label and would hold teardown open for the Job's 24-hour retention;
   3. reads the lease's labelled objects again, Jobs included, adding pods, PodCliques, Deployments and StatefulSets. Terminating pods count;
-  4. reports `complete` only when every attempt is resolved, nothing changed hands, every list was read, and nothing of the lease is left. Otherwise it refuses `teardown_incomplete`, with what it resolved and what is left.
+  4. waits the drain, probing the fence, then reads the inventory and probes once more;
+  5. reports `complete` only when every attempt is resolved, nothing changed hands, every list was read, nothing of the lease is left, the gate reads `closing` for it, and the fence was armed throughout. Otherwise it refuses `teardown_incomplete`, with what it resolved and what is left.
 - `down` never deletes, labels or patches the pre-made namespace. The plugin frees the lease's GPUs only through one transaction conditional on that completion (`k8s-leases` README). Running `down` again after a crash goes on from where it stopped.
 - A pod with the DGD's name label but not the lease label is never selected, waited for or deleted.
 
-Claims stay off until the admission webhook that counts controller writes exists: until then `k8s-leases` refuses every claim with `enforcement_unhealthy`.
+Claims stay off until the fence enforces: before every claim `k8s-leases` asks a host for `fence probe`, and refuses `enforcement_unhealthy`, with the probe's cause, unless it reads `enforcing` with scope `finegrained` (or `audit` for a trial). The gate is a code option of the plugin, never a setting.
 
 Install order: this guard calls `bb k8s lease attempt begin` on every leased write, in a namespace it created too, and `bb k8s lease latest` for a claim. A `k8s-leases` older than the claim protocol answers those with usage text, which the guard reads as an unreachable plugin, so every leased write would refuse `lease_unavailable`. Install the plugin first, then let hosts take this guard (`chezmoi update` or `chezmoi-headless-update`). The older guard works with the newer plugin.
+
+## The fence policy
+
+A claim of the pre-made namespace is fenced by two Kyverno ClusterPolicies that ops install: `agent-lease-fence` and `agent-lease-fence-canary`. The template is `policy/agent-lease-fence.template.yaml`; `fence render` fills it from the profiles. The policies see the request and one live read of the gate. They cannot see `k8s-leases`' database, a write in flight, or which thread the guard serves, and they enforce no GPU budget: the guard and `k8s-sweep` stay the budget's check.
+
+### Scope
+
+- **The webhook.** Each policy gets its own webhook entry, `validate.kyverno.svc-fail-finegrained-<policy>`, with `failurePolicy: Fail` and one match condition: the request is in the named pre-made namespace, and a ConfigMap only when it is the gate. The API server evaluates it, so a namespace that is not named never reaches Kyverno, even while Kyverno is down. The condition uses `has(request.name)`: the namespace controller's bulk delete carries no name, and a bare `request.name` is an error, which fails closed and leaves the namespace stuck Terminating (measured on kind).
+- **The policy.** Namespaces `<prefix>*` that carry the opt-in label `dynamo.nvidia.com/agent-lease-fence: "true"`. Ops set the label by hand after the install check; the bot cannot label a Namespace.
+- **The operations.** CREATE of Pods and of the bot's roots (DynamoGraphDeployment, Job, PodCliqueSet, Deployment, StatefulSet), and CREATE and UPDATE of the gate. Nothing else, so an outage never blocks a delete or a scale-down.
+
+### Two policies, not one
+
+On a policy's own webhook, Kyverno 1.15.2 evaluates the whole policy with the first rule-level failure action it finds (`pkg/webhooks/resource/handlers.go`, `engineresponse.go` `GetValidationFailureAction`). One always-enforcing rule would make every rule of the same policy enforce from install, and there would be no audit window. Measured on kind: with the canary as a rule of the main policy at `Audit`, a real unlabelled Pod was refused. So the canary is its own policy: it always enforces, and it refuses only the probe's canary Pod. The main policy is pure `Audit`, then `Enforce`. The main Pod rule excludes the canary-labelled Pod, so neither entry can answer for the other.
+
+### The gate
+
+ConfigMap `wcep-agent-fence` in the pre-made namespace holds `lease_id`, `state` (`active` or `closing`), `seq` and `uid`. `seq` is the claim's sequence from `k8s-leases`: strictly rising per namespace, never reused. The gate carries no lease label, and the guard never applies or deletes it (`fence_protected`).
+
+The policy's rule for writes to the gate, compared only as numbers (`"07"` is `"7"`):
+
+- only the bot writes it, with a numeric `seq`, a lease id, and a state of `active` or `closing`;
+- `seq` never goes down; the same `seq` keeps its lease; the same `seq` may go `active` to `closing`, never back;
+- a higher `seq` may set either state, and so may a create.
+
+A DELETE is not the policy's: Kyverno 1.15.2 never denies a DELETE on a policy's own webhook (measured on kind; the same rule denies through the shared webhook). A deleted gate reads `missing`, which denies every Pod, so the failure is safe. The one residual: once deleted, the gate can be created again at any `seq`, because a create is not ordered. The guard's own check covers its writes: it opens only over a lower `seq`, and refuses `fence_mismatch` over a higher one.
+
+**Open** (`ns claim`, after the plugin answers `active`): a create-only POST, or a JSON Patch that tests the version, `seq`, lease and state. A replay over an open gate writes nothing; a replay that answers `released` or `torn-down` writes nothing; a gate already `closing` for this lease and `seq` is left (teardown came first); a gate above this `seq` refuses `fence_mismatch`. If the write fails, the lease stands and no Pod can start: run `ns claim` again with the same terms. Every claimed write refuses `fence_not_open` until the gate reads `active` for its lease and `seq`.
+
+**Close** (step 0 of claimed teardown): write `closing` for this lease and `seq` over anything below it, and read it back. So a claim that committed but never opened its gate still completes, and a late open of the same `seq` is denied.
+
+What the Pod rule needs: the gate `active` for the Pod's lease label, and a controller owner. A Pod that lands after its roots are gone has a dangling owner, and the garbage collector removes it. The bot-root rule needs the gate `active` for the root's lease and a guard attempt stamp. A missing gate and a gate the policy could not read deny with different words (`Gate: missing`, `Gate: unreadable`).
+
+### The probe and "armed"
+
+`fence probe` sends two server dry-run Pod creates, with no GPU and tiny requests. They change nothing.
+
+- **The canary Pod** (`wcep.agent/fence-probe: canary`): `finegrained` when the canary policy's own entry refuses it with rule `probe-canary`; `shared` when the shared entry refuses it; `engine_unavailable` on `failed calling webhook` naming one of our two entries; `disarmed` when admitted; `probe_failed` for any other refusal, which proves nothing.
+- **The mode Pod** (a lease label no lease has): `enforcing` when the main policy's entry refuses it with `pods-need-the-open-lease`; `audit` when it is admitted with Kyverno's warning `policy agent-lease-fence.pods-need-the-open-lease: ...`; `absent` when admitted without it; `engine_unavailable` as above.
+- **Armed** = the canary refused by the canary policy's own entry (or `engine_unavailable`), **and** the mode Pod refused by the main policy's own entry (or `engine_unavailable`). Both entries are needed: with either policy removed, the probe reads not armed (measured).
+- **What it proves, and what it does not.** In Enforce the two refusals prove both entries exist and the main one enforces. An entry's name does not prove its expression: only the ops read at install does. In Audit the canary proves only its own entry; no probe proves the main entry, so the ops read is the only proof of it. During an outage, `failed calling webhook` names whichever of our entries the API server called first, so an outage proves one of our entries, not both.
+- **Not armed carries its cause**, in words an operator can act on, into the teardown report, the plugin's refusal and its `fence_disarmed` flag. Both Pods admitted reads: no fence webhook answered, because the policies or the label are gone, or Kyverno has no webhook entries.
+
+### The engine's failure modes
+
+- **Down, entries in place** (a crash, a node drain; replicas stay 1): Pod and root creates and gate writes in the pre-made namespace are refused; nothing outside it is touched; a delete and a non-gate ConfigMap write succeed. The probe reads `engine_unavailable`: armed. Measured on kind.
+- **Back after more than 100 s away**: Kyverno's watchdog empties its webhook list until its next reconcile. Measured on kind after 110 s away: the main entry was absent for about 10 s, starting 8 s after the pod was ready, and the probe read not armed through that window. A window shorter than the probe interval (5 s) would not be seen; the bot cannot read the webhook configuration to check (`references/bot.md`).
+- **The admission controller scaled to 0** (or its Deployment deleted): Kyverno deletes every one of its webhook configurations (`pkg/utils/runtime/utils.go` `IsGoingDown`, `pkg/webhooks/server.go` `cleanup`). Measured: both entries gone, both probe Pods admitted, not armed. The entries come back when it scales up.
+- **Ops switch to Audit, remove the label, or delete a policy**: denials stop; the probe reads not armed.
+- **A cluster whose mutating Kyverno webhook covers every Pod create** (one of our clusters has such a policy, which defaults GPU Pods to a scheduler): during an outage the API server calls that webhook first, and the probe's answer names it, not ours: `probe_failed`, not armed. Teardown then keeps the charge until Kyverno is back. That is the safe direction.
+
+Every not-armed reading keeps the lease's GPUs charged: a fence that is not armed never completes a teardown.
+
+### Claimed teardown with the fence
+
+1. Probe. 2. Close the gate and read it back. 3. Resolve the open attempts and delete the lease's roots (as before). 4. Drain: wait `K8S_GUARD_FENCE_DRAIN_SECONDS` (120) of monotonic time from this run's own read of `closing`, probing at least every `K8S_GUARD_FENCE_PROBE_SECONDS` (5). 5. Read the inventory. 6. Probe again.
+
+It reports `complete` only when, besides the phase-1 conditions, the gate read back `closing` for this lease and `seq`, the drain ran its full time, and every probe was armed. The report carries `fence`, `drain_monotonic_seconds`, `armed` (`continuous`, `trial` or `retired`), `lease_fence` and `probes`. A probe that is not armed ends the wait: `teardown_incomplete` with `fence_disarmed` and the probe, its cause included; the GPUs stay charged, and the next run starts with a new close and a new drain. A wall-clock step never ends the drain. The plugin checks the drain against its own 120 s, never the host's number.
+
+The drain is a wait before the final check, not a timer that frees GPUs. A Pod admitted while the gate was open that lands after the drain is not seen; its owner is gone, so garbage collection removes it, and `k8s-sweep` flags it (`gpus_no_lease`). One probe is two dry-run creates: one per claim, one every 5 minutes per live lease (the plugin's tick), about 26 per teardown run.
+
+**Two ways out of a `fence_disarmed` strand.** Re-arm (ops restore Enforce, the label, the policies, or Kyverno's replicas): the next teardown completes. Or retire the fence for good: ops remove the label and both policies, the on-call engineer gathers the proof, and `k8s-guard down <premade> --lease <id> --fence-retired <proof URL>`, run on a host, records the proof with the plugin. It refuses `fence_not_retired` while the namespace carries the label or the canary reads anything but `disarmed`. It still closes the gate and waits the drain, needs no probe, and reports `armed: retired`.
+
+### Trial claims and the audit window
+
+`ns claim --audit-trial --gpus 1` asks the plugin for a trial: allowed only while the main policy is in Audit (the probe reads `audit` with scope `finegrained`), with the owner's first-run approval. Under a trial lease the guard refuses any Pod that requests a GPU (`trial_gpu_refused`) and every build (`trial_build_refused`): only a 0-GPU mocker runs. The trial's two steps: `fence trial close` closes the gate while the lease is active, and `fence trial delete-pod <pod>` deletes one of the lease's own Pods (lease label checked, UID and version preconditions, as an attempt), so its controller's replacement is a would-be denial the recorder must show. A trial teardown completes as `armed: trial` when every probe reads the policies present in Audit.
+
+### The recorder
+
+`fence record` (read only) reads the namespace's PolicyReports and Kyverno's Events naming `agent-lease-fence`, and appends rows it has not seen to `${XDG_STATE_HOME:-~/.local/state}/k8s-fence/<cluster>.jsonl`. A user timer, `k8s-fence-record@<context>.timer`, runs it every 15 minutes, inside the Events' one-hour lifetime; chezmoi never enables it. Rows hold only fields those shapes hold: no user, no operation. Probe rows are left out (by name and by the canary policy). Its output counts the probes this host sent, by rule, for the tally. Measured on kind in Audit: a would-be denial leaves a PolicyViolation Event on the Pod in the namespace, and so does each dry-run mode probe; dry runs count in `kyverno_policy_results_total` (`dry_run="true"`). It cannot see an object made and deleted between two runs whose Event also expired; ops read the counter at the end of the window for that.
+
+### Where a denial shows, and the off-switch
+
+Every message names the policy, the owner, the contact and where the off-switch is written; the policies' descriptions hold the full text. A denial shows in the client's error, in the `FailedCreate` Event on a controller's owner, in Kyverno's violation Event and in its `blocking admission request` log line; never in a report, because a denied object never exists. The off-switch, in order: set the main policy to Audit; remove the label; delete both policies. Each stops denials, and each keeps a live lease's GPUs charged until the owner is told. Scaling the admission controller to 0 also disarms the fence, for every Kyverno policy on the cluster.
+
+### The Kyverno CLI
+
+The CLI suites (`policy/tests/`, run by `test/test-k8s-fence.py`) mock the gate; the kind fixture (`test/kind-fence.sh`) runs the real read. The v1.15.2 CLI has three defects these tests work around: it panics on a policy with webhook match conditions (so the suites run on the policies without them); it counts an expected `result: fail` of a validate rule as passed whatever the policy did; and it writes `Excluded` for a resource no rule answered, whatever was expected. So the test reads every row's reason, and each suite is run against broken policies it must fail.
 
 ## Apply
 
@@ -231,9 +315,16 @@ The tests use fakes. The first run on a cluster must confirm these, and run `sel
 - `crane digest` on `nvcr.io` answers a missing tag with `MANIFEST_UNKNOWN` on stderr and exit 1, and an existing one with exit 0; a missing repository answers `NAME_UNKNOWN` or `MANIFEST_UNKNOWN`, and both are absent; `v0.20.2`, named by the plan, is no longer served by `gcr.io/go-containerregistry/crane`;
 - every container's `ephemeral-storage` request and limit are accepted together with the node's allocatable storage;
 - the bot may `create jobs.batch` in the pre-made namespace.
+- the bot's username as the API server sees it through Teleport (the policies name `bot.user`; a trial's bot-root rule must read `pass`, not `skip`);
+- that the Dynamo operator (both DGD versions) and Grove copy the lease label onto Pods and give them a controller owner (a trial's Pod rule must read `pass`); the Grove multi-node path is first proven by the first enforced GPU deploy, where a mismatch refuses it;
+- that Kyverno emits a PolicyViolation Event for each Audit would-be denial on the managed clusters (measured on kind);
+- each cluster's support for webhook `matchConditions`, and the drain against its real request timeout;
+- the bot's read of PolicyReports and Events in its namespace.
 
 ## Tests
 
 ```bash
-timeout 300 python3 test/test-k8s-guard.py </dev/null
+timeout 600 python3 test/test-k8s-guard.py </dev/null
+KYVERNO_CLI=~/.local/bin/kyverno timeout 300 python3 test/test-k8s-fence.py </dev/null   # Kyverno CLI v1.15.2
+timeout 2400 bash test/kind-fence.sh </dev/null   # the dev host only: kind, helm and the chart images
 ```

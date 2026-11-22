@@ -20,6 +20,11 @@ Usage (every command takes --context <kube context>; -n may come anywhere):
   k8s-guard extend <ns> [--uid <uid>] [--lease <id>]           copy the lease's expiry into the namespace
   k8s-guard inspect <ns>                                       read only
   k8s-guard -n <ns> selftest fences                            send each fence with a wrong UID; change nothing
+  k8s-guard fence probe <premade>                              is the lease fence armed? two dry-run Pods
+  k8s-guard fence render --owner <o> --contact <c> --runbook <r>
+                                                               the fence policy for ops, from the template
+  k8s-guard fence record <premade>                             append new audit rows, read only
+  k8s-guard -n <premade> fence trial close|delete-pod <pod>    a trial claim's two trial-only steps
 
 Every command prints one JSON object on stdout. Failures exit non-zero with
 {"error": ..., "code": ...}. The rules and the reasons for them are in
@@ -54,7 +59,9 @@ from k8s_guard_rules import (  # noqa: E402
     LEASE_LABEL, LEASE_RECORD, NS_UID_LABEL, PUSH_SECRET, Refusal, admit, allocation, arch_arg,
     budget_allocation, build_job, build_verdict, check_gpu_product, check_job, check_lease_label, check_one_node,
     commit_arg, dgd_gpus, dockerfile_arg, git_secret_spec, gpu_pod_summary, image_arg, index_job, job_state,
-    redact_build_log, repo_arg, repo_is_ssh, zero_patch)
+    redact_build_log, repo_arg, repo_is_ssh, zero_patch, components)
+import k8s_fence_rules as fence  # noqa: E402
+from k8s_fence_rules import FENCE_LABEL, FENCE_RECORD, FenceError  # noqa: E402
 
 DGD_RESOURCE = 'dynamographdeployments.nvidia.com'
 THREAD_LABEL = 'wcep.agent/thread'
@@ -109,6 +116,8 @@ KINDS = {
     'PersistentVolumeClaim': ('persistentvolumeclaims', 'persistentvolumeclaims'),
     'PodCliqueSet': ('podcliquesets.grove.io', 'podcliquesets'),
     'Job': ('jobs.batch', 'jobs'),
+    # Only a trial claim deletes a Pod by name (fence trial delete-pod); teardown never does.
+    'Pod': ('pods', 'pods'),
 }
 # The kinds `apply` admits (k8s_guard_rules.admit decides the details).
 APPLY_KINDS = {(DGD_KIND, 'nvidia.com/v1alpha1'), (DGD_KIND, 'nvidia.com/v1beta1'), ('ConfigMap', 'v1'), ('Service', 'v1')}
@@ -129,7 +138,11 @@ CLAIM_REFUSALS = {
     'gpu_type_not_on_cluster', 'gpu_type_no_limit', 'multi_node_unapproved', 'namespace_not_premade',
     'thread_not_live', 'namespace_not_found', 'inspect_failed', 'uid_mismatch', 'namespace_not_ours',
     'namespace_over_lease', 'cluster_changed', 'namespace_leased', 'predecessor_mismatch', 'over_limit',
-    'request_conflict'}
+    'request_conflict', 'namespace_not_enrolled'}
+# How long claimed teardown waits, on the monotonic clock, between reading the gate closed and its final inventory
+# read, and how often it probes the fence meanwhile (references/k8s-guard.md, "The fence policy").
+FENCE_DRAIN_SECONDS = 120
+FENCE_PROBE_SECONDS = 5
 # What the API server answers when it refused a write outright: the write did not happen. Any other failure
 # (a timeout, a lost connection, an internal error) leaves the outcome unknown.
 DEFINITE = ('(AlreadyExists)', '(Conflict)', '(NotFound)', '(Invalid)', '(BadRequest)', '(Forbidden)',
@@ -297,6 +310,11 @@ def lease_show(lease_id):
                 raise Refusal('lease_invalid', f'bb k8s lease show {lease_id}: {key} is missing or not a {kind.__name__}')
         if v['state'] not in LEASE_STATES:
             raise Refusal('lease_invalid', f'lease {lease_id} has an unknown state {v["state"]!r}')
+        seq = v.get('claim_seq')
+        if seq is not None and (not isinstance(seq, int) or isinstance(seq, bool) or seq < 1):
+            raise Refusal('lease_invalid', f'bb k8s lease show {lease_id}: claim_seq {seq!r} is not a whole number')
+        if not isinstance(v.get('trial', False), bool):
+            raise Refusal('lease_invalid', f'bb k8s lease show {lease_id}: trial is not a boolean')
     return res
 
 
@@ -663,13 +681,19 @@ def settle_attempts(g, view, lease):
                                             'observed')
 
 
-def fenced(g, view, body):
-    """Run body(lease, slot) inside the lease's one operation slot; with no lease, body(None, None)."""
+def fenced(g, view, body, gate=True):
+    """Run body(lease, slot) inside the lease's one operation slot; with no lease, body(None, None).
+
+    In a claimed namespace every write also needs the gate open for this lease (`gate=False` only for a trial
+    claim's own steps after it closed the gate).
+    """
     if not view.lease_id:
         if view.claimed:
             raise Refusal('namespace_not_claimed', f'{view.name} has no claim: no writes, CPU-only included')
         return body(None, None)
     lease = lease_for_write(g, view)
+    if view.claimed and gate:
+        require_open_gate(g, view, lease)
     settle_attempts(g, view, lease)
     res = bb('k8s', 'lease', 'op', 'begin', view.lease_id)
     if res.offline:
@@ -955,6 +979,99 @@ def delete_owned(g, ns, obj, still_ours, timeout=KUBECTL_TIMEOUT, attempts=None)
     raise Refusal('write_conflict', f'{kind}/{name} changed under every delete; try again')
 
 
+# --- the lease fence ------------------------------------------------------------------------------------
+#
+# A Kyverno policy ops install fences the pre-made namespace: a Pod or bot root is admitted only under the lease
+# the gate ConfigMap names (references/k8s-guard.md, "The fence policy"). The guard opens the gate after a claim,
+# closes it first in teardown, and never trusts that the fence is armed: it probes it with two server dry-run
+# Pods, before the close, through the drain and after the final read. The rules are k8s_fence_rules'.
+
+def env_seconds(name, default):
+    """A duration from the environment (for tests), else the default. Never negative."""
+    text = os.environ.get(name)
+    if text is None:
+        return float(default)
+    try:
+        value = float(text)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value < 0:
+        raise Refusal('usage', f'{name} must be a number of seconds, not {text!r}', status=2)
+    return value
+
+
+def probe_fence(g, ns, record=True):
+    """The fence probe: the canary and the mode Pod as server dry runs. Writes nothing to the cluster."""
+    answers = []
+    for which in ('canary', 'mode'):
+        rc, out, err = g.kc.run('create', '-f', '-', '-n', ns, '--dry-run=server', '-o', 'name',
+                                input=json.dumps(fence.probe_pod(which, ns)))
+        answers += [rc, err]
+    verdict = fence.fence_verdict(*answers)
+    if record:
+        # The audit tally counts the probes the guard sent, by rule (references/k8s-guard.md, "The recorder").
+        g.record(ns, f'FenceProbe/{ns}', 0, 'probe', canary=verdict['canary'], mode=verdict['mode'],
+                 armed=verdict['armed'])
+    return verdict
+
+
+def read_gate(g, ns):
+    cm = g.kc.json('get', 'configmap', FENCE_RECORD, '-n', ns, '-o', 'json', not_found=MISSING)
+    return None if cm is MISSING else cm
+
+
+def gate_view(gate):
+    """The gate as the guard reports it: lease, state and seq, or None when it is missing."""
+    return None if gate is None else {k: gate[k] for k in ('lease_id', 'state', 'seq')}
+
+
+def move_gate(g, ns, uid, lease_id, seq, state):
+    """Open (active) or close (closing) the gate for (lease_id, seq) under the seq rule, then read it back.
+
+    Returns (what, gate): what is 'created' or 'patched' after a write, else what the plan found ('open',
+    'closing' when opening over a gate teardown closed first, 'closed' when closing an already closed one).
+    Every write carries its fences (a create-only POST, or a patch that tests the version, seq, lease and
+    state), so a gate that moved under it is read and planned again, a bounded number of times.
+    """
+    plan = fence.plan_open if state == 'active' else fence.plan_close
+    for _ in range(WRITE_ROUNDS):
+        live = read_gate(g, ns)
+        try:
+            action, _ = plan(fence.gate_of(live), lease_id, seq)
+        except FenceError as e:
+            raise Refusal(e.code, str(e), gate=gate_view(fence.gate_of(live)))
+        if action in ('open', 'closing', 'closed'):
+            return action, fence.gate_of(live)
+        confirm_uid(g, ns, uid)
+        if action == 'create':
+            rc, out, err = g.kc.run('create', '-f', '-', '-n', ns, '-o', 'json',
+                                    input=json.dumps(fence.gate_object(ns, lease_id, state, seq, uid)))
+        else:
+            rc, out, err = g.kc.run('patch', f'configmaps/{FENCE_RECORD}', '-n', ns, '--type=json', '-p',
+                                    json.dumps(fence.gate_patch(live, lease_id, state, seq, uid)), '-o', 'json')
+        if rc == 0:
+            return ('created' if action == 'create' else 'patched'), fence.gate_of(read_gate(g, ns))
+        if not is_conflict(err):
+            raise kubectl_error((action, 'configmap', FENCE_RECORD), rc, err)
+    raise Refusal('write_conflict', f'{FENCE_RECORD} in {ns} changed under every write; try again')
+
+
+def require_open_gate(g, view, lease):
+    """A claimed write needs the gate to read active for this lease and its claim seq."""
+    seq = lease.get('claim_seq')
+    gate = fence.gate_of(read_gate(g, view.name))
+    if not isinstance(seq, int) or not fence.gate_reads(gate, view.lease_id, seq, 'active'):
+        raise Refusal('fence_not_open', f'{FENCE_RECORD} in {view.name} does not read active for lease '
+                                        f'{view.lease_id} at seq {seq} (it reads {gate_view(gate)}); run '
+                                        f'`k8s-guard -n {view.name} ns claim` again with the same terms to open it',
+                      gate=gate_view(gate))
+    return gate
+
+
+def trial_refusal(e):
+    return Refusal(e.code, str(e))
+
+
 # --- commands -----------------------------------------------------------------------
 
 def cmd_inspect(g, a):
@@ -966,7 +1083,8 @@ def cmd_inspect(g, a):
             'dgd_gpus': sum(dgd_gpus(d) for d in dgds), 'pod_gpus': pod_total,
             'gpu_type': g.profile.get('gpu_type'), 'gpu_pods_left': gpu_pods,
             'allocation': allocation(dgds, pods), 'lease_id': view.lease_id, 'cluster': g.cluster,
-            'developer': view.labels.get(DEVELOPER_LABEL), 'agent_rbac': view.labels.get(AGENT_RBAC_LABEL)}
+            'developer': view.labels.get(DEVELOPER_LABEL), 'agent_rbac': view.labels.get(AGENT_RBAC_LABEL),
+            'lease_fence': view.labels.get(FENCE_LABEL)}
 
 
 def cmd_ns_create(g, a):
@@ -1030,11 +1148,19 @@ def cmd_ns_claim(g, a):
         raise Refusal('namespace_not_premade', f'{ns} is not the pre-made namespace {g.premade}; only it is claimed')
     if not re.match(r'^[1-9][0-9]{0,3}$', a.gpus):
         raise Refusal('usage', '--gpus must be a whole number from 1', status=2)
+    if a.audit_trial and a.gpus != '1':
+        raise Refusal('usage', 'a trial claim (--audit-trial) charges 1 GPU and runs no GPU work: pass --gpus 1',
+                      status=2)
     hours_arg(a.hours, math.inf)  # the plugin holds the limit
     view = NsView(g, ns, claimed=True)
     if view.labels.get(DEVELOPER_LABEL) != g.bot['developer'] or view.labels.get(AGENT_RBAC_LABEL) != 'true':
         raise Refusal('namespace_not_ours', f'{ns} lacks {DEVELOPER_LABEL}={g.bot["developer"]} or '
                                             f'{AGENT_RBAC_LABEL}=true')
+    if view.labels.get(FENCE_LABEL) != 'true':
+        # Ops enroll the namespace in the lease fence by setting this label after the install check; the bot
+        # cannot set it. Without it no policy fences the claim, so there is no claim.
+        raise Refusal('namespace_not_enrolled', f'{ns} lacks {FENCE_LABEL}=true: it is not enrolled in the lease '
+                                                'fence (references/k8s-guard.md, "The fence policy")')
     # Only what the caller can set can make its retry ask with other terms: the UID is not a term, and ops
     # re-creating the namespace must not strand a pending request no flag value could clear.
     terms = {'claim_gpus': a.gpus, 'claim_hours': a.hours}
@@ -1058,14 +1184,14 @@ def cmd_ns_claim(g, a):
     # A pending request is replayed with the UID it named. The plugin replays a committed request before it
     # looks at the UID; one it never committed gets a full fresh claim and must see that old UID, so it is
     # refused instead of granting a lease this ledger's claim line would then make unwritable.
-    res = ask_claim(g, ns, request, replaces, request_uid or view.uid, a.gpus, a.hours)
+    res = ask_claim(g, ns, request, replaces, request_uid or view.uid, a.gpus, a.hours, a.audit_trial)
     if not res.ok and res.code in CLAIM_REFUSALS and pending:
         # The replay answered: the pending request was refused, so this thread holds no lease of ns. One
         # fresh request may follow in the same run, naming the live UID.
         g.record(ns, f'Claim/{ns}', 0, 'claim-refused', request=request, code=res.code)
         request_uid = view.uid
         request, replaces = new_claim_request(g, ns, request_uid, a.gpus, a.hours)
-        res = ask_claim(g, ns, request, replaces, view.uid, a.gpus, a.hours)
+        res = ask_claim(g, ns, request, replaces, view.uid, a.gpus, a.hours, a.audit_trial)
     if not res.ok:
         if res.code in CLAIM_REFUSALS:
             g.record(ns, f'Claim/{ns}', 0, 'claim-refused', request=request, code=res.code)
@@ -1076,11 +1202,37 @@ def cmd_ns_claim(g, a):
     lease_id, expires = res.value.get('lease_id'), res.value.get('expires_at')
     if not isinstance(lease_id, str) or not LEASE_ID.match(lease_id) or not isinstance(expires, str):
         raise Refusal('lease_invalid', 'acquire returned no lease id or expiry')
-    g.record(ns, f'Claim/{ns}', 0, 'claim', uid=request_uid, lease=lease_id, request=request)
-    return {'lease_id': lease_id, 'expires_at': expires, 'namespace': ns, 'claimed': True,
-            'state': res.value.get('state', 'active'), 'pod_label': {LEASE_LABEL: lease_id},
+    seq, state = res.value.get('seq'), res.value.get('state', 'active')
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
+        raise Refusal('lease_invalid', f'acquire returned no claim seq for {lease_id}; the gate cannot be opened')
+    trial = res.value.get('trial') is True
+    g.record(ns, f'Claim/{ns}', 0, 'claim', uid=request_uid, lease=lease_id, request=request, seq=seq, trial=trial)
+    fence_state = open_gate(g, ns, request_uid or view.uid, lease_id, seq, state)
+    return {'lease_id': lease_id, 'expires_at': expires, 'namespace': ns, 'claimed': True, 'seq': seq, 'trial': trial,
+            'fence': fence_state, 'state': state, 'pod_label': {LEASE_LABEL: lease_id},
             'pod_affinity': {'podAffinity': {'requiredDuringSchedulingIgnoredDuringExecution': [{
                 'labelSelector': {'matchLabels': {LEASE_LABEL: lease_id}}, 'topologyKey': HOSTNAME_TOPOLOGY}]}}}
+
+
+def open_gate(g, ns, uid, lease_id, seq, state):
+    """Open the gate after the plugin answered `active`; a replay that answers anything else writes nothing.
+
+    A failed write leaves the lease standing with no Pod able to start: `ns claim` again writes the gate again.
+    A gate above this claim's seq refuses fence_mismatch: a later claim holds the namespace.
+    """
+    if state != 'active':
+        return {'state': 'not_opened', 'why': f'the lease is {state}'}
+    try:
+        what, gate = move_gate(g, ns, uid, lease_id, seq, 'active')
+    except Refusal as e:
+        if e.code == 'fence_mismatch':
+            raise
+        return {'state': 'not_open', 'why': f'{e.code}: {e}; run ns claim again with the same terms to open it'}
+    if what == 'closing':
+        return {'state': 'closing', 'why': 'teardown closed the gate first; this lease takes no writes'}
+    if not fence.gate_reads(gate, lease_id, seq, 'active'):
+        return {'state': 'not_open', 'why': f'the gate reads {gate_view(gate)} after the write'}
+    return {'state': 'active', 'seq': seq}
 
 
 def new_claim_request(g, ns, uid, gpus, hours):
@@ -1098,11 +1250,11 @@ def new_claim_request(g, ns, uid, gpus, hours):
     return request, replaces
 
 
-def ask_claim(g, ns, request, replaces, uid, gpus, hours):
+def ask_claim(g, ns, request, replaces, uid, gpus, hours, trial=False):
     """Ask the plugin for one claim, once: the request it names decides a replay's answer."""
     res = bb('k8s', 'lease', 'acquire', '--claim', '--request', request, '--replaces', replaces, '--cluster',
              g.cluster, '--namespace', ns, '--uid', uid, '--gpu-type', g.profile['gpu_type'], '--gpus', gpus,
-             '--hours', hours)
+             '--hours', hours, *(['--audit-trial'] if trial else []))
     if res.offline:
         raise lease_unavailable(res, 'acquire')
     return res
@@ -1305,6 +1457,9 @@ def cmd_apply(g, a):
                                               'DynamoGraphDeployment, ConfigMap, ClusterIP Service')
             if not isinstance(meta.get('name'), str) or not DNS_SUBDOMAIN.match(meta['name']):
                 raise Refusal('usage', f'{where} has no valid name', status=2)
+            if item.get('kind') == 'ConfigMap' and meta['name'] == FENCE_RECORD:
+                raise Refusal('fence_protected', f'{where} is the lease fence\'s gate; only ns claim and teardown '
+                                                 'write it')
             meta['namespace'] = ns
             attempt = new_attempt_id() if lease_id else None
             if attempt:
@@ -1381,6 +1536,11 @@ def cmd_apply(g, a):
                 raise Refusal('one_node_required', f'{total} GPUs do not fit one {g.profile["gpu_type"]} node '
                                                    f'({g.profile["gpus_per_node"]}) without multi-node approval',
                               allocation=total)
+            if lease.get('trial'):
+                try:
+                    fence.trial_admit(components, new)
+                except FenceError as e:
+                    raise trial_refusal(e)
             check_lease_label(new, lease)
             check_one_node(after, lease, g.profile)
             check_gpu_product(after, g.profile)
@@ -1402,6 +1562,8 @@ def cmd_delete(g, a):
         protected.add(('PersistentVolumeClaim', g.profile['model_cache']))
     if g.profile.get('pull_secret'):
         protected.add(('Secret', g.profile['pull_secret']))
+    if (kind, name) == ('ConfigMap', FENCE_RECORD):
+        raise Refusal('fence_protected', f'{kind}/{name} is the lease fence\'s gate; it is never deleted')
     if (kind, name) in protected:
         raise Refusal('object_protected', f'{kind}/{name} is not deleted on its own (runbook section 10)')
     ns, view = g.owned()
@@ -1581,14 +1743,43 @@ def labelled(g, ns, resource, lease_id):
         return None
 
 
-def claimed_teardown(g, view, lease_id, lease):
-    """Resolve the lease's open attempts, delete its roots, and read its inventory again.
+def claimed_teardown(g, view, lease_id, lease, retired=None):
+    """Close the gate, resolve the lease's open attempts, delete its roots, drain, and read its inventory again.
 
-    Complete only when every attempt is resolved, every root is gone or was never there, and a read made
-    after the last resolution finds nothing of the lease: no root, no generated child, no pod, terminating
-    or not. Otherwise teardown_incomplete, and k8s-leases keeps the GPUs charged. No Namespace request.
+    Complete only when every attempt is resolved, every root is gone or was never there, a read made after the
+    drain finds nothing of the lease (no root, no generated child, no pod, terminating or not), the gate read back
+    closing for this lease and seq, and the fence was shown armed before the close, at least every probe interval
+    through the drain and after the final read. Otherwise teardown_incomplete, and k8s-leases keeps the GPUs
+    charged. A trial lease, which runs no GPU work, needs the policies present in Audit instead of armed; a
+    retired fence (`retired`, the proof URL) needs no probe. No Namespace request.
     """
     ns = view.name
+    seq = lease.get('claim_seq')
+    if not isinstance(seq, int):
+        raise Refusal('fence_mismatch', f'lease {lease_id} has no claim seq, so its gate cannot be closed')
+    drain = env_seconds('K8S_GUARD_FENCE_DRAIN_SECONDS', FENCE_DRAIN_SECONDS)
+    every = env_seconds('K8S_GUARD_FENCE_PROBE_SECONDS', FENCE_PROBE_SECONDS)
+    trial = lease.get('trial') is True
+    probes, failed = [], []
+
+    def probe():
+        """One probe; False when the fence is not as this teardown needs it."""
+        if retired:
+            return True
+        v = probe_fence(g, ns)
+        probes.append(v)
+        ok = v['armed'] or (trial and v['canary'] == 'finegrained' and v['mode'] == 'audit')
+        if not ok and not failed:
+            failed.append({k: v[k] for k in ('canary', 'mode', 'scope', 'armed', 'cause', 'canary_text', 'mode_text')
+                           if k in v})
+        return ok
+
+    probe()  # before the close
+    # Step 0: close the gate for this lease and seq, whatever it held below, and read it back.
+    _, gate = move_gate(g, ns, view.uid, lease_id, seq, 'closing')
+    closed = fence.gate_reads(gate, lease_id, seq, 'closing')
+    closed_at = time.monotonic()
+
     resolutions, unresolved = [], []
     for a in lease.get('open_attempts') or []:
         outcome = resolve_attempt(g, ns, a)
@@ -1597,7 +1788,7 @@ def claimed_teardown(g, view, lease_id, lease):
         else:
             resolutions.append({'attempt': a['attempt'], 'outcome': outcome})
     protected = {(k, n) for k, n in (('PersistentVolumeClaim', g.profile.get('model_cache')),
-                                      ('Secret', g.profile.get('pull_secret'))) if n}
+                                      ('Secret', g.profile.get('pull_secret')), ('ConfigMap', FENCE_RECORD)) if n}
     confirm_uid(g, ns, view.uid)
     deleted, changed_hands, unreadable = [], [], []
 
@@ -1624,6 +1815,21 @@ def claimed_teardown(g, view, lease_id, lease):
                 if e.code not in ('object_not_yours', 'uid_mismatch', 'write_conflict'):
                     raise
                 changed_hands.append(f'{kind}/{name}')
+
+    # The drain: a create admitted while the gate was open may still land. Wait `drain` seconds of monotonic time
+    # from this run's own read of closing, probing at least every `every` seconds. A probe that fails ends the
+    # wait: this run cannot complete, and the next one starts with a new close read and a new drain.
+    last_probe = closed_at
+    while closed and not failed:
+        elapsed = time.monotonic() - closed_at
+        if elapsed >= drain:
+            break
+        time.sleep(max(0.0, min(last_probe + every - time.monotonic(), drain - elapsed)) if every else drain - elapsed)
+        last_probe = time.monotonic()
+        if every or time.monotonic() - closed_at >= drain:
+            probe()
+    drained = time.monotonic() - closed_at
+
     left = {}
     for resource in [KINDS[k][0] for k in ROOT_KINDS] + list(CHILD_RESOURCES):
         items = labelled(g, ns, resource, lease_id)
@@ -1636,19 +1842,51 @@ def claimed_teardown(g, view, lease_id, lease):
                  {(KINDS[k][0], n) for k, n in protected}]
         if names:
             left[resource] = names
+    if not failed:
+        probe()  # after the final read
     g.record(ns, f'Claim/{ns}', 0, 'down', uid=view.uid, lease=lease_id, deleted=deleted)
-    if unresolved or changed_hands or unreadable or left:
+    report = {'fence': {'lease_id': gate['lease_id'], 'seq': gate['seq'], 'state': gate['state']} if gate else None,
+              'drain_monotonic_seconds': round(drained, 3), 'lease_fence': view.labels.get(FENCE_LABEL),
+              'probes': len(probes)}
+    if retired:
+        report['fence_retired_proof'] = retired
+    if unresolved or changed_hands or unreadable or left or not closed or failed or drained < drain:
         why = '; '.join(filter(None, [
             unresolved and f'{len(unresolved)} write(s) whose outcome is unknown',
             changed_hands and f'{", ".join(changed_hands)} changed hands under the delete',
             unreadable and f'could not list {", ".join(unreadable)}',
-            left and f'still there: {json.dumps(left)}']))
+            left and f'still there: {json.dumps(left)}',
+            not closed and f'{FENCE_RECORD} does not read closing for {lease_id} at seq {seq} ({gate_view(gate)})',
+            failed and f'the fence was not armed: {failed[0].get("cause")}']))
+        extra = {'fence_disarmed': True, 'probe': failed[0]} if failed else {}
         raise Refusal('teardown_incomplete', f'lease {lease_id} in {ns} is not torn down: {why}; its GPUs stay '
                                              'charged and the next teardown goes on', resolutions=resolutions,
                       unresolved=unresolved, changed_hands=changed_hands, unreadable=unreadable, left=left,
-                      deleted=deleted)
+                      deleted=deleted, **report, **extra)
     return {'namespace': ns, 'lease_id': lease_id, 'complete': True, 'namespace_kept': True, 'deleted': deleted,
-            'resolutions': resolutions}
+            'resolutions': resolutions, 'armed': 'retired' if retired else 'trial' if trial else 'continuous',
+            **report}
+
+
+def check_retired(g, view, lease_id, url):
+    """Exit 2: the fence is retired for good. Only when ops removed the label and no entry answers the canary."""
+    if not re.match(r'^https://[^\s]{1,2040}$', url or ''):
+        raise Refusal('usage', '--fence-retired needs the proof URL (https://...)', status=2)
+    if view.labels.get(FENCE_LABEL) == 'true':
+        raise Refusal('fence_not_retired', f'{view.name} still carries the label {FENCE_LABEL}=true: the fence is not '
+                                           'retired; re-arm it, or ops remove the label and the policies first')
+    v = probe_fence(g, view.name)
+    if v['canary'] != 'disarmed':
+        raise Refusal('fence_not_retired', f'the canary reads {v["canary"]}, not disarmed: a fence entry still '
+                                           'answers, so the fence is not retired', probe=v)
+    if not g.thread:
+        # Run on a host (by on-call or by the plugin's host entry): record the proof, so the plugin accepts a
+        # retired completion and passes the proof to its next teardown.
+        res = bb('k8s', 'lease', 'fence-retired', lease_id, '--proof', url)
+        if res.offline:
+            raise lease_unavailable(res, 'fence-retired')
+        if not res.ok:
+            raise Refusal(res.code, f'the plugin did not record the proof: {res.error}')
 
 
 def claimed_down(g, view, a):
@@ -1686,7 +1924,9 @@ def claimed_down(g, view, a):
         raise Refusal('lease_active', f'lease {lease_id} is active; only its owner\'s down may end it')
     if lease['state'] not in LIVE:
         raise Refusal('lease_ended', f'lease {lease_id} is {lease["state"]}; the plugin gives no teardown authority')
-    return claimed_teardown(g, view, lease_id, lease)
+    if a.fence_retired:
+        check_retired(g, view, lease_id, a.fence_retired)
+    return claimed_teardown(g, view, lease_id, lease, retired=a.fence_retired)
 
 
 def cmd_down(g, a):
@@ -1695,6 +1935,8 @@ def cmd_down(g, a):
     view = namespace_view(g, ns, a.lease)
     if view.claimed:
         return claimed_down(g, view, a)
+    if a.fence_retired:
+        raise Refusal('usage', '--fence-retired is only for the claimed pre-made namespace', status=2)
     check_uid(view, a.uid)
     lease_id = a.lease or view.lease_id
     owner = False
@@ -1920,15 +2162,24 @@ def cmd_selftest_fences(g, a):
             stale['metadata']['resourceVersion'] = '1'
             probes.append(('replace lease record: stale resourceVersion', 'stale resourceVersion',
                            ('replace', '-f', '-', '-n', ns, '-o', 'json'), json.dumps(stale)))
+        gate_before = read_gate(g, ns) if view.claimed else None
+        if gate_before is not None:
+            # The gate's fences: a patch that writes the gate back unchanged, under a stale resourceVersion.
+            gate = fence.gate_of(gate_before)
+            ops = fence.gate_patch(gate_before, gate['lease_id'], gate['state'], gate['seq'] or 0, gate['uid'])
+            ops[1]['value'] = STALE_VERSION
+            probes.append(('patch gate: stale resourceVersion', 'patch test',
+                           ('patch', f'configmaps/{FENCE_RECORD}', '-n', ns, '--type=json', '-p', json.dumps(ops)),
+                           None))
         results = []
-        for label, fence, args, stdin in probes:
+        for label, held_by, args, stdin in probes:
             confirm_uid(g, ns, view.uid)
             if slot:
                 slot.check()
             rc, out, err = g.kc.run(*args, input=stdin)
             # Held only when the server refused it for this fence's reason.
             results.append({'fence': label, 'refused': rc != 0, 'exit': rc,
-                            'held': rc != 0 and any(m in err for m in FENCE_REFUSALS[fence]),
+                            'held': rc != 0 and any(m in err for m in FENCE_REFUSALS[held_by]),
                             'response': clip(err if rc else out, 600)})
         # Prove nothing changed: the namespace, the DGD and the record, read again.
         after_ns = g.kc.json('get', 'namespace', ns, '-o', 'json', not_found=MISSING)
@@ -1941,6 +2192,10 @@ def cmd_selftest_fences(g, a):
         if view.record is not None:
             after_rec = g.lease_record(ns)
             unchanged['lease_record'] = after_rec is not None and after_rec.get('data') == view.record.get('data')
+        if gate_before is not None:
+            after_gate = read_gate(g, ns)
+            unchanged['gate'] = after_gate is not None and after_gate.get('data') == gate_before.get('data') and \
+                after_gate['metadata'].get('resourceVersion') == gate_before['metadata'].get('resourceVersion')
         held = all(r['held'] for r in results) and all(unchanged.values())
         g.record(ns, f'selftest/fences on {name}', 0, 'selftest', uid=view.uid, lease=view.lease_id, issue=view.issue)
         report = {'namespace': ns, 'dgd': name, 'probes': results, 'unchanged': unchanged, 'all_held': held}
@@ -2007,6 +2262,9 @@ def submit_job(g, ns, view, lease, slot, job, expect, charge):
 def build_prerequisites(g, ns, lease, ssh):
     if lease is None:
         raise Refusal('lease_required', f'{ns} has no live lease; a build Job runs under this thread\'s claim')
+    if lease.get('trial'):
+        raise Refusal('trial_build_refused', f'lease {lease["lease_id"]} is a trial claim: the fence is in Audit, so '
+                                             'it runs no build, only a 0-GPU mocker')
     if ssh and (get_object(g, ns, 'Secret', GIT_SECRET) is None
                 or get_object(g, ns, 'ConfigMap', KNOWN_HOSTS_CONFIGMAP) is None):
         raise Refusal('secret_unavailable', f'the ssh source needs Secret/{GIT_SECRET} and '
@@ -2112,6 +2370,114 @@ def cmd_build_delete(g, a):
     return fenced(g, view, body)
 
 
+# --- the fence commands -------------------------------------------------------------------------------
+
+TEMPLATE = Path(__file__).resolve().parent.parent / 'policy/agent-lease-fence.template.yaml'
+
+
+def cmd_fence_probe(g, a):
+    """Is the lease fence armed in this namespace? Two server dry-run Pods; writes nothing."""
+    ns = g.ns_name(a.namespace or (None if g.namespace else g.premade))
+    view = NsView(g, ns, claimed=bool(g.premade and ns == g.premade))
+    return dict(probe_fence(g, ns), namespace=ns, lease_fence=view.labels.get(FENCE_LABEL))
+
+
+def cmd_fence_render(g, a):
+    """The two fence policies for ops, filled from the profiles and the flags. Local: no cluster call."""
+    if not g.premade:
+        raise Refusal('premade_namespace_unset', 'the profiles name no pre-made namespace (bot.premade_namespace)')
+    try:
+        text = fence.render_fence_policy(TEMPLATE.read_text(), g.premade, g.bot['namespace_prefix'],
+                                         a.bot_user or g.bot['user'], a.owner, a.contact, a.runbook)
+    except FenceError as e:
+        raise Refusal(e.code, str(e), status=2 if e.code == 'usage' else 1)
+    except OSError as e:
+        raise Refusal('template_missing', f'cannot read {TEMPLATE}: {e}')
+    return {'policy': text, 'premade': g.premade, 'prefix': g.bot['namespace_prefix'],
+            'bot_user': a.bot_user or g.bot['user']}
+
+
+def cmd_fence_record(g, a):
+    """The audit window's recorder: append the rows not seen before, from reports and Events. Read only."""
+    ns = g.ns_name(a.namespace or (None if g.namespace else g.premade))
+    rc, out, err = g.kc.run('get', 'policyreports.wgpolicyk8s.io', '-n', ns, '-o', 'json')
+    if rc != 0:
+        raise kubectl_error(('get', 'policyreports'), rc, err)
+    reports = json.loads(out).get('items') or []
+    events = g.kc.json('get', 'events', '-n', ns, '-o', 'json').get('items') or []
+    rows = fence.record_rows(reports, events, fence.probe_names())
+    state = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'k8s-fence'
+    path = state / f'{g.cluster}.jsonl'
+    seen = set()
+    if path.exists():
+        for line in path.read_text().splitlines():
+            try:
+                seen.add(json.loads(line).get('key'))
+            except json.JSONDecodeError:
+                continue
+    new = [dict(r, cluster=g.cluster, namespace=ns, recorded=rfc3339(now())) for r in rows if r['key'] not in seen]
+    if new:
+        state.mkdir(parents=True, exist_ok=True)
+        with open(path, 'a') as f:
+            for r in new:
+                f.write(json.dumps(r) + '\n')
+    # The tally: the probes this host sent, each one a canary and a mode Pod (references/k8s-guard.md).
+    host_ledger = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'k8s-guard/ledger.jsonl'
+    probes = 0
+    if host_ledger.exists():
+        for line in host_ledger.read_text().splitlines():
+            try:
+                l = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if l.get('object') == f'FenceProbe/{ns}' and l.get('cluster') == g.cluster:
+                probes += 1
+    return {'namespace': ns, 'new_rows': len(new), 'total_rows': len(seen) + len(new), 'file': str(path),
+            'probes_sent': {fence.CANARY_RULE: probes, fence.POD_RULE: probes}}
+
+
+def cmd_fence_trial(g, a):
+    """A trial claim's two trial-only steps: close its own gate while it is active, and delete one of its Pods."""
+    g.require_writable()
+    ns, view = g.owned()
+    if not view.claimed:
+        raise Refusal('trial_only', f'{ns} is not the claimed pre-made namespace')
+    if a.step == 'close':
+        lease = lease_for_write(g, view)
+        if not lease.get('trial'):
+            raise Refusal('trial_only', f'lease {view.lease_id} is not a trial claim')
+        what, gate = move_gate(g, ns, view.uid, view.lease_id, lease.get('claim_seq'), 'closing')
+        if not fence.gate_reads(gate, view.lease_id, lease.get('claim_seq'), 'closing'):
+            raise Refusal('fence_mismatch', f'{FENCE_RECORD} reads {gate_view(gate)} after the close')
+        g.record(ns, f'ConfigMap/{FENCE_RECORD}', 0, 'trial-close', uid=view.uid, lease=view.lease_id)
+        return {'namespace': ns, 'fence': gate_view(gate)}
+    if a.step != 'delete-pod' or not a.pod or not DNS_SUBDOMAIN.match(a.pod):
+        raise Refusal('usage', 'fence trial close | fence trial delete-pod <pod>', status=2)
+
+    def body(lease, slot):
+        if not lease.get('trial'):
+            raise Refusal('trial_only', f'lease {view.lease_id} is not a trial claim')
+        obj = get_object(g, ns, 'Pod', a.pod)
+        if obj is None:
+            raise Refusal('not_found', f'Pod/{a.pod} not found in {ns}')
+        obj.setdefault('kind', 'Pod')
+
+        def mine(live):
+            return labels_of(live).get(LEASE_LABEL) == view.lease_id
+
+        if not mine(obj):
+            raise Refusal('object_not_yours', f'Pod/{a.pod} is not this lease\'s ({LEASE_LABEL}='
+                                              f'{labels_of(obj).get(LEASE_LABEL) or "none"}); left alone')
+        confirm_uid(g, ns, view.uid)
+        slot.check()
+        delete_owned(g, ns, obj, mine, timeout=slot.timeout(), attempts=slot.attempts)
+        g.record(ns, f'Pod/{a.pod}', 0, 'trial-delete', uid=view.uid, lease=view.lease_id)
+        return {'namespace': ns, 'deleted': f'Pod/{a.pod}'}
+
+    # The trial closed its gate first (step 4), so this one write goes without the open-gate check.
+    return fenced(g, view, body, gate=False)
+
+
 # --- argv ----------------------------------------------------------------------------
 
 class Parser(argparse.ArgumentParser):
@@ -2131,7 +2497,8 @@ COMMANDS = {
     ('inspect',): (cmd_inspect, ((('namespace',), {}),)),
     ('ns', 'create'): (cmd_ns_create, ((('purpose',), {}), (('--issue',), {'required': True}),
                                        (('--hours',), {'required': True}))),
-    ('ns', 'claim'): (cmd_ns_claim, ((('--gpus',), {'required': True}), (('--hours',), {'required': True}))),
+    ('ns', 'claim'): (cmd_ns_claim, ((('--gpus',), {'required': True}), (('--hours',), {'required': True}),
+                                     (('--audit-trial',), {'action': 'store_true'}))),
     ('lease', 'acquire'): (cmd_lease_acquire, ((('--gpus',), {'required': True}),
                                                (('--hours',), {'required': True}))),
     ('secret',): (cmd_secret, ((('which',), {'choices': sorted(SECRETS) + ['git']}), (('--repo',), {}),
@@ -2144,11 +2511,19 @@ COMMANDS = {
     ('build', 'delete'): (cmd_build_delete, ((('name',), {}),)),
     ('apply',): (cmd_apply, ((('-f', '--filename'), {'required': True}),)),
     ('delete',): (cmd_delete, ((('target',), {}),)),
-    ('down',): (cmd_down, TEARDOWN),
+    ('down',): (cmd_down, TEARDOWN + ((('--fence-retired',), {}),)),
     ('expire',): (cmd_expire, TEARDOWN),
     ('extend',): (cmd_extend, TEARDOWN),
     ('selftest', 'fences'): (cmd_selftest_fences, ()),
+    ('fence', 'probe'): (cmd_fence_probe, ((('namespace',), {'nargs': '?'}),)),
+    ('fence', 'render'): (cmd_fence_render, ((('--owner',), {'required': True}), (('--contact',), {'required': True}),
+                                             (('--runbook',), {'required': True}), (('--bot-user',), {}))),
+    ('fence', 'record'): (cmd_fence_record, ((('namespace',), {'nargs': '?'}),)),
+    ('fence', 'trial'): (cmd_fence_trial, ((('step',), {'choices': ['close', 'delete-pod']}),
+                                           (('pod',), {'nargs': '?'}))),
 }
+# Commands that talk to no cluster, so they need no bot credentials.
+LOCAL = {('fence', 'render')}
 
 
 def split_globals(argv):
@@ -2199,7 +2574,8 @@ def main(argv=None):
         except ProfileError as e:
             raise Refusal(e.code, str(e))
         g = Guard(profiles, context, namespace)
-        g.check_identity()
+        if key not in LOCAL:
+            g.check_identity()
         return emit(func(g, args))
     except Refusal as e:
         return emit(dict(e.extra, error=str(e), code=e.code), status=e.status)

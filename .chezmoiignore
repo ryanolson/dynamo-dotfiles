@@ -41,7 +41,7 @@ test/**
 **/__pycache__
 **/__pycache__/**
 
-# The agents' Teleport bot (tbot) config and unit, and the k8s-sweep units, deploy
+# The agents' Teleport bot (tbot) config and unit, and the k8s-sweep and fence-record units, deploy
 # only on hosts whose chezmoi config has a k8s_tbot block. Its key directory is never managed.
 {{- if not (hasKey . "k8s_tbot") }}
 .config/tbot
@@ -51,6 +51,8 @@ test/**
 .config/systemd/user/k8s-sweep.timer
 .config/systemd/user/k8s-sweep-enforce.service
 .config/systemd/user/k8s-sweep-enforce.timer
+.config/systemd/user/k8s-fence-record@.service
+.config/systemd/user/k8s-fence-record@.timer
 {{- end }}
 
 # Local development files

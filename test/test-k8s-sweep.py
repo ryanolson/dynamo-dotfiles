@@ -895,7 +895,8 @@ BASE = 'data:\n  name: "N"\n  email: "e@example.com"\n  machine_class: "sudo"\n 
 BLOCK = ('  k8s_tbot:\n    name: "tenant-a"\n    proxy_server: "proxy.example.test:443"\n    token: "bot-a-join"\n'
          '    selector_labels:\n      environment: "dev"\n')
 TARGETS = {'.config/systemd/user/k8s-sweep.service', '.config/systemd/user/k8s-sweep.timer',
-           '.config/systemd/user/k8s-sweep-enforce.service', '.config/systemd/user/k8s-sweep-enforce.timer'}
+           '.config/systemd/user/k8s-sweep-enforce.service', '.config/systemd/user/k8s-sweep-enforce.timer',
+           '.config/systemd/user/k8s-fence-record@.service', '.config/systemd/user/k8s-fence-record@.timer'}
 
 
 def load_sweep():
@@ -1002,6 +1003,17 @@ class Units(unittest.TestCase):
                 self.assertEqual(path.split(':')[0], '%h/.local/bin')  # the bb wrapper
                 self.assertTrue([l for l in lines if l.startswith('TimeoutStartSec=')])
                 self.assertFalse([l for l in lines if l.startswith(('User=', 'Restart='))])
+
+    def test_the_fence_recorder_runs_the_guard_per_cluster_every_15_minutes(self):
+        lines = self.lines('k8s-fence-record@.service')
+        self.assertIn('Type=oneshot', lines)
+        [start] = [l for l in lines if l.startswith('ExecStart=')]
+        self.assertEqual(start.split('=', 1)[1].split(),
+                         ['%h/.agents/skills/k8s-clusters/scripts/k8s-guard', '--context', '%i', 'fence', 'record'])
+        self.assertIn('Environment=KUBECONFIG=%h/.local/share/tbot/tenant-a/kube/kubeconfig.yaml', lines)
+        timer = self.lines('k8s-fence-record@.timer')
+        self.assertIn('OnCalendar=*:0/15', timer, 'inside the 1-hour Event lifetime')
+        self.assertIn('Persistent=true', timer)
 
     def test_timers(self):
         report = self.lines('k8s-sweep.timer')

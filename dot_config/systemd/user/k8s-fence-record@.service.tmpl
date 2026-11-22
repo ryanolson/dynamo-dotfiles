@@ -1,0 +1,18 @@
+{{- /* User unit for k8s-guard fence record (dot_agents/skills/k8s-clusters/references/k8s-guard.md, "The
+       recorder"). Deployed only with the k8s_tbot block (see .chezmoiignore); never enabled or started by
+       chezmoi. The instance name is the cluster's kube context. */ -}}
+{{- $name := .k8s_tbot.name -}}
+{{- if not (regexMatch "^[A-Za-z0-9_-][A-Za-z0-9._-]*$" ($name | toString)) -}}
+{{-   fail "k8s_tbot.name must be one directory name of letters, digits, '.', '_' or '-'" -}}
+{{- end -}}
+# Managed by chezmoi (dot_config/systemd/user/k8s-fence-record@.service.tmpl).
+[Unit]
+Description=k8s-guard fence record for %i: the lease fence's audit rows (read only)
+ConditionPathExists=%h/.local/share/tbot/{{ $name }}/kube/kubeconfig.yaml
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=KUBECONFIG=%h/.local/share/tbot/{{ $name }}/kube/kubeconfig.yaml
+ExecStart=%h/.agents/skills/k8s-clusters/scripts/k8s-guard --context %i fence record
+TimeoutStartSec=5min

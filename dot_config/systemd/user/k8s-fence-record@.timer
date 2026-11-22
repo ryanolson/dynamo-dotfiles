@@ -1,0 +1,13 @@
+# Managed by chezmoi (dot_config/systemd/user/k8s-fence-record@.timer). Never enabled by chezmoi.
+# One instance per enrolled cluster, named by its kube context: k8s-fence-record@<context>.timer.
+[Unit]
+Description=Record the lease fence's audit rows for %i every 15 minutes
+
+[Timer]
+# Kyverno's Events live 1 hour; 15 minutes keeps every one in reach (references/k8s-guard.md, "The recorder").
+OnCalendar=*:0/15
+Persistent=true
+RandomizedDelaySec=30s
+
+[Install]
+WantedBy=timers.target

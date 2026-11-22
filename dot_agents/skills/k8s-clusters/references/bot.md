@@ -52,10 +52,11 @@ The bot never installs anything cluster-scoped. Everything that writes goes thro
 
 ## The namespace
 
-The bot cannot create namespaces, so the owner pre-makes one per writable cluster, with a fixed name that starts with the profile's `namespace_prefix`. It carries two labels:
+The bot cannot create namespaces, so the owner pre-makes one per writable cluster, with a fixed name that starts with the profile's `namespace_prefix`. It carries two labels, and a third once ops enroll it in the lease fence:
 
 - `dynamo.nvidia.com/developer: <developer>`
 - `dynamo.nvidia.com/developer-agent-rbac: "true"`
+- `dynamo.nvidia.com/agent-lease-fence: "true"`: set by ops after they install the two fence policies and read the webhook configuration (`k8s-guard.md`, "The fence policy"). The bot cannot set it, and a claim refuses `namespace_not_enrolled` without it.
 
 A cluster policy then gives the bot admin rights and DynamoGraphDeployment rights inside it. To find it, read only:
 
@@ -72,7 +73,9 @@ Rules while the namespace is shared by all tasks:
 
 The profiles name it as `[bot] premade_namespace`. `k8s-guard ns create` refuses with `namespace_create_denied` and names `k8s-guard -n <premade> ns claim`, which takes a `k8s-leases` lease on it: the lease is the claim, and teardown deletes the lease's objects, never the namespace (`k8s-guard.md`, "A claimed namespace").
 
-Known gap: `k8s-leases` refuses claims (`enforcement_unhealthy`) until the admission webhook that counts controller writes is installed. Until then no task can deploy into the pre-made namespace through the guard. Do not write through a different path. Stop and tell the owner.
+Known gap: `k8s-leases` refuses claims (`enforcement_unhealthy`) until the fence enforces: ops install the two policies (`agent-lease-fence` and `agent-lease-fence-canary`), set the label, run the audit window, and switch the main policy to Enforce. Until then no task can deploy into the pre-made namespace through the guard, except a trial claim the owner approved. Do not write through a different path. Stop and tell the owner.
+
+The bot cannot read the cluster's webhook configuration, so the probe cannot see a webhook list that Kyverno empties and restores between two probes (5 s apart). On kind the emptied window lasted about 10 s. Checking the configuration's generation would need a cluster-scoped read the bot does not have.
 
 ## The key
 
