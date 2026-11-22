@@ -1,0 +1,419 @@
+{
+  "apiVersion": "v1",
+  "items": [
+    {
+      "action": "Resource Passed",
+      "apiVersion": "v1",
+      "eventTime": "2026-11-22T22:16:40.412131Z",
+      "firstTimestamp": null,
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": "audit-would-deny",
+        "namespace": "dyntest-fixture-agent",
+        "uid": "8189bcbf-3473-4717-9685-ad9c9b920bd6"
+      },
+      "kind": "Event",
+      "lastTimestamp": null,
+      "message": "policy agent-lease-fence/pods-need-the-open-lease fail: agent-lease-fence (owner fixture-owner, contact fixture-contact; off-switch in the policy's description): dyntest-fixture-agent admits a Pod only under its open agent lease, with a controller owner. Gate: missing for '' ('unreadable' means the policy could not read its gate: the policy is broken, not the lease). Pod lease label: ''.",
+      "metadata": {
+        "creationTimestamp": "2026-11-22T22:16:40Z",
+        "name": "audit-would-deny.18ea7ddf84587149",
+        "namespace": "dyntest-fixture-agent",
+        "resourceVersion": "1002",
+        "uid": "7ab49db8-9991-43a4-8a83-cf07bcde4fd6"
+      },
+      "reason": "PolicyViolation",
+      "reportingComponent": "kyverno-admission",
+      "reportingInstance": "kyverno-admission-kyverno-admission-controller-7dcf98969d-xvpmn",
+      "source": {},
+      "type": "Warning"
+    },
+    {
+      "action": "Resource Passed",
+      "apiVersion": "v1",
+      "eventTime": "2026-11-22T22:16:40.412200Z",
+      "firstTimestamp": null,
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": "audit-would-deny",
+        "namespace": "dyntest-fixture-agent",
+        "uid": "8189bcbf-3473-4717-9685-ad9c9b920bd6"
+      },
+      "kind": "Event",
+      "lastTimestamp": null,
+      "message": "policy agent-lease-fence/pods-need-the-open-lease fail: agent-lease-fence (owner fixture-owner, contact fixture-contact; off-switch in the policy's description): dyntest-fixture-agent admits a Pod only under its open agent lease, with a controller owner. Gate: missing for '' ('unreadable' means the policy could not read its gate: the policy is broken, not the lease). Pod lease label: ''.",
+      "metadata": {
+        "creationTimestamp": "2026-11-22T22:16:40Z",
+        "name": "audit-would-deny.18ea7ddf84597eea",
+        "namespace": "dyntest-fixture-agent",
+        "resourceVersion": "1006",
+        "uid": "662807d2-dfb7-49fc-b6a5-26113d38e106"
+      },
+      "reason": "PolicyViolation",
+      "reportingComponent": "kyverno-admission",
+      "reportingInstance": "kyverno-admission-kyverno-admission-controller-7dcf98969d-xvpmn",
+      "source": {},
+      "type": "Warning"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-11-22T22:16:40Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": "audit-would-deny",
+        "namespace": "dyntest-fixture-agent",
+        "resourceVersion": "1000",
+        "uid": "8189bcbf-3473-4717-9685-ad9c9b920bd6"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-11-22T22:16:40Z",
+      "message": "Successfully assigned dyntest-fixture-agent/audit-would-deny to agent-fence-control-plane",
+      "metadata": {
+        "creationTimestamp": "2026-11-22T22:16:40Z",
+        "name": "audit-would-deny.18ea7ddf85228870",
+        "namespace": "dyntest-fixture-agent",
+        "resourceVersion": "1007",
+        "uid": "2c5483e1-5577-4b97-89e8-0a8be5128581"
+      },
+      "reason": "Scheduled",
+      "reportingComponent": "default-scheduler",
+      "reportingInstance": "",
+      "source": {
+        "component": "default-scheduler"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-11-22T22:16:43Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{main}",
+        "kind": "Pod",
+        "name": "audit-would-deny",
+        "namespace": "dyntest-fixture-agent",
+        "resourceVersion": "1005",
+        "uid": "8189bcbf-3473-4717-9685-ad9c9b920bd6"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-11-22T22:16:43Z",
+      "message": "Container image \"registry.k8s.io/pause:3.10\" already present on machine and can be accessed by the pod",
+      "metadata": {
+        "creationTimestamp": "2026-11-22T22:16:43Z",
+        "name": "audit-would-deny.18ea7de04a73af16",
+        "namespace": "dyntest-fixture-agent",
+        "resourceVersion": "1021",
+        "uid": "aa0171ff-f940-4359-bea2-1e6ea47c4c4e"
+      },
+      "reason": "Pulled",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "agent-fence-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "agent-fence-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-11-22T22:16:43Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{main}",
+        "kind": "Pod",
+        "name": "audit-would-deny",
+        "namespace": "dyntest-fixture-agent",
+        "resourceVersion": "1005",
+        "uid": "8189bcbf-3473-4717-9685-ad9c9b920bd6"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-11-22T22:16:43Z",
+      "message": "Container created",
+      "metadata": {
+        "creationTimestamp": "2026-11-22T22:16:43Z",
+        "name": "audit-would-deny.18ea7de04be8e704",
+        "namespace": "dyntest-fixture-agent",
+        "resourceVersion": "1023",
+        "uid": "c7201701-31ae-4bf3-8254-fd6466556554"
+      },
+      "reason": "Created",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "agent-fence-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "agent-fence-control-plane"
+      },
+      "type": "Normal"
+    },
+    {
+      "apiVersion": "v1",
+      "count": 1,
+      "eventTime": null,
+      "firstTimestamp": "2026-11-22T22:16:46Z",
+      "involvedObject": {
+        "apiVersion": "v1",
+        "fieldPath": "spec.containers{main}",
+        "kind": "Pod",
+        "name": "audit-would-deny",
+        "namespace": "dyntest-fixture-agent",
+        "resourceVersion": "1005",
+        "uid": "8189bcbf-3473-4717-9685-ad9c9b920bd6"
+      },
+      "kind": "Event",
+      "lastTimestamp": "2026-11-22T22:16:46Z",
+      "message": "Error: failed to create containerd task: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: container init was OOM-killed (memory limit too low?)",
+      "metadata": {
+        "creationTimestamp": "2026-11-22T22:16:46Z",
+        "name": "audit-would-deny.18ea7de10b65a075",
+        "namespace": "dyntest-fixture-agent",
+        "resourceVersion": "1035",
+        "uid": "808fb4ad-3d9d-4433-8940-79dd1cac9d48"
+      },
+      "reason": "Failed",
+      "reportingComponent": "kubelet",
+      "reportingInstance": "agent-fence-control-plane",
+      "source": {
+        "component": "kubelet",
+        "host": "agent-fence-control-plane"
+      },
+      "type": "Warning"
+    },
+    {
+      "action": "Resource Passed",
+      "apiVersion": "v1",
+      "eventTime": "2026-11-22T22:16:25.335462Z",
+      "firstTimestamp": null,
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": "wcep-fence-probe-mode",
+        "namespace": "dyntest-fixture-agent",
+        "uid": "36988461-131d-4468-9e62-8407f286bbf8"
+      },
+      "kind": "Event",
+      "lastTimestamp": null,
+      "message": "policy agent-lease-fence/pods-need-the-open-lease fail: agent-lease-fence (owner fixture-owner, contact fixture-contact; off-switch in the policy's description): dyntest-fixture-agent admits a Pod only under its open agent lease, with a controller owner. Gate: missing for '' ('unreadable' means the policy could not read its gate: the policy is broken, not the lease). Pod lease label: 'lse_fenceprobe0'.",
+      "metadata": {
+        "creationTimestamp": "2026-11-22T22:16:25Z",
+        "name": "wcep-fence-probe-mode.18ea7ddc01b4bab1",
+        "namespace": "dyntest-fixture-agent",
+        "resourceVersion": "925",
+        "uid": "e180fa78-3350-437d-82e7-deea86dfea74"
+      },
+      "reason": "PolicyViolation",
+      "reportingComponent": "kyverno-admission",
+      "reportingInstance": "kyverno-admission-kyverno-admission-controller-7dcf98969d-xvpmn",
+      "source": {},
+      "type": "Warning"
+    },
+    {
+      "action": "Resource Passed",
+      "apiVersion": "v1",
+      "eventTime": "2026-11-22T22:16:25.335475Z",
+      "firstTimestamp": null,
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": "wcep-fence-probe-mode",
+        "namespace": "dyntest-fixture-agent",
+        "uid": "36988461-131d-4468-9e62-8407f286bbf8"
+      },
+      "kind": "Event",
+      "lastTimestamp": null,
+      "message": "policy agent-lease-fence/pods-need-the-open-lease fail: agent-lease-fence (owner fixture-owner, contact fixture-contact; off-switch in the policy's description): dyntest-fixture-agent admits a Pod only under its open agent lease, with a controller owner. Gate: missing for '' ('unreadable' means the policy could not read its gate: the policy is broken, not the lease). Pod lease label: 'lse_fenceprobe0'.",
+      "metadata": {
+        "creationTimestamp": "2026-11-22T22:16:25Z",
+        "name": "wcep-fence-probe-mode.18ea7ddc01b4ed71",
+        "namespace": "dyntest-fixture-agent",
+        "resourceVersion": "927",
+        "uid": "f7a4e6ac-7707-4ff8-9d9f-cc0435a69f28"
+      },
+      "reason": "PolicyViolation",
+      "reportingComponent": "kyverno-admission",
+      "reportingInstance": "kyverno-admission-kyverno-admission-controller-7dcf98969d-xvpmn",
+      "source": {},
+      "type": "Warning"
+    },
+    {
+      "action": "Resource Passed",
+      "apiVersion": "v1",
+      "eventTime": "2026-11-22T22:16:31.391616Z",
+      "firstTimestamp": null,
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": "wcep-fence-probe-mode",
+        "namespace": "dyntest-fixture-agent",
+        "uid": "12739614-5832-4831-9d25-c7bff63e5b5c"
+      },
+      "kind": "Event",
+      "lastTimestamp": null,
+      "message": "policy agent-lease-fence/pods-need-the-open-lease fail: agent-lease-fence (owner fixture-owner, contact fixture-contact; off-switch in the policy's description): dyntest-fixture-agent admits a Pod only under its open agent lease, with a controller owner. Gate: missing for '' ('unreadable' means the policy could not read its gate: the policy is broken, not the lease). Pod lease label: 'lse_fenceprobe0'.",
+      "metadata": {
+        "creationTimestamp": "2026-11-22T22:16:31Z",
+        "name": "wcep-fence-probe-mode.18ea7ddd6aae4fe8",
+        "namespace": "dyntest-fixture-agent",
+        "resourceVersion": "953",
+        "uid": "63a9d52c-55d0-49a0-ba5e-c2a6cd8bdb02"
+      },
+      "reason": "PolicyViolation",
+      "reportingComponent": "kyverno-admission",
+      "reportingInstance": "kyverno-admission-kyverno-admission-controller-7dcf98969d-xvpmn",
+      "source": {},
+      "type": "Warning"
+    },
+    {
+      "action": "Resource Passed",
+      "apiVersion": "v1",
+      "eventTime": "2026-11-22T22:16:31.391630Z",
+      "firstTimestamp": null,
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": "wcep-fence-probe-mode",
+        "namespace": "dyntest-fixture-agent",
+        "uid": "12739614-5832-4831-9d25-c7bff63e5b5c"
+      },
+      "kind": "Event",
+      "lastTimestamp": null,
+      "message": "policy agent-lease-fence/pods-need-the-open-lease fail: agent-lease-fence (owner fixture-owner, contact fixture-contact; off-switch in the policy's description): dyntest-fixture-agent admits a Pod only under its open agent lease, with a controller owner. Gate: missing for '' ('unreadable' means the policy could not read its gate: the policy is broken, not the lease). Pod lease label: 'lse_fenceprobe0'.",
+      "metadata": {
+        "creationTimestamp": "2026-11-22T22:16:31Z",
+        "name": "wcep-fence-probe-mode.18ea7ddd6aae8368",
+        "namespace": "dyntest-fixture-agent",
+        "resourceVersion": "955",
+        "uid": "2cb61e94-a0da-4805-8222-2439e9fb02ec"
+      },
+      "reason": "PolicyViolation",
+      "reportingComponent": "kyverno-admission",
+      "reportingInstance": "kyverno-admission-kyverno-admission-controller-7dcf98969d-xvpmn",
+      "source": {},
+      "type": "Warning"
+    },
+    {
+      "action": "Resource Passed",
+      "apiVersion": "v1",
+      "eventTime": "2026-11-22T22:16:31.662704Z",
+      "firstTimestamp": null,
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": "wcep-fence-probe-mode",
+        "namespace": "dyntest-fixture-agent",
+        "uid": "b7e3dd2f-dd44-4e1d-87c1-0095d9c09198"
+      },
+      "kind": "Event",
+      "lastTimestamp": null,
+      "message": "policy agent-lease-fence/pods-need-the-open-lease fail: agent-lease-fence (owner fixture-owner, contact fixture-contact; off-switch in the policy's description): dyntest-fixture-agent admits a Pod only under its open agent lease, with a controller owner. Gate: missing for '' ('unreadable' means the policy could not read its gate: the policy is broken, not the lease). Pod lease label: 'lse_fenceprobe0'.",
+      "metadata": {
+        "creationTimestamp": "2026-11-22T22:16:31Z",
+        "name": "wcep-fence-probe-mode.18ea7ddd7ad6c6b2",
+        "namespace": "dyntest-fixture-agent",
+        "resourceVersion": "959",
+        "uid": "dc80f95d-cd7b-49f8-a4a0-f8274381e77f"
+      },
+      "reason": "PolicyViolation",
+      "reportingComponent": "kyverno-admission",
+      "reportingInstance": "kyverno-admission-kyverno-admission-controller-7dcf98969d-xvpmn",
+      "source": {},
+      "type": "Warning"
+    },
+    {
+      "action": "Resource Passed",
+      "apiVersion": "v1",
+      "eventTime": "2026-11-22T22:16:31.662730Z",
+      "firstTimestamp": null,
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": "wcep-fence-probe-mode",
+        "namespace": "dyntest-fixture-agent",
+        "uid": "b7e3dd2f-dd44-4e1d-87c1-0095d9c09198"
+      },
+      "kind": "Event",
+      "lastTimestamp": null,
+      "message": "policy agent-lease-fence/pods-need-the-open-lease fail: agent-lease-fence (owner fixture-owner, contact fixture-contact; off-switch in the policy's description): dyntest-fixture-agent admits a Pod only under its open agent lease, with a controller owner. Gate: missing for '' ('unreadable' means the policy could not read its gate: the policy is broken, not the lease). Pod lease label: 'lse_fenceprobe0'.",
+      "metadata": {
+        "creationTimestamp": "2026-11-22T22:16:31Z",
+        "name": "wcep-fence-probe-mode.18ea7ddd7ad72f22",
+        "namespace": "dyntest-fixture-agent",
+        "resourceVersion": "960",
+        "uid": "c61e7c8f-e77a-4372-b783-51789944c3ed"
+      },
+      "reason": "PolicyViolation",
+      "reportingComponent": "kyverno-admission",
+      "reportingInstance": "kyverno-admission-kyverno-admission-controller-7dcf98969d-xvpmn",
+      "source": {},
+      "type": "Warning"
+    },
+    {
+      "action": "Resource Passed",
+      "apiVersion": "v1",
+      "eventTime": "2026-11-22T22:16:31.924271Z",
+      "firstTimestamp": null,
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": "wcep-fence-probe-mode",
+        "namespace": "dyntest-fixture-agent",
+        "uid": "7cb0452a-1aac-4351-9a1d-82b36b08ee97"
+      },
+      "kind": "Event",
+      "lastTimestamp": null,
+      "message": "policy agent-lease-fence/pods-need-the-open-lease fail: agent-lease-fence (owner fixture-owner, contact fixture-contact; off-switch in the policy's description): dyntest-fixture-agent admits a Pod only under its open agent lease, with a controller owner. Gate: missing for '' ('unreadable' means the policy could not read its gate: the policy is broken, not the lease). Pod lease label: 'lse_fenceprobe0'.",
+      "metadata": {
+        "creationTimestamp": "2026-11-22T22:16:31Z",
+        "name": "wcep-fence-probe-mode.18ea7ddd8a6df861",
+        "namespace": "dyntest-fixture-agent",
+        "resourceVersion": "966",
+        "uid": "cbf142d2-a2be-4573-8607-03a0c87173f9"
+      },
+      "reason": "PolicyViolation",
+      "reportingComponent": "kyverno-admission",
+      "reportingInstance": "kyverno-admission-kyverno-admission-controller-7dcf98969d-xvpmn",
+      "source": {},
+      "type": "Warning"
+    },
+    {
+      "action": "Resource Passed",
+      "apiVersion": "v1",
+      "eventTime": "2026-11-22T22:16:31.924289Z",
+      "firstTimestamp": null,
+      "involvedObject": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": "wcep-fence-probe-mode",
+        "namespace": "dyntest-fixture-agent",
+        "uid": "7cb0452a-1aac-4351-9a1d-82b36b08ee97"
+      },
+      "kind": "Event",
+      "lastTimestamp": null,
+      "message": "policy agent-lease-fence/pods-need-the-open-lease fail: agent-lease-fence (owner fixture-owner, contact fixture-contact; off-switch in the policy's description): dyntest-fixture-agent admits a Pod only under its open agent lease, with a controller owner. Gate: missing for '' ('unreadable' means the policy could not read its gate: the policy is broken, not the lease). Pod lease label: 'lse_fenceprobe0'.",
+      "metadata": {
+        "creationTimestamp": "2026-11-22T22:16:31Z",
+        "name": "wcep-fence-probe-mode.18ea7ddd8a6e4131",
+        "namespace": "dyntest-fixture-agent",
+        "resourceVersion": "968",
+        "uid": "fc1e5239-12a6-4e0d-8e1b-463a2057aaa1"
+      },
+      "reason": "PolicyViolation",
+      "reportingComponent": "kyverno-admission",
+      "reportingInstance": "kyverno-admission-kyverno-admission-controller-7dcf98969d-xvpmn",
+      "source": {},
+      "type": "Warning"
+    }
+  ],
+  "kind": "List",
+  "metadata": {
+    "resourceVersion": ""
+  }
+}

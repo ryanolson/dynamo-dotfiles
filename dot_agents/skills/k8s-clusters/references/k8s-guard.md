@@ -25,7 +25,7 @@ Every command prints one JSON object on stdout. A refusal exits non-zero with `{
 | `-n <ns> selftest fences` | the namespace's thread | For the first run on a cluster. On the first DGD the guard applied, it sends each teardown fence once with a wrong UID, a stale `resourceVersion` or a wrong lease label: three JSON patches, two DGD deletes, a namespace delete (not in a claimed namespace, which gets no Namespace request at all), and a lease record replace. Each payload changes nothing even if the server ignored its fence. It prints each server response and reads the objects again. It fails with `fence_failed` unless every request was refused for its fence's own reason (`testing value`, `Precondition failed`, `the object has been modified`) and nothing changed. Another error, such as Forbidden, proves nothing. |
 | `fence probe [<premade>]` | anyone | Read only: two server dry-run Pods. Prints `canary`, `mode`, `scope`, `armed`, the matched texts, `lease_fence`, and the `cause` when not armed. See "The fence policy". |
 | `fence render --owner <o> --contact <c> --runbook <r> [--bot-user <u>]` | anyone | Local, no cluster call: the two fence policies for ops, filled from the profiles. |
-| `fence record [<premade>]` | anyone | Read only: appends the audit window's new rows from PolicyReports and Kyverno Events. See "The recorder". |
+| `fence record [<premade>] [--since <time>]` | anyone | Read only: appends the audit window's new rows from PolicyReports and Kyverno Events, and counts the probes this host sent (since `--since`). See "The recorder". |
 | `-n <premade> fence trial close` / `fence trial delete-pod <pod>` | the trial claim's thread | A trial claim's two trial-only steps; refused outside a trial (`trial_only`). |
 | `inspect <ns>` | anyone | Read only. Prints `uid`, `thread`, `expires_at`, `dgd_gpus`, `pod_gpus`, `gpu_type`, `gpu_pods_left`, and also `allocation`, `lease_id`, `developer` and `agent_rbac` (the Namespace's two opt-in labels), and `lease_fence` (the fence label). A missing namespace gives code `not_found`; any other failure gives another code. |
 
@@ -138,6 +138,14 @@ The drain is a wait before the final check, not a timer that frees GPUs. A Pod a
 ### The recorder
 
 `fence record` (read only) reads the namespace's PolicyReports and Kyverno's Events naming `agent-lease-fence`, and appends rows it has not seen to `${XDG_STATE_HOME:-~/.local/state}/k8s-fence/<cluster>.jsonl`. A user timer, `k8s-fence-record@<context>.timer`, runs it every 15 minutes, inside the Events' one-hour lifetime; chezmoi never enables it. Rows hold only fields those shapes hold: no user, no operation. Probe rows are left out (by name and by the canary policy). Its output counts the probes this host sent, by rule, for the tally. Measured on kind in Audit: a would-be denial leaves a PolicyViolation Event on the Pod in the namespace, and so does each dry-run mode probe; dry runs count in `kyverno_policy_results_total` (`dry_run="true"`). It cannot see an object made and deleted between two runs whose Event also expired; ops read the counter at the end of the window for that.
+
+**The tally.** At the end of the window ops read `kyverno_policy_results_total` for `agent-lease-fence` and `agent-lease-fence-canary`, by rule and result, for the time since the admission pod last started: the counter lives in memory, and a restart zeroes it. Measured on Kyverno 1.15.2 in Audit (the kind fixture pins these numbers, so a Kyverno change shows there first), each request the Pod rule fails moves its counter by 2, because the admission and the audit evaluations each count, and leaves 2 Events; each probe moves the canary's counter by 1. So, with `P` the probes every probing host sent since that start (the sum of `k8s-guard fence record --since <start>` `probes_sent` over the hosts) and `R` the distinct objects among the recorder's rows for the Pod rule since then:
+
+- `pods-need-the-open-lease` `fail` = 2 × (`P` + `R`);
+- `probe-canary` `fail` = `P`;
+- the bot-root rule's `fail` = its recorder objects (not measured on kind; a trial shows it).
+
+A trial's planned denials are among the recorder's rows and are not added again. Any difference resets that cluster's window.
 
 ### Where a denial shows, and the off-switch
 
@@ -319,7 +327,8 @@ The tests use fakes. The first run on a cluster must confirm these, and run `sel
 - that the Dynamo operator (both DGD versions) and Grove copy the lease label onto Pods and give them a controller owner (a trial's Pod rule must read `pass`); the Grove multi-node path is first proven by the first enforced GPU deploy, where a mismatch refuses it;
 - that Kyverno emits a PolicyViolation Event for each Audit would-be denial on the managed clusters (measured on kind);
 - each cluster's support for webhook `matchConditions`, and the drain against its real request timeout;
-- the bot's read of PolicyReports and Events in its namespace.
+- the bot's read of PolicyReports and Events in its namespace;
+- that no other admission check (Pod Security admission, or another policy on the shared webhook) refuses a probe Pod before ours answers: the probe would read `probe_failed`, so claims refuse and teardown keeps the charge, and with webhooks answering in parallel the reading could change from one probe to the next. A trial shows it.
 
 ## Tests
 

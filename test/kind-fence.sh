@@ -74,6 +74,10 @@ elif cmd == 'probe-pod':
 elif cmd == 'verdict':
     crc, cerr, mrc, merr = int(sys.argv[3]), open(sys.argv[4]).read(), int(sys.argv[5]), open(sys.argv[6]).read()
     print(json.dumps(f.fence_verdict(crc, cerr, mrc, merr)))
+elif cmd == 'rows':
+    reports = json.load(open(sys.argv[3])).get('items') or []
+    events = json.load(open(sys.argv[4])).get('items') or []
+    print(json.dumps(f.record_rows(reports, events, f.probe_names())))
 elif cmd == 'gate':
     print(json.dumps(f.gate_object(sys.argv[3], sys.argv[4], sys.argv[5], int(sys.argv[6]), 'uid-fixture')))
 PY
@@ -211,6 +215,10 @@ for _ in 1 2 3; do probe >/dev/null; done
 sleep 8
 c1=$(canary_sum); m1=$(metric_sum pods-need-the-open-lease fail); e1=$(events_of)
 say "TALLY 3 dry-run probes: probe-canary fail +$((c1 - c0)), pods-need-the-open-lease fail +$((m1 - m0)), events in the namespace +$((e1 - e0))"
+# The tally's multipliers, measured on Kyverno 1.15.2 in Audit: pinned, so a Kyverno change shows up here.
+check "tally: one dry-run probe moves the canary's counter by 1" test "$((c1 - c0))" = 3
+check "tally: one dry-run probe moves the Pod rule's counter by 2 (admission and audit evaluations)" test "$((m1 - m0))" = 6
+check "tally: one dry-run probe leaves 2 Events in the namespace" test "$((e1 - e0))" = 6
 say "METRIC $(metrics | head -2 | tr '\n' ' ')"
 pod_json audit-would-deny "" no | KB create -f - -o name >/dev/null 2>"$WORK/pod.err"; rc=$?
 check "audit: a real would-be denial is admitted" test "$rc" = 0
@@ -218,13 +226,21 @@ record_text "would-be denial answer (Audit)" "$WORK/pod.err"
 sleep 10
 m2=$(metric_sum pods-need-the-open-lease fail); e2=$(events_of)
 say "TALLY 1 real would-be denial: pods-need-the-open-lease fail +$((m2 - m1)), events in the namespace +$((e2 - e1))"
-check "audit: the real would-be denial moves the counter" test "$((m2 - m1))" -ge 1
+check "tally: a real would-be denial moves the Pod rule's counter by 2" test "$((m2 - m1))" = 2
+check "tally: a real would-be denial leaves 2 Events in the namespace" test "$((e2 - e1))" = 2
 K -n "$PREMADE" get events -o json | jq -c '.items[] | select((.message // "") | contains("agent-lease-fence")) | {reason, type, involvedObject: {kind: .involvedObject.kind, name: .involvedObject.name}, reportingComponent, count, message: .message[0:160]}' > "$WORK/events.jsonl"
 say "EVENTS $(wc -l <"$WORK/events.jsonl") in the namespace naming the policy; for the real Pod: $(grep -c '"audit-would-deny"' "$WORK/events.jsonl")"
 check "audit: the would-be denial has an Event in the namespace (what the recorder reads)" grep -q '"audit-would-deny"' "$WORK/events.jsonl"
 sleep 20
-K -n "$PREMADE" get policyreports -o json > "$WORK/policyreports.json" 2>/dev/null
+# The recorder's rule on the raw shapes, read as the guard reads them.
+K -n "$PREMADE" get policyreports.wgpolicyk8s.io -o json > "$WORK/policyreports.json" 2>/dev/null
+K -n "$PREMADE" get events -o json > "$WORK/events-raw.json"
 say "REPORTS $(jq '[.items[]?.results[]? | select(.policy == "agent-lease-fence")] | length' "$WORK/policyreports.json") results naming the policy"
+helper rows "$WORK/policyreports.json" "$WORK/events-raw.json" > "$WORK/rows.json"
+say "ROWS $(jq -c '[.[] | {source, name, rule, reason, result}]' "$WORK/rows.json" | head -c 1500)"
+check "recorder: the would-be denial has a row from the report and from its Events" \
+  jq -e '([.[] | select(.name == "audit-would-deny" and .source == "report")] | length >= 1) and ([.[] | select(.name == "audit-would-deny" and .source == "event")] | length >= 1)' "$WORK/rows.json"
+check "recorder: no probe row" jq -e '[.[] | select(.name | test("wcep-fence-probe"))] | length == 0' "$WORK/rows.json"
 K -n "$PREMADE" delete pod audit-would-deny --wait=false >/dev/null 2>&1
 
 # --- Enforce: armed, and the gate read end to end (T4 condition 2) -------------------------------------------

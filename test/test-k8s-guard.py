@@ -5241,6 +5241,18 @@ class FenceRecord(FenceCase):
         path = self.state_home / f'k8s-fence/{PROFILE}.jsonl'
         return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
 
+    def test_the_real_v1_15_2_shapes_give_the_would_be_denial_and_no_probe(self):
+        fixtures = ROOT / 'test/fixtures/k8s-fence'
+        self.k8s['policyreports.wgpolicyk8s.io'] = {PREMADE: json.loads((fixtures / 'policyreports.json').read_text())['items']}
+        self.k8s['events'] = {PREMADE: json.loads((fixtures / 'events.json').read_text())['items']}
+        self.flush()
+        body = self.record()
+        rows = self.rows()
+        self.assertEqual(sorted((r['source'], r['name']) for r in rows),
+                         [('event', 'audit-would-deny'), ('event', 'audit-would-deny'), ('report', 'audit-would-deny')])
+        self.assertEqual(body['new_rows'], 3)
+        self.assertEqual(self.record()['new_rows'], 0, 'a second run appends nothing')
+
     def test_rows_come_from_the_report_and_the_event_shapes_only(self):
         self.k8s['policyreports.wgpolicyk8s.io'] = {PREMADE: [REPORT]}
         self.k8s['events'] = {PREMADE: [event('someones-pod', 'uid-pod-1', VIOLATION)]}
@@ -5275,6 +5287,20 @@ class FenceRecord(FenceCase):
         self.flush()
         self.record()
         self.assertEqual([r['name'] for r in self.rows()], ['someones-pod'])
+
+    def test_since_counts_only_the_probes_after_the_counter_started(self):
+        # Kyverno's counter lives in memory: an admission pod restart zeroes it, so the tally counts the probes
+        # sent since that pod started.
+        ledger = self.state_home / 'k8s-guard/ledger.jsonl'
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text(json.dumps({'time': '2026-01-01T00:00:00Z', 'cluster': PROFILE, 'namespace': PREMADE,
+                                      'object': f'FenceProbe/{PREMADE}', 'direction': 'probe'}) + '\n')
+        self.probe()
+        self.assertEqual(self.record()['probes_sent']['probe-canary'], 2)
+        body = self.ok('--context', CTX, 'fence', 'record', '--since', '2026-06-01T00:00:00Z', host_entry=True)
+        self.assertEqual(body['probes_sent'], {'probe-canary': 1, 'pods-need-the-open-lease': 1}, body)
+        self.assertEqual(body['since'], '2026-06-01T00:00:00Z')
+        self.refused('invalid_time', '--context', CTX, 'fence', 'record', '--since', 'yesterday', host_entry=True)
 
     def test_the_ledger_counts_the_probes_it_sent_by_rule(self):
         self.probe()

@@ -23,7 +23,7 @@ Usage (every command takes --context <kube context>; -n may come anywhere):
   k8s-guard fence probe <premade>                              is the lease fence armed? two dry-run Pods
   k8s-guard fence render --owner <o> --contact <c> --runbook <r>
                                                                the fence policy for ops, from the template
-  k8s-guard fence record <premade>                             append new audit rows, read only
+  k8s-guard fence record <premade> [--since <time>]            append new audit rows; count the probes sent
   k8s-guard -n <premade> fence trial close|delete-pod <pod>    a trial claim's two trial-only steps
 
 Every command prints one JSON object on stdout. Failures exit non-zero with
@@ -2400,6 +2400,7 @@ def cmd_fence_render(g, a):
 def cmd_fence_record(g, a):
     """The audit window's recorder: append the rows not seen before, from reports and Events. Read only."""
     ns = g.ns_name(a.namespace or (None if g.namespace else g.premade))
+    since = parse_time(a.since, '--since') if a.since else None
     rc, out, err = g.kc.run('get', 'policyreports.wgpolicyk8s.io', '-n', ns, '-o', 'json')
     if rc != 0:
         raise kubectl_error(('get', 'policyreports'), rc, err)
@@ -2430,10 +2431,16 @@ def cmd_fence_record(g, a):
                 l = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if l.get('object') == f'FenceProbe/{ns}' and l.get('cluster') == g.cluster:
-                probes += 1
+            if l.get('object') != f'FenceProbe/{ns}' or l.get('cluster') != g.cluster:
+                continue
+            try:
+                if since and parse_time(l.get('time'), 'a ledger time') < since:
+                    continue
+            except Refusal:
+                continue
+            probes += 1
     return {'namespace': ns, 'new_rows': len(new), 'total_rows': len(seen) + len(new), 'file': str(path),
-            'probes_sent': {fence.CANARY_RULE: probes, fence.POD_RULE: probes}}
+            'probes_sent': {fence.CANARY_RULE: probes, fence.POD_RULE: probes}, 'since': a.since}
 
 
 def cmd_fence_trial(g, a):
@@ -2518,7 +2525,7 @@ COMMANDS = {
     ('fence', 'probe'): (cmd_fence_probe, ((('namespace',), {'nargs': '?'}),)),
     ('fence', 'render'): (cmd_fence_render, ((('--owner',), {'required': True}), (('--contact',), {'required': True}),
                                              (('--runbook',), {'required': True}), (('--bot-user',), {}))),
-    ('fence', 'record'): (cmd_fence_record, ((('namespace',), {'nargs': '?'}),)),
+    ('fence', 'record'): (cmd_fence_record, ((('namespace',), {'nargs': '?'}), (('--since',), {}))),
     ('fence', 'trial'): (cmd_fence_trial, ((('step',), {'choices': ['close', 'delete-pod']}),
                                            (('pod',), {'nargs': '?'}))),
 }

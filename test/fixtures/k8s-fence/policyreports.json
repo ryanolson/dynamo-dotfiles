@@ -1,0 +1,63 @@
+{
+  "apiVersion": "v1",
+  "items": [
+    {
+      "apiVersion": "wgpolicyk8s.io/v1alpha2",
+      "kind": "PolicyReport",
+      "metadata": {
+        "creationTimestamp": "2026-11-22T22:17:00Z",
+        "generation": 1,
+        "labels": {
+          "app.kubernetes.io/managed-by": "kyverno"
+        },
+        "name": "8189bcbf-3473-4717-9685-ad9c9b920bd6",
+        "namespace": "dyntest-fixture-agent",
+        "ownerReferences": [
+          {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "name": "audit-would-deny",
+            "uid": "8189bcbf-3473-4717-9685-ad9c9b920bd6"
+          }
+        ],
+        "resourceVersion": "1088",
+        "uid": "ccc349f1-1555-4249-9665-28ba8a1a07fb"
+      },
+      "results": [
+        {
+          "message": "agent-lease-fence (owner fixture-owner, contact fixture-contact; off-switch in the policy's description): dyntest-fixture-agent admits a Pod only under its open agent lease, with a controller owner. Gate: missing for '' ('unreadable' means the policy could not read its gate: the policy is broken, not the lease). Pod lease label: ''.",
+          "policy": "agent-lease-fence",
+          "properties": {
+            "process": "admission review"
+          },
+          "result": "fail",
+          "rule": "pods-need-the-open-lease",
+          "scored": true,
+          "source": "kyverno",
+          "timestamp": {
+            "nanos": 0,
+            "seconds": 1795385800
+          }
+        }
+      ],
+      "scope": {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": "audit-would-deny",
+        "namespace": "dyntest-fixture-agent",
+        "uid": "8189bcbf-3473-4717-9685-ad9c9b920bd6"
+      },
+      "summary": {
+        "error": 0,
+        "fail": 1,
+        "pass": 0,
+        "skip": 0,
+        "warn": 0
+      }
+    }
+  ],
+  "kind": "List",
+  "metadata": {
+    "resourceVersion": ""
+  }
+}
