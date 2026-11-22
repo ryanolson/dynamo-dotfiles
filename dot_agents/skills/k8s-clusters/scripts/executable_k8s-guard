@@ -995,7 +995,10 @@ def cmd_ns_claim(g, a):
     The bot cannot create, label or delete it, so the lease's row in k8s-leases is the only authority:
     the plugin takes the owner from the calling thread and checks the exact profile name, both labels
     and the live UID on a trusted host. The request id is kept in the thread ledger before the call, so
-    a retry after a lost reply gets the same outcome. Nothing here writes to the cluster.
+    a retry after a lost reply gets the same outcome. Only --gpus and --hours are terms the caller can
+    change, so a pending request blocks a retry only when one of them differs. The claim is recorded
+    against the UID its request named, so a namespace re-created under the same name is left alone.
+    Nothing here writes to the cluster.
     """
     g.require_writable()
     g.require_thread()
@@ -1012,7 +1015,9 @@ def cmd_ns_claim(g, a):
     if view.labels.get(DEVELOPER_LABEL) != g.bot['developer'] or view.labels.get(AGENT_RBAC_LABEL) != 'true':
         raise Refusal('namespace_not_ours', f'{ns} lacks {DEVELOPER_LABEL}={g.bot["developer"]} or '
                                             f'{AGENT_RBAC_LABEL}=true')
-    terms = {'uid': view.uid, 'claim_gpus': a.gpus, 'claim_hours': a.hours}
+    # Only what the caller can set can make its retry ask with other terms: the UID is not a term, and ops
+    # re-creating the namespace must not strand a pending request no flag value could clear.
+    terms = {'claim_gpus': a.gpus, 'claim_hours': a.hours}
     lines = g.claim_lines(ns)
     last = lines[-1] if lines else {}
     pending = last.get('direction') == 'claim-request' and REQUEST_ID.match(str(last.get('request')))
@@ -1021,25 +1026,23 @@ def cmd_ns_claim(g, a):
         # refuses while this thread's own lease may stand unnamed in its ledger.
         raise Refusal('claim_pending', f'the last claim of {ns} (request {last["request"]}: --gpus '
                                        f'{last.get("claim_gpus")} --hours {last.get("claim_hours")}) has no known '
-                                       'outcome; run ns claim again with those terms to learn it')
+                                       'outcome; run ns claim again with those --gpus and --hours to learn it')
     if pending:
-        # The last request has no known outcome (its reply was lost, or an error came after it): ask again.
-        request, replaces = last['request'], last.get('replaces') or 'none'
+        # The last request has no known outcome (its reply was lost, or an error came after it): ask again
+        # with it. That is the one call that learns the outcome, whether or not the namespace was
+        # re-created since, and the plugin replays a claim it committed.
+        request_uid, request, replaces = last.get('uid'), last['request'], last.get('replaces') or 'none'
     else:
-        latest = bb('k8s', 'lease', 'latest', '--cluster', g.cluster, '--namespace', ns)
-        if latest.offline:
-            raise lease_unavailable(latest, 'lease latest')
-        if not latest.ok:
-            raise Refusal(latest.code, f'lease latest: {latest.error}')
-        prior = latest.value.get('lease_id')
-        replaces = prior if isinstance(prior, str) and LEASE_ID.match(prior) else 'none'
-        request = 'req_' + secrets.token_hex(12)
-        g.record(ns, f'Claim/{ns}', 0, 'claim-request', request=request, replaces=replaces, **terms)
-    res = bb('k8s', 'lease', 'acquire', '--claim', '--request', request, '--replaces', replaces, '--cluster', g.cluster,
-             '--namespace', ns, '--uid', view.uid, '--gpu-type', g.profile['gpu_type'], '--gpus', a.gpus,
-             '--hours', a.hours)
-    if res.offline:
-        raise lease_unavailable(res, 'acquire')
+        request_uid = view.uid
+        request, replaces = new_claim_request(g, ns, request_uid, a.gpus, a.hours)
+    res = ask_claim(g, ns, request, replaces, view.uid, a.gpus, a.hours)
+    if not res.ok and res.code in CLAIM_REFUSALS and pending:
+        # The replay answered: the pending request was refused, so this thread holds no lease of ns. One
+        # fresh request may follow in the same run, naming the live UID.
+        g.record(ns, f'Claim/{ns}', 0, 'claim-refused', request=request, code=res.code)
+        request_uid = view.uid
+        request, replaces = new_claim_request(g, ns, request_uid, a.gpus, a.hours)
+        res = ask_claim(g, ns, request, replaces, view.uid, a.gpus, a.hours)
     if not res.ok:
         if res.code in CLAIM_REFUSALS:
             g.record(ns, f'Claim/{ns}', 0, 'claim-refused', request=request, code=res.code)
@@ -1050,11 +1053,36 @@ def cmd_ns_claim(g, a):
     lease_id, expires = res.value.get('lease_id'), res.value.get('expires_at')
     if not isinstance(lease_id, str) or not LEASE_ID.match(lease_id) or not isinstance(expires, str):
         raise Refusal('lease_invalid', 'acquire returned no lease id or expiry')
-    g.record(ns, f'Claim/{ns}', 0, 'claim', uid=view.uid, lease=lease_id, request=request)
+    g.record(ns, f'Claim/{ns}', 0, 'claim', uid=request_uid, lease=lease_id, request=request)
     return {'lease_id': lease_id, 'expires_at': expires, 'namespace': ns, 'claimed': True,
             'state': res.value.get('state', 'active'), 'pod_label': {LEASE_LABEL: lease_id},
             'pod_affinity': {'podAffinity': {'requiredDuringSchedulingIgnoredDuringExecution': [{
                 'labelSelector': {'matchLabels': {LEASE_LABEL: lease_id}}, 'topologyKey': HOSTNAME_TOPOLOGY}]}}}
+
+
+def new_claim_request(g, ns, uid, gpus, hours):
+    """One new claim request for ns, recorded in the ledger before any call: its id and its predecessor."""
+    latest = bb('k8s', 'lease', 'latest', '--cluster', g.cluster, '--namespace', ns)
+    if latest.offline:
+        raise lease_unavailable(latest, 'lease latest')
+    if not latest.ok:
+        raise Refusal(latest.code, f'lease latest: {latest.error}')
+    prior = latest.value.get('lease_id')
+    replaces = prior if isinstance(prior, str) and LEASE_ID.match(prior) else 'none'
+    request = 'req_' + secrets.token_hex(12)
+    g.record(ns, f'Claim/{ns}', 0, 'claim-request', request=request, replaces=replaces, uid=uid,
+             claim_gpus=gpus, claim_hours=hours)
+    return request, replaces
+
+
+def ask_claim(g, ns, request, replaces, uid, gpus, hours):
+    """Ask the plugin for one claim, once: the request it names decides a replay's answer."""
+    res = bb('k8s', 'lease', 'acquire', '--claim', '--request', request, '--replaces', replaces, '--cluster',
+             g.cluster, '--namespace', ns, '--uid', uid, '--gpu-type', g.profile['gpu_type'], '--gpus', gpus,
+             '--hours', hours)
+    if res.offline:
+        raise lease_unavailable(res, 'acquire')
+    return res
 
 
 def hours_arg(text, maximum):

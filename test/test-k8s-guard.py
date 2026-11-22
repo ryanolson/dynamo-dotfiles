@@ -544,6 +544,15 @@ if argv[:4] == ['k8s', 'lease', 'acquire', '--claim']:
     save()
     if st.get('claims', 'off') == 'off':
         err('enforcement_unhealthy', 'Claims of a pre-made namespace stay off until the admission webhook is installed.')
+    if st.get('claim_error_before_commit'):
+        st['claim_error_before_commit'] = False
+        save()
+        err('internal', 'the claim failed before it committed')
+    if st.get('refuse_replay') and any(c['request'] == o['request'] for c in st['claim_calls'][:-1]):
+        # This request was asked with earlier: the call asks again, and the plugin refuses it.
+        code = st.pop('refuse_replay')
+        save()
+        err(code, 'refused by the fake')
     for l in st['leases'].values():
         if l.get('request') == o['request']:
             out({'lease_id': l['lease_id'], 'expires_at': l['expires_at'], 'state': l['state']})
@@ -3034,6 +3043,24 @@ class ClaimedCase(GuardCase):
         return self.guard('--context', CTX, verb, PREMADE, '--uid', 'uid-premade-1', '--lease', lid,
                           host_entry=True, **kw)
 
+    def earlier_lease(self, state='released'):
+        """A lease of the namespace an earlier task made: the one `lease latest` names."""
+        self.bb['latest'] = {PREMADE: 'lse_earlier001'}
+        self.bb['leases']['lse_earlier001'] = {'lease_id': 'lse_earlier001', 'state': state, 'cluster': PROFILE,
+                                               'namespace': PREMADE, 'uid': 'uid-premade-1', 'thread': OTHER,
+                                               'gpu_type': 'gb300', 'gpus': 1, 'multi_node': False, 'mode': 'claimed',
+                                               'expires_at': iso_ms(hours_from_now(-1 if state == 'released' else 2))}
+        self.flush()
+
+    def recreate_namespace(self):
+        """Ops re-created the pre-made namespace under its name, so its live UID is a new one."""
+        self.k8s['namespaces'][PREMADE]['metadata']['uid'] = 'uid-premade-2'
+        self.flush()
+        return 'uid-premade-2'
+
+    def claim_lines(self):
+        return [l for l in self.ledger() if l['object'] == f'Claim/{PREMADE}']
+
 
 class NamespaceClaim(ClaimedCase):
     def test_claims_are_off_until_the_admission_webhook_exists(self):
@@ -3086,15 +3113,69 @@ class NamespaceClaim(ClaimedCase):
         self.assertEqual(body['lease_id'], next(iter(self.bb['leases'])))
 
     def test_a_fresh_claim_names_the_latest_lease_as_its_predecessor(self):
-        self.bb['latest'] = {PREMADE: 'lse_earlier001'}
-        self.bb['leases']['lse_earlier001'] = {'lease_id': 'lse_earlier001', 'state': 'released', 'cluster': PROFILE,
-                                               'namespace': PREMADE, 'uid': 'uid-premade-1', 'thread': OTHER,
-                                               'gpu_type': 'gb300', 'gpus': 1, 'expires_at': iso_ms(hours_from_now(-1)),
-                                               'multi_node': False, 'mode': 'claimed'}
-        self.flush()
+        self.earlier_lease()
         rc, body, _ = self.claim()
         self.assertEqual(rc, 0, body)
         self.assertEqual(self.bb['claim_calls'][0]['replaces'], 'lse_earlier001')
+
+    def test_a_re_created_namespace_still_asks_with_the_pending_request(self):
+        # The plugin failed, so the claim may have committed: its request stays pending, naming the namespace
+        # UID it was made against. Ops re-created that namespace meanwhile. The UID is not a term the caller
+        # can set, so it must never strand the request: asking again with the same id learns the outcome,
+        # and the plugin replays its grant.
+        self.bb['claim_error_after_commit'] = True
+        self.flush()
+        rc, body, _ = self.claim()
+        self.assertEqual(body.get('code'), 'internal', body)
+        [pending] = self.claim_lines()
+        self.assertEqual(pending['direction'], 'claim-request')
+        [lease_id] = self.bb['leases']
+        live_uid = self.recreate_namespace()
+        asked = len(self.bb['claim_calls'])
+        rc, body, _ = self.claim()
+        self.assertEqual(rc, 0, body)
+        [replay] = self.bb['claim_calls'][asked:]
+        self.assertEqual(replay['request'], pending['request'], 'the pending request is the one asked with')
+        self.assertEqual(body['lease_id'], lease_id)
+        # The claim names the UID the request was made against, not the live one: that is what keeps every
+        # owned write away from the re-created namespace.
+        claims = self.claim_lines()
+        self.assertEqual([(l['direction'], l['lease']) for l in claims], [('claim-request', None), ('claim', lease_id)])
+        self.assertEqual((claims[-1]['uid'], claims[-1]['request']), (pending['uid'], pending['request']))
+        self.assertNotEqual(claims[-1]['uid'], live_uid, 'the claim names the UID its request was made against')
+        self.assertNotIn('claim_pending', [l.get('code') for l in claims])
+        rc, body, _ = self.apply(gpu_dgd('w', 1, lease_id), ns=PREMADE)
+        self.assertEqual(body.get('code'), 'uid_mismatch', body)
+        self.assertEqual(self.writes(), [], 'the re-created namespace is left alone for on-call')
+
+    def test_a_refused_replay_starts_one_fresh_request(self):
+        # The plugin refused the pending request before it committed, and its error hid that. The replay's
+        # refusal is the answer that was missing: record it, then make one new request, which names the
+        # live UID and the lease `latest` names as its predecessor.
+        self.earlier_lease()
+        self.bb['claim_error_before_commit'] = True
+        self.bb['next_id'] = 'lse_fresh0001'
+        self.flush()
+        rc, body, _ = self.claim()
+        self.assertEqual(body.get('code'), 'internal', body)
+        [pending] = self.claim_lines()
+        live_uid = self.recreate_namespace()
+        self.bb['refuse_replay'] = 'uid_mismatch'
+        self.flush()
+        asked = len(self.bb['claim_calls'])
+        rc, body, _ = self.claim()
+        self.assertEqual(rc, 0, body)
+        replay, fresh = self.bb['claim_calls'][asked:]
+        self.assertEqual(replay['request'], pending['request'])
+        self.assertNotEqual(fresh['request'], pending['request'])
+        self.assertEqual(fresh['replaces'], 'lse_earlier001')
+        self.assertEqual(body['lease_id'], 'lse_fresh0001')
+        self.assertEqual([(l['direction'], l.get('request'), l.get('code')) for l in self.claim_lines()],
+                         [('claim-request', pending['request'], None),
+                          ('claim-refused', pending['request'], 'uid_mismatch'),
+                          ('claim-request', fresh['request'], None),
+                          ('claim', fresh['request'], None)])
+        self.assertEqual(self.claim_lines()[-1]['uid'], live_uid, 'the fresh request names the live UID')
 
     def test_only_the_profiles_premade_namespace_with_both_labels(self):
         self.bb['claims'] = 'on'
