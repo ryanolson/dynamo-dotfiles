@@ -480,8 +480,10 @@ def zero_patch(dgd, lease_id):
 REGISTRY = 'nvcr.io/goirlvsxnepa/llm_nim'
 BUILDKIT_IMAGE = ('mirror.gcr.io/moby/buildkit:v0.23.2-rootless'
                   '@sha256:cab936745de5d673465948f1e93ff4d6e372bbe33f218afd3314eba45a6f85a9')
-CRANE_IMAGE = ('gcr.io/go-containerregistry/crane:v0.20.3'
-               '@sha256:fc86bcad43a000c2a1ca926a1e167db26c053cebc3fa5d14285c72773fb8c11d')
+# The :debug variant of the same release: ko adds a busybox shell at /busybox, which the tag-check
+# script needs to turn crane's exit code into the init container's answer. The crane binary is the same.
+CRANE_IMAGE = ('gcr.io/go-containerregistry/crane/debug:v0.20.3'
+               '@sha256:94f61956845714bea3b788445454ae4827f49a90dcd9dac28255c4cccb6220ad')
 PUSH_SECRET = 'nvcr-push'
 GIT_SECRET = 'git'
 KNOWN_HOSTS_CONFIGMAP = 'git-known-hosts'
@@ -500,34 +502,16 @@ OWNER = re.compile(r'^[A-Za-z0-9]([A-Za-z0-9-]{0,38})$')
 REPOSITORY = re.compile(r'^[A-Za-z0-9._-]{1,100}$')
 DIGEST_IMAGE = re.compile(r'@sha256:[0-9a-f]{64}$')
 
-# The registry probe the tag-check initContainer runs, in the pinned builder image (the crane image has
-# no shell). It answers with one marker line, which `build show` reports: tag_exists and registry_denied
-# refuse the build, registry_error refuses it too, and only a manifest unknown lets the clone and the
-# build run. Its test is test/test-k8s-guard.py (TagCheckScript), on a fake wget.
+# The tag-check initContainer runs crane under the debug image's busybox shell. `crane digest` sends
+# every manifest Accept type itself, so a 404 is a missing tag and not an unaccepted OCI index; its
+# error text carries MANIFEST_UNKNOWN for an absent tag. Only that string lets the build run: 401/403
+# refuse, and any other failure refuses rather than guessing. Its test is TagCheckScript.
 TAG_CHECK_SCRIPT = r'''set -u
-config="$DOCKER_CONFIG/config.json"
-auth=$(sed -n 's/.*"auth"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$config" | head -n 1)
-if [ -z "$auth" ]; then echo "registry_error: no auth in $config"; exit 1; fi
-challenge=$(wget -S -O /dev/null "https://$REGISTRY/v2/" 2>&1)
-realm=$(printf '%s\n' "$challenge" | sed -n 's/.*realm="\([^"]*\)".*/\1/p' | head -n 1)
-service=$(printf '%s\n' "$challenge" | sed -n 's/.*service="\([^"]*\)".*/\1/p' | head -n 1)
-header="Basic $auth"
-if [ -n "$realm" ]; then
-  token=$(wget -O - --header="Authorization: Basic $auth" \
-    "$realm?service=$service&scope=repository:$REPO_PATH:pull" 2>/dev/null \
-    | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
-  if [ -z "$token" ]; then echo registry_denied; exit 1; fi
-  header="Bearer $token"
-fi
-answer=$(wget -S -O - --header="Authorization: $header" \
-  "https://$REGISTRY/v2/$REPO_PATH/manifests/$TAG" 2>&1)
-status=$(printf '%s\n' "$answer" | sed -n 's/.*HTTP\/[0-9.]*[[:space:]]\([0-9][0-9][0-9]\).*/\1/p' | tail -n 1)
-case "$status" in
-  200) echo tag_exists; exit 1 ;;
-  401|403) echo registry_denied; exit 1 ;;
-  404) case "$answer" in *manifest*unknown*|*MANIFEST_UNKNOWN*) exit 0 ;; esac
-       echo "registry_error: $answer"; exit 1 ;;
-  *) echo "registry_error: $answer"; exit 1 ;;
+out=$("$CRANE" digest "$REF" 2>&1) && { echo tag_exists; exit 1; }
+case "$out" in
+  *MANIFEST_UNKNOWN*|*"manifest unknown"*) exit 0 ;;
+  *UNAUTHORIZED*|*DENIED*|*"401"*|*"403"*) echo registry_denied; exit 1 ;;
+  *) echo "registry_error: $out"; exit 1 ;;
 esac
 '''
 
@@ -702,11 +686,10 @@ def build_job(ns, uid, lease_id, attempt, repo, commit, dockerfile, image, arch,
         'nodeSelector': {ARCH_LABEL: arch},
         'volumes': volumes,
         'initContainers': [
-            {'name': 'tag-check', 'image': BUILDKIT_IMAGE,
-             'command': ['sh', '-c', TAG_CHECK_SCRIPT],
-             'env': [{'name': 'REGISTRY', 'value': 'nvcr.io'},
-                     {'name': 'REPO_PATH', 'value': f'goirlvsxnepa/llm_nim/{image}'},
-                     {'name': 'TAG', 'value': image_tag(commit, arch)},
+            {'name': 'tag-check', 'image': CRANE_IMAGE,
+             'command': ['/busybox/sh', '-c', TAG_CHECK_SCRIPT],
+             'env': [{'name': 'CRANE', 'value': '/ko-app/crane'},
+                     {'name': 'REF', 'value': image_ref(image, commit, arch)},
                      {'name': 'DOCKER_CONFIG', 'value': '/home/user/.docker'}],
              'volumeMounts': [_docker_config_mount()],
              'resources': resources('1', '1Gi', '5Gi', '2', '2Gi', '10Gi')},
@@ -813,6 +796,20 @@ def check_ssh_mount(pod, clone):
 
 def check_build_pod(pod, expect):
     init, main = pod.get('initContainers') or [], pod.get('containers') or []
+    checks = [c for c in init if c.get('name') == 'tag-check']
+    if len(checks) != 1 or checks[0].get('image') != CRANE_IMAGE:
+        raise Refusal('field_refused', 'the tag check must run the pinned crane debug image')
+    check_command = checks[0].get('command') or []
+    if check_command[:1] != ['/busybox/sh'] or 'digest' not in ' '.join(check_command):
+        raise Refusal('field_refused', 'the tag check runs the crane probe under the debug image shell')
+    check_env = {e.get('name'): e.get('value') for e in checks[0].get('env') or []}
+    if check_env.get('REF') != image_ref(expect['image'], expect['commit'], expect['arch']) \
+            or check_env.get('CRANE') != '/ko-app/crane' \
+            or check_env.get('DOCKER_CONFIG') != '/home/user/.docker':
+        raise Refusal('field_refused', 'the tag check must digest this image tag with the mounted credential')
+    check_mounts = [m for m in checks[0].get('volumeMounts') or [] if m.get('name') == 'docker-config']
+    if len(check_mounts) != 1 or check_mounts[0].get('readOnly') is not True:
+        raise Refusal('field_refused', 'the tag check reads the push credential read-only')
     clones = [c for c in init if c.get('name') == 'clone']
     if len(clones) != 1:
         raise Refusal('field_refused', 'the build needs one clone initContainer')

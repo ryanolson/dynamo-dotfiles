@@ -1157,10 +1157,10 @@ def cmd_lease_acquire(g, a):
 
 def cmd_secret(g, a):
     g.require_writable()
-    # The push credential is readable by everyone in Access-dynamo-clusters-dev once it is in the namespace.
-    # The owner accepted that exposure for the PAT; this flag makes creating the secret a stated step, so a
-    # thread cannot make one just because it holds a claim. It is a tripwire, not an authority check: the
-    # acceptance itself lives with the owner and the live half's first run.
+    # The push credential is readable by everyone in Access-dynamo-clusters-dev once it is in the namespace,
+    # so creating it is a stated step (--exposure-accepted), not something a thread does because it holds a
+    # claim. The flag is a tripwire, not an authority check: the exposure's acceptance is the owner's, and a
+    # cluster policy is the boundary (a follow-up, not this guard).
     if a.which == 'ngc-push' and not a.exposure_accepted:
         raise Refusal('push_not_approved', 'nvcr-push puts the push credential in the namespace, where every member '
                                            'of Access-dynamo-clusters-dev can read it; pass --exposure-accepted only '
@@ -1185,9 +1185,16 @@ def cmd_secret(g, a):
                                stdin=subprocess.DEVNULL, timeout=FLEET_TIMEOUT)
         except (FileNotFoundError, subprocess.TimeoutExpired) as e:
             raise Refusal('secret_unavailable', f'fleet secret get failed: {type(e).__name__}')
-        value = p.stdout[:-1] if p.stdout.endswith('\n') else p.stdout
+        # A token is stored without its one trailing newline. An OpenSSH private key needs the newline that
+        # ends its last line, or ssh refuses it (`error in libcrypto`), so git keys keep exactly one.
+        raw = p.stdout
+        if a.which == 'git':
+            value = raw.rstrip('\n') + '\n' if raw.strip() else ''
+        else:
+            value = raw[:-1] if raw.endswith('\n') else raw
         if value:
             remember_secret(value)
+            remember_secret(value.rstrip('\n'))
         if p.returncode != 0 or not value:
             raise Refusal('secret_unavailable', f'fleet secret get exited {p.returncode}: {clip(p.stderr, 200)}')
         if a.which in ('ngc', 'ngc-push'):
@@ -1198,15 +1205,23 @@ def cmd_secret(g, a):
             payload = value
         labels = {NS_UID_LABEL: view.uid, **({LEASE_LABEL: lease['lease_id']} if lease else {})}
         attempt = new_attempt_id() if slot else None
-        metadata = {'namespace': ns, 'labels': labels,
-                    **({'annotations': {ATTEMPT_ANNOTATION: attempt}} if attempt else {})}
+        # Each object carries its own attempt id: a create resolves only from the stamp it was recorded
+        # with, so a ConfigMap that inherited the Secret's id could never resolve.
+        cm_attempt = new_attempt_id() if (slot and a.which == 'git') else None
+
+        def metadata(name, attempt_id):
+            meta = {'name': name, 'namespace': ns, 'labels': labels}
+            if attempt_id:
+                meta['annotations'] = {ATTEMPT_ANNOTATION: attempt_id}
+            return meta
+
         obj = {'apiVersion': 'v1', 'kind': 'Secret', 'type': spec.get('type', 'Opaque'),
-               'metadata': {'name': spec['name'], **metadata},
+               'metadata': metadata(spec['name'], attempt),
                'stringData': {spec['key']: payload}}
         # The pinned host key travels beside the key: the clone's UserKnownHostsFile needs it, and ssh
         # refuses a host it cannot verify.
         known_hosts = {'apiVersion': 'v1', 'kind': 'ConfigMap',
-                       'metadata': {'name': KNOWN_HOSTS_CONFIGMAP, **metadata},
+                       'metadata': metadata(KNOWN_HOSTS_CONFIGMAP, cm_attempt),
                        'data': {'known_hosts': GITHUB_KNOWN_HOSTS}} if a.which == 'git' else None
         confirm_uid(g, ns, view.uid)
         if slot:
@@ -1230,10 +1245,11 @@ def cmd_secret(g, a):
                 send()
 
         create(obj, attempt)
-        g.record(ns, f'Secret/{spec["name"]}', 0, 'up', uid=view.uid, lease=view.lease_id, issue=view.issue)
+        extra = {'exposure_accepted': True} if a.which == 'ngc-push' else {}
+        g.record(ns, f'Secret/{spec["name"]}', 0, 'up', uid=view.uid, lease=view.lease_id, issue=view.issue, **extra)
         result = {'secret': spec['name'], 'namespace': ns}
         if known_hosts is not None:
-            create(known_hosts, new_attempt_id() if slot else None)
+            create(known_hosts, cm_attempt)
             g.record(ns, f'ConfigMap/{KNOWN_HOSTS_CONFIGMAP}', 0, 'up', uid=view.uid, lease=view.lease_id,
                      issue=view.issue)
             result['known_hosts'] = KNOWN_HOSTS_CONFIGMAP
@@ -1991,9 +2007,11 @@ def submit_job(g, ns, view, lease, slot, job, expect, charge):
 def build_prerequisites(g, ns, lease, ssh):
     if lease is None:
         raise Refusal('lease_required', f'{ns} has no live lease; a build Job runs under this thread\'s claim')
-    if ssh and get_object(g, ns, 'Secret', GIT_SECRET) is None:
-        raise Refusal('secret_unavailable', f'the ssh source needs Secret/{GIT_SECRET}; run `k8s-guard -n {ns} '
-                                            'secret git --repo <owner>/<repo>` first')
+    if ssh and (get_object(g, ns, 'Secret', GIT_SECRET) is None
+                or get_object(g, ns, 'ConfigMap', KNOWN_HOSTS_CONFIGMAP) is None):
+        raise Refusal('secret_unavailable', f'the ssh source needs Secret/{GIT_SECRET} and '
+                                            f'ConfigMap/{KNOWN_HOSTS_CONFIGMAP}; run `k8s-guard -n {ns} secret '
+                                            'git --repo <owner>/<repo>` first')
     if get_object(g, ns, 'Secret', PUSH_SECRET) is None:
         raise Refusal('secret_unavailable', f'the build pushes with Secret/{PUSH_SECRET}; run `k8s-guard -n {ns} '
                                             'secret ngc-push` first')
@@ -2046,9 +2064,12 @@ def cmd_build_show(g, a):
     if job is None:
         raise Refusal('not_found', f'Job/{name} not found in {ns}')
     state = job_state(job)
-    # --all-containers so the tag-check and clone initContainers' lines are in the tail too.
-    rc, out, _ = g.kc.run('logs', f'job/{name}', '-n', ns, '--tail=200', '--all-containers=true')
-    tail = redact_build_log(out if rc == 0 else '')
+    # --all-containers so the tag-check and clone initContainers' lines are in the tail too, and
+    # --ignore-errors because a container that never started would otherwise end the call: its log is
+    # exactly the marker this command exists to report. Keep stdout on a non-zero exit for the same reason.
+    rc, out, err = g.kc.run('logs', f'job/{name}', '-n', ns, '--tail=200', '--all-containers=true',
+                            '--ignore-errors=true')
+    tail = redact_build_log(out if out.strip() else (err if rc != 0 else ''))
     if state == 'failed':
         code = build_verdict(tail)
         detail = next((line for line in reversed(tail.splitlines()) if line.strip()), '')

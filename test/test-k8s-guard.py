@@ -484,7 +484,7 @@ if cmd == 'logs':
     save()
     key = pos[1] if len(pos) > 1 else ''
     sys.stdout.write(st.get('job_logs', {}).get(key, ''))
-    sys.exit(0)
+    sys.exit(int(st.get('job_logs_rc', 0)))
 
 if cmd == 'delete':
     fail('fake kubectl: k8s-guard sent a delete without UID and resourceVersion preconditions', 96)
@@ -936,7 +936,7 @@ class GuardCase(unittest.TestCase):
         self.profiles.write_text(re.sub(r'kubectl_sha256 = "[0-9a-f]*"', f'kubectl_sha256 = "{pin}"',
                                         self.profiles.read_text()))
 
-    def env(self, thread=ME, host_entry=False, kubeconfig=None, storage=True, fleet_fail=False):
+    def env(self, thread=ME, host_entry=False, kubeconfig=None, storage=True, fleet_fail=False, secret=None):
         self.pin_kubectl()
         env = {'PATH': f'{self.bin}:/usr/bin:/bin', 'HOME': str(self.home),
                'K8S_CLUSTERS_PROFILES': str(self.profiles),
@@ -945,7 +945,8 @@ class GuardCase(unittest.TestCase):
                'FAKE_K8S_STATE': str(self.k8s_state), 'FAKE_KUBECTL_LOG': str(self.kubectl_log),
                'FAKE_BB_STATE': str(self.bb_state), 'FAKE_BB_LOG': str(self.bb_log),
                'FAKE_FLEET_LOG': str(self.fleet_log), 'FAKE_TSH_LOG': str(self.tsh_log),
-               'FAKE_SECRET': SECRET, 'K8S_GUARD_DOWN_WAIT_SECONDS': '0', 'K8S_GUARD_POLL_SECONDS': '0',
+               'FAKE_SECRET': SECRET if secret is None else secret,
+               'K8S_GUARD_DOWN_WAIT_SECONDS': '0', 'K8S_GUARD_POLL_SECONDS': '0',
                'FAKE_FLEET_FAIL': '1' if fleet_fail else '',
                'FAKE_PW_DIR': str(self.home), 'FAKE_KUBECTL': str(self.kubectl_path),
                'FAKE_TBOT_LOG': str(self.tbot_log),
@@ -3826,8 +3827,8 @@ TAG = COMMIT[:12]
 REGISTRY = 'nvcr.io/goirlvsxnepa/llm_nim'
 BUILDKIT = ('mirror.gcr.io/moby/buildkit:v0.23.2-rootless'
             '@sha256:cab936745de5d673465948f1e93ff4d6e372bbe33f218afd3314eba45a6f85a9')
-CRANE = ('gcr.io/go-containerregistry/crane:v0.20.3'
-         '@sha256:fc86bcad43a000c2a1ca926a1e167db26c053cebc3fa5d14285c72773fb8c11d')
+CRANE = ('gcr.io/go-containerregistry/crane/debug:v0.20.3'
+         '@sha256:94f61956845714bea3b788445454ae4827f49a90dcd9dac28255c4cccb6220ad')
 GITHUB_KEY = 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl'
 PULL_REF = 'op://Fleet/NGC Pull Key/credential'
 PUSH_REF = 'op://Fleet/NGC NIM Operations PAT/credential'
@@ -3964,10 +3965,14 @@ class BuildRun(BuildCase):
         self.assertEqual((cfg_mount['mountPath'], cfg_mount['readOnly']), ('/home/user/.docker', True))
         # The tag check runs first, in the same pinned image, and carries the plan's three answers.
         check = named(pod['initContainers'], 'tag-check')
-        self.assertEqual(check['image'], BUILDKIT)
+        self.assertEqual(check['image'], CRANE)
+        self.assertEqual(check['command'][0], '/busybox/sh')
         script = check['command'][-1]
-        for marker in ('tag_exists', 'registry_denied', 'manifest*unknown', 'exit 0'):
+        for marker in ('tag_exists', 'registry_denied', 'MANIFEST_UNKNOWN', 'exit 0'):
             self.assertIn(marker, script)
+        check_env = {e['name']: e['value'] for e in check['env']}
+        self.assertEqual(check_env['REF'], f'{REGISTRY}/gdl-operator:{TAG}-{self.arch}')
+        self.assertEqual(check_env['CRANE'], '/ko-app/crane')
         # The clone passes the whole commit and verifies the checkout is exactly it.
         clone = named(pod['initContainers'], 'clone')
         self.assertEqual(clone['image'], BUILDKIT)
@@ -4164,6 +4169,19 @@ class BuildShow(BuildCase):
         self.assertTrue(logs and '--all-containers=true' in logs[0]['pos'], logs)
         self.assertEqual([c for c in self.writes() if c['pos'][:1] == ['delete']], [])
 
+    def test_the_marker_survives_a_non_zero_logs_exit(self):
+        name = self.failed_job('tag_exists\n')
+        self.k8s['job_logs_rc'] = 1
+        self.flush()
+
+        rc, body, _ = self.build_guard('show', name)
+
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(body.get('code'), 'tag_exists', body)
+        self.assertIn('tag_exists', body['tail'])
+        logs = [c for c in self.kubectl_calls() if c['pos'][:1] == ['logs']]
+        self.assertTrue(logs and '--ignore-errors=true' in logs[0]['pos'], logs)
+
     def test_the_tag_check_answers_become_the_refusal_codes(self):
         cases = {'tag_exists': 'tag_exists', 'registry_denied': 'registry_denied',
                  'registry_error: connection reset': 'registry_error'}
@@ -4267,13 +4285,21 @@ class GitBuild(BuildCase):
         self.assertEqual([l for l in self.fleet_log.read_text().splitlines() if 'deploy key' in l],
                          ['secret get ' + self.REF])
         stored = self.k8s['objects'][NS]['Secret/git']
-        self.assertEqual(stored['stringData'], {'id_ed25519': SECRET})
+        self.assertEqual(stored['stringData'], {'id_ed25519': SECRET + '\n'})
         self.assertEqual(stored['metadata']['labels'], {NS_UID: 'uid-ns-1', LEASE_LABEL: self.lid})
         cm = self.k8s['objects'][NS]['ConfigMap/git-known-hosts']
         self.assertEqual(cm['data'], {'known_hosts': GITHUB_KEY})
         self.assertEqual(cm['metadata']['labels'], {NS_UID: 'uid-ns-1', LEASE_LABEL: self.lid})
         self.assertEqual(body, {'secret': 'git', 'namespace': NS, 'known_hosts': 'git-known-hosts'})
         self.assert_no_leak(p)
+
+    def test_the_git_key_keeps_exactly_one_trailing_newline(self):
+        rc, body, p = self.guard('--context', self.ctx, '-n', NS, 'secret', 'git', '--repo', self.REPO,
+                                 secret=SECRET + '\n\n')
+
+        self.assertEqual(rc, 0, f'{body} {p.stderr}')
+        stored = self.k8s['objects'][NS]['Secret/git']
+        self.assertEqual(stored['stringData'], {'id_ed25519': SECRET + '\n'})
 
     def test_the_clone_mounts_the_key_and_known_hosts_read_only_for_user_1000(self):
         self.made()
@@ -4310,6 +4336,18 @@ class GitBuild(BuildCase):
         body = self.refused('secret_unavailable', '--context', self.ctx, '-n', NS, 'build', 'run',
                             *self.run_argv(repo=self.SSH))
         self.assertIn('secret git', body['error'])
+        self.assertEqual(len(self.writes()), before)
+
+    def test_a_missing_known_hosts_configmap_is_refused_before_any_write(self):
+        self.made()
+        del self.k8s['objects'][NS]['ConfigMap/git-known-hosts']
+        self.flush()
+        before = len(self.writes())
+
+        body = self.refused('secret_unavailable', '--context', self.ctx, '-n', NS, 'build', 'run',
+                            *self.run_argv(repo=self.SSH))
+
+        self.assertIn('git-known-hosts', body['error'])
         self.assertEqual(len(self.writes()), before)
 
     def test_a_public_repo_needs_no_mount(self):
@@ -4461,6 +4499,24 @@ class ClaimedBuild(ClaimedCase):
         self.assertEqual([r['outcome'] for r in body['resolutions']], ['committed'])
         self.assertIsNone(self.k8s['objects'][PREMADE].get(f'Job/{name}'))
 
+    def test_a_timed_out_known_hosts_create_resolves_and_tears_down(self):
+        lid = self.claimed()
+        self.k8s['stall_create'] = ['ConfigMap/git-known-hosts']
+        self.flush()
+
+        rc, body, _ = self.guard('--context', CTX, '-n', PREMADE, 'secret', 'git', '--repo', 'owner/repo')
+        self.assertEqual(body.get('code'), 'write_unresolved', body)
+        cm = next(a for a in self.bb['leases'][lid]['attempts'] if a['kind'] == 'ConfigMap')
+
+        self.land_pending()
+        self.bb['leases'][lid].update(slot=None, state='revoking')
+        self.flush()
+        body = self.ok('--context', CTX, 'down', PREMADE, '--uid', 'uid-premade-1', '--lease', lid, host_entry=True)
+
+        self.assertTrue(body['complete'], body)
+        self.assertIn({'attempt': cm['attempt'], 'outcome': 'committed'}, body['resolutions'])
+        self.assertNotIn('ConfigMap/git-known-hosts', self.k8s['objects'][PREMADE])
+
     def test_nvcr_push_lives_only_as_long_as_the_claim(self):
         lid = self.claimed(gpus=1)
         rc, body, p = self.guard('--context', CTX, '-n', PREMADE, 'secret', 'ngc-push', '--exposure-accepted')
@@ -4509,7 +4565,8 @@ class BuildSecrets(GuardCase):
                          ('$oauthtoken', SECRET))
         self.assertEqual(self.fleet_log.read_text().splitlines(), ['secret get ' + PUSH_REF])
         self.assert_no_leak(p)
-        self.assertEqual(self.ledger()[0]['object'], 'Secret/nvcr-push')
+        [line] = [l for l in self.ledger() if l['object'] == 'Secret/nvcr-push']
+        self.assertTrue(line['exposure_accepted'], line)
 
     def test_pull_secret_uses_the_pull_only_item_and_never_falls_back(self):
         rc, body, p = self.guard('--context', CTX, '-n', NS, 'secret', 'ngc')
@@ -4535,38 +4592,23 @@ class BuildSecrets(GuardCase):
 
 # --- the tag-check probe ----------------------------------------------------
 
-FAKE_WGET = r'''#!/usr/bin/env python3
-"""Fake wget for the tag-check probe: a token challenge, then the status the test names."""
+FAKE_CRANE = r'''#!/usr/bin/env python3
+"""Fake crane for the tag-check probe: prints what the test says and exits with its code."""
 import json, os, sys
 
-argv = [a for a in sys.argv[1:] if not a.startswith('-')]
-with open(os.environ['FAKE_WGET_LOG'], 'a') as log:
-    log.write(json.dumps(sys.argv[1:]) + '\n')
-url = argv[-1] if argv else ''
-if url.endswith('/v2/'):
-    sys.stderr.write('  HTTP/1.1 401 Unauthorized\n'
-                     '  Www-Authenticate: Bearer realm="https://auth.example.test/token",'
-                     'service="registry.example.test"\n')
-    sys.exit(0)
-if url.startswith('https://auth.example.test/token'):
-    sys.stdout.write(json.dumps({'token': 'made-up-token'}))
-    sys.exit(0)
-if os.environ.get('FAKE_WGET_SILENT') == '1':
-    sys.stderr.write("wget: bad address 'registry.example.test'\n")
-    sys.exit(4)
-status = int(os.environ.get('FAKE_WGET_STATUS', '200'))
-sys.stderr.write(f'  HTTP/1.1 {status} Something\n')
-sys.stdout.write(os.environ.get('FAKE_WGET_BODY', ''))
-sys.exit(8 if status >= 400 else 0)
+open(os.environ['FAKE_CRANE_LOG'], 'a').write(json.dumps(sys.argv[1:]) + '\n')
+sys.stderr.write(os.environ.get('FAKE_CRANE_ERR', ''))
+sys.stdout.write(os.environ.get('FAKE_CRANE_OUT', ''))
+sys.exit(int(os.environ.get('FAKE_CRANE_RC', '0')))
 '''
 
 
 class TagCheckScript(GuardCase):
-    """The probe the tag-check initContainer runs, against a fake wget: the plan's three answers, no cluster.
+    """The tag-check probe the initContainer runs, against a fake crane: the plan's answers, no cluster.
 
-    It runs in the pinned builder image because the crane image has no shell; its answers are the ones
-    crane gives: the tag is there (tag_exists), 401/403 (registry_denied), and only a manifest unknown
-    lets the build run.
+    crane is the plan's tool: it sends every manifest Accept type itself, so a 404 is a missing tag and
+    not an unaccepted OCI index, and its stderr carries MANIFEST_UNKNOWN. The probe turns its exit code
+    into the initContainer's answer.
     """
 
     def setUp(self):
@@ -4576,71 +4618,57 @@ class TagCheckScript(GuardCase):
         from k8s_guard_rules import TAG_CHECK_SCRIPT
         self.script = self.tmp / 'tag-check.sh'
         self.script.write_text(TAG_CHECK_SCRIPT)
-        (self.bin / 'wget').write_text(FAKE_WGET)
-        (self.bin / 'wget').chmod(0o755)
-        self.config = self.tmp / 'config.json'
-        self.config.write_text(json.dumps({'auths': {'registry.example.test': {
-            'username': '$oauthtoken', 'password': 'made-up', 'auth': 'bWFkZS11cA=='}}}))
-        self.wget_log = self.tmp / 'wget.log'
+        (self.bin / 'crane').write_text(FAKE_CRANE)
+        (self.bin / 'crane').chmod(0o755)
+        self.ref = f'{REGISTRY}/gdl-operator:{TAG}-amd64'
+        self.crane_log = self.tmp / 'crane.log'
 
-    def probe(self, status, body='', silent=False):
-        env = {'PATH': f'{self.bin}:/usr/bin:/bin', 'FAKE_WGET_LOG': str(self.wget_log),
-               'FAKE_WGET_STATUS': str(status), 'FAKE_WGET_BODY': body,
-               'FAKE_WGET_SILENT': '1' if silent else '',
-               'REGISTRY': 'registry.example.test', 'REPO_PATH': 'goirlvsxnepa/llm_nim/gdl-operator',
-               'TAG': f'{TAG}-amd64', 'DOCKER_CONFIG': str(self.tmp)}
+    def probe(self, rc, err='', out=''):
+        env = {'PATH': f'{self.bin}:/usr/bin:/bin', 'FAKE_CRANE_LOG': str(self.crane_log),
+               'FAKE_CRANE_RC': str(rc), 'FAKE_CRANE_ERR': err, 'FAKE_CRANE_OUT': out,
+               'CRANE': 'crane', 'REF': self.ref, 'DOCKER_CONFIG': str(self.tmp)}
         p = subprocess.run(['/bin/sh', str(self.script)], env=env, capture_output=True, text=True, timeout=20,
                            stdin=subprocess.DEVNULL)
         return p.returncode, (p.stdout + p.stderr).strip()
 
     def test_the_tag_that_exists_refuses(self):
-        rc, out = self.probe(200)
+        rc, out = self.probe(0, out='sha256:' + 'a' * 64)
         self.assertEqual((rc, out), (1, 'tag_exists'))
 
     def test_a_denied_registry_refuses(self):
-        for status in (401, 403):
-            with self.subTest(status=status):
-                rc, out = self.probe(status)
+        for err in ('Error: GET https://nvcr.io/...: UNAUTHORIZED: authentication required',
+                    'Error: GET https://nvcr.io/...: DENIED: requested access to the resource is denied',
+                    'unexpected status code 403 Forbidden'):
+            with self.subTest(err=err):
+                rc, out = self.probe(1, err=err)
                 self.assertEqual(rc, 1)
                 self.assertIn('registry_denied', out)
 
     def test_only_manifest_unknown_lets_the_build_run(self):
-        missing = json.dumps({'errors': [{'code': 'MANIFEST_UNKNOWN', 'message': 'manifest unknown'}]})
-        rc, out = self.probe(404, missing)
-        self.assertEqual((rc, out), (0, ''))
-        for body in (json.dumps({'errors': [{'code': 'DENIED'}]}), 'not found', ''):
-            with self.subTest(body=body):
-                rc, out = self.probe(404, body)
+        for err in ('Error: GET https://nvcr.io/...: MANIFEST_UNKNOWN: Failed to fetch "x"',
+                    'Error: manifest unknown'):
+            with self.subTest(err=err):
+                rc, out = self.probe(1, err=err)
+                self.assertEqual((rc, out), (0, ''))
+        for err in ('Error: GET https://nvcr.io/...: NAME_UNKNOWN: repository name not known',
+                    'Error: unexpected status code 404 Not Found', ''):
+            with self.subTest(err=err):
+                rc, out = self.probe(1, err=err)
                 self.assertEqual(rc, 1)
                 self.assertIn('registry_error', out)
 
     def test_any_other_answer_refuses(self):
-        for status in (500, 502):
-            with self.subTest(status=status):
-                rc, out = self.probe(status)
+        for err in ('Error: unexpected status code 500 Internal Server Error',
+                    'Get "https://nvcr.io/v2/": dial tcp: lookup nvcr.io: no such host'):
+            with self.subTest(err=err):
+                rc, out = self.probe(1, err=err)
                 self.assertEqual(rc, 1)
                 self.assertIn('registry_error', out)
 
-    def test_a_network_failure_is_never_absent(self):
-        # No HTTP status at all (DNS, connection, timeout): the probe must refuse, never build.
-        rc, out = self.probe(200, silent=True)
-        self.assertEqual(rc, 1)
-        self.assertIn('registry_error', out)
-
-    def test_the_probe_sends_the_mounted_basic_auth_and_the_pinned_tag(self):
-        self.probe(200)
-        calls = [json.loads(line) for line in self.wget_log.read_text().splitlines()]
-        self.assertTrue(any(a == '--header=Authorization: Basic bWFkZS11cA==' for c in calls for a in c), calls)
-        self.assertTrue(any('https://auth.example.test/token' in a for c in calls for a in c), calls)
-        self.assertTrue(any(f'manifests/{TAG}-amd64' in a for c in calls for a in c), calls)
-
-    def test_no_auth_in_the_mount_refuses_without_a_request(self):
-        self.config.write_text('{}')
-        rc, out = self.probe(200)
-        self.assertEqual(rc, 1)
-        self.assertIn('registry_error', out)
-        self.assertFalse(self.wget_log.exists())
-
+    def test_the_probe_digests_the_pinned_tag_with_crane(self):
+        self.probe(0)
+        [call] = [json.loads(line) for line in self.crane_log.read_text().splitlines()]
+        self.assertEqual(call, ['digest', self.ref])
 
 if __name__ == '__main__':
     unittest.main()
