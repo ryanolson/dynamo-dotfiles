@@ -9,7 +9,8 @@ when LINEAR_API_KEY is unset, the script re-runs itself under
   sgc-linear issues [--project NAME] [--state NAME] [--label NAME] [--limit N]
   sgc-linear comment STRGT-123 --body-file FILE|-
   sgc-linear update STRGT-123 [--state NAME] [--add-label NAME]... [--remove-label NAME]...
-  sgc-linear gql --file FILE|- [--vars JSON]      (any other read or write)
+  sgc-linear gql --file FILE|- [--vars JSON]      (any other read or write;
+                                                   FILE holds raw GraphQL text, not a JSON body)
 
 Output is JSON. Exit 1 on an API error, with the error on stderr.
 """
