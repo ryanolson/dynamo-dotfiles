@@ -143,9 +143,15 @@ CLAIM_REFUSALS = {
 # read, and how often it probes the fence meanwhile (references/k8s-guard.md, "The fence policy").
 FENCE_DRAIN_SECONDS = 120
 FENCE_PROBE_SECONDS = 5
-# How far the span from one probe's start to the next probe's end may pass the interval: the probe's own two
-# dry-run calls. A longer span is time nobody watched, so it reads as not armed. The plugin holds its own limit.
+# How far the span from one probe's start to the next probe's end may pass the interval. A longer span is time
+# nobody watched, so it reads as not armed. The plugin holds its own limit (8 s), below the shortest emptied
+# webhook window measured on kind (about 10 s).
 FENCE_PROBE_SLACK = 3
+# While teardown works (the close, the attempts, the deletes, the inventory), it probes after any kubectl call
+# once this long has passed since the last probe began. With a probe's two Pods sent at once, the worst span is
+# the larger of 2 s + 2c and 3c for c seconds per call, and 5 s + c in the drain: up to 2.5 s per call stays
+# under 8 s (references/k8s-guard.md, "Claimed teardown with the fence").
+FENCE_WORK_PROBE_SECONDS = 2
 # What the API server answers when it refused a write outright: the write did not happen. Any other failure
 # (a timeout, a lost connection, an internal error) leaves the outcome unknown.
 DEFINITE = ('(AlreadyExists)', '(Conflict)', '(NotFound)', '(Invalid)', '(BadRequest)', '(Forbidden)',
@@ -219,17 +225,52 @@ class Kubectl:
             raise Refusal(e.code, str(e))
         self.base = [kubectl, '--kubeconfig', f'/proc/self/fd/{self.fd}', '--context', context]
         self.env = kubectl_env()
+        # Called after every single call while claimed teardown watches the fence (it probes when one is due).
+        self.after_call = None
 
     def run(self, *args, input=None, timeout=KUBECTL_TIMEOUT):
         try:
             p = subprocess.run(self.base + list(args), input=input, capture_output=True, text=True,
                                env=self.env, timeout=timeout, pass_fds=(self.fd,),
                                stdin=None if input is not None else subprocess.DEVNULL)
+            result = p.returncode, p.stdout, p.stderr
         except subprocess.TimeoutExpired:
-            return 124, '', f'kubectl timed out after {timeout}s'
+            result = 124, '', f'kubectl timed out after {timeout}s'
         except FileNotFoundError:
-            return 127, '', 'kubectl is not on PATH'
-        return p.returncode, p.stdout, p.stderr
+            result = 127, '', 'kubectl is not on PATH'
+        if self.after_call is not None:
+            self.after_call()
+        return result
+
+    def run_pair(self, first, second, timeout=KUBECTL_TIMEOUT):
+        """Two calls at once, each (args, input): the fence probe's two Pods cost one call's time, not two."""
+        procs = []
+        try:
+            for args, body in (first, second):
+                procs.append(subprocess.Popen(self.base + list(args), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                              stderr=subprocess.PIPE, text=True, env=self.env, pass_fds=(self.fd,)))
+        except FileNotFoundError:
+            for p in procs:
+                p.kill()
+            return [(127, '', 'kubectl is not on PATH')] * 2
+        # Both requests go out before either answer is read: the bodies are small (one Pod each).
+        for p, (_, body) in zip(procs, (first, second)):
+            try:
+                p.stdin.write(body or '')
+                p.stdin.close()
+            except BrokenPipeError:
+                pass
+            p.stdin = None  # written and closed: communicate() below only reads the answers
+        results, deadline = [], time.monotonic() + timeout
+        for p in procs:
+            try:
+                out, err = p.communicate(timeout=max(1, deadline - time.monotonic()))
+                results.append((p.returncode, out, err))
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.communicate()
+                results.append((124, '', f'kubectl timed out after {timeout}s'))
+        return results
 
     def json(self, *args, input=None, not_found=None, timeout=KUBECTL_TIMEOUT):
         rc, out, err = self.run(*args, input=input, timeout=timeout)
@@ -1005,12 +1046,10 @@ def env_seconds(name, default):
 
 def probe_fence(g, ns, record=True):
     """The fence probe: the canary and the mode Pod as server dry runs. Writes nothing to the cluster."""
-    answers = []
-    for which in ('canary', 'mode'):
-        rc, out, err = g.kc.run('create', '-f', '-', '-n', ns, '--dry-run=server', '-o', 'name',
-                                input=json.dumps(fence.probe_pod(which, ns)))
-        answers += [rc, err]
-    verdict = fence.fence_verdict(*answers)
+    args = ('create', '-f', '-', '-n', ns, '--dry-run=server', '-o', 'name')
+    (crc, _, cerr), (mrc, _, merr) = g.kc.run_pair((args, json.dumps(fence.probe_pod('canary', ns))),
+                                                   (args, json.dumps(fence.probe_pod('mode', ns))))
+    verdict = fence.fence_verdict(crc, cerr, mrc, merr)
     if record:
         # The audit tally counts the probes the guard sent, by rule (references/k8s-guard.md, "The recorder").
         g.record(ns, f'FenceProbe/{ns}', 0, 'probe', canary=verdict['canary'], mode=verdict['mode'],
@@ -1795,6 +1834,7 @@ def claimed_teardown(g, view, lease_id, lease, retired=None):
         end = time.monotonic()
         if spans and end - spans[-1][0] > limit and not failed:
             failed.append({'canary': v['canary'], 'mode': v['mode'], 'scope': v['scope'], 'armed': False,
+                           'canary_text': v['canary_text'], 'mode_text': v['mode_text'],
                            'cause': f'probes were {end - spans[-1][0]:.1f} s apart, more than the {limit:g} s limit: '
                                     'a fence state between them went unseen'})
         spans.append((start, end))
@@ -1805,13 +1845,27 @@ def claimed_teardown(g, view, lease_id, lease, retired=None):
                            if k in v})
         return ok and not failed
 
+    work_every = min(every, FENCE_WORK_PROBE_SECONDS)
+
     def due():
-        """Probe now if the interval has passed since the last probe started: inside the delete and inventory
-        loops as well as the drain, so slow cluster calls never stretch the gap unseen."""
-        if not retired and not failed and spans and time.monotonic() - spans[-1][0] >= every:
+        """After every kubectl call while teardown works: probe once `work_every` has passed since the last probe
+        began, so no stretch of cluster calls grows the gap unseen. A probe's own calls do not come back here."""
+        if not retired and not failed and spans and time.monotonic() - spans[-1][0] >= work_every:
             probe()
 
     probe()  # before the close
+    g.kc.after_call = due
+    try:
+        return claimed_teardown_watched(g, view, lease_id, lease, retired, seq, drain, every, probe, probes, failed,
+                                        spans)
+    finally:
+        g.kc.after_call = None
+
+
+def claimed_teardown_watched(g, view, lease_id, lease, retired, seq, drain, every, probe, probes, failed, spans):
+    """claimed_teardown's steps after the first probe, with every kubectl call followed by a probe when due."""
+    ns = view.name
+    trial = lease.get('trial') is True
     # Step 0: close the gate for this lease and seq, whatever it held below, and read it back.
     _, gate = move_gate(g, ns, view.uid, lease_id, seq, 'closing')
     closed = fence.gate_reads(gate, lease_id, seq, 'closing')
@@ -1833,13 +1887,11 @@ def claimed_teardown(g, view, lease_id, lease, retired=None):
         return labels_of(live).get(LEASE_LABEL) == lease_id
 
     for kind in ROOT_KINDS:
-        due()
         items = labelled(g, ns, KINDS[kind][0], lease_id)
         if items is None:
             unreadable.append(KINDS[kind][0])
             continue
         for obj in items:
-            due()
             obj.setdefault('kind', kind)
             name = obj['metadata']['name']
             if (kind, name) in protected:
@@ -1870,7 +1922,6 @@ def claimed_teardown(g, view, lease_id, lease, retired=None):
 
     left = {}
     for resource in [KINDS[k][0] for k in ROOT_KINDS] + list(CHILD_RESOURCES):
-        due()
         items = labelled(g, ns, resource, lease_id)
         if items is None:
             if resource not in unreadable:

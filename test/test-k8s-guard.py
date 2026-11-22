@@ -154,6 +154,10 @@ except OSError:
 with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:
     log.write(json.dumps({'argv': argv, 'pos': pos, 'flags': flags, 'parent': parent,
                           'env': {k: os.environ.get(k) for k in ('KUBECONFIG', 'KUBECTL_KUBERC')}}) + '\n')
+# The guard sends a fence probe's two Pods at once: hold the state file for the whole call.
+import fcntl
+_lock = open(STATE + '.lock', 'a')
+fcntl.flock(_lock, fcntl.LOCK_EX)
 st = json.load(open(STATE))
 ns_flag = flags.get('-n') or flags.get('--namespace')
 out_json = flags.get('-o', flags.get('--output')) == 'json'
@@ -360,10 +364,17 @@ if cmd == 'create' and len(pos) == 1:
         if flags.get('--dry-run') != 'server' or which not in ('canary', 'mode'):
             fail('fake kubectl: k8s-guard sent a Pod create that is not a fence probe dry run', 96)
         st.setdefault('probe_bodies', []).append(obj)
-        if which == 'canary':
-            seq = st.get('fence_seq') or []
-            st['fence_now'] = seq.pop(0) if seq else st.get('fence', 'armed')
-        answer = FENCE_ANSWERS[st.get('fence_now') or st.get('fence', 'armed')][which]
+        if st.get('probe_sleep'):
+            # Show whether the two dry runs overlap: release the state while "the server" works.
+            started = time.time()
+            save(); fcntl.flock(_lock, fcntl.LOCK_UN)
+            time.sleep(st['probe_sleep'])
+            fcntl.flock(_lock, fcntl.LOCK_EX); st = json.load(open(STATE))
+            st.setdefault('probe_times', []).append([which, started, time.time()])
+        # Each Pod takes its answer from its own queue, so the order the two arrive in does not matter.
+        queue = st.setdefault(f'fence_seq_{which}', list(st.get('fence_seq') or []))
+        state = queue.pop(0) if queue else st.get('fence', 'armed')
+        answer = FENCE_ANSWERS[state][which]
         save()
         if answer is None:
             emit(obj)
@@ -4886,6 +4897,20 @@ def labelled(*args, **kw):
 
 g['confirm_uid'] = confirm_uid
 g['labelled'] = labelled
+per_call = float(os.environ.get('FENCE_TEST_PER_CALL', '0'))
+Kubectl = g['Kubectl']
+real_run, real_pair = Kubectl.run, getattr(Kubectl, 'run_pair', None)
+
+def run(self, *args, **kw):
+    clock.elapsed += per_call
+    return real_run(self, *args, **kw)
+
+Kubectl.run = run
+if real_pair is not None:
+    def run_pair(self, *args, **kw):
+        clock.elapsed += per_call  # the two Pods go at once: one call's time
+        return real_pair(self, *args, **kw)
+    Kubectl.run_pair = run_pair
 real_now = g['now']
 g['now'] = lambda: real_now() + timedelta(days=1)  # a wall-clock step: must not end the drain
 status = guard['main']()
@@ -4997,10 +5022,19 @@ class FenceProbe(FenceCase):
         for c in creates:
             self.assertEqual(c['flags'].get('--dry-run'), 'server')
         self.assertEqual(self.writes(), [])
-        bodies = self.k8s['probe_bodies']
-        self.assertEqual([b['metadata']['labels']['wcep.agent/fence-probe'] for b in bodies], ['canary', 'mode'])
-        self.assertEqual(bodies[1]['metadata']['labels'][LEASE_LABEL], 'lse_fenceprobe0')
+        bodies = {b['metadata']['labels']['wcep.agent/fence-probe']: b for b in self.k8s['probe_bodies']}
+        self.assertEqual(sorted(bodies), ['canary', 'mode'])  # sent at once, so in either order
+        self.assertEqual(bodies['mode']['metadata']['labels'][LEASE_LABEL], 'lse_fenceprobe0')
         self.assertNotIn('nvidia.com/gpu', json.dumps(bodies))
+
+    def test_the_two_probe_pods_are_sent_at_once(self):
+        # One probe costs one call's time, not two: the canary's and the mode Pod's dry runs overlap.
+        self.k8s['probe_sleep'] = 0.4
+        self.flush()
+        self.ok('--context', CTX, 'fence', 'probe', PREMADE, host_entry=True)
+        spans = {w: (a, b) for w, a, b in self.k8s['probe_times']}
+        (c0, c1), (m0, m1) = spans['canary'], spans['mode']
+        self.assertLess(max(c0, m0), min(c1, m1), f'the two dry runs did not overlap: {spans}')
 
     def test_each_probe_is_counted_in_the_host_ledger(self):
         self.ok('--context', CTX, 'fence', 'probe', PREMADE, host_entry=True)
@@ -5184,7 +5218,8 @@ class FenceArmed(FenceCase):
         self.assertEqual(body['drain_monotonic_seconds'], 120)
         self.assertEqual(body['probes'], 26, 'before the close, every 5 s through 120 s, after the final read')
         self.assertTrue(all(s <= 5 for s in self.k8s['clock_sleeps']), self.k8s['clock_sleeps'])
-        self.assertEqual(self.probes_sent(), ['canary', 'mode'] * 26)
+        # The two Pods of a probe go at once, so they arrive in either order.
+        self.assertEqual(sorted(self.probes_sent()), sorted(['canary', 'mode'] * 26))
 
     def test_a_slow_delete_phase_with_no_probe_in_it_keeps_the_charge(self):
         # T3 F1: the deletes after the close take 130 s, longer than the drain. Before the fix the run reported
@@ -5212,6 +5247,48 @@ class FenceArmed(FenceCase):
         self.assertEqual(body.get('code'), 'teardown_incomplete', body)
         self.assertTrue(body.get('fence_disarmed'), body)
         self.assertGreater(body['max_probe_gap_seconds'], 8)
+
+    def leased_with_an_open_attempt(self):
+        """A releasing claim with objects to delete and one open attempt, whose create landed with its stamp."""
+        lid = self.claimed()
+        for name in ('w', 'v'):
+            d = gpu_dgd(name, 1, lid)
+            d['metadata'].setdefault('annotations', {})['wcep.agent/attempt'] = f'att_{name}0123456789'
+            self.add_obj(d, ns=PREMADE)
+        self.bb['leases'][lid]['attempts'] = [{'attempt': 'att_w0123456789', 'verb': 'create',
+                                               'kind': 'DynamoGraphDeployment', 'name': 'w', 'uid': None, 'rv': None,
+                                               'outcome': None}]
+        self.bb['leases'][lid]['state'] = 'releasing'
+        self.flush()
+        return lid
+
+    def test_teardown_completes_at_the_stated_latency_of_2_5_s_per_call(self):
+        # T3 N1: the gap bound must leave a teardown able to complete at a real per-call latency. The design
+        # tolerates 2.5 s per kubectl call: a probe's two Pods go at once, and the guard probes after any call
+        # once 2 s passed since the last probe began (5 s in the drain, where nothing else runs).
+        lid = self.leased_with_an_open_attempt()
+        rc, body = self.clocked_down(lid, {'FENCE_TEST_PER_CALL': '2.5'})
+        self.assertEqual(rc, 0, body)
+        self.assertTrue(body['complete'])
+        self.assertLessEqual(body['max_probe_gap_seconds'], 8, body)
+        self.assertEqual(body['resolutions'], [{'attempt': 'att_w0123456789', 'outcome': 'committed'}])
+        self.assertEqual(sorted(body['deleted']), ['DynamoGraphDeployment/v', 'DynamoGraphDeployment/w'])
+
+    def test_beyond_the_stated_latency_the_charge_stays(self):
+        # At 3 s a call, a probe, a call and a probe already pass 8 s: the bound holds and the run says so.
+        lid = self.leased_with_an_open_attempt()
+        rc, body = self.clocked_down(lid, {'FENCE_TEST_PER_CALL': '3'})
+        self.assertEqual(body.get('code'), 'teardown_incomplete', body)
+        self.assertTrue(body['fence_disarmed'])
+        self.assertGreater(body['max_probe_gap_seconds'], 8)
+
+    def test_a_gap_failure_carries_the_texts_the_plugin_requires(self):
+        # T3 N2: the plugin drops a probe record without canary_text and mode_text, and with it the cause.
+        lid = self.claimed(state='releasing')
+        rc, body = self.clocked_down(lid, {'FENCE_TEST_SLOW_AFTER_CLOSE': '130'})
+        for key in ('canary', 'mode', 'scope', 'armed', 'cause', 'canary_text', 'mode_text'):
+            self.assertIn(key, body['probe'])
+        self.assertIn('apart', body['probe']['cause'])
 
     def test_the_gap_is_reported_and_bounded_on_a_normal_run(self):
         lid = self.claimed(state='releasing')
