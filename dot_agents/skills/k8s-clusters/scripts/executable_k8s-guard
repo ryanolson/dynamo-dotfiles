@@ -7,8 +7,8 @@ Usage (every command takes --context <kube context>; -n may come anywhere):
   k8s-guard -n <ns> secret hf|ngc                              a secret piped from `fleet secret get`
   k8s-guard -n <ns> apply -f <file>                            DGDs, ConfigMaps, ClusterIP Services
   k8s-guard -n <ns> delete <kind>/<name>                       one object
-  k8s-guard down <ns> [--uid <uid>] [--lease <id>]             tear down and delete the namespace
-  k8s-guard expire <ns> [--uid <uid>] [--lease <id>]           scale every DGD to 0
+  k8s-guard down <ns> [--uid <uid>] [--lease <id>]             delete the lease's DGDs, then the namespace
+  k8s-guard expire <ns> [--uid <uid>] [--lease <id>]           scale the lease's DGDs to 0
   k8s-guard extend <ns> [--uid <uid>] [--lease <id>]           copy the lease's expiry into the namespace
   k8s-guard inspect <ns>                                       read only
   k8s-guard -n <ns> selftest fences                            send each fence with a wrong UID; change nothing
@@ -667,9 +667,14 @@ def cmd_secret(g, a):
     return fenced(g, view, body)
 
 
-def stamp(g, manifest, uid):
-    """The manifest as one JSON List, each object labelled with the namespace UID. Local: no API call."""
-    rc, out, err = g.kc.run('label', '--local', '-f', '-', f'{NS_UID_LABEL}={uid}', '--overwrite', '-o', 'json',
+def stamp(g, manifest, uid, lease_id):
+    """The manifest as one JSON List, each object labelled as `apply` writes it. Local: no API call.
+
+    Every object carries the namespace instance's UID and, when the write runs under a lease, that
+    lease. Teardown selects DGDs by the lease label; the UID is only an instance check.
+    """
+    labels = [f'{NS_UID_LABEL}={uid}'] + ([f'{LEASE_LABEL}={lease_id}'] if lease_id else [])
+    rc, out, err = g.kc.run('label', '--local', '-f', '-', *labels, '--overwrite', '-o', 'json',
                             input=manifest)
     if rc != 0:
         raise Refusal('usage', f'kubectl could not read the manifest: {clip(err, 300)}', status=2)
@@ -697,15 +702,16 @@ def cmd_apply(g, a):
     ns, view = g.owned()
 
     def body(lease, slot):
-        # kubectl, run locally, parses the file and stamps every object with the namespace's UID;
-        # teardown selects by that stamp. The same JSON goes to the dry run and to the apply, and
-        # the checks run on what the server returned.
-        stamped = stamp(g, manifest, view.uid)
+        # kubectl, run locally, parses the file and stamps every object with the namespace's UID and
+        # the lease it is written under; teardown of that lease selects by the lease label. The same
+        # JSON goes to the dry run and to the apply, and the checks run on what the server returned.
+        lease_id = lease['lease_id'] if lease else None
+        stamped = stamp(g, manifest, view.uid, lease_id)
         result = g.kc.json('apply', '-f', '-', '-n', ns, '--dry-run=server', '-o', 'json', input=stamped)
         objects = result.get('items') if result.get('kind') == 'List' else [result]
         if not objects:
             raise Refusal('usage', f'{a.filename} holds no objects', status=2)
-        new = admit(objects, ns, view.uid)
+        new = admit(objects, ns, view.uid, lease_id)
         current = g.dgds(ns)
         pods = g.pods(ns)
         # kubectl writes the objects one at a time and goes on after a failure, so any subset of the
@@ -809,25 +815,30 @@ def confirm_uid(g, ns, uid):
         raise Refusal('uid_mismatch', f'{ns} now has UID {current}, not {uid}: it was re-created; left alone')
 
 
-def stamped_dgds(g, ns, uid):
-    """The DGDs the guard applied in the namespace instance with this UID.
+def lease_dgds(g, ns, lease_id):
+    """The DGDs `apply` stamped with this lease, and why there are none when there is no lease.
 
-    apply stamps every object with the namespace's UID, so a namespace re-created under the same
-    name never matches, whatever happens between the guard's reads and its writes.
+    apply labels every object with the lease it was written under, so teardown selects by that label.
+    The namespace UID is never a selector: in a long-lived namespace it is the same for every task
+    that ever applied there, so selecting by it picks up a colleague's DGD as well. The UID stays an
+    instance check (confirm_uid), and each DGD's own UID is the fence its delete or patch carries.
     """
-    return g.kc.json('get', DGD_RESOURCE, '-n', ns, '-l', f'{NS_UID_LABEL}={uid}', '-o', 'json').get('items') or []
+    if not lease_id:
+        return [], (f'{ns} has no lease record, so no object carries {LEASE_LABEL}: teardown selects no DGD')
+    query = ['get', DGD_RESOURCE, '-n', ns, '-l', f'{LEASE_LABEL}={lease_id}', '-o', 'json']
+    return g.kc.json(*query).get('items') or [], None
 
 
 def do_expire(g, ns, uid, lease_id):
     scaled, before = [], 0
-    dgds = stamped_dgds(g, ns, uid)
+    dgds, why_none = lease_dgds(g, ns, lease_id)
     confirm_uid(g, ns, uid)
     for d in dgds:
         try:
             before += dgd_gpus(d)
         except Refusal:
             pass  # scale it down even when it cannot be counted
-        ops = zero_patch(d, uid)
+        ops = zero_patch(d, lease_id)
         if ops is None:
             continue
         group, _, version = d['apiVersion'].partition('/')
@@ -840,7 +851,11 @@ def do_expire(g, ns, uid, lease_id):
         scaled.append(d['metadata']['name'])
     _, left = gpu_pod_summary(g.pods(ns))
     g.record(ns, f'Namespace/{ns}', before, 'down', uid=uid, lease=lease_id)
-    return {'namespace': ns, 'scaled': scaled, 'gpu_pods_left': left}
+    result = {'namespace': ns, 'scaled': scaled, 'gpu_pods_left': left}
+    if why_none:
+        # Nothing could be selected: say so, so an empty `scaled` is not read as success.
+        result['dgds_skipped'] = why_none
+    return result
 
 
 def cmd_expire(g, a):
@@ -887,7 +902,7 @@ def cmd_down(g, a):
                 raise Refusal(res.code, f'lease {lease_id}: {res.error}')
     else:
         why = teardown_authority(g, view, a.uid, a.lease)
-    dgds = stamped_dgds(g, ns, view.uid)
+    dgds, why_none = lease_dgds(g, ns, lease_id)
     confirm_uid(g, ns, view.uid)
     before = 0
     for d in dgds:
@@ -902,6 +917,7 @@ def cmd_down(g, a):
             if 'Precondition failed' in err or 'Conflict' in err:
                 raise Refusal('uid_mismatch', f'DGD {d["metadata"]["name"]} is no longer the one the guard read')
             raise kubectl_error(('delete', 'dgd', d['metadata']['name']), rc, err)
+    dgds_deleted = [d['metadata']['name'] for d in dgds]
     wait = float(os.environ.get('K8S_GUARD_DOWN_WAIT_SECONDS', '300'))
     poll = float(os.environ.get('K8S_GUARD_POLL_SECONDS', '5'))
     give_up = time.monotonic() + wait
@@ -920,7 +936,11 @@ def cmd_down(g, a):
         # Already being deleted (an earlier down): a second delete would only be refused.
         g.record(ns, f'Namespace/{ns}', before, 'down', uid=view.uid, lease=lease_id, issue=view.issue,
                  gpu_pods_left=left)
-        return {'namespace': ns, 'deleted': True, 'terminating': True, 'authority': why, 'gpu_pods_left': left}
+        result = {'namespace': ns, 'deleted': True, 'terminating': True, 'authority': why, 'gpu_pods_left': left,
+                  'dgds_deleted': dgds_deleted}
+        if why_none:
+            result['dgds_skipped'] = why_none
+        return result
     body = json.dumps({'kind': 'DeleteOptions', 'apiVersion': 'v1', 'preconditions': {'uid': view.uid}})
     rc, out, err = g.kc.run('delete', '--raw', f'/api/v1/namespaces/{ns}', '-f', '-', input=body)
     if rc != 0 and not is_not_found(err):
@@ -929,7 +949,12 @@ def cmd_down(g, a):
         raise kubectl_error(('delete', 'namespace', ns), rc, err)
     g.record(ns, f'Namespace/{ns}', before, 'down', uid=view.uid, lease=lease_id, issue=view.issue, deleted=True,
              gpu_pods_left=left)
-    return {'namespace': ns, 'deleted': True, 'terminating': bool(left), 'authority': why, 'gpu_pods_left': left}
+    result = {'namespace': ns, 'deleted': True, 'terminating': bool(left), 'authority': why, 'gpu_pods_left': left,
+              'dgds_deleted': dgds_deleted}
+    if why_none:
+        # Everything in the namespace still goes with it; the DGD phase selected nothing of its own.
+        result['dgds_skipped'] = why_none
+    return result
 
 
 def offline_owner(view):
@@ -1010,14 +1035,17 @@ def cmd_selftest_fences(g, a):
     def body(lease, slot):
         if lease is None and allocation(g.dgds(ns), g.pods(ns)) > 0:
             raise Refusal('lease_required', f'{ns} holds GPUs but has no lease')
-        dgds = stamped_dgds(g, ns, view.uid)
+        dgds, why_none = lease_dgds(g, ns, view.lease_id)
+        if why_none:
+            raise Refusal('lease_required', f'{why_none}; the selftest needs a DGD of the lease')
         if not dgds:
-            raise Refusal('selftest_needs_dgd', f'{ns} has no DGD applied by the guard; apply one first')
+            raise Refusal('selftest_needs_dgd', f'{ns} has no DGD applied under lease {view.lease_id}; '
+                                                'apply one first')
         d = dgds[0]
         name, dgd_uid = d['metadata']['name'], d['metadata']['uid']
         group, _, version = d['apiVersion'].partition('/')
         res = f'dynamographdeployments.{version}.{group}/{name}'
-        label_path = '/metadata/labels/' + NS_UID_LABEL.replace('~', '~0').replace('/', '~1')
+        label_path = '/metadata/labels/' + LEASE_LABEL.replace('~', '~0').replace('/', '~1')
         # A no-op payload: write back the replica count the first component already has.
         spec = d.get('spec') or {}
         if d['apiVersion'] == 'nvidia.com/v1beta1' and spec.get('components'):
@@ -1032,8 +1060,7 @@ def cmd_selftest_fences(g, a):
         probes = [
             ('patch: wrong DGD UID', 'patch test', ('patch', res, '-n', ns, '--type=json', '-p', json.dumps(
                 [{'op': 'test', 'path': '/metadata/uid', 'value': WRONG_UID}, noop])), None),
-            ('patch: wrong namespace-uid label', 'patch test', ('patch', res, '-n', ns, '--type=json', '-p',
-                                                                json.dumps(
+            ('patch: wrong lease label', 'patch test', ('patch', res, '-n', ns, '--type=json', '-p', json.dumps(
                 [{'op': 'test', 'path': '/metadata/uid', 'value': dgd_uid},
                  {'op': 'test', 'path': label_path, 'value': WRONG_UID}, noop])), None),
             ('delete DGD: wrong UID precondition', 'delete precondition',

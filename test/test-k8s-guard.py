@@ -42,6 +42,7 @@ DGD_API = 'nvidia.com/v1beta1'
 DGD_LIST = 'dynamographdeployments.nvidia.com'
 DGD_NAME_LABEL = 'nvidia.com/dynamo-graph-deployment-name'
 LEASE_CM = 'wcep-agent-lease'
+LEASE_LABEL = 'wcep.agent/lease'
 NS_UID = 'wcep.agent/namespace-uid'
 
 EXTRA_PROFILE = '''
@@ -165,10 +166,11 @@ def json_patch(obj, ops):
 
 cmd = pos[0] if pos else ''
 if pos[:1] == ['label'] and '--local' in pos:
-    # Local: parse the manifest, set the label on every object, print the objects. No API call.
-    k, v = next(p for p in pos[1:] if '=' in p).split('=', 1)
+    # Local: parse the manifest, set every label given on every object, print the objects. No API call.
+    pairs = [p.split('=', 1) for p in pos[1:] if '=' in p]
     for obj in docs(stdin):
-        obj.setdefault('metadata', {}).setdefault('labels', {})[k] = v
+        for k, v in pairs:
+            obj.setdefault('metadata', {}).setdefault('labels', {})[k] = v
         sys.stdout.write(json.dumps(obj) + '\n')
     sys.exit(0)
 if pos[:2] == ['config', 'view']:
@@ -301,6 +303,9 @@ if cmd == 'patch':
     o = st['objects'].get(ns_flag, {}).get('DynamoGraphDeployment/' + name)
     if o is None:
         fail(f'Error from server (NotFound): dynamographdeployments "{name}" not found')
+    if st.get('strip_lease_on_patch'):
+        # Another writer changes the object between the guard's read and its patch.
+        o['metadata'].get('labels', {}).pop('wcep.agent/lease', None)
     o = copy.deepcopy(o); json_patch(o, json.loads(flags.get('-p') or flags.get('--patch')))
     o['metadata']['resourceVersion'] = rv()
     st['objects'][ns_flag]['DynamoGraphDeployment/' + name] = o; save(); emit(o)
@@ -512,7 +517,7 @@ def container(gpus=0, name='main', resources=True):
 
 def one_node(lease_id):
     return {'podAffinity': {'requiredDuringSchedulingIgnoredDuringExecution': [{
-        'labelSelector': {'matchLabels': {'wcep.agent/lease': lease_id}},
+        'labelSelector': {'matchLabels': {LEASE_LABEL: lease_id}},
         'topologyKey': 'kubernetes.io/hostname'}]}}
 
 
@@ -522,7 +527,7 @@ def component(name, gpus=0, replicas=1, lease_id=None, ctype='worker', **extra):
     if gpus and lease_id:
         spec['affinity'] = one_node(lease_id)
         spec['nodeSelector'] = {'nvidia.com/gpu.product': 'NVIDIA-GB300'}
-        meta['labels'] = {'wcep.agent/lease': lease_id}
+        meta['labels'] = {LEASE_LABEL: lease_id}
     c = {'name': name, 'type': ctype, 'replicas': replicas, 'podTemplate': {'metadata': meta, 'spec': spec}}
     c.update(extra)
     return c
@@ -535,8 +540,11 @@ def dgd(name, *components, **spec_extra):
 
 
 def gpu_dgd(name, gpus, lease_id, replicas=1):
-    return dgd(name, component('Frontend', ctype='frontend'),
-               component('decode', gpus=gpus, replicas=replicas, lease_id=lease_id))
+    """A GPU DGD as `apply` writes it: the DGD itself carries the lease it was applied under."""
+    d = dgd(name, component('Frontend', ctype='frontend'),
+            component('decode', gpus=gpus, replicas=replicas, lease_id=lease_id))
+    d['metadata'].setdefault('labels', {})[LEASE_LABEL] = lease_id
+    return d
 
 
 def pod(dgd_name, gpus, terminating=False, phase='Running', name=None):
@@ -647,9 +655,17 @@ class GuardCase(unittest.TestCase):
     def add_obj(self, obj, ns=NS, uid=None, stamp=True):
         obj = copy.deepcopy(obj)
         obj['metadata'].update(namespace=ns, uid=uid or f'uid-{obj["metadata"]["name"]}', resourceVersion='30')
-        if stamp and obj['kind'] != 'ConfigMap':
-            # As `apply` writes it: stamped with the namespace instance's UID.
-            obj['metadata'].setdefault('labels', {})[NS_UID] = self.k8s['namespaces'][ns]['metadata']['uid']
+        labels = obj['metadata'].setdefault('labels', {})
+        if obj['kind'] != 'ConfigMap':
+            # As `apply` writes it: stamped with the namespace instance's UID and the lease it was
+            # written under. With stamp=False, an object `apply` never wrote.
+            if stamp:
+                labels[NS_UID] = self.k8s['namespaces'][ns]['metadata']['uid']
+            else:
+                labels.pop(NS_UID, None)
+                labels.pop(LEASE_LABEL, None)
+        if not labels:
+            del obj['metadata']['labels']
         self.k8s['objects'][ns][obj['kind'] + '/' + obj['metadata']['name']] = obj
         self.flush()
 
@@ -1311,6 +1327,22 @@ class Manifest(GuardCase):
         rc, body, _ = self.apply(dgd('b' * 40))
         self.assertEqual(body.get('code'), 'dgd_name_too_long', body)
 
+    def test_object_without_the_lease_stamp_refused(self):
+        # The local label step writes both stamps. A write that loses the lease stamp would leave a
+        # DGD no teardown of that lease can find, so admission refuses it.
+        self.add_lease(gpus=2)
+        fake = FAKE_KUBECTL.replace(
+            "            obj.setdefault('metadata', {}).setdefault('labels', {})[k] = v",
+            "            if not k.endswith('/lease'):\n"
+            "                obj.setdefault('metadata', {}).setdefault('labels', {})[k] = v", 1)
+        self.assertNotEqual(fake, FAKE_KUBECTL)
+        self.kubectl_path.write_text(fake)
+        rc, body, _ = self.apply(dgd('m'))  # no lease label in the manifest: only the stamp writes it
+        self.assertNotEqual(rc, 0, body)
+        self.assertEqual(body.get('code'), 'field_refused', body)
+        self.assertIn('wcep.agent/lease', body['error'])
+        self.assertEqual(self.writes(), [])
+
 
 # --- rule 7: budget --------------------------------------------------------
 
@@ -1650,6 +1682,20 @@ class Expire(GuardCase):
         ops = json.loads(patches[0]['flags']['-p'])
         self.assertEqual(ops[0], {'op': 'test', 'path': '/metadata/uid', 'value': 'uid-w'})
 
+    def test_expire_scales_the_dgd_apply_stamped_with_the_lease(self):
+        # Round trip: apply writes the lease label, and expire finds the DGD by that label alone.
+        self.add_ns()  # this thread's namespace, so apply may write in it
+        self.lid = self.add_lease()
+        rc, body, p = self.apply(gpu_dgd('w', 2, self.lid))
+        self.assertEqual(rc, 0, f'{body} {p.stderr}')
+        self.assertEqual(self.dgd_obj('w')['metadata']['labels'][LEASE_LABEL], self.lid)
+        self.bb['leases'][self.lid]['state'] = 'revoking'
+        self.flush()
+        rc, body, p = self.expire()
+        self.assertEqual(rc, 0, f'{body} {p.stderr}')
+        self.assertEqual(body['scaled'], ['w'])
+        self.assertEqual(self.replicas(), [0, 0])
+
     def test_releasing_lease_allowed(self):
         self.busy(state='releasing')
         self.assertEqual(self.expire()[0], 0)
@@ -1754,7 +1800,8 @@ class Expire(GuardCase):
 
     def test_v1alpha1_scaled_to_zero(self):
         self.busy(state='revoking')
-        alpha = {'apiVersion': 'nvidia.com/v1alpha1', 'kind': 'DynamoGraphDeployment', 'metadata': {'name': 'a'},
+        alpha = {'apiVersion': 'nvidia.com/v1alpha1', 'kind': 'DynamoGraphDeployment',
+                 'metadata': {'name': 'a', 'labels': {LEASE_LABEL: self.lid}},
                  'spec': {'services': {'Frontend': {'replicas': 2}, 'decode/x': {'replicas': 3}}}}
         self.add_obj(alpha)
         self.assertEqual(self.expire()[0], 0)
@@ -1812,6 +1859,19 @@ class Down(GuardCase):
         self.assertTrue(first_write['pos'][0] == 'delete')
         self.assertNotIn(NS, self.k8s['namespaces'])
         self.assertEqual(self.ledger()[-1]['direction'], 'down')
+
+    def test_owner_down_deletes_the_dgd_apply_stamped_with_the_lease(self):
+        # Round trip: the owner's apply writes the lease label, and down finds the DGD by it alone.
+        self.add_ns()
+        lid = self.add_lease()
+        rc, body, p = self.apply(gpu_dgd('w', 2, lid))
+        self.assertEqual(rc, 0, f'{body} {p.stderr}')
+        self.assertEqual(self.dgd_obj('w')['metadata']['labels'][LEASE_LABEL], lid)
+        rc, body, p = self.guard('--context', CTX, 'down', NS)
+        self.assertEqual(rc, 0, f'{body} {p.stderr}')
+        raws = [c['flags']['--raw'] for c in self.writes() if 'dynamographdeployments' in c['flags'].get('--raw', '')]
+        self.assertEqual(raws, [f'/apis/nvidia.com/v1beta1/namespaces/{NS}/dynamographdeployments/w'])
+        self.assertNotIn(NS, self.k8s['namespaces'])
 
     def test_owner_down_without_lease(self):
         self.add_ns()
@@ -1871,6 +1931,104 @@ class Down(GuardCase):
     def test_missing_namespace_not_found(self):
         self.refused('not_found', '--context', CTX, 'down', NS, '--uid', 'uid-ns-1', '--lease', 'lse_test0001',
                      host_entry=True)
+
+
+class SharedNamespaceTeardown(GuardCase):
+    """Teardown of a pre-made namespace selects the lease, never the namespace UID.
+
+    Every task that ever applied in a long-lived namespace shares one namespace UID, so a selector
+    on that stamp picks up the DGDs of every earlier task as well.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.add_ns(thread=OTHER)
+        self.lid = self.add_lease(thread=OTHER, state='revoking')
+        self.add_obj(gpu_dgd('current', 2, self.lid))
+        # An earlier task's GPU DGD in the same namespace: it carries only the shared UID stamp.
+        self.add_obj(dgd('neighbour', component('Frontend', ctype='frontend'),
+                         component('decode', gpus=2, lease_id='lse_earlier01')))
+
+    def dgd_writes(self):
+        out = []
+        for c in self.writes():
+            if 'dynamographdeployments' in c['flags'].get('--raw', '') or (
+                    c['pos'][:1] == ['patch'] and c['pos'][1].startswith('dynamographdeployments.')):
+                out.append(c)
+        return out
+
+    def raw_deletes(self):
+        return [c['flags']['--raw'] for c in self.dgd_writes() if '--raw' in c['flags']]
+
+    def replicas(self, name):
+        return [c['replicas'] for c in self.dgd_obj(name)['spec']['components']]
+
+    def teardown(self, command):
+        return self.guard('--context', CTX, command, NS, '--uid', 'uid-ns-1', '--lease', self.lid,
+                          host_entry=True)
+
+    def test_down_deletes_only_the_lease_dgd(self):
+        rc, body, p = self.teardown('down')
+        self.assertEqual(rc, 0, f'{body} {p.stderr}')
+        self.assertEqual(self.raw_deletes(),
+                         [f'/apis/nvidia.com/v1beta1/namespaces/{NS}/dynamographdeployments/current'])
+
+    def test_down_leaves_another_leases_dgd_alone(self):
+        self.add_obj(gpu_dgd('colleague', 2, 'lse_other0001'))
+        rc, body, p = self.teardown('down')
+        self.assertEqual(rc, 0, f'{body} {p.stderr}')
+        self.assertEqual(self.raw_deletes(),
+                         [f'/apis/nvidia.com/v1beta1/namespaces/{NS}/dynamographdeployments/current'])
+
+    def test_expire_scales_only_the_lease_dgd(self):
+        rc, body, p = self.teardown('expire')
+        self.assertEqual(rc, 0, f'{body} {p.stderr}')
+        self.assertEqual(body['scaled'], ['current'])
+        self.assertEqual(self.replicas('current'), [0, 0])
+        self.assertEqual(self.replicas('neighbour'), [1, 1])
+
+    def test_expire_patch_tests_the_lease_label(self):
+        rc, body, p = self.teardown('expire')
+        self.assertEqual(rc, 0, f'{body} {p.stderr}')
+        self.assertEqual(len(self.dgd_writes()), 1)
+        ops = json.loads(self.dgd_writes()[0]['flags']['-p'])
+        self.assertIn({'op': 'test', 'path': '/metadata/labels/wcep.agent~1lease', 'value': self.lid}, ops)
+
+    def test_expire_refuses_a_dgd_that_lost_the_lease_label(self):
+        # The label can go between the guard's read and its patch; the patch tests it, so the server
+        # refuses, rather than scaling a DGD that is no longer this lease's.
+        self.k8s['strip_lease_on_patch'] = True
+        self.flush()
+        rc, body, p = self.teardown('expire')
+        self.assertNotEqual(rc, 0, body)
+        self.assertEqual(body.get('code'), 'uid_mismatch', body)
+        self.assertEqual(self.replicas('current'), [1, 1])
+
+    def lease_less_world(self):
+        self.k8s = {'namespaces': {}, 'objects': {}, 'pods': {}}
+        self.bb = {'leases': {}, 'unreachable': True}
+        self.kubectl_log.unlink(missing_ok=True)
+        self.add_ns(thread=OTHER, expires_at=iso_ms(hours_from_now(-1)))
+        self.add_obj(dgd('earlier', component('Frontend', ctype='frontend'),
+                         component('decode', gpus=2, lease_id='lse_earlier01')))
+        self.flush()
+
+    def test_teardown_without_a_lease_selects_no_dgd_and_names_why(self):
+        # No lease record means no lease to select by, so no DGD is touched. The namespace delete
+        # at the end of `down` still ends everything in it.
+        for command in ('down', 'expire'):
+            with self.subTest(command=command):
+                self.lease_less_world()
+                rc, body, p = self.guard('--context', CTX, command, NS, '--uid', 'uid-ns-1', host_entry=True)
+                self.assertEqual(rc, 0, f'{body} {p.stderr}')
+                self.assertEqual(self.dgd_writes(), [])
+                self.assertIn('no lease record', body['dgds_skipped'])
+                if command == 'down':
+                    self.assertEqual(body['dgds_deleted'], [])
+                    self.assertNotIn(NS, self.k8s['namespaces'])  # the namespace takes the DGD with it
+                else:
+                    self.assertEqual(body['scaled'], [])
+                    self.assertEqual(self.replicas('earlier'), [1, 1])
 
 
 class DownWaitDeadline(GuardCase):
@@ -2622,7 +2780,7 @@ class SelftestFences(GuardCase):
         body = self.ok('--context', CTX, '-n', NS, 'selftest', 'fences')
         self.assertTrue(body['all_held'], body)
         self.assertEqual([p['fence'] for p in body['probes']], [
-            'patch: wrong DGD UID', 'patch: wrong namespace-uid label', 'delete DGD: wrong UID precondition',
+            'patch: wrong DGD UID', 'patch: wrong lease label', 'delete DGD: wrong UID precondition',
             'delete namespace: wrong UID precondition', 'replace lease record: stale resourceVersion'])
         self.assertTrue(all(p['refused'] for p in body['probes']), body)
         self.assertEqual(self.k8s['namespaces'], before['namespaces'])

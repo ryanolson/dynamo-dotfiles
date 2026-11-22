@@ -332,20 +332,27 @@ def check_dgd(dgd, where):
     components(dgd)  # refuses GPU forms the guard cannot count
 
 
-def admit(objects, ns, uid):
-    """Check every object the dry run returned. Returns the DGDs among them."""
+def admit(objects, ns, uid, lease_id):
+    """Check every object the dry run returned. Returns the DGDs among them.
+
+    Every object must carry both stamps `apply` writes: the namespace instance's UID and, when the
+    write runs under a lease, that lease. Teardown selects by the lease label.
+    """
     dgds, seen = [], set()
     for i, obj in enumerate(objects):
         kind, api = obj.get('kind'), obj.get('apiVersion')
         meta = obj.get('metadata') or {}
+        labels = meta.get('labels') or {}
         where = f'{kind}/{meta.get("name")}'
         if (kind, meta.get('name')) in seen:
             raise Refusal('duplicate_object', f'{where} appears twice; kubectl would write both, one at a time')
         seen.add((kind, meta.get('name')))
         if meta.get('namespace') != ns:
             raise Refusal('kind_refused', f'{where} is not a namespaced object in {ns}')
-        if (meta.get('labels') or {}).get(NS_UID_LABEL) != uid:
+        if labels.get(NS_UID_LABEL) != uid:
             raise Refusal('field_refused', f'{where} lost the label {NS_UID_LABEL}={uid}')
+        if lease_id and labels.get(LEASE_LABEL) != lease_id:
+            raise Refusal('field_refused', f'{where} lost the label {LEASE_LABEL}={lease_id}')
         if kind == DGD_KIND and api in DGD_VERSIONS:
             check_dgd(obj, where)
             dgds.append(obj)
@@ -402,16 +409,15 @@ def esc(name):
     return str(name).replace('~', '~0').replace('/', '~1')
 
 
-def zero_patch(dgd, ns_uid):
+def zero_patch(dgd, lease_id):
     """A JSON patch that sets every replica count to 0.
 
-    Its test operations make the server refuse it unless the object is still the one read (UID) and
-    was applied in the namespace instance being torn down (the UID label), and every component
-    index still names the same component.
+    Its test operations make the server refuse it unless the object is still the one read (its UID),
+    still carries the lease label of the teardown being run, and every component index still names
+    the same component.
     """
     ops = [{'op': 'test', 'path': '/metadata/uid', 'value': dgd['metadata']['uid']},
-           {'op': 'test', 'path': '/metadata/labels/' + NS_UID_LABEL.replace('~', '~0').replace('/', '~1'),
-            'value': ns_uid}]
+           {'op': 'test', 'path': '/metadata/labels/' + esc(LEASE_LABEL), 'value': lease_id}]
     spec = dgd.get('spec') or {}
     changed = False
     if dgd.get('apiVersion') == 'nvidia.com/v1beta1':

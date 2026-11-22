@@ -13,8 +13,8 @@ Every command prints one JSON object on stdout. A refusal exits non-zero with `{
 | `-n <ns> secret hf\|ngc` | the namespace's thread | Pipes `fleet secret get` into `kubectl create secret ... --from-file=<key>=/dev/stdin`. Prints only the secret's name. |
 | `-n <ns> apply -f <file>` | the namespace's thread | Applies DGDs, ConfigMaps and ClusterIP Services, after the checks below. |
 | `-n <ns> delete <kind>/<name>` | the namespace's thread | Deletes one DGD, ConfigMap, Service, Secret, PVC or PodCliqueSet. The lease record, the model cache PVC and the pull secret are refused. Like `apply`, it takes the lease's slot, or needs a namespace that holds no GPUs. |
-| `down <ns> [--uid <uid>] [--lease <id>]` | the namespace's thread, or anyone with teardown authority | Releases an active lease first (owner only). Deletes each DGD labelled for this namespace with its UID as a precondition. Waits, at most `K8S_GUARD_DOWN_WAIT_SECONDS` (300), for every GPU pod in the namespace to go. Then deletes the namespace with its UID as a precondition, whatever is left, and reports `gpu_pods_left`. A namespace already being deleted gets no second delete (`terminating: true`). |
-| `expire <ns> [--uid <uid>] [--lease <id>]` | anyone with teardown authority | Sets every replica count of every DGD to 0. |
+| `down <ns> [--uid <uid>] [--lease <id>]` | the namespace's thread, or anyone with teardown authority | Releases an active lease first (owner only). Deletes each DGD labelled with the lease being torn down, with the DGD's UID as a precondition. Waits, at most `K8S_GUARD_DOWN_WAIT_SECONDS` (300), for every GPU pod in the namespace to go. Then deletes the namespace with its UID as a precondition, whatever is left, and reports `gpu_pods_left`. A namespace already being deleted gets no second delete (`terminating: true`). With no lease record on the namespace it deletes no DGD and says so in `dgds_skipped`. |
+| `expire <ns> [--uid <uid>] [--lease <id>]` | anyone with teardown authority | Sets every replica count of every DGD labelled with the lease being torn down to 0. With no lease record on the namespace it scales nothing and says so in `dgds_skipped`. |
 | `extend <ns> [--uid <uid>] [--lease <id>]` | anyone | Copies the lease's `expires_at`, unchanged, into the lease record. It only replaces the record `lease acquire` wrote, under the `resourceVersion` it read, and never creates one. The lease must be `active` and match the cluster, the namespace and the UID. It never moves the stored expiry earlier, so a late call cannot undo a newer extension. |
 | `-n <ns> selftest fences` | the namespace's thread | For the first run on a cluster. On the first DGD the guard applied, it sends each teardown fence once with a wrong UID or a stale `resourceVersion`: two JSON patches, a DGD delete, a namespace delete, and a lease record replace. Each payload changes nothing even if the server ignored its fence. It prints each server response and reads the objects again. It fails with `fence_failed` unless every request was refused for its fence's own reason (`testing value`, `Precondition failed`, `the object has been modified`) and nothing changed. Another error, such as Forbidden, proves nothing. |
 | `inspect <ns>` | anyone | Read only. Prints `uid`, `thread`, `expires_at`, `dgd_gpus`, `pod_gpus`, `gpu_type`, `gpu_pods_left`, and also `allocation` and `lease_id`. A missing namespace gives code `not_found`; any other failure gives another code. |
@@ -42,7 +42,7 @@ The expiry of a namespace is the record's `expires_at` when the record's `uid` m
 
 The rules in this section and the next are pure functions in `scripts/k8s_guard_rules.py`.
 
-The guard parses no YAML. `kubectl label --local` (no API call) reads the file and labels every object `wcep.agent/namespace-uid=<namespace UID>`. The guard sends that JSON to `kubectl apply --dry-run=server -o json`, then the same JSON to the real apply. Every check runs on the JSON from the dry run, so defaults and webhook changes are checked too.
+The guard parses no YAML. `kubectl label --local` (no API call) reads the file and labels every object with `wcep.agent/namespace-uid=<namespace UID>` and, when the write runs under a lease, `wcep.agent/lease=<lease id>`. Every object must carry both stamps. The guard sends that JSON to `kubectl apply --dry-run=server -o json`, then the same JSON to the real apply. Every check runs on the JSON from the dry run, so defaults and webhook changes are checked too.
 
 - **Kinds:** `DynamoGraphDeployment` (`nvidia.com/v1alpha1` or `v1beta1`), `ConfigMap`, and `Service` of type `ClusterIP`. Each object must be in the `-n` namespace.
 - **DGD fields:** only the fields the guard can count. Refused: scaling adapters, enabled autoscaling, planner, EPP and LPX components, `roles`, DRA resource claims, any GPU resource other than `nvidia.com/gpu`, PVCs the DGD would create, and any field the guard does not know.
@@ -83,6 +83,10 @@ A JSON error from the plugin, such as an unknown lease, is an answer, not an out
 
 `down` does not match pods to DGDs: names can be reused, and pods carry no reliable link to their DGD.
 
+Teardown selects the DGDs of the lease it is tearing down: `wcep.agent/lease=<lease id>`. It never selects by the namespace UID. In a long-lived namespace, every task that ever applied there shares that UID, so a selector on it picks a colleague's DGD too. The UID stays an instance check: the namespace is read again, and each DGD's own UID is the precondition its delete or patch carries.
+
+With no lease record on the namespace there is no label to select by, so teardown deletes no DGD and reports the reason as `dgds_skipped`. `down` still deletes the namespace, which ends everything in it. A DGD with no lease label, such as one an earlier task applied, is never selected: `expire` leaves it running, and `down` still ends it with the namespace.
+
 ## A re-created namespace
 
 A namespace name is never made twice: `ns create` adds a random suffix and refuses a name that exists. So no namespace can be re-created under a name an earlier one had, through the guard. The checks below stay as defense in depth.
@@ -93,14 +97,14 @@ One residual remains, and the owner accepted it. All three of these must happen 
 - its suffix collides with a deleted namespace's suffix, about 1 in 3.7e15;
 - the owner races its own `apply` against its own `down`.
 
-Then the late `apply` can land in the new namespace. Its DGD carries the deleted namespace's UID label, so `expire` never touches it. `inspect` counts it, so `k8s-leases` sees the over-allocation, revokes the lease and flags it. At the grace deadline, `down` deletes the namespace after its bounded wait, so the stray DGD and its pods go with it. The namespace delete carries the UID precondition, so nothing outside that namespace is touched.
+Then the late `apply` can land in the new namespace. Its DGD carries the deleted namespace's lease label, so `expire` of the new namespace never touches it. `inspect` counts it, so `k8s-leases` sees the over-allocation, revokes the lease and flags it. At the grace deadline, `down` deletes the namespace after its bounded wait, so the stray DGD and its pods go with it. The namespace delete carries the UID precondition, so nothing outside that namespace is touched.
 
 `k8s-leases` sends `expire`, `down` and `extend` with the UID it stored, without reading the namespace first. The guard refuses a `--uid` that differs from the namespace, before any write.
 
 A read cannot fence a later write, so the writes carry their own fences, which the API server checks:
 
-- `expire` and `down` select only DGDs labelled with the namespace's UID. A namespace re-created under the same name holds none.
-- Each `expire` patch tests the DGD's UID and that label. Each DGD delete and the namespace delete carry the UID as a precondition.
+- `expire` and `down` select only DGDs labelled with the lease being torn down. A namespace re-created under the same name holds no DGD of that lease.
+- Each `expire` patch tests the DGD's UID and its lease label, so a DGD that lost the label is refused, not scaled. Each DGD delete and the namespace delete carry the UID as a precondition.
 - `extend` replaces the lease record under its `resourceVersion` and never creates one.
 
 The guard also reads the UID again before each write, so most races stop before a request is sent.
@@ -114,6 +118,7 @@ Every write appends one JSON line to `${XDG_STATE_HOME:-~/.local/state}/k8s-guar
 The tests use fakes. The first run on a cluster must confirm these, and run `selftest fences` in its smoke namespace:
 
 - the bot can create a namespace with labels and annotations, and can delete it;
+- `kubectl label --local` writes both stamps in one call, and the server dry run returns them on every object;
 - the API server accepts the `DeleteOptions` body that `kubectl delete --raw <path> -f -` sends without a `Content-Type`;
 - the dry run of a stock DGD adds no field the guard refuses.
 
