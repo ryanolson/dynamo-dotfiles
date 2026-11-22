@@ -431,6 +431,8 @@ module = importlib.util.module_from_spec(importlib.util.spec_from_loader('k8s_sw
 loader.exec_module(module)
 command = json.loads(os.environ['SWEEP_TEST_GUARD'])
 module.guard_command = lambda: list(command)
+if os.environ.get('SWEEP_TEST_GUARD_TIMEOUT'):
+    module.GUARD_TIMEOUT = float(os.environ['SWEEP_TEST_GUARD_TIMEOUT'])
 sys.exit(module.main(sys.argv[2:]))
 '''
 
@@ -456,7 +458,7 @@ class SweepCase(G.GuardCase):
         self.thread_dir.mkdir(parents=True)
         self.storage = self.thread_dir  # add_ns() writes the creating thread's ledger here
 
-    def sweep(self, *args, clusters=(PROFILE,), real_guard=False, thread=None, **env_kw):
+    def sweep(self, *args, clusters=(PROFILE,), real_guard=False, thread=None, guard_timeout=None, **env_kw):
         # The fake kubectl serves one world whatever the context, so each run names its cluster.
         env_kw.setdefault('host_entry', True)
         env = self.env(**env_kw)
@@ -466,6 +468,8 @@ class SweepCase(G.GuardCase):
         env['FAKE_GUARD_LOG'] = str(self.guard_log)
         guard = ['python3', '-I', str(self.runner), str(GUARD)] if real_guard else [str(self.logging_guard)]
         env['SWEEP_TEST_GUARD'] = json.dumps(guard)
+        if guard_timeout:
+            env['SWEEP_TEST_GUARD_TIMEOUT'] = str(guard_timeout)
         p = subprocess.run(['python3', '-I', str(self.sweep_runner), str(SWEEP), *clusters, *args], env=env,
                            capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
         self.reload()
@@ -809,6 +813,54 @@ class Enforce(SweepCase):
         self.assertIn('enforce_failed', [e['code'] for e in body['errors']])
         self.assertEqual(rc, 1)
         self.assertEqual(self.ledger(host=True)[-1]['result'], 'guard_no_json')
+
+    def test_an_identity_that_is_not_the_bot_stops_the_cluster_before_any_guard_call(self):
+        self.expired_world(5)
+        self.k8s['whoami'] = 'someone-else'
+        self.bb['unreachable'] = True
+        self.flush()
+        rc, body, p = self.sweep('--enforce')
+        self.assertEqual(rc, 1)
+        self.assertIn({'cluster': PROFILE, 'code': 'not_bot'}, [{k: e[k] for k in ('cluster', 'code')} for e in body['errors']])
+        self.assertEqual((body['clusters'], body['namespaces']), ([], []))
+        self.assertEqual(self.guard_calls(), [])
+        self.assertEqual([c['pos'][:2] for c in self.sweep_calls() if c['pos'][:2] != ['config', 'view']],
+                         [['auth', 'whoami']])
+
+    def guard_answers(self, script, **kw):
+        """An expired namespace past grace, bb up (so only the guard's answer can fail the run), and a guard
+        that answers with `script`."""
+        self.expired_world(5)
+        self.logging_guard.write_text('#!/bin/sh\n' + script)
+        return self.sweep('--enforce', **kw)
+
+    def assert_enforce_failed(self, body, rc, result):
+        self.assertEqual(self.row(body)['action'], {'action': 'down', 'result': result})
+        self.assertEqual([e['code'] for e in body['errors']], ['enforce_failed'])
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.ledger(host=True)[-1]['result'], result)
+
+    def test_a_guard_kubectl_error_fails_the_run(self):
+        rc, body, p = self.guard_answers('echo \'{"error": "Forbidden", "code": "kubectl_error"}\'\nexit 1\n')
+        self.assert_enforce_failed(body, rc, 'kubectl_error')
+
+    def test_a_guard_internal_error_fails_the_run(self):
+        rc, body, p = self.guard_answers('echo \'{"error": "boom", "code": "internal_error"}\'\nexit 1\n')
+        self.assert_enforce_failed(body, rc, 'internal_error')
+
+    def test_a_guard_that_exits_nonzero_without_a_code_is_not_ok(self):
+        rc, body, p = self.guard_answers('echo \'{"namespace": "x"}\'\nexit 1\n')
+        self.assertEqual(self.row(body)['action'], {'action': 'down', 'result': 'guard_error'})
+        self.assertEqual(self.ledger(host=True)[-1]['result'], 'guard_error')
+
+    def test_a_guard_that_hangs_fails_the_run(self):
+        rc, body, p = self.guard_answers('exec sleep 30\n', guard_timeout=1)
+        self.assert_enforce_failed(body, rc, 'guard_timeout')
+
+    def test_a_guard_refusal_on_its_rules_does_not_fail_the_run(self):
+        rc, body, p = self.guard_answers('echo \'{"error": "active", "code": "lease_active"}\'\nexit 1\n')
+        self.assertEqual(self.row(body)['action'], {'action': 'down', 'result': 'lease_active'})
+        self.assertEqual((body['errors'], rc), ([], 0))
 
     def test_premade_and_terminating_namespaces_are_never_enforced(self):
         premade = PREFIX + 'agent'

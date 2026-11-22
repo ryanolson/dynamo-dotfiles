@@ -57,6 +57,12 @@ M = [
  ('script: premade record read', S, "        record = None if name == premade else reader.json(", "        record = reader.json("),
  ('script: guard failure not an error', S, "            if result in GUARD_FAILURES:", "            if False:"),
  ('script: no sweep ledger line', S, "    record({'time': now.strftime", "    (lambda *a: None)({'time': now.strftime"),
+ ('script: identity check skipped', S, "    reader.verify_bot(bot)\n", "    pass\n"),
+ ('script: identity never refused', S, "        if name != bot['user']:", "        if False:"),
+ ('script: kubectl_error not a failure', S, "'guard_timeout', 'internal_error', 'kubectl_error')", "'guard_timeout', 'internal_error')"),
+ ('script: internal_error not a failure', S, "'guard_timeout', 'internal_error', 'kubectl_error')", "'guard_timeout', 'kubectl_error')"),
+ ('script: guard_timeout not a failure', S, "('guard_no_json', 'guard_timeout', 'internal_error',", "('guard_no_json', 'internal_error',"),
+ ('script: non-zero exit without code is ok', S, "        elif p.returncode == 0 and 'code' not in body:", "        elif 'code' not in body:"),
 ]
 orig = {p: open(p, 'rb').read() for p in (R, S)}
 bad = 0
