@@ -1,0 +1,12 @@
+# Managed by chezmoi (dot_config/systemd/user/k8s-sweep.timer). Never enabled by chezmoi.
+[Unit]
+Description=Run k8s-sweep every hour
+
+[Timer]
+OnCalendar=hourly
+# A run missed while the host was off runs at the next boot.
+Persistent=true
+RandomizedDelaySec=30s
+
+[Install]
+WantedBy=timers.target

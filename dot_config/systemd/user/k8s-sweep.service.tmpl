@@ -1,0 +1,20 @@
+{{- /* User unit for k8s-sweep (dot_agents/skills/k8s-clusters/references/k8s-sweep.md). Deployed
+       only with the k8s_tbot block (see .chezmoiignore); never enabled or started by chezmoi. */ -}}
+{{- $name := .k8s_tbot.name -}}
+{{- /* % is a systemd specifier; the tbot config template refuses the same names. */ -}}
+{{- if not (regexMatch "^[A-Za-z0-9_-][A-Za-z0-9._-]*$" ($name | toString)) -}}
+{{-   fail "k8s_tbot.name must be one directory name of letters, digits, '.', '_' or '-'" -}}
+{{- end -}}
+# Managed by chezmoi (dot_config/systemd/user/k8s-sweep.service.tmpl).
+[Unit]
+Description=k8s-sweep: report our use of the shared clusters (read only)
+# The bot's kubeconfig exists once tbot-k8s-agent.service has joined.
+ConditionPathExists=%h/.local/share/tbot/{{ $name }}/kube/kubeconfig.yaml
+
+[Service]
+Type=oneshot
+# ~/.local/bin holds the bb wrapper; kubectl is found by its pinned sha256, never by PATH.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=KUBECONFIG=%h/.local/share/tbot/{{ $name }}/kube/kubeconfig.yaml
+ExecStart=%h/.agents/skills/k8s-clusters/scripts/k8s-sweep
+TimeoutStartSec=30min

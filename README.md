@@ -571,6 +571,12 @@ timeout 60 python3 test/test-k8s-render.py </dev/null
 timeout 300 python3 test/test-k8s-guard.py </dev/null
 ```
 
+`k8s-sweep` checks the leases against what the clusters run. It is read only: it flags GPUs with no active lease, more GPUs than the lease, a GPU pod that no DGD owns, and a lease whose namespace is gone. It also lists ledger entries that no `down` closed, and writes one table for the steward's digest to `~/.local/state/k8s-sweep/digest.md`. Its one write is `--enforce`, the backstop for when bb is down: after a namespace's expiry it runs `k8s-guard expire`, and after the one-hour grace period `k8s-guard down`, with the UID the ledger recorded. The same `k8s_tbot` block deploys two user units, `k8s-sweep.timer` (hourly) and `k8s-sweep-enforce.timer` (every 15 minutes). As with tbot, `chezmoi apply` never enables them; `systemctl --user enable --now k8s-sweep.timer k8s-sweep-enforce.timer` does. The rules are in `dot_agents/skills/k8s-clusters/references/k8s-sweep.md`:
+
+```bash
+timeout 300 python3 test/test-k8s-sweep.py </dev/null
+```
+
 ### Antigravity in bb
 
 `iou_antigravity_acp` installs the Antigravity ACP server from the ACP registry. Google publishes one archive for each platform. The command installs the archive for this machine in `~/.local/share/agy-acp-server/<version>`. It writes `launch.json` there with the command and arguments from the registry (Linux needs `--uid=`). Then it points `current` at that version and removes the other versions. A run that finds the version installed downloads nothing. The command does not sign in.

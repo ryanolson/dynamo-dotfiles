@@ -85,8 +85,13 @@ while i < len(argv):
         pos.append(a); i += 1
 stdin = sys.stdin.read() if flags.get('-f', flags.get('--filename')) == '-' or \
     '/dev/stdin' in flags.get('--from-file', '') else ''
+try:
+    # Which program sent the call: k8s-sweep's tests require every write to come from k8s-guard.
+    parent = open(f'/proc/{os.getppid()}/cmdline').read().split('\0')
+except OSError:
+    parent = []
 with open(os.environ['FAKE_KUBECTL_LOG'], 'a') as log:
-    log.write(json.dumps({'argv': argv, 'pos': pos, 'flags': flags,
+    log.write(json.dumps({'argv': argv, 'pos': pos, 'flags': flags, 'parent': parent,
                           'env': {k: os.environ.get(k) for k in ('KUBECONFIG', 'KUBECTL_KUBERC')}}) + '\n')
 st = json.load(open(STATE))
 ns_flag = flags.get('-n') or flags.get('--namespace')
@@ -227,8 +232,14 @@ for needle in st.get('forbid', []):
 if st.get('unreachable'):
     fail('Unable to connect to the server: dial tcp 192.0.2.1:443: i/o timeout')
 
+if pos[:2] == ['auth', 'whoami']:
+    emit({'kind': 'SelfSubjectReview', 'apiVersion': 'authentication.k8s.io/v1',
+          'status': {'userInfo': {'username': st.get('whoami', 'bot-example-agent')}}})
+
 if cmd == 'get':
     what = pos[1]
+    if what in ('namespaces', 'ns') and len(pos) == 2:
+        emit({'kind': 'List', 'apiVersion': 'v1', 'items': labelled(list(st['namespaces'].values()))})
     if what == 'namespace':
         ns = st['namespaces'].get(pos[2])
         if ns is None:
@@ -426,6 +437,10 @@ if cmd == 'delete' and '--raw' in flags:
             fail(f'Error from server (NotFound): namespaces "{parts[3]}" not found')
         if want is None:
             fail('fake kubectl: namespace delete without a UID precondition', 96)
+        if st.get('recreate_ns_on_delete'):
+            # Deleted and made again under the same name just before this delete reaches the server.
+            ns['metadata']['uid'] = 'uid-recreated'
+            save()
         if ns['metadata']['uid'] != want:
             fail('Error from server (Conflict): Precondition failed: UID in precondition: %s, UID in object meta: %s'
                  % (want, ns['metadata']['uid']))
@@ -511,6 +526,10 @@ st = json.load(open(os.environ['FAKE_BB_STATE']))
 with open(os.environ['FAKE_BB_LOG'], 'a') as log:
     log.write(json.dumps(argv) + '\n')
 if st.get('unreachable'):
+    if '--json' in argv:
+        # bb's own form: with --json the CLI prints its error envelope on stdout as well.
+        print(json.dumps({'ok': False, 'error': {'code': 'server_unreachable',
+                                                 'message': 'bb is not running at http://127.0.0.1:1'}}, indent=2))
     sys.stderr.write('Cannot connect to BB server. Ensure it is running and BB_SERVER_URL is correct.\n')
     sys.exit(1)
 
@@ -606,6 +625,19 @@ if argv[:4] == ['k8s', 'lease', 'acquire', '--claim']:
         sys.stderr.write('Cannot connect to BB server.\n')
         sys.exit(1)
     out({'lease_id': lid, 'expires_at': st['leases'][lid]['expires_at'], 'state': 'active'})
+if argv[:2] == ['k8s', 'leases'] and '--json' in argv:
+    # As the plugin's showJson prints a row; live leases unless --all.
+    rows = []
+    for l in st['leases'].values():
+        if '--all' not in argv and l['state'] not in ('active', 'revoking', 'releasing'):
+            continue
+        row = {'lease_id': l['lease_id'], 'state': l['state'], 'cluster': l['cluster'], 'context': l.get('context'),
+               'namespace': l['namespace'], 'uid': l['uid'], 'thread': l['thread'], 'gpu_type': l['gpu_type'],
+               'gpus': l['gpus'], 'expires_at': l['expires_at'], 'multi_node': l.get('multi_node', False),
+               'renewals': 0, 'reason': l.get('reason'), 'grace_deadline': l.get('grace_deadline'),
+               'mode': l.get('mode', 'created'), 'predecessor': None}
+        rows.append(row)
+    print(json.dumps(rows)); sys.exit(0)
 if argv[:3] == ['k8s', 'lease', 'latest']:
     o = {argv[i][2:]: argv[i + 1] for i in range(3, len(argv) - 1, 2)}
     lid = st.get('latest', {}).get(o['namespace'])

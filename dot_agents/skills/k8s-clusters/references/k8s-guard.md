@@ -212,6 +212,8 @@ Every write appends one JSON line to `${XDG_STATE_HOME:-~/.local/state}/k8s-guar
 
 Read a `down` line's `gpus` as the allocation that down ended: the lease's DGDs, or, when it had no lease id to select by, every DGD in the namespace, which the namespace delete ended with it. `gpu_pods_left` counts the GPU pods still there when the wait ran out.
 
+`k8s-sweep --enforce` calls `expire` and `down` with teardown authority, never as the owner. After each call it appends a line with `object: Sweep/<ns>` and `direction: enforce` to the host ledger. The guard's ledger reader ignores that direction (`references/k8s-sweep.md`).
+
 `dgds_kept` is in the command's output, not the ledger: it names the DGDs of the lease that changed between the read and the delete, so this down did not delete them. They went with the namespace in the same call, or, for `expire`, they were never scaled.
 
 ## Not proven without a cluster

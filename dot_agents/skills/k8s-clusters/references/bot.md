@@ -23,6 +23,7 @@ bot kubeconfig  --kubectl --context <cluster>-->  the cluster
 4. `chezmoi diff` and then `chezmoi apply` for only `~/.config/tbot` and the `tbot-k8s-agent.service` unit.
 5. `systemctl --user start tbot-k8s-agent.service`, then read `journalctl --user -u tbot-k8s-agent.service`. A good start says `Fetched new bot identity` and `Generated identity for Kubernetes access` with a cluster count.
 6. Run `systemctl --user enable` on the unit if the host should keep the bot across reboots. Chezmoi never enables it.
+7. The same block deploys the `k8s-sweep` units: an hourly read-only report and the 15-minute `--enforce` backstop. Enable them with `systemctl --user enable --now k8s-sweep.timer k8s-sweep-enforce.timer`, with linger on (`references/k8s-sweep.md`, "Timers").
 
 ## Each session
 

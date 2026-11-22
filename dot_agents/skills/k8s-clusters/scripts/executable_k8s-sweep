@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""Report our use of the shared clusters, and enforce namespace expiry when bb is down.
+
+Usage:
+  k8s-sweep [cluster ...] [--enforce] [--text] [--ledger-glob GLOB ...]
+
+With no cluster it reads every profile that is not marked `never`. For each, it lists our
+namespaces (the bot's developer label, under the bot's namespace prefix), and in each one its
+pods, DGDs and lease record, with the bot's kubeconfig and the pinned kubectl exactly as k8s-check
+does. It matches them against `bb k8s leases --all --json`, and reads every ledger on the host.
+
+Read only, except --enforce: once a namespace's expiry has passed it runs `k8s-guard expire`
+(DGDs to 0) on every run, and once the expiry plus the one-hour grace period has passed it runs
+`k8s-guard down` with the namespace's recorded UID. It never writes with kubectl itself; the guard
+checks its own teardown authority. The rules are in k8s_sweep_rules.py; the reference is
+references/k8s-sweep.md.
+
+Each run writes ${XDG_STATE_HOME:-~/.local/state}/k8s-sweep/report.json and digest.md (one
+table, for the steward's digest), and prints the JSON report, or with --text the table. Exit
+status: 0 when the run completes (flags are not failures), 1 when a cluster, the lease list or
+a ledger could not be read or an enforcement call failed, 2 for a usage error.
+"""
+import argparse
+from datetime import datetime, timezone
+import glob
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+
+sys.dont_write_bytecode = True  # keep the deployed skill directory clean
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import k8s_sweep_rules as rules  # noqa: E402
+from k8s_profiles import ProfileError, load_profiles  # noqa: E402
+
+DGD_RESOURCE = 'dynamographdeployments.nvidia.com'
+LEASE_RECORD = 'wcep-agent-lease'
+NO_CRD = "doesn't have a resource type"
+DNS_LABEL = re.compile(r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
+BB_TIMEOUT = 30
+# `down` waits up to K8S_GUARD_DOWN_WAIT_SECONDS (300) for GPU pods, around its API calls.
+GUARD_TIMEOUT = 900
+LEDGER_GLOBS = ('~/.bb-machines/*/thread-storage/*/k8s-ledger.jsonl',)
+# Guard answers that mean the backstop itself failed, not that the guard refused on its rules.
+GUARD_FAILURES = ('guard_no_json', 'guard_timeout', 'internal_error', 'kubectl_error')
+
+
+def load_check():
+    """k8s-check as a module, so this script uses its pinned kubectl and kubeconfig rules, not a copy."""
+    for name in ('k8s-check', 'executable_k8s-check'):
+        path = HERE / name
+        if path.exists():
+            loader = importlib.machinery.SourceFileLoader('k8s_check', str(path))
+            module = importlib.util.module_from_spec(importlib.util.spec_from_loader('k8s_check', loader))
+            loader.exec_module(module)
+            return module
+    raise ProfileError('k8s_check_missing', f'k8s-check is not next to this script ({HERE})')
+
+
+def guard_command():
+    """The guard next to this script. The only write path: the sweep sends kubectl nothing but reads."""
+    for name in ('k8s-guard', 'executable_k8s-guard'):
+        path = HERE / name
+        if path.exists():
+            return [sys.executable, '-I', str(path)]
+    raise ProfileError('k8s_guard_missing', f'k8s-guard is not next to this script ({HERE})')
+
+
+def state_home():
+    return Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state')
+
+
+class Reader:
+    """The pinned kubectl on the bot's sealed kubeconfig, for reads only."""
+
+    def __init__(self, check, bot, context):
+        self.check = check
+        self.kc = check.Kubectl(bot['kubeconfig'], bot['kubectl_sha256'], context)
+
+    def json(self, *args, missing=False):
+        """The parsed answer; with missing=<value>, that value when the server says NotFound."""
+        if args[0] != 'get' and tuple(args[:2]) != ('auth', 'whoami'):
+            raise ProfileError('not_a_read', f'k8s-sweep sends kubectl only reads, not {args[0]}')
+        rc, out, err = self.kc.run(*args)
+        if rc != 0:
+            if missing is not False and '(NotFound)' in err:
+                return missing
+            raise self.check.KubectlError(args, rc, err)
+        try:
+            return json.loads(out)
+        except json.JSONDecodeError:
+            raise self.check.KubectlError(args, 0, 'output is not JSON')
+
+    def verify_bot(self, bot):
+        """Stop unless the caller is the bot, the way k8s-check does."""
+        try:
+            who = self.json('auth', 'whoami', '-o', 'json')
+            name = (((who.get('status') or {}).get('userInfo')) or {}).get('username')
+        except self.check.KubectlError as e:
+            if not self.check.whoami_not_served(e):
+                raise
+            name = self.kc.certificate_name()
+        if name != bot['user']:
+            raise self.check.Refusal('not_bot', f'identity is {name!r}, not the bot {bot["user"]!r}; stop')
+
+
+def read_namespaces(reader, bot, now):
+    """Our namespaces as rows: the developer label and the bot's prefix. Read one namespace at a time."""
+    prefix, premade = bot['namespace_prefix'], bot.get('premade_namespace')
+    listed = reader.json('get', 'namespaces', '-l', f'{rules.DEVELOPER_LABEL}={bot["developer"]}', '-o', 'json')
+    ours = [n for n in listed.get('items') or [] if ((n.get('metadata') or {}).get('name') or '').startswith(prefix)]
+    rows = []
+    for ns in sorted(ours, key=lambda n: n['metadata']['name']):
+        name = ns['metadata']['name']
+        pods = reader.json('get', 'pods', '-n', name, '-o', 'json').get('items') or []
+        try:
+            dgds = reader.json('get', DGD_RESOURCE, '-n', name, '-o', 'json').get('items') or []
+        except reader.check.KubectlError as e:
+            if NO_CRD not in str(e):
+                raise
+            dgds = []  # a cluster without the Dynamo CRD has no DGDs
+        record = None if name == premade else reader.json('get', 'configmap', LEASE_RECORD, '-n', name, '-o', 'json',
+                                                          missing=None)
+        rows.append(rules.namespace_row(ns, record, dgds, pods, now, premade))
+    return rows
+
+
+def read_leases(env):
+    """`bb k8s leases --all --json`, or (None, why). With --json, an unreachable bb prints its error
+    envelope on stdout: anything but a list is no answer."""
+    try:
+        p = subprocess.run(['bb', 'k8s', 'leases', '--all', '--json'], env=env, capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=BB_TIMEOUT)
+    except FileNotFoundError:
+        return None, 'bb is not on PATH', []
+    except subprocess.TimeoutExpired:
+        return None, f'bb timed out after {BB_TIMEOUT}s', []
+    try:
+        body = json.loads(p.stdout)
+    except json.JSONDecodeError:
+        body = None
+    if p.returncode != 0 or not isinstance(body, list):
+        error = body.get('error') if isinstance(body, dict) else None
+        why = (error.get('message') if isinstance(error, dict) else None) or p.stderr.strip() or \
+            f'bb exited {p.returncode}'
+        return None, str(why)[:300], []
+    shape = {'lease_id': str, 'state': str, 'cluster': str, 'namespace': str, 'uid': str, 'gpus': int}
+    good, bad = [], []
+    for row in body:
+        if isinstance(row, dict) and all(isinstance(row.get(k), t) and not isinstance(row.get(k), bool)
+                                         for k, t in shape.items()):
+            good.append(row)
+        else:
+            bad.append(str(row.get('lease_id') if isinstance(row, dict) else row)[:80])
+    return good, None, bad
+
+
+def read_ledgers(extra_globs):
+    """(line, source) from the host ledger and every thread ledger on the host, and read errors."""
+    host = state_home() / 'k8s-guard/ledger.jsonl'
+    paths = [(host, 'host')]
+    for pattern in extra_globs:
+        for found in sorted(glob.glob(os.path.expanduser(pattern))):
+            paths.append((Path(found), Path(found).parent.name))
+    pairs, errors, seen = [], [], set()
+    for path, source in paths:
+        real = os.path.realpath(path)
+        if real in seen:
+            continue
+        seen.add(real)
+        try:
+            text = path.read_text()
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            errors.append({'cluster': None, 'code': 'ledger_unreadable', 'message': f'{path}: {e.strerror}'})
+            continue
+        for raw in text.splitlines():
+            try:
+                pairs.append((json.loads(raw), source))
+            except json.JSONDecodeError:
+                continue
+    return pairs, errors
+
+
+def recorded_uid(known, leases, cluster, ns):
+    """The UID a record older than this read gives: the ledger's create line, else the live lease's."""
+    if (cluster, ns) in known:
+        return known[(cluster, ns)]
+    uids = {l['uid'] for l in leases or [] if l['cluster'] == cluster and l['namespace'] == ns
+            and l['state'] in rules.LIVE}
+    return uids.pop() if len(uids) == 1 else None
+
+
+def record(line):
+    path = state_home() / 'k8s-guard/ledger.jsonl'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'a') as f:
+        f.write(json.dumps(line) + '\n')
+
+
+def enforce(cluster, prof, row, action, uid, now):
+    """Run the guard's expire or down with the recorded UID, and record what it said."""
+    cmd = guard_command() + ['--context', prof['context'], action, row['namespace'], '--uid', uid]
+    body = None
+    try:
+        p = subprocess.run(cmd, env=rules.guard_env(os.environ, Path.home()), capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=GUARD_TIMEOUT)
+        try:
+            body = json.loads(p.stdout)
+        except json.JSONDecodeError:
+            pass
+        if not isinstance(body, dict):
+            result, body = 'guard_no_json', {'stderr': p.stderr.strip()[-300:]}
+        elif p.returncode == 0 and 'code' not in body:
+            result = 'ok'
+        else:
+            result = str(body.get('code') or 'guard_error')
+    except subprocess.TimeoutExpired:
+        result, body = 'guard_timeout', {}
+    record({'time': now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'thread': None, 'cluster': cluster,
+            'context': prof['context'], 'namespace': row['namespace'], 'uid': uid,
+            'object': f'Sweep/{row["namespace"]}', 'gpus': row['gpus'], 'direction': 'enforce',
+            'lease': row['lease_record'], 'issue': None, 'action': action, 'result': result,
+            'expires_at': row['expires_at'], 'by': 'k8s-sweep'})
+    return result, body
+
+
+def lookup(reader, names):
+    """Namespaces read by name: name to UID, or None for NotFound. Only names that could be ours."""
+    out = {}
+    for name in sorted(names):
+        if DNS_LABEL.match(name) and len(name) <= 63:  # never a value kubectl could take for a flag
+            ns = reader.json('get', 'namespace', name, '-o', 'json', missing=None)
+            out[name] = None if ns is None else (ns.get('metadata') or {}).get('uid')
+    return out
+
+
+def sweep_cluster(check, profiles, cluster, leases, known, entries, args, now, report):
+    prof, bot = profiles['clusters'][cluster], profiles['bot']
+    reader = Reader(check, bot, prof['context'])
+    reader.verify_bot(bot)
+    rows = read_namespaces(reader, bot, now)
+    listed = {r['namespace']: r['uid'] for r in rows}
+    wanted = {l['namespace'] for l in leases or [] if l['cluster'] == cluster and l['state'] in rules.LIVE}
+    wanted |= {e['namespace'] for e in entries if e['cluster'] == cluster and isinstance(e['namespace'], str)}
+    exists = lookup(reader, {n for n in wanted - set(listed) if n.startswith(bot['namespace_prefix'])})
+    flags = rules.match_leases(cluster, rows, leases, exists)
+    for r in rows:
+        r['cluster'] = cluster
+        d = rules.decide(r, recorded_uid(known, leases, cluster, r['namespace']), now)
+        if d['flag']:
+            r['flags'].append(rules.flag(d['flag'], r['namespace'], d['reason']))
+        for f in r['flags']:
+            f['cluster'] = cluster
+        if not d['action']:
+            continue
+        if not args.enforce:
+            r['action'] = {'action': d['action'], 'result': 'not run: report only'}
+        elif not prof.get('bot_can_write'):
+            r['action'] = {'action': d['action'], 'result': 'not run: cluster read only'}
+        else:
+            uid = recorded_uid(known, leases, cluster, r['namespace'])
+            result, body = enforce(cluster, prof, r, d['action'], uid, now)
+            r['action'] = {'action': d['action'], 'result': result}
+            report['enforced'].append({'cluster': cluster, 'namespace': r['namespace'], 'uid': uid,
+                                       'action': d['action'], 'reason': d['reason'], 'result': result, 'guard': body})
+            if result in GUARD_FAILURES:
+                report['errors'].append({'cluster': cluster, 'code': 'enforce_failed',
+                                         'message': f'k8s-guard {d["action"]} {r["namespace"]}: {result}'})
+    for e in entries:
+        if e['cluster'] != cluster:
+            continue
+        uid = listed.get(e['namespace'], exists.get(e['namespace']))
+        e['exists'] = uid == e['uid'] if e['kind'] == 'namespace' else uid is not None
+    report['namespaces'] += rows
+    report['stale_leases'] += [f for f in flags if f['kind'] == 'lease_namespace_gone']
+
+
+def write_outputs(report):
+    """report.json and digest.md, each replaced whole: a reader never sees half of one."""
+    out = state_home() / 'k8s-sweep'
+    out.mkdir(parents=True, exist_ok=True)
+    for name, text in (('report.json', json.dumps(report, indent=2) + '\n'), ('digest.md', rules.digest_table(report))):
+        with tempfile.NamedTemporaryFile('w', dir=out, prefix=f'.{name}.', delete=False) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(f.name, out / name)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog='k8s-sweep', description=__doc__.split('\n\n')[0])
+    parser.add_argument('clusters', nargs='*', help='clusters to read (default: every profile that is not never)')
+    parser.add_argument('--enforce', action='store_true',
+                        help='run k8s-guard expire after expiry and k8s-guard down after the grace period')
+    parser.add_argument('--text', action='store_true', help='print the digest table instead of JSON')
+    parser.add_argument('--ledger-glob', action='append', default=None, metavar='GLOB',
+                        help=f'thread ledgers to read besides the host ledger (default: {LEDGER_GLOBS[0]})')
+    args = parser.parse_args(argv)
+
+    now = datetime.now(timezone.utc)
+    report = {'host': socket.gethostname(), 'checked_at': now.strftime('%Y-%m-%dT%H:%M:%SZ'),
+              'mode': 'enforce' if args.enforce else 'report', 'grace_hours': rules.GRACE.total_seconds() / 3600,
+              'clusters': [], 'skipped': [], 'namespaces': [], 'stale_leases': [], 'open_ledger': [], 'flags': [],
+              'enforced': [], 'errors': []}
+
+    def finish():
+        report['flags'] = [f for r in report['namespaces'] for f in r['flags']] + report['stale_leases']
+        write_outputs(report)
+        print(rules.digest_table(report) if args.text else json.dumps(report, indent=2), end='' if args.text else '\n')
+        return 1 if report['errors'] else 0
+
+    try:
+        profiles = load_profiles()
+        check = load_check()
+        check.check_kubeconfig(profiles['bot'])
+    except ProfileError as e:  # check.Refusal is one
+        report['errors'].append({'cluster': None, 'code': getattr(e, 'code', 'error'), 'message': str(e)})
+        return finish()
+
+    wanted = args.clusters or sorted(profiles['clusters'])
+    todo = []
+    for cluster in wanted:
+        prof = profiles['clusters'].get(cluster)
+        if prof is None:
+            parser.error(f'{cluster} has no profile; known: {", ".join(sorted(profiles["clusters"]))}')
+        if prof['allowed'] == 'never':
+            report['skipped'].append({'cluster': cluster, 'reason': 'profile says never'})
+        else:
+            todo.append(cluster)
+
+    leases, why, bad = read_leases(rules.bb_env(os.environ, Path.home()))
+    if leases is None:
+        report['errors'].append({'cluster': None, 'code': 'leases_unavailable', 'message': why})
+    if bad:
+        report['errors'].append({'cluster': None, 'code': 'lease_unreadable',
+                                 'message': f'bb k8s leases rows without the fields the sweep needs: {", ".join(bad)}'})
+    pairs, ledger_errors = read_ledgers(LEDGER_GLOBS if args.ledger_glob is None else args.ledger_glob)
+    report['errors'] += ledger_errors
+    ended = {l['lease_id'] for l in leases or [] if l['state'] in rules.ENDED}
+    entries = [dict(e, exists=None) for e in rules.open_ledger(pairs, ended)]
+    report['open_ledger'] = entries
+    known = rules.created_uids(pairs)
+
+    for cluster in todo:
+        try:
+            sweep_cluster(check, profiles, cluster, leases, known, entries, args, now, report)
+            report['clusters'].append(cluster)
+        except ProfileError as e:  # check.Refusal is one
+            report['errors'].append({'cluster': cluster, 'code': e.code, 'message': str(e)})
+        except check.KubectlError as e:
+            report['errors'].append({'cluster': cluster, 'code': 'kubectl_error', 'message': str(e)})
+    return finish()
+
+
+if __name__ == '__main__':
+    sys.exit(main())

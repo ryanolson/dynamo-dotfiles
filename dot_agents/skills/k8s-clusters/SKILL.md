@@ -39,6 +39,15 @@ It reads pods, DynamoGraphDeployments and namespaces on each cluster with the bo
 
 The API shows no GPU utilization, so a finding means "could be released", not "is idle". Only running pods count as holding GPUs. One hold can match several rules, so do not add GPU counts across findings. Ask the owner; never delete or scale someone else's work. The rules are in `scripts/k8s_stale_rules.py`.
 
+## Check leases against the clusters, and the expiry backstop
+
+```bash
+export KUBECONFIG=<bot.kubeconfig from the profiles>
+~/.agents/skills/k8s-clusters/scripts/k8s-sweep --text        # read only: every profile that is not `never`
+```
+
+It lists our namespaces with their age, thread, expiry, GPUs, pod age and reaper warnings. It matches them against `bb k8s leases` and flags `gpus_no_lease`, `gpus_over_lease`, `gpu_pod_no_dgd` and `lease_namespace_gone`. It also lists ledger entries on the host that no `down` closed. Each run writes the table the steward's digest reads to `~/.local/state/k8s-sweep/digest.md`. `--enforce` is the backstop for when bb is down: after a namespace's expiry it runs `k8s-guard expire`, and one hour later `k8s-guard down`, with the UID the ledger recorded. It never writes with kubectl. Two user timers run the report every hour and `--enforce` every 15 minutes, on hosts with the bot. The rules, the flags and the units are in `references/k8s-sweep.md`.
+
 ## Threat model
 
 `k8s-check` and `k8s-guard` protect against accidental use of credentials other than the bot's: a stray kubeconfig, a kuberc, `KUBECONFIG`, a `tsh` exec plugin, a wrong path, or a file swapped by mistake. They do not protect against a malicious process running as the same Unix user, which could replace `~/.local/bin/tbot` or trace the checker. A wrapper compiled into an allowlisted path counts as replacing tbot or kubectl: out of scope, though the kubectl sha256 pin catches one installed after the pin was taken. The bot's own permissions on the server are the boundary against that.
