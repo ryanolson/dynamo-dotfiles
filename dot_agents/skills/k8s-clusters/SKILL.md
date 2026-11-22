@@ -18,7 +18,7 @@ The source of truth is the Linear document "Runbook: build and run on our Dynamo
 
 How the bot works, how to set up a host, what it can and cannot do, the pre-made namespace, the key rules, and what to do when it fails are in `references/bot.md`. Read it before you set up a host or deploy.
 
-One known gap, tested: the bot cannot create namespaces, so `k8s-guard ns create` fails with it. `kubectl auth whoami` is not served on these clusters, so `k8s-check` names the bot from its client certificate instead (the report says `"source": "certificate"`). To check access by hand, use `kubectl --context <ctx> get nodes`.
+One known gap, tested: the bot cannot create namespaces, so `k8s-guard ns create` refuses `namespace_create_denied` and names `ns claim`, which claims the pre-made namespace with a lease. Claims stay off (`enforcement_unhealthy`) until the admission webhook that counts controller writes exists. `kubectl auth whoami` is not served on these clusters, so `k8s-check` names the bot from its client certificate instead (the report says `"source": "certificate"`). To check access by hand, use `kubectl --context <ctx> get nodes`.
 
 ## Find stale deployments and GPU holds
 

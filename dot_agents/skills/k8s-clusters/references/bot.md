@@ -69,7 +69,9 @@ Rules while the namespace is shared by all tasks:
 - Teardown removes the objects your task made. It never deletes the namespace, and nothing may delete it: the bot cannot make a new one.
 - Do not touch objects you did not make.
 
-Known gap: `k8s-guard ns create` assumes the bot can create a namespace, so it fails with this bot. Until the guard can use a pre-made namespace, do not write through a different path. Stop and tell the owner.
+The profiles name it as `[bot] premade_namespace`. `k8s-guard ns create` refuses with `namespace_create_denied` and names `k8s-guard -n <premade> ns claim`, which takes a `k8s-leases` lease on it: the lease is the claim, and teardown deletes the lease's objects, never the namespace (`k8s-guard.md`, "A claimed namespace").
+
+Known gap: `k8s-leases` refuses claims (`enforcement_unhealthy`) until the admission webhook that counts controller writes is installed. Until then no task can deploy into the pre-made namespace through the guard. Do not write through a different path. Stop and tell the owner.
 
 ## The key
 

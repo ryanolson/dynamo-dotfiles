@@ -565,7 +565,7 @@ timeout 120 python3 test/test-k8s-check.py </dev/null
 timeout 60 python3 test/test-k8s-render.py </dev/null
 ```
 
-`k8s-guard` is the only write path to a cluster. It refuses any write outside our namespaces, our kinds, or the namespace's GPU lease from the `k8s-leases` plugin, and records each write in a ledger. Teardown selects DGDs by the lease label, never by the namespace UID. Its rules are in `dot_agents/skills/k8s-clusters/references/k8s-guard.md`. The tests use a fake `kubectl`, `bb`, `fleet`, `tbot` and `tsh`, and never contact a cluster:
+`k8s-guard` is the only write path to a cluster. It refuses any write outside our namespaces, our kinds, or the namespace's GPU lease from the `k8s-leases` plugin, and records each write in a ledger. Teardown selects DGDs by the lease label, never by the namespace UID. Every write carries its ownership checks to the server (create-only POST, JSON Patch tests, delete preconditions) and is an attempt recorded in `k8s-leases` before it is sent. `ns claim` claims the profiles' pre-made namespace, whose teardown deletes the lease's objects and never the namespace; claims stay off until the admission webhook exists. Its rules are in `dot_agents/skills/k8s-clusters/references/k8s-guard.md`. The tests use a fake `kubectl`, `bb`, `fleet`, `tbot` and `tsh`, and never contact a cluster:
 
 ```bash
 timeout 300 python3 test/test-k8s-guard.py </dev/null

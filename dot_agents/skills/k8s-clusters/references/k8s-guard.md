@@ -8,20 +8,21 @@ Every command prints one JSON object on stdout. A refusal exits non-zero with `{
 
 | Command | Who may run it | What it does |
 |---|---|---|
-| `ns create <purpose> --issue <n> --hours <h>` | a bb thread | Creates `<namespace_prefix><n>-<purpose>-<suffix>`, where the suffix is 10 random letters and digits from the CSPRNG, with the opt-in labels, `owner`, `wcep.agent/thread`, `wcep.agent/issue`, and the annotation `wcep.agent/expires-at`. `h` is at most 4. A name that exists is refused, and a name longer than 63 characters. It records the name and UID in the thread's ledger. |
+| `ns create <purpose> --issue <n> --hours <h>` | a bb thread | Creates `<namespace_prefix><n>-<purpose>-<suffix>`, where the suffix is 10 random letters and digits from the CSPRNG, with the opt-in labels, `owner`, `wcep.agent/thread`, `wcep.agent/issue`, and the annotation `wcep.agent/expires-at`. `h` is at most 4. A name that exists is refused, and a name longer than 63 characters. It records the name and UID in the thread's ledger. Where the bot may not create a namespace (Forbidden at the cluster scope, as on our clusters), it refuses `namespace_create_denied` and names `ns claim`. |
+| `-n <premade> ns claim --gpus <n> --hours <h>` | a bb thread | Claims the profiles' pre-made namespace (`[bot] premade_namespace`) with a `k8s-leases` lease. See "A claimed namespace" below. It writes nothing to the cluster. |
 | `-n <ns> lease acquire --gpus <n> --hours <h>` | the namespace's thread | Calls `bb k8s lease acquire` with the profile name, the namespace UID, the thread, and the profile's GPU type. Writes the lease record (below). Prints the pod label and pod affinity that GPU pods must carry. |
-| `-n <ns> secret hf\|ngc` | the namespace's thread | Pipes `fleet secret get` into `kubectl create secret ... --from-file=<key>=/dev/stdin`. Prints only the secret's name. |
+| `-n <ns> secret hf\|ngc` | the namespace's thread | Creates the Secret from `fleet secret get`, on stdin only, with `kubectl create -f -`: create-only, labelled with the namespace UID and the lease. Prints only the secret's name. |
 | `-n <ns> apply -f <file>` | the namespace's thread | Applies DGDs, ConfigMaps and ClusterIP Services, after the checks below. |
-| `-n <ns> delete <kind>/<name>` | the namespace's thread | Deletes one DGD, ConfigMap, Service, Secret, PVC or PodCliqueSet. The lease record, the model cache PVC and the pull secret are refused. Like `apply`, it takes the lease's slot, or needs a namespace that holds no GPUs. |
-| `down <ns> [--uid <uid>] [--lease <id>]` | the namespace's thread, or anyone with teardown authority | Releases an active lease first (owner only). Deletes each DGD labelled with the lease being torn down: it reads the DGD again, checks that its UID is still the one the list gave and that its lease label still holds, then deletes it under that listed UID and the `resourceVersion` just read. A DGD that changed in between is left (`dgds_kept`), not deleted. Waits, at most `K8S_GUARD_DOWN_WAIT_SECONDS` (300), for every GPU pod in the namespace to go. Then deletes the namespace with its UID as a precondition, whatever is left, and reports `gpu_pods_left`. A namespace already being deleted gets no second delete (`terminating: true`). With no lease id (no `--lease` and no record) it deletes no DGD and says so in `dgds_skipped`. |
+| `-n <ns> delete <kind>/<name>` | the namespace's thread | Deletes one DGD, ConfigMap, Service, Secret, PVC or PodCliqueSet, with its UID and `resourceVersion` as preconditions. An object labelled with another lease is refused (`object_not_yours`); in a claimed namespace, so is one without this lease's label. The lease record, the model cache PVC and the pull secret are refused. Like `apply`, it takes the lease's slot, or needs a namespace that holds no GPUs. |
+| `down <ns> [--uid <uid>] [--lease <id>]` | the namespace's thread, or anyone with teardown authority | Releases an active lease first (owner only). Deletes each DGD labelled with the lease being torn down: it reads the DGD again, checks that its UID is still the one the list gave and that its lease label still holds, then deletes it under that listed UID and the `resourceVersion` just read. A DGD that changed in between is left (`dgds_kept`), not deleted. Waits, at most `K8S_GUARD_DOWN_WAIT_SECONDS` (300), for every GPU pod in the namespace to go. Then deletes the namespace with its UID as a precondition, whatever is left, and reports `gpu_pods_left`. A namespace already being deleted gets no second delete (`terminating: true`). With no lease id (no `--lease` and no record) it deletes no DGD and says so in `dgds_skipped`. In a claimed namespace it never deletes the namespace: see "A claimed namespace". |
 | `expire <ns> [--uid <uid>] [--lease <id>]` | anyone with teardown authority | Sets every replica count of every DGD labelled with the lease being torn down to 0. With no lease id (no `--lease` and no record) it scales nothing and says so in `dgds_skipped`. |
 | `extend <ns> [--uid <uid>] [--lease <id>]` | anyone | Copies the lease's `expires_at`, unchanged, into the lease record. It only replaces the record `lease acquire` wrote, under the `resourceVersion` it read, and never creates one. The lease must be `active` and match the cluster, the namespace and the UID. It never moves the stored expiry earlier, so a late call cannot undo a newer extension. |
-| `-n <ns> selftest fences` | the namespace's thread | For the first run on a cluster. On the first DGD the guard applied, it sends each teardown fence once with a wrong UID or a stale `resourceVersion`: two JSON patches, a DGD delete, a namespace delete, and a lease record replace. Each payload changes nothing even if the server ignored its fence. It prints each server response and reads the objects again. It fails with `fence_failed` unless every request was refused for its fence's own reason (`testing value`, `Precondition failed`, `the object has been modified`) and nothing changed. Another error, such as Forbidden, proves nothing. |
-| `inspect <ns>` | anyone | Read only. Prints `uid`, `thread`, `expires_at`, `dgd_gpus`, `pod_gpus`, `gpu_type`, `gpu_pods_left`, and also `allocation` and `lease_id`. A missing namespace gives code `not_found`; any other failure gives another code. |
+| `-n <ns> selftest fences` | the namespace's thread | For the first run on a cluster. On the first DGD the guard applied, it sends each teardown fence once with a wrong UID, a stale `resourceVersion` or a wrong lease label: three JSON patches, two DGD deletes, a namespace delete (not in a claimed namespace, which gets no Namespace request at all), and a lease record replace. Each payload changes nothing even if the server ignored its fence. It prints each server response and reads the objects again. It fails with `fence_failed` unless every request was refused for its fence's own reason (`testing value`, `Precondition failed`, `the object has been modified`) and nothing changed. Another error, such as Forbidden, proves nothing. |
+| `inspect <ns>` | anyone | Read only. Prints `uid`, `thread`, `expires_at`, `dgd_gpus`, `pod_gpus`, `gpu_type`, `gpu_pods_left`, and also `allocation`, `lease_id`, `developer` and `agent_rbac` (the Namespace's two opt-in labels). A missing namespace gives code `not_found`; any other failure gives another code. |
 
 Every command needs `--context`. `-n` can come anywhere.
 
-The commands for the namespace's thread (`lease acquire`, `secret`, `apply`, `delete`, `selftest fences`, and the owner's `down`) take the namespace from the thread's ledger, `$BB_THREAD_STORAGE/k8s-ledger.jsonl`. A given `-n` must be a namespace this thread created, and its UID must still be the one recorded. Without `-n`, the thread's only live namespace is used. Everything else is refused, including `scale`, `patch`, `edit`, `replace`, `set`, `label`, `annotate`, `get`, and `-A`.
+The commands for the namespace's thread (`lease acquire`, `secret`, `apply`, `delete`, `selftest fences`, and the owner's `down`) take the namespace from the thread's ledger, `$BB_THREAD_STORAGE/k8s-ledger.jsonl`. A given `-n` must be a namespace this thread created, and its UID must still be the one recorded. Without `-n`, the thread's only live namespace is used. The pre-made namespace is different: see "A claimed namespace". Everything else is refused, including `scale`, `patch`, `edit`, `replace`, `set`, `label`, `annotate`, `get`, and `-A`.
 
 ## Identity and cluster
 
@@ -38,11 +39,48 @@ The bot's rights come from RoleBindings inside the namespace, so the guard write
 
 The expiry of a namespace is the record's `expires_at` when the record's `uid` matches the namespace. Otherwise it is the creation annotation. The record only points to the lease. The plugin's `bb k8s lease show` decides.
 
+## A claimed namespace
+
+On our clusters the bot cannot create a namespace. Ops made one per cluster for it, named in the profiles as `[bot] premade_namespace`, with the labels `dynamo.nvidia.com/developer` and `dynamo.nvidia.com/developer-agent-rbac: "true"`. The bot cannot label, annotate or delete it, so nothing in the namespace can mark which task owns it. The `k8s-leases` plugin holds that instead: the lease's row in its database is the claim, the GPU charge and the completion.
+
+- `ns claim` reads the namespace and checks both labels. It keeps a request id in the thread ledger before it calls `bb k8s lease acquire --claim`, so a retry after a lost reply asks again with the same id and gets the same answer. It names the namespace's latest lease (`bb k8s lease latest`) as the one this claim replaces. The plugin takes the owner from the calling thread, checks the exact profile name, both labels and the live UID on a host, and decides in one transaction. The same owner can adopt its own matching active lease after losing its ledger. Nobody else can, and a lease being torn down keeps the namespace.
+- Every owner command in the pre-made namespace needs this thread's claim, and the plugin's lease must be `active` and name this thread, cluster, namespace, UID and GPU type. The ledger line only points at the lease. With no claim there are no writes, CPU-only included (`namespace_not_claimed`). `wcep.agent/thread` is never read there.
+- Teardown takes only the plugin's word (`revoking` or `releasing`). The namespace keeps no expiry, so there is no offline teardown; with the plugin unreachable, `down` and `expire` refuse `lease_unavailable`.
+- The owner's `down` releases the lease and returns. The plugin then runs `down` on a host, which:
+  1. resolves the lease's open write attempts from storage (below);
+  2. scales the lease's DGDs to 0, then deletes each object labelled `wcep.agent/lease=<id>` of the kinds DGD, PodCliqueSet, Service, ConfigMap, Secret and PVC (not the model cache PVC or the pull secret), each with its UID and `resourceVersion` as preconditions;
+  3. reads the lease's labelled objects again, adding pods, PodCliques, Deployments and StatefulSets. Terminating pods count;
+  4. reports `complete` only when every attempt is resolved, nothing changed hands, every list was read, and nothing of the lease is left. Otherwise it refuses `teardown_incomplete`, with what it resolved and what is left.
+- `down` never deletes, labels or patches the pre-made namespace. The plugin frees the lease's GPUs only through one transaction conditional on that completion (`k8s-leases` README). Running `down` again after a crash goes on from where it stopped.
+- A pod with the DGD's name label but not the lease label is never selected, waited for or deleted.
+
+Claims stay off until the admission webhook that counts controller writes exists: until then `k8s-leases` refuses every claim with `enforcement_unhealthy`.
+
 ## Apply
 
 The rules in this section and the next are pure functions in `scripts/k8s_guard_rules.py`.
 
-The guard parses no YAML. `kubectl label --local` (no API call) reads the file and labels every object with `wcep.agent/namespace-uid=<namespace UID>` and, when the write runs under a lease, `wcep.agent/lease=<lease id>`. Every object must carry both stamps. The guard sends that JSON to `kubectl apply --dry-run=server -o json`, then the same JSON to the real apply. Every check runs on the JSON from the dry run, so defaults and webhook changes are checked too.
+The guard parses no YAML. `kubectl label --local` (no API call) reads the file and labels every object with `wcep.agent/namespace-uid=<namespace UID>` and, when the write runs under a lease, `wcep.agent/lease=<lease id>`. Every object must carry both stamps. Then, for each object, the guard reads it and plans one write (see "Ownership on the mutation"). It sends that exact request with `--dry-run=server`, then sends it for real. Every check runs on the JSON from the dry run, so defaults and webhook changes are checked too. A write that meets a changed object makes the guard read, check and budget everything again, at most three times; then it refuses `write_conflict`.
+
+## Ownership on the mutation
+
+A read before a write proves nothing about the object the write reaches. So every write carries its own checks to the server:
+
+- an absent object gets a create-only POST (`kubectl create -f -`). If anything took the name meanwhile, the server answers `AlreadyExists`, and the guard reads the object again: one that is not ours is left alone (`object_not_yours`);
+- a present object must be ours: in a claimed namespace, labelled with this lease; in a namespace the guard created, labelled with this lease, or with this namespace UID and no lease. It gets a JSON Patch whose first operations test its UID, its `resourceVersion` and that label, before the edits. A merge patch (`kubectl apply`) can leave out an unchanged `resourceVersion`, so `apply` is never used to write. A patch never adopts an object with no stamp, since a controller may own it;
+- every delete carries both the UID and the `resourceVersion` in `DeleteOptions.preconditions`. On a conflict the guard reads again: it retries only while the object has the same UID and is still ours, so a relabel or a replacement defeats a stale delete;
+- scale to 0 tests the UID, the `resourceVersion` and the lease label.
+
+The patch replaces each field the manifest gives under `spec` on its own, so fields the server set (a Service's `clusterIP`) stay. It does not remove a field the manifest leaves out.
+
+## Write attempts
+
+A write whose reply never came can still land. A slot that expired, a client that exited, or a list that reads empty proves nothing about it. So every write under a lease is an attempt with its own id:
+
+1. The guard records the attempt in `k8s-leases` (`bb k8s lease attempt begin`, with the slot's token) before it sends the write: the verb, the object, and for a patch or delete the UID and `resourceVersion` its precondition carries.
+2. Creates and patches carry the id in the annotation `wcep.agent/attempt`.
+3. The attempt is resolved by the server's answer (success, or an outright refusal such as `AlreadyExists`, `Conflict` or `Invalid`), by seeing its id on the object, or by proof that its precondition can no longer hold: another object holds the name, or the object's UID or `resourceVersion` has moved on. A timeout, a lost connection or an internal error leaves the outcome unknown. A create that timed out and then reads 404 stays open: it may still land.
+4. An open attempt blocks the lease's next write. Before it takes the slot, the guard tries to resolve every open attempt from storage, and refuses `attempt_unresolved` while one stays open. A write whose outcome stays unknown refuses `write_unresolved`. Teardown cannot complete while an attempt is open, and the plugin keeps the GPUs charged. There is no timer: only seeing the write's outcome resolves it.
 
 - **Kinds:** `DynamoGraphDeployment` (`nvidia.com/v1alpha1` or `v1beta1`), `ConfigMap`, and `Service` of type `ClusterIP`. Each object must be in the `-n` namespace.
 - **DGD fields:** only the fields the guard can count. Refused: scaling adapters, enabled autoscaling, planner, EPP and LPX components, `roles`, DRA resource claims, any GPU resource other than `nvidia.com/gpu`, PVCs the DGD would create, and any field the guard does not know.
@@ -62,13 +100,15 @@ With no lease record, that allocation must be 0. With a record, the guard:
 2. takes the lease's slot (`bb k8s lease op begin`);
 3. runs the dry run and every check, and reads the DGDs and pods again;
 4. refuses when the allocation is more than the lease;
-5. without `multi_node`, refuses when the allocation is more than one node of the profile, and when a GPU pod lacks the label `wcep.agent/lease=<id>` or a required pod affinity to that label on `kubernetes.io/hostname`;
-6. reads the namespace UID once more, then applies the objects one request at a time. Before each one it refuses when less than 40 seconds of the slot are left, and it stops `kubectl` before the slot ends. Objects already applied stay; the budget above counts every subset;
+5. refuses when any pod template of a new DGD lacks exactly `wcep.agent/lease=<id>` (`lease_label_required`): every v1alpha1 service and v1beta1 component, GPU or not, zero replicas and multi-node included, because teardown finds the lease's pods by that label. Without `multi_node` it also refuses when the allocation is more than one node of the profile, and when a GPU pod lacks a required pod affinity to that label on `kubernetes.io/hostname`;
+6. reads the namespace UID once more, then writes the objects one request at a time, each as an attempt (above). Before each one it refuses when less than 40 seconds of the slot are left, and it stops `kubectl` before the slot ends. Objects already applied stay; the budget above counts every subset;
 7. calls `op end`. When it reports the lease as no longer `active`, the guard runs `expire` at once and exits with `lease_revoked`.
 
 Every write in a namespace with a lease record takes the slot, GPU or not. `secret` and `delete` follow the same rule.
 
 ## Teardown authority
+
+In a claimed namespace only the first rule below applies.
 
 `down` by the owner releases an active lease first. Any other `down`, and every `expire`, needs one of these:
 
@@ -104,7 +144,7 @@ Then the late `apply` can land in the new namespace. Its DGD carries the deleted
 A read cannot fence a later write, so the writes carry their own fences, which the API server checks:
 
 - `expire` and `down` select only DGDs labelled with the lease being torn down. A namespace re-created under the same name holds no DGD of that lease.
-- Each `expire` patch tests the DGD's UID and its lease label, so a DGD that lost the label is refused, not scaled.
+- Each `expire` patch tests the DGD's UID, its `resourceVersion` and its lease label, so a DGD that lost the label is refused, not scaled.
 - Each DGD delete reads the DGD again and checks that its UID is still the listed one and that its lease label holds before sending, then carries the listed UID and `resourceVersion`: a delete has no label test, so the version is what refuses a change in place, and the UID refuses a replacement with the same name. On a conflict it reads and checks again, a bounded number of times, so a status write does not stop a teardown that is still the lease's. The namespace delete carries the namespace UID.
 - `extend` replaces the lease record under its `resourceVersion` and never creates one.
 
@@ -122,7 +162,9 @@ Read a `down` line's `gpus` as the allocation that down ended: the lease's DGDs,
 
 The tests use fakes. The first run on a cluster must confirm these, and run `selftest fences` in its smoke namespace:
 
-- the bot can create a namespace with labels and annotations, and can delete it;
+- the bot cannot create a namespace on our clusters (`namespaces is forbidden ... at the cluster scope`), so `ns create` refuses `namespace_create_denied`; where a cluster grants it, it can create a namespace with labels and annotations, and delete it;
+- a JSON Patch `test` on `/metadata/resourceVersion` is refused with `testing value` when the version moved, and a `resourceVersion` in `DeleteOptions.preconditions` is refused with `Precondition failed`;
+- `kubectl get <resource> -l wcep.agent/lease=<id>` works for each kind the claimed teardown lists, and a resource the server does not serve fails with `doesn't have a resource type`;
 - `kubectl label --local` writes both stamps in one call, and the server dry run returns them on every object;
 - the API server accepts the `DeleteOptions` body that `kubectl delete --raw <path> -f -` sends without a `Content-Type`;
 - the dry run of a stock DGD adds no field the guard refuses.

@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import tomllib
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1324,7 +1325,7 @@ class K8sCheck(unittest.TestCase):
 
     def test_premade_namespace_is_optional_and_exact(self):
         base = EXAMPLE.read_text()
-        self.assertNotIn('premade_namespace', base.split('[clusters.')[0])  # the example works without it
+        self.assertNotIn('premade_namespace', tomllib.loads(base)['bot'])  # the example works without it
         with_key = base.replace('namespace_prefix = "dyntest-alice-"',
                                 'namespace_prefix = "dyntest-alice-"\npremade_namespace = "dyntest-alice-agent"')
         self.profiles.write_text(with_key)
