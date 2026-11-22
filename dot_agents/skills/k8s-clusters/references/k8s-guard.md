@@ -56,6 +56,8 @@ On our clusters the bot cannot create a namespace. Ops made one per cluster for 
 
 Claims stay off until the admission webhook that counts controller writes exists: until then `k8s-leases` refuses every claim with `enforcement_unhealthy`.
 
+Install order: this guard calls `bb k8s lease attempt begin` on every leased write, in a namespace it created too, and `bb k8s lease latest` for a claim. A `k8s-leases` older than the claim protocol answers those with usage text, which the guard reads as an unreachable plugin, so every leased write would refuse `lease_unavailable`. Install the plugin first, then let hosts take this guard (`chezmoi update` or `chezmoi-headless-update`). The older guard works with the newer plugin.
+
 ## Apply
 
 The rules in this section and the next are pure functions in `scripts/k8s_guard_rules.py`.
