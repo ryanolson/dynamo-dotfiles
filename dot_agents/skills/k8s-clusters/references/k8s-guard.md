@@ -114,6 +114,10 @@ The guard also reads the UID again before each write, so most races stop before 
 
 Every write appends one JSON line to `${XDG_STATE_HOME:-~/.local/state}/k8s-guard/ledger.jsonl` on the host. When `BB_THREAD_STORAGE` is set, it also appends the line to `$BB_THREAD_STORAGE/k8s-ledger.jsonl`. A line holds the time, the calling thread, the cluster, the context, the namespace, its UID, the object, the GPUs, the direction (`up`, `down` or `extend`), the lease, and the issue. No secret value reaches stdout, stderr, or a ledger.
 
+Read a `down` line's `gpus` as the allocation that down ended: the lease's DGDs, or, when it had no lease id to select by, every DGD in the namespace, which the namespace delete ended with it. `gpu_pods_left` counts the GPU pods still there when the wait ran out.
+
+`dgds_kept` is in the command's output, not the ledger: it names the DGDs of the lease that changed between the read and the delete, so this down did not delete them. They went with the namespace in the same call, or, for `expire`, they were never scaled.
+
 ## Not proven without a cluster
 
 The tests use fakes. The first run on a cluster must confirm these, and run `selftest fences` in its smoke namespace:
