@@ -522,6 +522,19 @@ def lease(lid):
     return l
 
 
+def live_uid(ns):
+    # The plugin reads the live namespace on a host before a fresh claim decides. The fake kubectl's state
+    # file is that read; a replay already returned above, so only a fresh claim reaches this.
+    path = os.environ.get('FAKE_K8S_STATE')
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        state = json.load(open(path))
+    except json.JSONDecodeError:
+        return None
+    return state.get('namespaces', {}).get(ns, {}).get('metadata', {}).get('uid')
+
+
 def kubectl_writes():
     # How many cluster writes the fake kubectl has seen: an attempt must be recorded before its write.
     path = os.environ.get('FAKE_KUBECTL_LOG')
@@ -540,6 +553,7 @@ if argv[:4] == ['k8s', 'lease', 'acquire', '--claim']:
     o = {argv[i][2:]: argv[i + 1] for i in range(4, len(argv) - 1, 2)}
     ledger = os.path.join(os.environ.get('BB_THREAD_STORAGE', '/nonexistent'), 'k8s-ledger.jsonl')
     st.setdefault('claim_calls', []).append({'request': o['request'], 'replaces': o['replaces'],
+                                             'uid': o['uid'],
                                              'ledger_had_request': os.path.exists(ledger) and o['request'] in open(ledger).read()})
     save()
     if st.get('claims', 'off') == 'off':
@@ -548,14 +562,12 @@ if argv[:4] == ['k8s', 'lease', 'acquire', '--claim']:
         st['claim_error_before_commit'] = False
         save()
         err('internal', 'the claim failed before it committed')
-    if st.get('refuse_replay') and any(c['request'] == o['request'] for c in st['claim_calls'][:-1]):
-        # This request was asked with earlier: the call asks again, and the plugin refuses it.
-        code = st.pop('refuse_replay')
-        save()
-        err(code, 'refused by the fake')
     for l in st['leases'].values():
         if l.get('request') == o['request']:
             out({'lease_id': l['lease_id'], 'expires_at': l['expires_at'], 'state': l['state']})
+    ns_uid = live_uid(o['namespace'])
+    if ns_uid is not None and ns_uid != o['uid']:
+        err('uid_mismatch', f'{o["namespace"]} has UID {ns_uid}, not {o["uid"]}.')
     latest = st.get('latest', {}).get(o['namespace'])
     if (latest or 'none') != o['replaces']:
         print(json.dumps({'error': 'stale predecessor', 'code': 'predecessor_mismatch', 'current': latest or 'none'}))
@@ -3136,6 +3148,8 @@ class NamespaceClaim(ClaimedCase):
         self.assertEqual(rc, 0, body)
         [replay] = self.bb['claim_calls'][asked:]
         self.assertEqual(replay['request'], pending['request'], 'the pending request is the one asked with')
+        self.assertEqual(replay['uid'], pending['uid'],
+                         'the replay names the UID the pending request was made against')
         self.assertEqual(body['lease_id'], lease_id)
         # The claim names the UID the request was made against, not the live one: that is what keeps every
         # owned write away from the re-created namespace.
@@ -3149,9 +3163,10 @@ class NamespaceClaim(ClaimedCase):
         self.assertEqual(self.writes(), [], 'the re-created namespace is left alone for on-call')
 
     def test_a_refused_replay_starts_one_fresh_request(self):
-        # The plugin refused the pending request before it committed, and its error hid that. The replay's
-        # refusal is the answer that was missing: record it, then make one new request, which names the
-        # live UID and the lease `latest` names as its predecessor.
+        # The plugin refused the pending request before it committed, and its error hid that. The replay
+        # names the UID the request was made against, so the plugin's host read refuses it `uid_mismatch`:
+        # record that refusal, then make one new request, which names the live UID and `latest` as its
+        # predecessor.
         self.earlier_lease()
         self.bb['claim_error_before_commit'] = True
         self.bb['next_id'] = 'lse_fresh0001'
@@ -3160,14 +3175,15 @@ class NamespaceClaim(ClaimedCase):
         self.assertEqual(body.get('code'), 'internal', body)
         [pending] = self.claim_lines()
         live_uid = self.recreate_namespace()
-        self.bb['refuse_replay'] = 'uid_mismatch'
-        self.flush()
         asked = len(self.bb['claim_calls'])
         rc, body, _ = self.claim()
         self.assertEqual(rc, 0, body)
         replay, fresh = self.bb['claim_calls'][asked:]
         self.assertEqual(replay['request'], pending['request'])
+        self.assertEqual(replay['uid'], pending['uid'],
+                         'the replay names the UID the pending request was made against')
         self.assertNotEqual(fresh['request'], pending['request'])
+        self.assertEqual(fresh['uid'], live_uid, 'the fresh request names the live UID')
         self.assertEqual(fresh['replaces'], 'lse_earlier001')
         self.assertEqual(body['lease_id'], 'lse_fresh0001')
         self.assertEqual([(l['direction'], l.get('request'), l.get('code')) for l in self.claim_lines()],

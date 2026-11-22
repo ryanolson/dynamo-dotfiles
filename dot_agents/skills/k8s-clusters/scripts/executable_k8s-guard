@@ -1035,7 +1035,10 @@ def cmd_ns_claim(g, a):
     else:
         request_uid = view.uid
         request, replaces = new_claim_request(g, ns, request_uid, a.gpus, a.hours)
-    res = ask_claim(g, ns, request, replaces, view.uid, a.gpus, a.hours)
+    # A pending request is replayed with the UID it named. The plugin replays a committed request before it
+    # looks at the UID; one it never committed gets a full fresh claim and must see that old UID, so it is
+    # refused instead of granting a lease this ledger's claim line would then make unwritable.
+    res = ask_claim(g, ns, request, replaces, request_uid or view.uid, a.gpus, a.hours)
     if not res.ok and res.code in CLAIM_REFUSALS and pending:
         # The replay answered: the pending request was refused, so this thread holds no lease of ns. One
         # fresh request may follow in the same run, naming the live UID.
