@@ -3860,7 +3860,7 @@ class BuildCase(GuardCase):
         super().setUp()
         self.add_ns(thread=ME, cluster=self.cluster)
         self.lid = self.add_lease(cluster=self.cluster, gpu_type=self.gpu_type, gpus=1)
-        rc, body, p = self.guard('--context', self.ctx, '-n', NS, 'secret', 'ngc-push')
+        rc, body, p = self.guard('--context', self.ctx, '-n', NS, 'secret', 'ngc-push', '--exposure-accepted')
         self.assertEqual(rc, 0, f'{body} {p.stderr}')
 
     def run_argv(self, **over):
@@ -4390,7 +4390,7 @@ class GitBuild(BuildCase):
 class ClaimedBuild(ClaimedCase):
     def claimed_build(self, **over):
         over.setdefault('arch', 'arm64')
-        for which, extra in (('ngc-push', ()), ('git', ('--repo', 'owner/repo'))):
+        for which, extra in (('ngc-push', ('--exposure-accepted',)), ('git', ('--repo', 'owner/repo'))):
             if f'Secret/{which}' not in self.k8s['objects'].get(PREMADE, {}):
                 rc, body, p = self.guard('--context', CTX, '-n', PREMADE, 'secret', which, *extra)
                 self.assertEqual(rc, 0, f'{body} {p.stderr}')
@@ -4463,7 +4463,7 @@ class ClaimedBuild(ClaimedCase):
 
     def test_nvcr_push_lives_only_as_long_as_the_claim(self):
         lid = self.claimed(gpus=1)
-        rc, body, p = self.guard('--context', CTX, '-n', PREMADE, 'secret', 'ngc-push')
+        rc, body, p = self.guard('--context', CTX, '-n', PREMADE, 'secret', 'ngc-push', '--exposure-accepted')
         self.assertEqual(rc, 0, f'{body} {p.stderr}')
         stored = self.k8s['objects'][PREMADE]['Secret/nvcr-push']
         self.assertEqual(stored['metadata']['labels'][LEASE_LABEL], lid)
@@ -4478,7 +4478,7 @@ class ClaimedBuild(ClaimedCase):
         self.assertIn('Secret/nvcr-push', body['deleted'])
 
         lid = self.claimed(gpus=1)
-        rc, body, p = self.guard('--context', CTX, '-n', PREMADE, 'secret', 'ngc-push')
+        rc, body, p = self.guard('--context', CTX, '-n', PREMADE, 'secret', 'ngc-push', '--exposure-accepted')
         self.assertEqual(rc, 0, f'{body} {p.stderr}')
         self.assertEqual(self.k8s['objects'][PREMADE]['Secret/nvcr-push']['metadata']['labels'][LEASE_LABEL], lid)
 
@@ -4489,8 +4489,15 @@ class BuildSecrets(GuardCase):
         self.add_ns()
         self.lid = self.add_lease(gpus=1)
 
+    def test_push_secret_needs_the_stated_acceptance(self):
+        self.refused('push_not_approved', '--context', CTX, '-n', NS, 'secret', 'ngc-push')
+        self.assertNotIn('Secret/nvcr-push', self.k8s['objects'][NS])
+        self.assertFalse(self.fleet_log.exists())
+        self.refused('usage', '--context', CTX, '-n', NS, 'secret', 'hf', '--exposure-accepted')
+        self.assertFalse(self.fleet_log.exists())
+
     def test_push_secret_is_piped_and_never_printed(self):
-        rc, body, p = self.guard('--context', CTX, '-n', NS, 'secret', 'ngc-push')
+        rc, body, p = self.guard('--context', CTX, '-n', NS, 'secret', 'ngc-push', '--exposure-accepted')
 
         self.assertEqual(rc, 0, f'{body} {p.stderr}')
         self.assertEqual(body, {'secret': 'nvcr-push', 'namespace': NS})
@@ -4544,6 +4551,9 @@ if url.endswith('/v2/'):
 if url.startswith('https://auth.example.test/token'):
     sys.stdout.write(json.dumps({'token': 'made-up-token'}))
     sys.exit(0)
+if os.environ.get('FAKE_WGET_SILENT') == '1':
+    sys.stderr.write("wget: bad address 'registry.example.test'\n")
+    sys.exit(4)
 status = int(os.environ.get('FAKE_WGET_STATUS', '200'))
 sys.stderr.write(f'  HTTP/1.1 {status} Something\n')
 sys.stdout.write(os.environ.get('FAKE_WGET_BODY', ''))
@@ -4573,9 +4583,10 @@ class TagCheckScript(GuardCase):
             'username': '$oauthtoken', 'password': 'made-up', 'auth': 'bWFkZS11cA=='}}}))
         self.wget_log = self.tmp / 'wget.log'
 
-    def probe(self, status, body=''):
+    def probe(self, status, body='', silent=False):
         env = {'PATH': f'{self.bin}:/usr/bin:/bin', 'FAKE_WGET_LOG': str(self.wget_log),
                'FAKE_WGET_STATUS': str(status), 'FAKE_WGET_BODY': body,
+               'FAKE_WGET_SILENT': '1' if silent else '',
                'REGISTRY': 'registry.example.test', 'REPO_PATH': 'goirlvsxnepa/llm_nim/gdl-operator',
                'TAG': f'{TAG}-amd64', 'DOCKER_CONFIG': str(self.tmp)}
         p = subprocess.run(['/bin/sh', str(self.script)], env=env, capture_output=True, text=True, timeout=20,
@@ -4609,6 +4620,12 @@ class TagCheckScript(GuardCase):
                 rc, out = self.probe(status)
                 self.assertEqual(rc, 1)
                 self.assertIn('registry_error', out)
+
+    def test_a_network_failure_is_never_absent(self):
+        # No HTTP status at all (DNS, connection, timeout): the probe must refuse, never build.
+        rc, out = self.probe(200, silent=True)
+        self.assertEqual(rc, 1)
+        self.assertIn('registry_error', out)
 
     def test_the_probe_sends_the_mounted_basic_auth_and_the_pinned_tag(self):
         self.probe(200)

@@ -1157,6 +1157,16 @@ def cmd_lease_acquire(g, a):
 
 def cmd_secret(g, a):
     g.require_writable()
+    # The push credential is readable by everyone in Access-dynamo-clusters-dev once it is in the namespace.
+    # The owner accepted that exposure for the PAT; this flag makes creating the secret a stated step, so a
+    # thread cannot make one just because it holds a claim. It is a tripwire, not an authority check: the
+    # acceptance itself lives with the owner and the live half's first run.
+    if a.which == 'ngc-push' and not a.exposure_accepted:
+        raise Refusal('push_not_approved', 'nvcr-push puts the push credential in the namespace, where every member '
+                                           'of Access-dynamo-clusters-dev can read it; pass --exposure-accepted only '
+                                           'after the owner has accepted that exposure')
+    if a.exposure_accepted and a.which != 'ngc-push':
+        raise Refusal('usage', '--exposure-accepted is only for `secret ngc-push`', status=2)
     if a.which == 'git':
         if not a.repo:
             raise Refusal('usage', 'secret git needs --repo <owner>/<repo>', status=2)
@@ -2103,7 +2113,8 @@ COMMANDS = {
     ('ns', 'claim'): (cmd_ns_claim, ((('--gpus',), {'required': True}), (('--hours',), {'required': True}))),
     ('lease', 'acquire'): (cmd_lease_acquire, ((('--gpus',), {'required': True}),
                                                (('--hours',), {'required': True}))),
-    ('secret',): (cmd_secret, ((('which',), {'choices': sorted(SECRETS) + ['git']}), (('--repo',), {}))),
+    ('secret',): (cmd_secret, ((('which',), {'choices': sorted(SECRETS) + ['git']}), (('--repo',), {}),
+                               (('--exposure-accepted',), {'action': 'store_true'}))),
     ('build', 'run'): (cmd_build_run, ((('--repo',), {'required': True}), (('--commit',), {'required': True}),
                                        (('--dockerfile',), {'required': True}), (('--image',), {'required': True}),
                                        (('--arch',), {}))),
