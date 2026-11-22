@@ -106,6 +106,15 @@ LABEL_VALUE = re.compile(r'^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$')
 LEASE_ID = re.compile(r'^lse_[a-z0-9]{4,64}$')
 ATTEMPT_ID = re.compile(r'^att_[a-z0-9]{8,64}$')
 REQUEST_ID = re.compile(r'^req_[a-z0-9]{8,64}$')
+# The plugin's refusals of a claim, all decided before its transaction commits. Any other error (an internal
+# one, say) may come after the commit, so the request stays the one to ask with again.
+CLAIM_REFUSALS = {
+    'enforcement_unhealthy', 'not_your_thread', 'invalid_argument', 'profiles_unavailable', 'cluster_not_allowed',
+    'cluster_never', 'cluster_read_only', 'cluster_profile_incomplete', 'first_run_unapproved', 'too_many_hours',
+    'gpu_type_not_on_cluster', 'gpu_type_no_limit', 'multi_node_unapproved', 'namespace_not_premade',
+    'thread_not_live', 'namespace_not_found', 'inspect_failed', 'uid_mismatch', 'namespace_not_ours',
+    'namespace_over_lease', 'cluster_changed', 'namespace_leased', 'predecessor_mismatch', 'over_limit',
+    'request_conflict'}
 # What the API server answers when it refused a write outright: the write did not happen. Any other failure
 # (a timeout, a lost connection, an internal error) leaves the outcome unknown.
 DEFINITE = ('(AlreadyExists)', '(Conflict)', '(NotFound)', '(Invalid)', '(BadRequest)', '(Forbidden)',
@@ -561,11 +570,10 @@ def resolve_attempt(g, ns, a):
     stamp = (meta.get('annotations') or {}).get(ATTEMPT_ANNOTATION)
     verb = a.get('verb')
     if verb == 'create':
-        # A create that timed out and reads 404 can still land: only its stamp, or another object holding
-        # the name (so the create must fail), resolves it.
-        if live is None:
-            return None
-        return 'committed' if stamp == a['attempt'] else 'failed'
+        # A create's only precondition is that the name is absent, and that can hold again: a 404 or another
+        # object holding the name proves nothing about a create still in flight. Only its own stamp does
+        # (or the server's definite answer, which Attempts.run takes when it comes).
+        return 'committed' if live is not None and stamp == a['attempt'] else None
     if verb == 'patch':
         if live is None or meta.get('uid') != a.get('uid'):
             return 'superseded'
@@ -883,16 +891,30 @@ def plan_write(g, ns, item, lease_id, uid, claimed):
 
 
 def delete_owned(g, ns, obj, still_ours, timeout=KUBECTL_TIMEOUT, attempts=None):
-    """Delete `obj` under its UID and resourceVersion. On a conflict, re-read: retry while still_ours(live).
+    """Delete `obj`, the object as it was listed or read, if it is still that object and still ours.
 
-    Returns 'deleted', 'gone' (someone else deleted it), or raises object_not_yours when it changed hands.
-    Under a slot each delete is an attempt.
+    Its identity is the UID it was listed with. Before every send, not only after a conflict, the object
+    is read again and must still have that UID and pass still_ours (its lease label): DeleteOptions can
+    test a UID and a resourceVersion but no label, and a fresh read is never trusted as the identity.
+    The delete then carries the listed UID and the resourceVersion just read, so a change after the read
+    is refused by the server. On a conflict, read and check again, a bounded number of times.
+
+    Returns 'deleted' or 'gone' (nothing left to delete), or raises object_not_yours when it changed
+    hands. Under a slot each delete is an attempt.
     """
     kind, name = obj['kind'], obj['metadata']['name']
+    listed_uid = obj['metadata']['uid']
     for _ in range(WRITE_ROUNDS):
-        meta = obj['metadata']
+        live = get_object(g, ns, kind, name)
+        if live is None:
+            return 'gone'
+        if live['metadata'].get('uid') != listed_uid or not still_ours(live):
+            raise Refusal('object_not_yours', f'{kind}/{name} changed hands after it was listed (UID '
+                                              f'{live["metadata"].get("uid")}, {LEASE_LABEL}='
+                                              f'{labels_of(live).get(LEASE_LABEL) or "none"}); left alone')
+        version = live['metadata']['resourceVersion']
         body = json.dumps({'kind': 'DeleteOptions', 'apiVersion': 'v1',
-                           'preconditions': {'uid': meta['uid'], 'resourceVersion': meta['resourceVersion']}})
+                           'preconditions': {'uid': listed_uid, 'resourceVersion': version}})
 
         def send(body=body):
             rc, out, err = g.kc.run('delete', '--raw', rest_path(obj, ns), '-f', '-', input=body, timeout=timeout)
@@ -904,19 +926,12 @@ def delete_owned(g, ns, obj, still_ours, timeout=KUBECTL_TIMEOUT, attempts=None)
 
         try:
             if attempts:
-                attempts.run(new_attempt_id(), 'delete', kind, name, meta['uid'], meta['resourceVersion'], send)
+                attempts.run(new_attempt_id(), 'delete', kind, name, listed_uid, version, send)
             else:
                 send()
             return 'deleted'
-        except WriteConflict as e:
-            err = str(e)
-        live = get_object(g, ns, kind, name)
-        if live is None:
-            return 'gone'
-        if live['metadata'].get('uid') != meta['uid'] or not still_ours(live):
-            raise Refusal('object_not_yours', f'{kind}/{name} changed hands before the delete reached it '
-                                              f'({clip(err, 200)}); left alone')
-        obj = live
+        except WriteConflict:
+            continue  # read and check again
     raise Refusal('write_conflict', f'{kind}/{name} changed under every delete; try again')
 
 
@@ -1000,9 +1015,15 @@ def cmd_ns_claim(g, a):
     terms = {'uid': view.uid, 'claim_gpus': a.gpus, 'claim_hours': a.hours}
     lines = g.claim_lines(ns)
     last = lines[-1] if lines else {}
-    if (last.get('direction') == 'claim-request' and REQUEST_ID.match(str(last.get('request')))
-            and all(last.get(k) == v for k, v in terms.items())):
-        # The last request has no known outcome (its reply was lost): ask again with the same id.
+    pending = last.get('direction') == 'claim-request' and REQUEST_ID.match(str(last.get('request')))
+    if pending and not all(last.get(k) == v for k, v in terms.items()):
+        # That request may have committed. Asking with other terms would make a new request the plugin
+        # refuses while this thread's own lease may stand unnamed in its ledger.
+        raise Refusal('claim_pending', f'the last claim of {ns} (request {last["request"]}: --gpus '
+                                       f'{last.get("claim_gpus")} --hours {last.get("claim_hours")}) has no known '
+                                       'outcome; run ns claim again with those terms to learn it')
+    if pending:
+        # The last request has no known outcome (its reply was lost, or an error came after it): ask again.
         request, replaces = last['request'], last.get('replaces') or 'none'
     else:
         latest = bb('k8s', 'lease', 'latest', '--cluster', g.cluster, '--namespace', ns)
@@ -1020,8 +1041,12 @@ def cmd_ns_claim(g, a):
     if res.offline:
         raise lease_unavailable(res, 'acquire')
     if not res.ok:
-        g.record(ns, f'Claim/{ns}', 0, 'claim-refused', request=request, code=res.code)
-        raise Refusal(res.code, f'the plugin refused the claim: {res.error}')
+        if res.code in CLAIM_REFUSALS:
+            g.record(ns, f'Claim/{ns}', 0, 'claim-refused', request=request, code=res.code)
+            raise Refusal(res.code, f'the plugin refused the claim: {res.error}')
+        # Any other error may have come after the claim committed: keep the request, so a retry learns it.
+        raise Refusal(res.code, f'the claim\'s outcome is unknown ({res.error}); run ns claim again with the same '
+                                '--gpus and --hours, which asks with the same request')
     lease_id, expires = res.value.get('lease_id'), res.value.get('expires_at')
     if not isinstance(lease_id, str) or not LEASE_ID.match(lease_id) or not isinstance(expires, str):
         raise Refusal('lease_invalid', 'acquire returned no lease id or expiry')
@@ -1492,7 +1517,7 @@ def claimed_teardown(g, view, lease_id, lease):
             try:
                 if kind == DGD_KIND:
                     scale_to_zero(g, ns, obj, lease_id)
-                    obj = get_object(g, ns, kind, name) or obj
+                # The listed object stays the identity; delete_owned reads it again only for its version.
                 if delete_owned(g, ns, obj, ours) == 'deleted':
                     deleted.append(f'{kind}/{name}')
             except Refusal as e:

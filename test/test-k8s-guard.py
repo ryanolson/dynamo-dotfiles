@@ -559,6 +559,10 @@ if argv[:4] == ['k8s', 'lease', 'acquire', '--claim']:
                          'multi_node': False, 'mode': 'claimed', 'request': o['request']}
     st.setdefault('latest', {})[o['namespace']] = lid
     save()
+    if st.get('claim_error_after_commit'):
+        st['claim_error_after_commit'] = False
+        save()
+        err('internal', 'publish failed after the claim committed')
     if st.get('lose_claim_reply'):
         st['lose_claim_reply'] = False
         save()
@@ -3063,6 +3067,24 @@ class NamespaceClaim(ClaimedCase):
         self.assertEqual(first['request'], second['request'])
         self.assertEqual(len(self.bb['leases']), 1)
 
+    def test_an_error_after_the_claim_commits_keeps_the_request(self):
+        # The plugin answers with an error, but the claim may have committed: the request stays the one to retry.
+        self.bb['claim_error_after_commit'] = True
+        self.flush()
+        rc, body, _ = self.claim()
+        self.assertEqual(body.get('code'), 'internal', body)
+        last = [l for l in self.ledger() if l['object'] == f'Claim/{PREMADE}'][-1]
+        self.assertEqual(last['direction'], 'claim-request', 'an unknown outcome was recorded as a refusal')
+        # Other terms would make a new request the plugin must refuse; the guard says to retry the same one.
+        rc, body, _ = self.claim(gpus='3')
+        self.assertEqual(body.get('code'), 'claim_pending', body)
+        rc, body, _ = self.claim()
+        self.assertEqual(rc, 0, body)
+        first, second = self.bb['claim_calls']  # claim_pending is the guard's own refusal: no call
+        self.assertEqual(first['request'], second['request'])
+        self.assertEqual(len(self.bb['leases']), 1)
+        self.assertEqual(body['lease_id'], next(iter(self.bb['leases'])))
+
     def test_a_fresh_claim_names_the_latest_lease_as_its_predecessor(self):
         self.bb['latest'] = {PREMADE: 'lse_earlier001'}
         self.bb['leases']['lse_earlier001'] = {'lease_id': 'lse_earlier001', 'state': 'released', 'cluster': PROFILE,
@@ -3250,6 +3272,80 @@ class ClaimedTeardown(ClaimedCase):
         self.assertEqual(body['resolutions'], [{'attempt': a['attempt'], 'outcome': 'committed'}])
         self.assertIsNone(self.dgd_obj('w', ns=PREMADE))
         self.assertEqual(self.namespace_writes(), [])
+
+    # A hook on the fake's patch: right after the scale-to-zero lands, the DGD changes hands.
+    PATCH_LANDS = "    st['objects'][ns_flag][k] = o; save(); emit(o)"
+
+    def after_scale(self, change):
+        hook = """    st['objects'][ns_flag][k] = o
+    if st.get('after_scale') and k == 'DynamoGraphDeployment/w':
+        CHANGE
+        st.pop('after_scale')
+    save(); emit(o)""".replace('CHANGE', change)
+        self.assertEqual(FAKE_KUBECTL.count(self.PATCH_LANDS), 1)
+        self.kubectl_path.write_text(FAKE_KUBECTL.replace(self.PATCH_LANDS, hook, 1))
+        self.k8s['after_scale'] = True
+        self.flush()
+
+    def test_a_replacement_after_the_scale_patch_is_left_and_keeps_the_charge(self):
+        lid = self.claimed(state='releasing')
+        self.add_obj(gpu_dgd('w', 2, lid), ns=PREMADE)
+        foreign = dgd('w')  # someone else's DGD, no lease label, same name
+        self.after_scale("new = FOREIGN\n        new['metadata'].update(namespace=ns_flag, uid='uid-foreign-w', "
+                         "resourceVersion=rv())\n        st['objects'][ns_flag][k] = new".replace('FOREIGN', repr(foreign)))
+        rc, body, _ = self.teardown('down', lid)
+        self.assertEqual(body.get('code'), 'teardown_incomplete', body)
+        self.assertEqual(self.dgd_obj('w', ns=PREMADE)['metadata']['uid'], 'uid-foreign-w',
+                         'teardown deleted the replacement')
+        self.assertIn('DynamoGraphDeployment/w', body['changed_hands'])
+
+    def test_a_relabel_after_the_scale_patch_is_left_and_keeps_the_charge(self):
+        lid = self.claimed(state='releasing')
+        self.add_obj(gpu_dgd('w', 2, lid), ns=PREMADE)
+        self.after_scale("o['metadata']['labels']['wcep.agent/lease'] = 'lse_someone9999'\n"
+                         "        o['metadata']['resourceVersion'] = rv()")
+        rc, body, _ = self.teardown('down', lid)
+        self.assertEqual(body.get('code'), 'teardown_incomplete', body)
+        left = self.dgd_obj('w', ns=PREMADE)
+        self.assertIsNotNone(left, 'teardown deleted a DGD relabelled to another lease')
+        self.assertEqual(left['metadata']['labels'][LEASE_LABEL], 'lse_someone9999')
+
+    def stalled_create_then_foreign_holder(self):
+        lid = self.claimed()
+        self.k8s['stall_create'] = ['DynamoGraphDeployment/w']
+        self.flush()
+        rc, body, _ = self.apply(gpu_dgd('w', 2, lid), ns=PREMADE)
+        self.assertEqual(body.get('code'), 'write_unresolved', body)
+        foreign = dgd('w')
+        foreign['metadata'].update(namespace=PREMADE, uid='uid-foreign-w', resourceVersion='77')
+        self.k8s['objects'][PREMADE]['DynamoGraphDeployment/w'] = foreign
+        self.flush()
+        return lid
+
+    def test_a_create_whose_name_another_object_holds_stays_open_through_teardown(self):
+        # Another holder proves nothing more than a 404: once it goes, the create in flight can still land.
+        lid = self.stalled_create_then_foreign_holder()
+        self.bb['leases'][lid].update(slot=None, state='releasing')
+        self.flush()
+        rc, body, _ = self.teardown('down', lid)
+        self.assertEqual(body.get('code'), 'teardown_incomplete', body)
+        self.assertEqual(body.get('resolutions'), [])
+        self.assertIsNone(self.bb['leases'][lid]['attempts'][0]['outcome'])
+        self.assertIsNotNone(self.dgd_obj('w', ns=PREMADE), 'the foreign holder is not the lease\'s to delete')
+        # The holder goes; the create lands; the next teardown sees its stamp, deletes it and completes.
+        del self.k8s['objects'][PREMADE]['DynamoGraphDeployment/w']
+        self.flush()
+        self.land_pending()
+        body = self.ok('--context', CTX, 'down', PREMADE, '--uid', 'uid-premade-1', '--lease', lid, host_entry=True)
+        self.assertTrue(body['complete'], body)
+        self.assertEqual([r['outcome'] for r in body['resolutions']], ['committed'])
+        self.assertIsNone(self.dgd_obj('w', ns=PREMADE))
+
+    def test_a_create_whose_name_another_object_holds_still_blocks_the_next_write(self):
+        lid = self.stalled_create_then_foreign_holder()
+        rc, body, _ = self.apply(dgd('other', component('Frontend', ctype='frontend', lease_id=lid)), ns=PREMADE)
+        self.assertEqual(body.get('code'), 'attempt_unresolved', body)
+        self.assertIsNone(self.bb['leases'][lid]['attempts'][0]['outcome'])
 
     def test_a_restarted_teardown_after_the_last_deletion_finishes_without_a_namespace_write(self):
         lid = self.claimed(state='revoking')
