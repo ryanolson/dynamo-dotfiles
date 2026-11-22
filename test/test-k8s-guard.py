@@ -21,6 +21,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -287,6 +288,17 @@ if cmd == 'create' and len(pos) == 1:
         fail('fake kubectl: only server dry runs', 97)
     if obj['metadata'].get('namespace', ns_flag) != ns_flag:
         fail('error: the namespace from the provided object does not match the namespace')
+    if not dry and key(obj) in st.get('stall_create', []):
+        # The request reached the server, but no reply comes back: it lands only when the test says.
+        st['stall_create'].remove(key(obj))
+        st.setdefault('pending', []).append({'ns': ns, 'object': obj})
+        save()
+        if st.get('hold_file'):
+            open(st['held_marker'], 'w').write('held')
+            while not os.path.exists(st['hold_file']):
+                time.sleep(0.02)
+        fail('Unable to connect to the server: net/http: request canceled (Client.Timeout exceeded while awaiting '
+             'headers)')
     if not dry:
         interfere(key(obj), 'create')
         if st.get('apply_fail'):
@@ -510,6 +522,74 @@ def lease(lid):
     return l
 
 
+def kubectl_writes():
+    # How many cluster writes the fake kubectl has seen: an attempt must be recorded before its write.
+    path = os.environ.get('FAKE_KUBECTL_LOG')
+    if not path or not os.path.exists(path):
+        return 0
+    n = 0
+    for line in open(path):
+        call = json.loads(line)
+        pos = call['pos']
+        if pos and pos[0] in ('create', 'apply', 'patch', 'replace', 'delete') and call['flags'].get('--dry-run') is None:
+            n += 1
+    return n
+
+
+if argv[:4] == ['k8s', 'lease', 'acquire', '--claim']:
+    o = {argv[i][2:]: argv[i + 1] for i in range(4, len(argv) - 1, 2)}
+    ledger = os.path.join(os.environ.get('BB_THREAD_STORAGE', '/nonexistent'), 'k8s-ledger.jsonl')
+    st.setdefault('claim_calls', []).append({'request': o['request'], 'replaces': o['replaces'],
+                                             'ledger_had_request': os.path.exists(ledger) and o['request'] in open(ledger).read()})
+    save()
+    if st.get('claims', 'off') == 'off':
+        err('enforcement_unhealthy', 'Claims of a pre-made namespace stay off until the admission webhook is installed.')
+    for l in st['leases'].values():
+        if l.get('request') == o['request']:
+            out({'lease_id': l['lease_id'], 'expires_at': l['expires_at'], 'state': l['state']})
+    latest = st.get('latest', {}).get(o['namespace'])
+    if (latest or 'none') != o['replaces']:
+        print(json.dumps({'error': 'stale predecessor', 'code': 'predecessor_mismatch', 'current': latest or 'none'}))
+        sys.exit(1)
+    lid = st.get('next_id', 'lse_fake0001')
+    now = datetime.now(timezone.utc)
+    st['leases'][lid] = {'lease_id': lid, 'state': 'active', 'cluster': o['cluster'], 'namespace': o['namespace'],
+                         'uid': o['uid'], 'thread': os.environ.get('BB_THREAD_ID'), 'gpu_type': o['gpu-type'],
+                         'gpus': int(o['gpus']), 'expires_at': iso(now + timedelta(hours=float(o['hours']))),
+                         'multi_node': False, 'mode': 'claimed', 'request': o['request']}
+    st.setdefault('latest', {})[o['namespace']] = lid
+    save()
+    if st.get('lose_claim_reply'):
+        st['lose_claim_reply'] = False
+        save()
+        sys.stderr.write('Cannot connect to BB server.\n')
+        sys.exit(1)
+    out({'lease_id': lid, 'expires_at': st['leases'][lid]['expires_at'], 'state': 'active'})
+if argv[:3] == ['k8s', 'lease', 'latest']:
+    o = {argv[i][2:]: argv[i + 1] for i in range(3, len(argv) - 1, 2)}
+    lid = st.get('latest', {}).get(o['namespace'])
+    out({'lease_id': lid, 'state': st['leases'][lid]['state'] if lid else None})
+if argv[:4] == ['k8s', 'lease', 'attempt', 'begin']:
+    l = lease(argv[4])
+    o = {argv[i][2:]: argv[i + 1] for i in range(6, len(argv) - 1, 2)}
+    if l['state'] != 'active':
+        err('lease_not_active', f'Lease {argv[4]} is {l["state"]}.')
+    if l.get('slot') != argv[5]:
+        err('slot_lost', 'Not your slot.')
+    if any(a.get('outcome') is None for a in l.get('attempts', [])):
+        err('attempt_unresolved', 'An earlier write is unresolved.')
+    l.setdefault('attempts', []).append({'attempt': o['attempt'], 'verb': o['verb'], 'kind': o['kind'], 'name': o['name'],
+                                         'uid': o.get('uid'), 'rv': o.get('rv'), 'outcome': None,
+                                         'writes_before': kubectl_writes()})
+    save(); out({'attempt': o['attempt'], 'epoch': len(l['attempts'])})
+if argv[:4] == ['k8s', 'lease', 'attempt', 'resolve']:
+    l = lease(argv[4])
+    outcome = argv[argv.index('--outcome') + 1]
+    done = False
+    for a in l.get('attempts', []):
+        if a['attempt'] == argv[5] and a['outcome'] is None:
+            a['outcome'], done = outcome, True
+    save(); out({'resolved': done})
 if argv[:3] == ['k8s', 'lease', 'acquire']:
     o = {argv[i][2:]: argv[i + 1] for i in range(3, len(argv) - 1, 2)}
     for l in st['leases'].values():
@@ -525,11 +605,16 @@ if argv[:3] == ['k8s', 'lease', 'acquire']:
                          'expires_at': iso(now + timedelta(hours=float(o['hours']))), 'multi_node': False}
     save(); out({'lease_id': lid, 'expires_at': st['leases'][lid]['expires_at']})
 if argv[:3] == ['k8s', 'lease', 'show']:
-    out(lease(argv[3]))
+    l = dict(lease(argv[3]))
+    l['open_attempts'] = [{k: a[k] for k in ('attempt', 'verb', 'kind', 'name', 'uid', 'rv')}
+                          for a in l.pop('attempts', []) if a.get('outcome') is None]
+    out(l)
 if argv[:4] == ['k8s', 'lease', 'op', 'begin']:
     l = lease(argv[4])
     if l['state'] != 'active':
         err('not_active', f'Lease {argv[4]} is {l["state"]}.')
+    if any(a.get('outcome') is None for a in l.get('attempts', [])):
+        err('attempt_unresolved', 'An earlier write is unresolved.')
     if l.get('slot'):
         err('slot_busy', 'The slot is held.')
     l['slot'] = 'tok-' + argv[4]
@@ -1551,7 +1636,9 @@ class Budget(GuardCase):
         self.assertEqual(rc, 0, f'{body} {p.stderr}')
         self.assertEqual(body['allocation'], 4)
         names = [c[:4] for c in self.bb_calls()]
+        # The write is an attempt, recorded before it is sent and resolved after, inside the slot.
         self.assertEqual(names, [['k8s', 'lease', 'show', lid], ['k8s', 'lease', 'op', 'begin'],
+                                 ['k8s', 'lease', 'attempt', 'begin'], ['k8s', 'lease', 'attempt', 'resolve'],
                                  ['k8s', 'lease', 'op', 'end']])
         [line] = self.ledger()
         self.assertEqual((line['gpus'], line['lease'], line['direction']), (4, lid, 'up'))
@@ -1765,7 +1852,10 @@ class Budget(GuardCase):
         self.k8s['apply_fail'] = True
         self.flush()
         rc, body, _ = self.apply(gpu_dgd('w', 1, lid))
-        self.assertEqual(body.get('code'), 'kubectl_error', body)
+        # An internal error leaves the outcome unknown: the attempt stays open, and the slot still ends.
+        self.assertEqual(body.get('code'), 'write_unresolved', body)
+        [attempt] = self.bb['leases'][lid]['attempts']
+        self.assertIsNone(attempt['outcome'])
         self.assertEqual(self.bb_calls()[-1][:4], ['k8s', 'lease', 'op', 'end'])
         self.assertEqual(self.ledger(), [])
 
@@ -2878,6 +2968,333 @@ class MutationOwnership(GuardCase):
         rc, body, _ = self.apply(gpu_dgd('old', 2, self.lid), gpu_dgd('new', 1, self.lid))
         self.assertEqual(rc, 0, body)
         self.assertEqual(sorted(c['pos'][0] for c in self.writes()), ['create', 'patch'])
+
+
+# --- a claimed namespace: the profile's pre-made one --------------------------------
+
+PREMADE = PREFIX + 'agent'
+
+
+class ClaimedCase(GuardCase):
+    """The pre-made namespace: the bot cannot label, create or delete it. A k8s-leases lease is its only
+    authority, the thread ledger only points at that lease, and teardown never writes the Namespace."""
+
+    def setUp(self):
+        super().setUp()
+        self.profiles.write_text(self.profiles.read_text().replace(
+            'namespace_prefix = "dyntest-alice-"',
+            f'namespace_prefix = "dyntest-alice-"\npremade_namespace = "{PREMADE}"', 1))
+        ns = namespace(PREMADE, None, 'uid-premade-1')
+        del ns['metadata']['labels']['wcep.agent/thread']
+        del ns['metadata']['annotations']
+        self.k8s['namespaces'][PREMADE] = ns
+        self.k8s['objects'][PREMADE] = {}
+        self.k8s['pods'][PREMADE] = []
+        self.flush()
+
+    def claim(self, gpus='2', **env_kw):
+        self.bb['claims'] = 'on'
+        self.flush()
+        return self.guard('--context', CTX, '-n', PREMADE, 'ns', 'claim', '--gpus', gpus, '--hours', '2', **env_kw)
+
+    def claimed(self, gpus=4, state='active'):
+        rc, body, _ = self.claim(str(gpus))
+        self.assertEqual(rc, 0, body)
+        if state != 'active':
+            self.bb['leases'][body['lease_id']]['state'] = state
+            self.flush()
+        return body['lease_id']
+
+    def namespace_writes(self):
+        out = []
+        for c in self.writes():
+            text = ' '.join(c['argv'])
+            if c['pos'][:2] in (['create', '-f'],) and 'Namespace' in text:
+                out.append(c)
+            if '/api/v1/namespaces/' + PREMADE in (c['flags'].get('--raw') or '') and \
+                    c['flags']['--raw'].rstrip('/').endswith('/namespaces/' + PREMADE):
+                out.append(c)
+            if c['pos'][:2] in (['patch', 'namespace'], ['label', 'namespace'], ['annotate', 'namespace']):
+                out.append(c)
+        return out
+
+    def land_pending(self):
+        self.reload()
+        for p in self.k8s.pop('pending', []):
+            obj = p['object']
+            obj['metadata'].update(uid='uid-landed-' + obj['metadata']['name'], resourceVersion='900')
+            self.k8s['objects'][p['ns']][obj['kind'] + '/' + obj['metadata']['name']] = obj
+        self.flush()
+
+    def teardown(self, verb, lid, **kw):
+        return self.guard('--context', CTX, verb, PREMADE, '--uid', 'uid-premade-1', '--lease', lid,
+                          host_entry=True, **kw)
+
+
+class NamespaceClaim(ClaimedCase):
+    def test_claims_are_off_until_the_admission_webhook_exists(self):
+        self.bb['claims'] = 'off'
+        self.flush()
+        body = self.refused('enforcement_unhealthy', '--context', CTX, '-n', PREMADE, 'ns', 'claim', '--gpus', '2',
+                            '--hours', '2')
+        self.assertIn('admission', body['error'])
+        self.assertEqual(self.writes(), [])
+
+    def test_claim_keeps_its_request_before_the_call_and_writes_no_namespace(self):
+        rc, body, _ = self.claim()
+        self.assertEqual(rc, 0, body)
+        self.assertEqual((body['namespace'], body['claimed']), (PREMADE, True))
+        [call] = self.bb['claim_calls']
+        self.assertTrue(call['ledger_had_request'], 'the request id must be kept before acquire is called')
+        self.assertEqual(call['replaces'], 'none')
+        argv = next(c for c in self.bb_calls() if c[:4] == ['k8s', 'lease', 'acquire', '--claim'])
+        self.assertNotIn('--thread', argv, 'the owner is the calling thread, not an argument')
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(body['pod_label'], {LEASE_LABEL: body['lease_id']})
+
+    def test_a_lost_reply_is_retried_with_the_same_request(self):
+        self.bb['lose_claim_reply'] = True
+        self.flush()
+        rc, body, _ = self.claim()
+        self.assertEqual(body.get('code'), 'lease_unavailable', body)
+        rc, body, _ = self.claim()
+        self.assertEqual(rc, 0, body)
+        first, second = self.bb['claim_calls']
+        self.assertEqual(first['request'], second['request'])
+        self.assertEqual(len(self.bb['leases']), 1)
+
+    def test_a_fresh_claim_names_the_latest_lease_as_its_predecessor(self):
+        self.bb['latest'] = {PREMADE: 'lse_earlier001'}
+        self.bb['leases']['lse_earlier001'] = {'lease_id': 'lse_earlier001', 'state': 'released', 'cluster': PROFILE,
+                                               'namespace': PREMADE, 'uid': 'uid-premade-1', 'thread': OTHER,
+                                               'gpu_type': 'gb300', 'gpus': 1, 'expires_at': iso_ms(hours_from_now(-1)),
+                                               'multi_node': False, 'mode': 'claimed'}
+        self.flush()
+        rc, body, _ = self.claim()
+        self.assertEqual(rc, 0, body)
+        self.assertEqual(self.bb['claim_calls'][0]['replaces'], 'lse_earlier001')
+
+    def test_only_the_profiles_premade_namespace_with_both_labels(self):
+        self.bb['claims'] = 'on'
+        other = PREFIX + 'other'
+        self.k8s['namespaces'][other] = copy.deepcopy(self.k8s['namespaces'][PREMADE])
+        self.k8s['namespaces'][other]['metadata']['name'] = other
+        self.flush()
+        self.refused('namespace_not_premade', '--context', CTX, '-n', other, 'ns', 'claim', '--gpus', '1', '--hours', '1')
+        del self.k8s['namespaces'][PREMADE]['metadata']['labels']['dynamo.nvidia.com/developer-agent-rbac']
+        self.flush()
+        self.refused('namespace_not_ours', '--context', CTX, '-n', PREMADE, 'ns', 'claim', '--gpus', '1', '--hours', '1')
+        self.assertEqual(self.bb.get('claim_calls', []), [])
+
+    def test_a_profile_without_the_key_has_nothing_to_claim(self):
+        self.profiles.write_text(self.profiles.read_text().replace(f'premade_namespace = "{PREMADE}"\n', ''))
+        self.refused('premade_namespace_unset', '--context', CTX, '-n', PREMADE, 'ns', 'claim', '--gpus', '1',
+                     '--hours', '1')
+
+
+class ClaimedWrites(ClaimedCase):
+    def test_no_lease_no_writes_cpu_only_included(self):
+        rc, body, _ = self.apply(dgd('cpu'), ns=PREMADE)
+        self.assertEqual(body.get('code'), 'namespace_not_claimed', body)
+        self.assertEqual(self.writes(), [])
+
+    def test_ownership_comes_from_the_plugin_lease_not_the_ledger(self):
+        lid = self.claimed()
+        self.bb['leases'][lid]['thread'] = OTHER  # the plugin's row says another thread owns it
+        self.flush()
+        rc, body, _ = self.apply(gpu_dgd('w', 1, lid), ns=PREMADE)
+        self.assertEqual(body.get('code'), 'lease_mismatch', body)
+        self.assertEqual(self.writes(), [])
+
+    def test_every_write_is_an_attempt_recorded_before_it_is_sent_and_stamped(self):
+        lid = self.claimed()
+        rc, body, _ = self.apply(gpu_dgd('w', 1, lid), {'apiVersion': 'v1', 'kind': 'ConfigMap',
+                                                       'metadata': {'name': 'cfg'}, 'data': {}}, ns=PREMADE)
+        self.assertEqual(rc, 0, body)
+        attempts = self.bb['leases'][lid]['attempts']
+        self.assertEqual([(a['verb'], a['kind'], a['name'], a['outcome']) for a in attempts],
+                         [('create', 'DynamoGraphDeployment', 'w', 'committed'), ('create', 'ConfigMap', 'cfg', 'committed')])
+        self.assertEqual([a['writes_before'] for a in attempts], [0, 1], 'an attempt must be recorded before its write')
+        for a in attempts:
+            obj = self.k8s['objects'][PREMADE][f'{a["kind"]}/{a["name"]}']
+            self.assertEqual(obj['metadata']['annotations']['wcep.agent/attempt'], a['attempt'])
+        self.assertEqual(self.namespace_writes(), [])
+
+    def test_a_timed_out_create_then_404_stays_outstanding_and_blocks_the_next_write(self):
+        lid = self.claimed()
+        self.k8s['stall_create'] = ['DynamoGraphDeployment/w']
+        self.flush()
+        rc, body, _ = self.apply(gpu_dgd('w', 1, lid), ns=PREMADE)
+        self.assertEqual(body.get('code'), 'write_unresolved', body)
+        [a] = self.bb['leases'][lid]['attempts']
+        self.assertIsNone(a['outcome'], 'a timed-out create followed by 404 was cleared')
+        rc, body, _ = self.apply(dgd('other', component('Frontend', ctype='frontend', lease_id=lid)), ns=PREMADE)
+        self.assertEqual(body.get('code'), 'attempt_unresolved', body)
+        self.assertNotIn(['k8s', 'lease', 'op', 'begin', lid], self.bb_calls()[-3:])
+        # The create lands; the next write first observes its stamp, resolves it, then goes on.
+        self.land_pending()
+        rc, body, _ = self.apply(dgd('other', component('Frontend', ctype='frontend', lease_id=lid)), ns=PREMADE)
+        self.assertEqual(rc, 0, body)
+        self.assertEqual([x['outcome'] for x in self.bb['leases'][lid]['attempts']], ['committed', 'committed'])
+
+    def test_secret_delete_and_scale_writes_are_attempts_too(self):
+        lid = self.claimed()
+        self.ok('--context', CTX, '-n', PREMADE, 'secret', 'hf')
+        self.add_obj(gpu_dgd('w', 1, lid), ns=PREMADE)
+        self.ok('--context', CTX, '-n', PREMADE, 'delete', 'dgd/w')
+        verbs = [(a['verb'], a['kind'], a['outcome']) for a in self.bb['leases'][lid]['attempts']]
+        self.assertEqual(verbs, [('create', 'Secret', 'committed'), ('delete', 'DynamoGraphDeployment', 'committed')])
+
+
+class ClaimedTeardown(ClaimedCase):
+    def leased(self, lid):
+        self.add_obj(gpu_dgd('w', 2, lid), ns=PREMADE)
+        self.k8s['objects'][PREMADE]['Secret/hf-token-secret'] = {
+            'apiVersion': 'v1', 'kind': 'Secret', 'metadata': {'name': 'hf-token-secret', 'namespace': PREMADE,
+                                                              'uid': 'uid-secret', 'resourceVersion': '31',
+                                                              'labels': {LEASE_LABEL: lid}}}
+        self.k8s['objects'][PREMADE]['ConfigMap/cfg'] = {
+            'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': 'cfg', 'namespace': PREMADE, 'uid': 'uid-cfg',
+                                                                 'resourceVersion': '32', 'labels': {LEASE_LABEL: lid}}}
+        self.flush()
+
+    def leased_pod(self, lid, terminating=False, name='w-decode'):
+        p = pod('w', 2, terminating=terminating, name=name)
+        p['metadata']['labels'][LEASE_LABEL] = lid
+        self.add_pod(p, ns=PREMADE)
+
+    def test_teardown_deletes_the_lease_inventory_and_never_writes_the_namespace(self):
+        lid = self.claimed(state='releasing')
+        self.leased(lid)
+        body = self.ok('--context', CTX, 'down', PREMADE, '--uid', 'uid-premade-1', '--lease', lid, host_entry=True)
+        self.assertEqual((body['complete'], body['namespace_kept']), (True, True), body)
+        self.assertEqual(self.k8s['objects'][PREMADE], {})
+        self.assertIn(PREMADE, self.k8s['namespaces'])
+        self.assertEqual(self.namespace_writes(), [])
+        for c in self.writes():
+            if c['pos'][0] == 'delete':
+                self.assertIn('--raw', c['flags'])
+
+    def test_a_terminating_leased_pod_holds_the_charge_and_a_foreign_pod_survives(self):
+        lid = self.claimed(state='releasing')
+        self.leased(lid)
+        self.leased_pod(lid, terminating=True)
+        self.k8s['terminate_pods_on_delete'] = False  # the DGD delete leaves its pods terminating
+        foreign = pod('w', 2, name='foreign-same-dgd-name')  # same DGD name label, no lease label
+        self.add_pod(foreign, ns=PREMADE)
+        rc, body, _ = self.teardown('down', lid)
+        self.assertEqual(body.get('code'), 'teardown_incomplete', body)
+        self.assertIn('w-decode', json.dumps(body.get('left')))
+        self.assertIn('foreign-same-dgd-name', [p['metadata']['name'] for p in self.k8s['pods'][PREMADE]])
+        self.k8s['pods'][PREMADE] = [foreign]
+        self.flush()
+        body = self.ok('--context', CTX, 'down', PREMADE, '--uid', 'uid-premade-1', '--lease', lid, host_entry=True)
+        self.assertTrue(body['complete'], body)
+        self.assertEqual([p['metadata']['name'] for p in self.k8s['pods'][PREMADE]], ['foreign-same-dgd-name'])
+
+    def test_an_incomplete_inventory_list_keeps_the_charge(self):
+        lid = self.claimed(state='releasing')
+        self.k8s['forbid'] = ['get secrets']
+        self.flush()
+        rc, body, _ = self.teardown('down', lid)
+        self.assertEqual(body.get('code'), 'teardown_incomplete', body)
+
+    def test_relabel_defeats_a_stale_teardown_delete_and_keeps_the_charge(self):
+        lid = self.claimed(state='releasing')
+        self.add_obj(gpu_dgd('w', 1, lid), ns=PREMADE)
+        self.interfere_relabel = {'key': 'DynamoGraphDeployment/w', 'when': 'delete', 'what': 'relabel', 'times': 1}
+        self.k8s.setdefault('interfere', []).append(self.interfere_relabel)
+        self.flush()
+        rc, body, _ = self.teardown('down', lid)
+        self.assertEqual(body.get('code'), 'teardown_incomplete', body)
+        self.assertIsNotNone(self.dgd_obj('w', ns=PREMADE), 'a stale delete removed an object that changed hands')
+        self.assertEqual(self.namespace_writes(), [])
+
+    def test_unresolved_write_crossing_teardown_then_commit_observe_drain(self):
+        # The phase-1 crossing case, guard side, with separate client and storage lifetimes: the guard is
+        # killed while its create is in flight; teardown against an empty list completes nothing; the
+        # create then lands, and the next teardown observes its stamp, deletes it and completes.
+        import signal
+        lid = self.claimed()
+        hold, held = self.tmp / 'release-write', self.tmp / 'write-held'
+        self.k8s.update(stall_create=['DynamoGraphDeployment/w'], hold_file=str(hold), held_marker=str(held))
+        self.flush()
+        proc = subprocess.Popen(['python3', '-I', str(self.runner), str(GUARD), '--context', CTX, '-n', PREMADE, 'apply',
+                                 '-f', self.manifest(gpu_dgd('w', 2, lid))], env=self.env(), stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, start_new_session=True)
+        try:
+            for _ in range(500):
+                if held.exists():
+                    break
+                time.sleep(0.02)
+            self.assertTrue(held.exists(), 'the write never reached the server')
+            os.killpg(proc.pid, signal.SIGKILL)
+        finally:
+            proc.wait(timeout=10)
+            proc.stdout.close()
+            proc.stderr.close()
+        self.reload()
+        [a] = self.bb['leases'][lid]['attempts']
+        self.assertIsNone(a['outcome'])
+        # The slot expires with its holder gone; the lease is returned.
+        self.bb['leases'][lid].update(slot=None, state='releasing')
+        self.k8s.pop('hold_file')
+        self.flush()
+        rc, body, _ = self.teardown('down', lid)
+        self.assertEqual(body.get('code'), 'teardown_incomplete', body)
+        self.assertNotIn('complete', body)
+        self.assertIsNone(self.bb['leases'][lid]['attempts'][0]['outcome'])
+        self.land_pending()
+        body = self.ok('--context', CTX, 'down', PREMADE, '--uid', 'uid-premade-1', '--lease', lid, host_entry=True)
+        self.assertTrue(body['complete'], body)
+        self.assertEqual(body['resolutions'], [{'attempt': a['attempt'], 'outcome': 'committed'}])
+        self.assertIsNone(self.dgd_obj('w', ns=PREMADE))
+        self.assertEqual(self.namespace_writes(), [])
+
+    def test_a_restarted_teardown_after_the_last_deletion_finishes_without_a_namespace_write(self):
+        lid = self.claimed(state='revoking')
+        self.leased(lid)
+        self.ok('--context', CTX, 'down', PREMADE, '--uid', 'uid-premade-1', '--lease', lid, host_entry=True)
+        body = self.ok('--context', CTX, 'down', PREMADE, '--uid', 'uid-premade-1', '--lease', lid, host_entry=True)
+        self.assertTrue(body['complete'], body)
+        self.assertEqual(self.namespace_writes(), [])
+
+    def test_no_offline_teardown_authority_for_a_claimed_namespace(self):
+        lid = self.claimed(state='revoking')
+        self.add_obj(gpu_dgd('w', 1, lid), ns=PREMADE)
+        self.bb['unreachable'] = True
+        self.flush()
+        for verb in ('expire', 'down'):
+            with self.subTest(verb=verb):
+                self.refused('lease_unavailable', '--context', CTX, verb, PREMADE, '--uid', 'uid-premade-1', '--lease',
+                             lid, host_entry=True)
+        self.assertEqual(self.writes(), [])
+
+    def test_expire_scales_the_lease_dgds_with_the_plugins_word(self):
+        lid = self.claimed(state='revoking')
+        self.add_obj(gpu_dgd('w', 1, lid), ns=PREMADE)
+        self.add_obj(gpu_dgd('theirs', 1, 'lse_someone9999'), ns=PREMADE)
+        body = self.ok('--context', CTX, 'expire', PREMADE, '--uid', 'uid-premade-1', '--lease', lid, host_entry=True)
+        self.assertEqual(body['scaled'], ['w'])
+        self.assertEqual(self.dgd_obj('theirs', ns=PREMADE)['spec']['components'][1]['replicas'], 1)
+
+    def test_owner_down_returns_the_lease_and_leaves_the_namespace(self):
+        lid = self.claimed()
+        body = self.ok('--context', CTX, '-n', PREMADE, 'down', PREMADE)
+        self.assertEqual(self.bb['leases'][lid]['state'], 'releasing')
+        self.assertIn(['k8s', 'lease', 'release', lid], self.bb_calls())
+        self.assertTrue(body['namespace_kept'], body)
+        self.assertIn(PREMADE, self.k8s['namespaces'])
+        self.assertEqual(self.namespace_writes(), [])
+
+    def test_selftest_in_a_claimed_namespace_sends_no_namespace_request(self):
+        lid = self.claimed()
+        self.add_obj(gpu_dgd('smoke', 1, lid), ns=PREMADE)
+        body = self.ok('--context', CTX, '-n', PREMADE, 'selftest', 'fences')
+        self.assertTrue(body['all_held'], body)
+        self.assertNotIn('delete namespace: wrong UID precondition', [p['fence'] for p in body['probes']])
+        self.assertFalse(any('/namespaces/' + PREMADE == (c['flags'].get('--raw') or '')[-len('/namespaces/' + PREMADE):]
+                             for c in self.kubectl_calls()), 'a Namespace request was sent')
 
 
 # --- environment the k8s-leases host entry gives -----------------------------

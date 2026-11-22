@@ -3,6 +3,7 @@
 
 Usage (every command takes --context <kube context>; -n may come anywhere):
   k8s-guard ns create <purpose> --issue <n> --hours <h>      a new namespace, never an existing one
+  k8s-guard -n <premade> ns claim --gpus <n> --hours <h>      claim the profile's pre-made namespace
   k8s-guard -n <ns> lease acquire --gpus <n> --hours <h>      a k8s-leases lease for the namespace
   k8s-guard -n <ns> secret hf|ngc                              a secret piped from `fleet secret get`
   k8s-guard -n <ns> apply -f <file>                            DGDs, ConfigMaps, ClusterIP Services
@@ -49,6 +50,10 @@ DGD_RESOURCE = 'dynamographdeployments.nvidia.com'
 THREAD_LABEL = 'wcep.agent/thread'
 ISSUE_LABEL = 'wcep.agent/issue'
 EXPIRES_ANNOTATION = 'wcep.agent/expires-at'
+# Every write under a lease carries the id of its attempt, recorded in k8s-leases before the write is sent.
+ATTEMPT_ANNOTATION = 'wcep.agent/attempt'
+DEVELOPER_LABEL = 'dynamo.nvidia.com/developer'
+AGENT_RBAC_LABEL = 'dynamo.nvidia.com/developer-agent-rbac'
 MAX_NS_HOURS = 4
 LIVE = ('revoking', 'releasing')
 LEASE_STATES = ('active', 'revoking', 'releasing', 'released', 'torn-down')
@@ -99,6 +104,13 @@ DNS_LABEL = re.compile(r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
 DNS_SUBDOMAIN = re.compile(r'^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$')
 LABEL_VALUE = re.compile(r'^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$')
 LEASE_ID = re.compile(r'^lse_[a-z0-9]{4,64}$')
+ATTEMPT_ID = re.compile(r'^att_[a-z0-9]{8,64}$')
+REQUEST_ID = re.compile(r'^req_[a-z0-9]{8,64}$')
+# What the API server answers when it refused a write outright: the write did not happen. Any other failure
+# (a timeout, a lost connection, an internal error) leaves the outcome unknown.
+DEFINITE = ('(AlreadyExists)', '(Conflict)', '(NotFound)', '(Invalid)', '(BadRequest)', '(Forbidden)',
+            '(UnprocessableEntity)', '(MethodNotAllowed)', '(Gone)', 'testing value', 'test operation',
+            'Precondition failed')
 UID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9-]{0,63}$')
 
 
@@ -203,7 +215,13 @@ def is_not_found(err):
 
 
 def kubectl_error(args, rc, err):
-    return Refusal('kubectl_error', f'kubectl {" ".join(args[:3])} exited {rc}: {clip(err, 600)}')
+    e = Refusal('kubectl_error', f'kubectl {" ".join(args[:3])} exited {rc}: {clip(err, 600)}')
+    e.raw = err  # kept, not printed: whether the server refused outright decides an attempt's outcome
+    return e
+
+
+def definite(err):
+    return any(m in err for m in DEFINITE)
 
 
 def clip(text, n):
@@ -282,6 +300,8 @@ class Guard:
         self.namespace = namespace
         self.thread = os.environ.get('BB_THREAD_ID') or None
         self.kc = None
+        # The one namespace of ours ops made where the bot cannot create namespaces, or None.
+        self.premade = self.bot.get('premade_namespace')
 
     def check_identity(self):
         # The parser resolved bot.kubeconfig and allows it only under tbot's directory in the
@@ -343,6 +363,47 @@ class Guard:
                 live.pop(line['namespace'], None)
         return live
 
+    def ledger_lines(self):
+        storage = os.environ.get('BB_THREAD_STORAGE')
+        if not storage:
+            raise Refusal('ledger_required', 'BB_THREAD_STORAGE is unset; the thread ledger names its namespaces')
+        try:
+            text = (Path(storage) / 'k8s-ledger.jsonl').read_text().splitlines()
+        except FileNotFoundError:
+            return []
+        out = []
+        for line in text:
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict) and obj.get('thread') == self.thread and obj.get('cluster') == self.cluster:
+                out.append(obj)
+        return out
+
+    def claim_lines(self, ns):
+        """This thread's claim lines for a namespace, oldest first: requests, grants and refusals."""
+        return [l for l in self.ledger_lines() if l.get('object') == f'Claim/{ns}']
+
+    def claimed_lease(self, ns):
+        """The lease and UID this thread's latest granted claim of ns names, or (None, None). Only a pointer:
+        the k8s-leases row decides."""
+        for line in reversed(self.claim_lines(ns)):
+            if line.get('direction') == 'claim' and LEASE_ID.match(str(line.get('lease'))):
+                return line['lease'], line.get('uid')
+        return None, None
+
+    def owned_claimed(self, name):
+        self.require_thread()
+        lease_id, uid = self.claimed_lease(name)
+        view = NsView(self, name, claimed=True, lease_id=lease_id)
+        if lease_id is None:
+            raise Refusal('namespace_not_claimed', f'{name} is the pre-made namespace and this thread holds no claim '
+                                                   f'of it; run `k8s-guard -n {name} ns claim --gpus <n> --hours <h>`')
+        if view.uid != uid:
+            raise Refusal('uid_mismatch', f'{name} has UID {view.uid}, not {uid} from the claim: it was re-created')
+        return name, view
+
     def owned(self):
         """The caller's namespace and the UID it was created with, from the thread's ledger.
 
@@ -350,7 +411,11 @@ class Guard:
         when it is one of the thread's own namespaces. With no -n, the thread's only live namespace.
         """
         self.require_thread()
+        if self.premade and self.namespace == self.premade:
+            return self.owned_claimed(self.premade)
         live = self.ledger_namespaces()
+        if self.namespace is None and not live and self.premade and self.claimed_lease(self.premade)[0]:
+            return self.owned_claimed(self.premade)
         if self.namespace is None:
             if len(live) != 1:
                 raise Refusal('namespace_required', 'name the namespace with -n; this thread has '
@@ -408,10 +473,11 @@ class Guard:
 class NsView:
     """One read of a namespace: its object, labels and the lease record ConfigMap."""
 
-    def __init__(self, g, ns):
+    def __init__(self, g, ns, claimed=False, lease_id=None):
         self.name = ns
-        # A claimed namespace is the profile's pre-made one: the bot cannot label or delete it.
-        self.claimed = False
+        # A claimed namespace is the profile's pre-made one: the bot cannot label or delete it, it keeps no
+        # lease record, and its lease comes from k8s-leases (the thread ledger only points at it).
+        self.claimed = claimed
         self.obj = g.get_namespace(ns)
         meta = self.obj.get('metadata') or {}
         self.uid = meta.get('uid')
@@ -419,9 +485,9 @@ class NsView:
         self.annotations = meta.get('annotations') or {}
         self.thread = self.labels.get(THREAD_LABEL)
         self.issue = self.labels.get(ISSUE_LABEL)
-        self.record = g.lease_record(ns)
+        self.record = None if claimed else g.lease_record(ns)
         data = (self.record or {}).get('data') or {}
-        self.lease_id = data.get('lease_id') or None
+        self.lease_id = lease_id if claimed else (data.get('lease_id') or None)
         # The record's expiry counts only for the namespace it was written in.
         self.record_expires = data.get('expires_at') if data.get('uid') == self.uid else None
         # The record must come from the namespace whose UID was read, not one re-created in between.
@@ -473,11 +539,115 @@ class Slot:
                                           f'less than the {SLOT_MARGIN}s an apply may take; try again')
 
 
+# --- write attempts -------------------------------------------------------------------
+#
+# A write whose reply never came may still land: a slot that expired, a client that exited and a list that
+# reads empty prove nothing about it. So every write under a lease is an attempt with its own id, recorded
+# in k8s-leases before the write is sent and resolved after it: by the server's answer, by observing the
+# id stamped on the object, or by proof that the write's precondition can no longer hold. An attempt
+# nobody can resolve keeps the lease's GPUs charged and blocks its next write (references/k8s-guard.md).
+
+def new_attempt_id():
+    return 'att_' + secrets.token_hex(10)
+
+
+def resolve_attempt(g, ns, a):
+    """What storage shows about attempt `a`: committed, failed, superseded, or None (it may still land)."""
+    kind, name = a.get('kind'), a.get('name')
+    if kind not in KINDS or not isinstance(name, str) or not DNS_SUBDOMAIN.match(name):
+        return None
+    live = get_object(g, ns, kind, name)
+    meta = (live or {}).get('metadata') or {}
+    stamp = (meta.get('annotations') or {}).get(ATTEMPT_ANNOTATION)
+    verb = a.get('verb')
+    if verb == 'create':
+        # A create that timed out and reads 404 can still land: only its stamp, or another object holding
+        # the name (so the create must fail), resolves it.
+        if live is None:
+            return None
+        return 'committed' if stamp == a['attempt'] else 'failed'
+    if verb == 'patch':
+        if live is None or meta.get('uid') != a.get('uid'):
+            return 'superseded'
+        if stamp == a['attempt']:
+            return 'committed'
+        return 'superseded' if meta.get('resourceVersion') != a.get('rv') else None
+    if verb == 'delete':
+        if live is None or meta.get('uid') != a.get('uid'):
+            return 'committed'
+        return 'superseded' if meta.get('resourceVersion') != a.get('rv') else None
+    return None
+
+
+class Attempts:
+    """The attempts of one fenced run, under its slot's token."""
+
+    def __init__(self, g, ns, lease_id, token):
+        self.g, self.ns, self.lease_id, self.token = g, ns, lease_id, token
+
+    def begin(self, attempt, verb, kind, name, uid=None, rv=None):
+        args = ['k8s', 'lease', 'attempt', 'begin', self.lease_id, self.token, '--attempt', attempt, '--verb', verb,
+                '--kind', kind, '--name', name]
+        if uid:
+            args += ['--uid', uid]
+        if rv:
+            args += ['--rv', rv]
+        res = bb(*args)
+        if res.offline:
+            raise lease_unavailable(res, 'attempt begin')
+        if not res.ok:
+            raise Refusal(res.code, f'attempt begin for {verb} {kind}/{name}: {res.error}')
+
+    def resolve(self, attempt, outcome):
+        # A lost report leaves the attempt open; the next run resolves it again from storage.
+        return bb('k8s', 'lease', 'attempt', 'resolve', self.lease_id, attempt, '--outcome', outcome).ok
+
+    def run(self, attempt, verb, kind, name, uid, rv, send):
+        """Record, send, resolve. Returns send()'s result, or None when an unknown outcome proved committed."""
+        self.begin(attempt, verb, kind, name, uid, rv)
+        try:
+            result = send()
+        except Refusal as e:
+            if isinstance(e, WriteConflict) or definite(getattr(e, 'raw', '') or ''):
+                self.resolve(attempt, 'failed')
+                raise
+            outcome = resolve_attempt(self.g, self.ns, {'attempt': attempt, 'verb': verb, 'kind': kind, 'name': name,
+                                                        'uid': uid, 'rv': rv})
+            if outcome is None:
+                raise Refusal('write_unresolved', f'{verb} {kind}/{name} may still land: its outcome is unknown ({e}). '
+                                                  'The lease keeps its GPUs, and its next write waits until k8s-guard '
+                                                  'observes this one', attempt=attempt)
+            self.resolve(attempt, outcome)
+            if outcome == 'committed':
+                return None
+            raise
+        self.resolve(attempt, 'committed')
+        return result
+
+
+def settle_attempts(g, view, lease):
+    """Resolve the lease's open attempts from storage before a new write; refuse while one stays unknown."""
+    left = []
+    for a in lease.get('open_attempts') or []:
+        outcome = resolve_attempt(g, view.name, a)
+        if outcome is None:
+            left.append(f'{a.get("verb")} {a.get("kind")}/{a.get("name")}')
+            continue
+        bb('k8s', 'lease', 'attempt', 'resolve', view.lease_id, a['attempt'], '--outcome', outcome)
+    if left:
+        raise Refusal('attempt_unresolved', f'lease {view.lease_id} has a write whose outcome is still unknown '
+                                            f'({", ".join(left)}); it may land, so no new write starts until it is '
+                                            'observed')
+
+
 def fenced(g, view, body):
     """Run body(lease, slot) inside the lease's one operation slot; with no lease, body(None, None)."""
     if not view.lease_id:
+        if view.claimed:
+            raise Refusal('namespace_not_claimed', f'{view.name} has no claim: no writes, CPU-only included')
         return body(None, None)
     lease = lease_for_write(g, view)
+    settle_attempts(g, view, lease)
     res = bb('k8s', 'lease', 'op', 'begin', view.lease_id)
     if res.offline:
         raise lease_unavailable(res, 'op begin')
@@ -487,6 +657,7 @@ def fenced(g, view, body):
     if not isinstance(token, str) or not isinstance(deadline, str):
         raise Refusal('lease_invalid', 'op begin returned no token or deadline')
     slot = Slot(view.lease_id, token, parse_time(deadline, 'the slot deadline'))
+    slot.attempts = Attempts(g, view.name, view.lease_id, token)
     error = None
     try:
         result = body(lease, slot)
@@ -517,8 +688,17 @@ def fenced(g, view, body):
 # --- teardown authority -----------------------------------------------------------------
 
 def teardown_authority(g, view, uid_arg, lease_arg):
-    """expire and down by anyone: (a) the plugin says revoking or releasing; (b) offline, past expires-at."""
+    """expire and down by anyone: (a) the plugin says revoking or releasing; (b) offline, past expires-at.
+
+    A claimed namespace has only (a): it keeps no expiry of its own, and no offline path may destroy in it.
+    """
     lease_id = lease_arg or view.lease_id
+    if view.claimed:
+        if not lease_id:
+            raise Refusal('lease_required', f'{view.name} is claimed: teardown names its lease with --lease')
+        res = lease_show(lease_id)
+        if res.offline:
+            raise lease_unavailable(res, f'lease {lease_id}; a claimed namespace has no offline teardown')
     if lease_id:
         res = lease_show(lease_id)
         if res.ok:
@@ -667,6 +847,7 @@ class Write:
 
     def __init__(self, item, live, ops):
         self.item, self.live, self.ops = item, live, ops
+        self.attempt = None
         self.name = f'{item["kind"]}/{item["metadata"]["name"]}'
 
     def args(self, ns, dry):
@@ -701,23 +882,34 @@ def plan_write(g, ns, item, lease_id, uid, claimed):
     return Write(item, live, identity_tests(live, label) + edit_ops(live, item))
 
 
-def delete_owned(g, ns, obj, still_ours, timeout=KUBECTL_TIMEOUT):
+def delete_owned(g, ns, obj, still_ours, timeout=KUBECTL_TIMEOUT, attempts=None):
     """Delete `obj` under its UID and resourceVersion. On a conflict, re-read: retry while still_ours(live).
 
     Returns 'deleted', 'gone' (someone else deleted it), or raises object_not_yours when it changed hands.
+    Under a slot each delete is an attempt.
     """
     kind, name = obj['kind'], obj['metadata']['name']
     for _ in range(WRITE_ROUNDS):
         meta = obj['metadata']
         body = json.dumps({'kind': 'DeleteOptions', 'apiVersion': 'v1',
                            'preconditions': {'uid': meta['uid'], 'resourceVersion': meta['resourceVersion']}})
-        rc, out, err = g.kc.run('delete', '--raw', rest_path(obj, ns), '-f', '-', input=body, timeout=timeout)
-        if rc == 0:
+
+        def send(body=body):
+            rc, out, err = g.kc.run('delete', '--raw', rest_path(obj, ns), '-f', '-', input=body, timeout=timeout)
+            if rc != 0:
+                if is_not_found(err) or is_conflict(err):
+                    raise WriteConflict(f'{kind}/{name}', err)
+                raise kubectl_error(('delete', kind, name), rc, err)
             return 'deleted'
-        if is_not_found(err):
-            return 'gone'
-        if not is_conflict(err):
-            raise kubectl_error(('delete', kind, name), rc, err)
+
+        try:
+            if attempts:
+                attempts.run(new_attempt_id(), 'delete', kind, name, meta['uid'], meta['resourceVersion'], send)
+            else:
+                send()
+            return 'deleted'
+        except WriteConflict as e:
+            err = str(e)
         live = get_object(g, ns, kind, name)
         if live is None:
             return 'gone'
@@ -738,7 +930,8 @@ def cmd_inspect(g, a):
     return {'namespace': ns, 'uid': view.uid, 'thread': view.thread, 'expires_at': view.expires_at(),
             'dgd_gpus': sum(dgd_gpus(d) for d in dgds), 'pod_gpus': pod_total,
             'gpu_type': g.profile.get('gpu_type'), 'gpu_pods_left': gpu_pods,
-            'allocation': allocation(dgds, pods), 'lease_id': view.lease_id, 'cluster': g.cluster}
+            'allocation': allocation(dgds, pods), 'lease_id': view.lease_id, 'cluster': g.cluster,
+            'developer': view.labels.get(DEVELOPER_LABEL), 'agent_rbac': view.labels.get(AGENT_RBAC_LABEL)}
 
 
 def cmd_ns_create(g, a):
@@ -779,6 +972,64 @@ def cmd_ns_create(g, a):
     uid = json.loads(out)['metadata']['uid']
     g.record(ns, f'Namespace/{ns}', 0, 'up', uid=uid, issue=a.issue, created=True)
     return {'namespace': ns, 'uid': uid, 'expires_at': expires, 'cluster': g.cluster}
+
+
+def cmd_ns_claim(g, a):
+    """Claim the profile's pre-made namespace for this thread with a k8s-leases lease.
+
+    The bot cannot create, label or delete it, so the lease's row in k8s-leases is the only authority:
+    the plugin takes the owner from the calling thread and checks the exact profile name, both labels
+    and the live UID on a trusted host. The request id is kept in the thread ledger before the call, so
+    a retry after a lost reply gets the same outcome. Nothing here writes to the cluster.
+    """
+    g.require_writable()
+    g.require_thread()
+    if not g.premade:
+        raise Refusal('premade_namespace_unset', f'the profiles name no pre-made namespace (bot.premade_namespace); '
+                                                 f'there is nothing to claim on {g.cluster}')
+    ns = g.ns_name()
+    if ns != g.premade:
+        raise Refusal('namespace_not_premade', f'{ns} is not the pre-made namespace {g.premade}; only it is claimed')
+    if not re.match(r'^[1-9][0-9]{0,3}$', a.gpus):
+        raise Refusal('usage', '--gpus must be a whole number from 1', status=2)
+    hours_arg(a.hours, math.inf)  # the plugin holds the limit
+    view = NsView(g, ns, claimed=True)
+    if view.labels.get(DEVELOPER_LABEL) != g.bot['developer'] or view.labels.get(AGENT_RBAC_LABEL) != 'true':
+        raise Refusal('namespace_not_ours', f'{ns} lacks {DEVELOPER_LABEL}={g.bot["developer"]} or '
+                                            f'{AGENT_RBAC_LABEL}=true')
+    terms = {'uid': view.uid, 'claim_gpus': a.gpus, 'claim_hours': a.hours}
+    lines = g.claim_lines(ns)
+    last = lines[-1] if lines else {}
+    if (last.get('direction') == 'claim-request' and REQUEST_ID.match(str(last.get('request')))
+            and all(last.get(k) == v for k, v in terms.items())):
+        # The last request has no known outcome (its reply was lost): ask again with the same id.
+        request, replaces = last['request'], last.get('replaces') or 'none'
+    else:
+        latest = bb('k8s', 'lease', 'latest', '--cluster', g.cluster, '--namespace', ns)
+        if latest.offline:
+            raise lease_unavailable(latest, 'lease latest')
+        if not latest.ok:
+            raise Refusal(latest.code, f'lease latest: {latest.error}')
+        prior = latest.value.get('lease_id')
+        replaces = prior if isinstance(prior, str) and LEASE_ID.match(prior) else 'none'
+        request = 'req_' + secrets.token_hex(12)
+        g.record(ns, f'Claim/{ns}', 0, 'claim-request', request=request, replaces=replaces, **terms)
+    res = bb('k8s', 'lease', 'acquire', '--claim', '--request', request, '--replaces', replaces, '--cluster', g.cluster,
+             '--namespace', ns, '--uid', view.uid, '--gpu-type', g.profile['gpu_type'], '--gpus', a.gpus,
+             '--hours', a.hours)
+    if res.offline:
+        raise lease_unavailable(res, 'acquire')
+    if not res.ok:
+        g.record(ns, f'Claim/{ns}', 0, 'claim-refused', request=request, code=res.code)
+        raise Refusal(res.code, f'the plugin refused the claim: {res.error}')
+    lease_id, expires = res.value.get('lease_id'), res.value.get('expires_at')
+    if not isinstance(lease_id, str) or not LEASE_ID.match(lease_id) or not isinstance(expires, str):
+        raise Refusal('lease_invalid', 'acquire returned no lease id or expiry')
+    g.record(ns, f'Claim/{ns}', 0, 'claim', uid=view.uid, lease=lease_id, request=request)
+    return {'lease_id': lease_id, 'expires_at': expires, 'namespace': ns, 'claimed': True,
+            'state': res.value.get('state', 'active'), 'pod_label': {LEASE_LABEL: lease_id},
+            'pod_affinity': {'podAffinity': {'requiredDuringSchedulingIgnoredDuringExecution': [{
+                'labelSelector': {'matchLabels': {LEASE_LABEL: lease_id}}, 'topologyKey': HOSTNAME_TOPOLOGY}]}}}
 
 
 def hours_arg(text, maximum):
@@ -853,18 +1104,29 @@ def cmd_secret(g, a):
         else:
             payload = value
         labels = {NS_UID_LABEL: view.uid, **({LEASE_LABEL: lease['lease_id']} if lease else {})}
+        attempt = new_attempt_id() if slot else None
         obj = {'apiVersion': 'v1', 'kind': 'Secret', 'type': spec.get('type', 'Opaque'),
-               'metadata': {'name': spec['name'], 'namespace': ns, 'labels': labels},
+               'metadata': {'name': spec['name'], 'namespace': ns, 'labels': labels,
+                            **({'annotations': {ATTEMPT_ANNOTATION: attempt}} if attempt else {})},
                'stringData': {spec['key']: payload}}
         confirm_uid(g, ns, view.uid)
         if slot:
             slot.check()
-        # Create, never apply: the server refuses a name that exists. The value goes on stdin only.
-        rc, out, err = g.kc.run('create', '-f', '-', '-n', ns, '-o', 'json', input=json.dumps(obj))
-        if rc != 0:
-            if 'AlreadyExists' in err:
-                raise Refusal('secret_exists', f'secret {spec["name"]} already exists in {ns}')
-            raise kubectl_error(('create', 'secret', spec['name']), rc, err)
+
+        def send():
+            # Create, never apply: the server refuses a name that exists. The value goes on stdin only.
+            rc, out, err = g.kc.run('create', '-f', '-', '-n', ns, '-o', 'json', input=json.dumps(obj))
+            if rc != 0:
+                if 'AlreadyExists' in err:
+                    e = Refusal('secret_exists', f'secret {spec["name"]} already exists in {ns}')
+                    e.raw = err
+                    raise e
+                raise kubectl_error(('create', 'secret', spec['name']), rc, err)
+
+        if attempt:
+            slot.attempts.run(attempt, 'create', 'Secret', spec['name'], None, None, send)
+        else:
+            send()
         g.record(ns, f'Secret/{spec["name"]}', 0, 'up', uid=view.uid, lease=view.lease_id, issue=view.issue)
         return {'secret': spec['name'], 'namespace': ns}
 
@@ -919,7 +1181,11 @@ def cmd_apply(g, a):
             if not isinstance(meta.get('name'), str) or not DNS_SUBDOMAIN.match(meta['name']):
                 raise Refusal('usage', f'{where} has no valid name', status=2)
             meta['namespace'] = ns
+            attempt = new_attempt_id() if lease_id else None
+            if attempt:
+                meta.setdefault('annotations', {})[ATTEMPT_ANNOTATION] = attempt
             w = plan_write(g, ns, item, lease_id, view.uid, view.claimed)
+            w.attempt = attempt
             writes.append(w)
             objects.append(w.send(g, ns, dry=True))
         if not objects:
@@ -943,7 +1209,16 @@ def cmd_apply(g, a):
                 for w in writes:
                     if slot:
                         slot.check()
-                    w.send(g, ns, dry=False, timeout=slot.timeout() if slot else APPLY_REQUEST_TIMEOUT + 15)
+
+                    def send(w=w):
+                        return w.send(g, ns, dry=False, timeout=slot.timeout() if slot else APPLY_REQUEST_TIMEOUT + 15)
+
+                    if slot and w.attempt:
+                        live = (w.live or {}).get('metadata') or {}
+                        slot.attempts.run(w.attempt, 'create' if w.live is None else 'patch', w.item['kind'],
+                                          w.item['metadata']['name'], live.get('uid'), live.get('resourceVersion'), send)
+                    else:
+                        send()
                     gpus = dgd_gpus(w.item) if w.item.get('kind') == DGD_KIND else 0
                     g.record(ns, w.name, gpus, 'up', uid=view.uid, lease=lease_id, issue=view.issue)
                     if w.name not in names:
@@ -1027,7 +1302,8 @@ def cmd_delete(g, a):
         confirm_uid(g, ns, view.uid)
         if slot:
             slot.check()
-        if delete_owned(g, ns, obj, mine, timeout=slot.timeout() if slot else KUBECTL_TIMEOUT) == 'gone':
+        if delete_owned(g, ns, obj, mine, timeout=slot.timeout() if slot else KUBECTL_TIMEOUT,
+                        attempts=slot.attempts if slot else None) == 'gone':
             raise Refusal('not_found', f'{kind}/{name} not found in {ns}')
         g.record(ns, f'{kind}/{name}', gpus, 'down', uid=view.uid, lease=view.lease_id, issue=view.issue)
         return {'deleted': f'{kind}/{name}', 'namespace': ns}
@@ -1147,19 +1423,153 @@ def scale_to_zero(g, ns, d, lease_id):
     raise Refusal('write_conflict', f'DGD {name} changed under every scale-to-zero; try again')
 
 
+def namespace_view(g, ns, lease_arg):
+    """The namespace as a teardown sees it: the pre-made one is claimed, and its lease comes from --lease."""
+    if g.premade and ns == g.premade:
+        return NsView(g, ns, claimed=True, lease_id=lease_arg)
+    return NsView(g, ns)
+
+
 def cmd_expire(g, a):
     g.require_writable()
     ns = g.ns_name(a.namespace)
-    view = NsView(g, ns)
+    view = namespace_view(g, ns, a.lease)
     check_uid(view, a.uid)
     why = teardown_authority(g, view, a.uid, a.lease)
     return dict(do_expire(g, ns, view.uid, a.lease or view.lease_id), authority=why)
 
 
+# Teardown of a claimed namespace: the roots it deletes, and everything it reads again before it says complete.
+ROOT_KINDS = (DGD_KIND, 'PodCliqueSet', 'Service', 'ConfigMap', 'Secret', 'PersistentVolumeClaim')
+CHILD_RESOURCES = ('pods', 'podcliques.grove.io', 'deployments.apps', 'statefulsets.apps')
+
+
+def labelled(g, ns, resource, lease_id):
+    """The objects of one resource carrying this lease's label: a list, or None when it could not be read."""
+    rc, out, err = g.kc.run('get', resource, '-n', ns, '-l', f'{LEASE_LABEL}={lease_id}', '-o', 'json')
+    if rc != 0:
+        # A resource type the server does not serve can hold nothing; any other failure is an incomplete list.
+        return [] if "doesn't have a resource type" in err else None
+    try:
+        return json.loads(out).get('items') or []
+    except json.JSONDecodeError:
+        return None
+
+
+def claimed_teardown(g, view, lease_id, lease):
+    """Resolve the lease's open attempts, delete its roots, and read its inventory again.
+
+    Complete only when every attempt is resolved, every root is gone or was never there, and a read made
+    after the last resolution finds nothing of the lease: no root, no generated child, no pod, terminating
+    or not. Otherwise teardown_incomplete, and k8s-leases keeps the GPUs charged. No Namespace request.
+    """
+    ns = view.name
+    resolutions, unresolved = [], []
+    for a in lease.get('open_attempts') or []:
+        outcome = resolve_attempt(g, ns, a)
+        if outcome is None:
+            unresolved.append(f'{a.get("verb")} {a.get("kind")}/{a.get("name")} ({a.get("attempt")})')
+        else:
+            resolutions.append({'attempt': a['attempt'], 'outcome': outcome})
+    protected = {(k, n) for k, n in (('PersistentVolumeClaim', g.profile.get('model_cache')),
+                                      ('Secret', g.profile.get('pull_secret'))) if n}
+    confirm_uid(g, ns, view.uid)
+    deleted, changed_hands, unreadable = [], [], []
+
+    def ours(live):
+        return labels_of(live).get(LEASE_LABEL) == lease_id
+
+    for kind in ROOT_KINDS:
+        items = labelled(g, ns, KINDS[kind][0], lease_id)
+        if items is None:
+            unreadable.append(KINDS[kind][0])
+            continue
+        for obj in items:
+            obj.setdefault('kind', kind)
+            name = obj['metadata']['name']
+            if (kind, name) in protected:
+                continue
+            try:
+                if kind == DGD_KIND:
+                    scale_to_zero(g, ns, obj, lease_id)
+                    obj = get_object(g, ns, kind, name) or obj
+                if delete_owned(g, ns, obj, ours) == 'deleted':
+                    deleted.append(f'{kind}/{name}')
+            except Refusal as e:
+                if e.code not in ('object_not_yours', 'uid_mismatch', 'write_conflict'):
+                    raise
+                changed_hands.append(f'{kind}/{name}')
+    left = {}
+    for resource in [KINDS[k][0] for k in ROOT_KINDS] + list(CHILD_RESOURCES):
+        items = labelled(g, ns, resource, lease_id)
+        if items is None:
+            if resource not in unreadable:
+                unreadable.append(resource)
+            continue
+        names = [o['metadata']['name'] + (' (terminating)' if o['metadata'].get('deletionTimestamp') else '')
+                 for o in items if (KINDS.get(o.get('kind'), (None,))[0], o['metadata']['name']) not in
+                 {(KINDS[k][0], n) for k, n in protected}]
+        if names:
+            left[resource] = names
+    g.record(ns, f'Claim/{ns}', 0, 'down', uid=view.uid, lease=lease_id, deleted=deleted)
+    if unresolved or changed_hands or unreadable or left:
+        why = '; '.join(filter(None, [
+            unresolved and f'{len(unresolved)} write(s) whose outcome is unknown',
+            changed_hands and f'{", ".join(changed_hands)} changed hands under the delete',
+            unreadable and f'could not list {", ".join(unreadable)}',
+            left and f'still there: {json.dumps(left)}']))
+        raise Refusal('teardown_incomplete', f'lease {lease_id} in {ns} is not torn down: {why}; its GPUs stay '
+                                             'charged and the next teardown goes on', resolutions=resolutions,
+                      unresolved=unresolved, changed_hands=changed_hands, unreadable=unreadable, left=left,
+                      deleted=deleted)
+    return {'namespace': ns, 'lease_id': lease_id, 'complete': True, 'namespace_kept': True, 'deleted': deleted,
+            'resolutions': resolutions}
+
+
+def claimed_down(g, view, a):
+    ns = view.name
+    check_uid(view, a.uid)
+    mine, _ = g.claimed_lease(ns) if (g.thread and os.environ.get('BB_THREAD_STORAGE')) else (None, None)
+    lease_id = a.lease or mine
+    if not lease_id:
+        raise Refusal('lease_required', f'{ns} is claimed: down names its lease with --lease, or runs in the '
+                                        'claiming thread')
+    res = lease_show(lease_id)
+    if res.offline:
+        raise lease_unavailable(res, f'lease {lease_id}; a claimed namespace has no offline teardown')
+    if not res.ok:
+        raise Refusal(res.code, f'lease {lease_id}: {res.error}')
+    lease = res.value
+    wrong = [f'{k} {lease[k]!r}, not {want!r}' for k, want in (
+        ('cluster', g.cluster), ('namespace', ns), ('uid', view.uid)) if lease[k] != want]
+    if wrong:
+        raise Refusal('lease_mismatch', f'lease {lease_id} is not this namespace\'s: ' + '; '.join(wrong))
+    if lease_id == mine and lease['thread'] == g.thread and lease['state'] in ('active',) + LIVE:
+        # The owner returns the lease. k8s-leases runs the teardown on a trusted host and completes it there;
+        # only that completion returns the GPUs.
+        state = lease['state']
+        if state == 'active':
+            rel = bb('k8s', 'lease', 'release', lease_id)
+            if not rel.ok:
+                raise Refusal('lease_release_failed', f'could not release {lease_id}: {rel.error}')
+            state = rel.value.get('state', 'releasing')
+        return {'namespace': ns, 'lease_id': lease_id, 'state': state, 'namespace_kept': True,
+                'authority': f'owner; released {lease_id}',
+                'teardown': 'complete' if state == 'released' else 'k8s-leases tears the lease down and returns '
+                                                                   'its GPUs when nothing of it is left'}
+    if lease['state'] == 'active':
+        raise Refusal('lease_active', f'lease {lease_id} is active; only its owner\'s down may end it')
+    if lease['state'] not in LIVE:
+        raise Refusal('lease_ended', f'lease {lease_id} is {lease["state"]}; the plugin gives no teardown authority')
+    return claimed_teardown(g, view, lease_id, lease)
+
+
 def cmd_down(g, a):
     g.require_writable()
     ns = g.ns_name(a.namespace)
-    view = NsView(g, ns)
+    view = namespace_view(g, ns, a.lease)
+    if view.claimed:
+        return claimed_down(g, view, a)
     check_uid(view, a.uid)
     lease_id = a.lease or view.lease_id
     owner = False
@@ -1436,6 +1846,7 @@ COMMANDS = {
     ('inspect',): (cmd_inspect, ((('namespace',), {}),)),
     ('ns', 'create'): (cmd_ns_create, ((('purpose',), {}), (('--issue',), {'required': True}),
                                        (('--hours',), {'required': True}))),
+    ('ns', 'claim'): (cmd_ns_claim, ((('--gpus',), {'required': True}), (('--hours',), {'required': True}))),
     ('lease', 'acquire'): (cmd_lease_acquire, ((('--gpus',), {'required': True}),
                                                (('--hours',), {'required': True}))),
     ('secret',): (cmd_secret, ((('which',), {'choices': sorted(SECRETS)}),)),
