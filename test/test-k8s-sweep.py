@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -125,6 +126,16 @@ class Rows(unittest.TestCase):
         r = self.row(pods=[gpu_pod(dgd=None, phase='Succeeded'), gpu_pod(dgd=None, name='f', phase='Failed')])
         self.assertEqual((r['gpus'], r['orphan_gpu_pods']), (0, []))
 
+    def test_finished_pods_do_not_age_or_warn(self):
+        warned = {'gpu-reaper.nvidia.com/state': 'warned'}
+        r = self.row(pods=[gpu_pod(dgd=None, phase='Succeeded', age_hours=50, annotations=warned)])
+        self.assertEqual((r['oldest_pod_hours'], r['reaper_warned']), (None, 0))
+
+    def test_premade_namespace_keeps_no_expiry_even_with_an_annotation(self):
+        r = self.row(ns_obj(PREFIX + 'agent', expires=at(days=-1)), rec=record(expires=at(days=-1)),
+                     premade=PREFIX + 'agent')
+        self.assertIsNone(r['expires_at'])
+
     def test_orphan_gpu_pod(self):
         # No DGD label, or a label naming a DGD that is not there: nothing the guard applied owns it.
         r = self.row(dgds=[gpu_dgd('w')], pods=[gpu_pod('w', name='w-0'), gpu_pod(None, name='bare-0'),
@@ -208,6 +219,9 @@ class Matching(unittest.TestCase):
         self.assertEqual(kinds(self.match([], [lease_row(ns=other)], exists={other: 'uid-x'})),
                          ['lease_namespace_gone'])
 
+    def test_a_lease_whose_namespace_was_not_read_is_not_judged(self):
+        self.assertEqual(self.match([], [lease_row(ns=PREFIX + '7-unread')], exists={}), [])
+
     def test_ended_leases_are_not_stale(self):
         for state in ('released', 'torn-down'):
             self.assertEqual(self.match([], [lease_row(state=state, ns=PREFIX + '9-x')],
@@ -250,6 +264,17 @@ class Decide(unittest.TestCase):
         d = self.decide(at(days=-1), known=None)
         self.assertIsNone(d['action'])
         self.assertEqual(d['flag'], 'uid_unknown')
+
+    def test_claimed_and_unread_rows_are_never_acted_on_whatever_their_expiry(self):
+        # decide() does not rely on the row builders blanking the expiry.
+        row = rules.namespace_row(ns_obj(expires=at(days=-1)), None, [], [], NOW, None)
+        for key in ('claimed', 'read_failed'):
+            with self.subTest(key=key):
+                self.assertIsNone(rules.decide(dict(row, **{key: True}), 'uid-ns-1', NOW)['action'])
+
+    def test_an_expiry_without_a_time_zone_is_unreadable(self):
+        d = self.decide('2026-01-10T09:00:00')
+        self.assertEqual((d['action'], d['flag']), (None, 'expiry_unreadable'))
 
     def test_no_expiry_unreadable_expiry_claimed_and_terminating(self):
         self.assertIsNone(self.decide(False)['action'])
@@ -294,6 +319,9 @@ class Ledger(unittest.TestCase):
         self.assertEqual((entry['kind'], entry['lease']), ('claim', 'lse_c0001'))
         self.assertEqual(self.opened([claim, self.line(f'Claim/{NS}', 'down', lease='lse_c0001')]), [])
         self.assertEqual(len(self.opened([claim, self.line(f'Claim/{NS}', 'down', lease='lse_c0002')])), 1)
+
+    def test_a_claim_line_without_a_lease_opens_nothing(self):
+        self.assertEqual(self.opened([self.line(f'Claim/{NS}', 'claim')]), [])
 
     def test_a_lease_the_plugin_reports_ended_closes_its_entry(self):
         claim = self.line(f'Claim/{NS}', 'claim', lease='lse_c0001')
@@ -771,6 +799,17 @@ class Enforce(SweepCase):
         [gone] = [e for e in body['open_ledger'] if e['namespace'] == PREFIX + '15-gone']
         self.assertIsNone(gone['exists'])  # its read failed: not judged
 
+    def test_a_guard_that_prints_no_json_fails_the_run(self):
+        self.expired_world(5)
+        self.bb['unreachable'] = True
+        self.flush()
+        self.logging_guard.write_text('#!/bin/sh\necho "Traceback: boom" >&2\nexit 1\n')
+        rc, body, p = self.sweep('--enforce')
+        self.assertEqual(self.row(body)['action'], {'action': 'down', 'result': 'guard_no_json'})
+        self.assertIn('enforce_failed', [e['code'] for e in body['errors']])
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.ledger(host=True)[-1]['result'], 'guard_no_json')
+
     def test_premade_and_terminating_namespaces_are_never_enforced(self):
         premade = PREFIX + 'agent'
         self.profiles.write_text(self.profiles.read_text().replace(
@@ -806,6 +845,50 @@ BLOCK = ('  k8s_tbot:\n    name: "tenant-a"\n    proxy_server: "proxy.example.te
          '    selector_labels:\n      environment: "dev"\n')
 TARGETS = {'.config/systemd/user/k8s-sweep.service', '.config/systemd/user/k8s-sweep.timer',
            '.config/systemd/user/k8s-sweep-enforce.service', '.config/systemd/user/k8s-sweep-enforce.timer'}
+
+
+def load_sweep():
+    loader = importlib.machinery.SourceFileLoader('sweep_module', str(SWEEP))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader('sweep_module', loader))
+    loader.exec_module(module)
+    return module
+
+
+class FakeKc:
+    def __init__(self):
+        self.calls = []
+
+    def run(self, *args):
+        self.calls.append(args)
+        return 0, '{"metadata": {"uid": "u"}}', ''
+
+
+class ReadOnly(unittest.TestCase):
+    def reader(self, module):
+        r = object.__new__(module.Reader)
+        r.check, r.kc = types.SimpleNamespace(KubectlError=Exception), FakeKc()
+        return r
+
+    def test_the_reader_refuses_every_verb_but_get_and_whoami_before_kubectl_runs(self):
+        module = load_sweep()
+        r = self.reader(module)
+        for verb in ('delete', 'patch', 'apply', 'create', 'scale', 'label', 'annotate', 'replace', 'auth'):
+            with self.subTest(verb=verb):
+                with self.assertRaises(module.ProfileError) as e:
+                    r.json(verb, 'namespace', NS)
+                self.assertEqual(e.exception.code, 'not_a_read')
+        self.assertEqual(r.kc.calls, [])
+        r.json('get', 'namespace', NS, '-o', 'json')
+        r.json('auth', 'whoami', '-o', 'json')
+        self.assertEqual(len(r.kc.calls), 2)
+
+    def test_lookup_reads_only_names_that_could_be_namespaces(self):
+        module = load_sweep()
+        r = self.reader(module)
+        errors = []
+        out = module.lookup(r, {PREFIX + '1-ok', '-A', '--all-namespaces', 'Bad_Name', 'x' * 64}, PROFILE, errors)
+        self.assertEqual(out, {PREFIX + '1-ok': 'u'})
+        self.assertEqual([c[2] for c in r.kc.calls], [PREFIX + '1-ok'])
 
 
 class GuardCommand(unittest.TestCase):

@@ -23,7 +23,7 @@ It also reads `bb k8s leases --all --json`, the host ledger (`${XDG_STATE_HOME:-
 For each namespace it reports the age, `wcep.agent/thread`, the expiry, the GPUs, the age of the oldest pod, and how many pods carry `gpu-reaper.nvidia.com/state: warned` (as a label or an annotation).
 
 - **GPUs** are the guard's allocation (`k8s_guard_rules.allocation`): for each DGD, the larger of its spec and its live pods, plus GPU pods that no DGD owns. Terminating pods count; finished pods do not.
-- **The expiry** is the guard's (`NsView.expires_at`): the record's `expires_at` when the record's `uid` is this namespace's, otherwise the creation annotation `wcep.agent/expires-at`. The pre-made namespace has none.
+- **The expiry** is the guard's (`NsView.expires_at`): the record's `expires_at` when the record's `uid` is this namespace's, otherwise the creation annotation `wcep.agent/expires-at`. The pre-made namespace has none. The sweep does not wait for the later of the two, by the owner's ruling: a namespace whose lease has ended can be reclaimed even while its annotation still reads live, and the annotation is only the fallback for a namespace with no record for its UID.
 
 ## Flags
 
