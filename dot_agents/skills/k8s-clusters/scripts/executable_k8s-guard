@@ -575,6 +575,14 @@ def cmd_ns_create(g, a):
     if rc != 0:
         if 'AlreadyExists' in err:
             raise Refusal('namespace_exists', f'{ns} already exists; namespaces are never adopted')
+        if 'Forbidden' in err and 'namespaces' in err:
+            # The bot's grant ends at its RoleBindings inside our namespaces: it cannot create one.
+            premade = g.bot.get('premade_namespace')
+            hint = (f'claim the pre-made namespace with `k8s-guard --context {g.context} -n {premade} ns claim '
+                    '--gpus <n> --hours <h>`' if premade else
+                    'this cluster needs a pre-made namespace: set bot.premade_namespace in the profiles and use '
+                    '`k8s-guard ns claim`')
+            raise Refusal('namespace_create_denied', f'the bot may not create namespaces on {g.cluster}; {hint}')
         raise kubectl_error(('create', 'namespace', ns), rc, err)
     uid = json.loads(out)['metadata']['uid']
     g.record(ns, f'Namespace/{ns}', 0, 'up', uid=uid, issue=a.issue, created=True)

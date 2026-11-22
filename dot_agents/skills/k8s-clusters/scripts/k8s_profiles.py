@@ -24,6 +24,9 @@ ARCHES = ('amd64', 'arm64')
 EFFECTS = ('NoSchedule', 'PreferNoSchedule', 'NoExecute')
 
 BOT_KEYS = {'user': str, 'kubeconfig': str, 'developer': str, 'namespace_prefix': str, 'kubectl_sha256': str}
+# Optional [bot] keys: allowed, never required. premade_namespace names the one namespace of ours that ops made
+# on clusters where the bot cannot create namespaces; k8s-guard claims it with a k8s-leases lease.
+BOT_OPTIONAL_KEYS = {'premade_namespace': str}
 # Keys every profile needs, then the ones every profile but a "never" one needs.
 BASE_KEYS = {'context': str, 'allowed': str, 'source': list}
 USE_KEYS = {'bot_can_write': bool, 'arch': str, 'gpu_product': str, 'gpu_type': str, 'gpus_per_node': int,
@@ -507,8 +510,11 @@ def load_profiles():
         errors.append('[bot] is required')
         bot = {}
     for key in bot:
-        if key not in BOT_KEYS:
+        if key not in BOT_KEYS and key not in BOT_OPTIONAL_KEYS:
             errors.append(f'bot.{key} is not a known key')
+    for key, kind in BOT_OPTIONAL_KEYS.items():
+        if key in bot:
+            check_type('bot', key, bot[key], kind, errors)
     for key, kind in BOT_KEYS.items():
         if key not in bot:
             errors.append(f'bot.{key} is required')
@@ -520,6 +526,11 @@ def load_profiles():
         errors.append('bot.kubectl_sha256 must be 64 lower-case hex digits (sha256sum of the kubectl binary)')
     if isinstance(prefix, str) and prefix and not prefix.endswith('-'):
         errors.append('bot.namespace_prefix must end in "-"')
+    premade = bot.get('premade_namespace')
+    if isinstance(premade, str) and isinstance(prefix, str) and not (
+            premade.startswith(prefix) and len(premade) > len(prefix) and len(premade) <= 63
+            and re.fullmatch(r'[a-z0-9]([-a-z0-9]*[a-z0-9])?', premade)):
+        errors.append(f'bot.premade_namespace must be a namespace name (a DNS label) under {prefix}*')
     resolved = None
     if isinstance(bot.get('kubeconfig'), str) and bot['kubeconfig']:
         resolved, problem = resolve_bot_kubeconfig(bot['kubeconfig'])

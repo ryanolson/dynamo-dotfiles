@@ -224,6 +224,9 @@ if cmd == 'get':
 if cmd == 'create' and len(pos) == 1:
     obj = json.loads(stdin)
     if obj['kind'] == 'Namespace':
+        if st.get('forbid_namespace_create'):
+            fail('Error from server (Forbidden): namespaces is forbidden: User "bot-example-agent" cannot create '
+                 'resource "namespaces" in API group "" at the cluster scope')
         name = obj['metadata']['name']
         if name in st['namespaces']:
             fail(f'Error from server (AlreadyExists): namespaces "{name}" already exists')
@@ -1112,6 +1115,16 @@ class NamespaceCreate(GuardCase):
     def test_thread_required(self):
         self.refused('thread_required', '--context', CTX, 'ns', 'create', 'smoke', '--issue', '12', '--hours', '1',
                      host_entry=True)
+
+    def test_bot_without_namespace_create_is_told_to_claim(self):
+        # The real bot has namespaced admin only: the API server refuses a Namespace create at the cluster scope.
+        self.k8s['forbid_namespace_create'] = True
+        self.flush()
+        body = self.refused('namespace_create_denied', '--context', CTX, 'ns', 'create', 'smoke', '--issue', '12',
+                            '--hours', '1')
+        self.assertIn('ns claim', body['error'])
+        self.assertEqual(self.k8s['namespaces'], {})
+        self.assertEqual(self.ledger(), [])
 
 
 # --- rule 5: ownership -----------------------------------------------------

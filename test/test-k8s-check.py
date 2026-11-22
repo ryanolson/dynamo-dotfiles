@@ -1322,6 +1322,28 @@ class K8sCheck(unittest.TestCase):
                     self.log.unlink()
                 self.invalid(text, needle)
 
+    def test_premade_namespace_is_optional_and_exact(self):
+        base = EXAMPLE.read_text()
+        self.assertNotIn('premade_namespace', base.split('[clusters.')[0])  # the example works without it
+        with_key = base.replace('namespace_prefix = "dyntest-alice-"',
+                                'namespace_prefix = "dyntest-alice-"\npremade_namespace = "dyntest-alice-agent"')
+        self.profiles.write_text(with_key)
+        rc, out = self.run_check('--list')
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out['schema_version'], 1)
+        self.assertEqual(out['bot']['premade_namespace'], 'dyntest-alice-agent')
+        cases = {
+            'outside the prefix': with_key.replace('"dyntest-alice-agent"', '"dyntest-bob-agent"'),
+            'not a DNS label': with_key.replace('"dyntest-alice-agent"', '"dyntest-alice-Agent_1"'),
+            'only the prefix': with_key.replace('"dyntest-alice-agent"', '"dyntest-alice-"'),
+            'not a string': with_key.replace('"dyntest-alice-agent"', '7'),
+        }
+        for name, text in cases.items():
+            with self.subTest(name):
+                if self.log.exists():
+                    self.log.unlink()
+                self.invalid(text, 'premade_namespace')
+
     def test_schema_version_requires_an_integer(self):
         self.profiles.write_text(EXAMPLE.read_text().replace('schema_version = 1', 'schema_version = 1.0'))
         rc, out = self.run_check('--list')
