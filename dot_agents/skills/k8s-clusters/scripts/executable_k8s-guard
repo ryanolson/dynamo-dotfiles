@@ -904,8 +904,11 @@ def cmd_down(g, a):
         why = teardown_authority(g, view, a.uid, a.lease)
     dgds, why_none = lease_dgds(g, ns, lease_id)
     confirm_uid(g, ns, view.uid)
+    # The ledger line counts what this down ends: the lease's DGDs, or, with no lease to select by,
+    # every DGD in the namespace, which the namespace delete below removes with it.
+    counted = g.dgds(ns) if why_none else dgds
     before = 0
-    for d in dgds:
+    for d in counted:
         try:
             before += dgd_gpus(d)
         except Refusal:

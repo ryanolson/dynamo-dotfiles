@@ -2026,6 +2026,7 @@ class SharedNamespaceTeardown(GuardCase):
                 if command == 'down':
                     self.assertEqual(body['dgds_deleted'], [])
                     self.assertNotIn(NS, self.k8s['namespaces'])  # the namespace takes the DGD with it
+                    self.assertEqual(self.ledger(host=True)[-1]['gpus'], 2)  # it ends every DGD there
                 else:
                     self.assertEqual(body['scaled'], [])
                     self.assertEqual(self.replicas('earlier'), [1, 1])
