@@ -565,11 +565,14 @@ timeout 120 python3 test/test-k8s-check.py </dev/null
 timeout 60 python3 test/test-k8s-render.py </dev/null
 ```
 
-`k8s-guard` is the only write path to a cluster. It refuses any write outside our namespaces, our kinds, or the namespace's GPU lease from the `k8s-leases` plugin, and records each write in a ledger. Teardown selects DGDs by the lease label, never by the namespace UID. Every write carries its ownership checks to the server (create-only POST, JSON Patch tests, delete preconditions) and is an attempt recorded in `k8s-leases` before it is sent. `ns claim` claims the profiles' pre-made namespace, whose teardown deletes the lease's objects and never the namespace. A claim is fenced by two Kyverno policies ops install (`agent-lease-fence` and `agent-lease-fence-canary`, rendered by `k8s-guard fence render`): Pods in the namespace are admitted only under the lease its gate ConfigMap names, and claimed teardown completes only while `fence probe` shows the fence armed. Claims stay off until the fence enforces. Its rules are in `dot_agents/skills/k8s-clusters/references/k8s-guard.md`. The guard tests use a fake `kubectl`, `bb`, `fleet`, `tbot` and `tsh`, and never contact a cluster. The policies' CLI tests need the Kyverno CLI v1.15.2, and the kind fixture runs only on the dev host:
+On clusters without an enforced fence, the [bot runbook](dot_agents/skills/k8s-clusters/references/bot.md#the-namespace) describes the RBAC path in the pre-made namespace. Jobs on that path request zero GPUs.
+
+`k8s-guard` implements the fenced write path. It refuses any write outside our namespaces, our kinds, or the namespace's GPU lease from the `k8s-leases` plugin, and records each write in a ledger. Teardown selects DGDs by the lease label, never by the namespace UID. Every write carries its ownership checks to the server (create-only POST, JSON Patch tests, delete preconditions) and is an attempt recorded in `k8s-leases` before it is sent. `ns claim` claims the profiles' pre-made namespace, whose teardown deletes the lease's objects and never the namespace. A claim is fenced by two Kyverno policies ops install (`agent-lease-fence` and `agent-lease-fence-canary`, rendered by `k8s-guard fence render`): Pods in the namespace are admitted only under the lease its gate ConfigMap names, and claimed teardown completes only while `fence probe` shows the fence armed. Claims stay off until the fence enforces. Its rules are in `dot_agents/skills/k8s-clusters/references/k8s-guard.md`. The guard tests use a fake `kubectl`, `bb`, `fleet`, `tbot` and `tsh`, and never contact a cluster. The policies' CLI tests need the Kyverno CLI v1.15.2, and the kind fixture runs only on the dev host:
 
 ```bash
 timeout 600 python3 test/test-k8s-guard.py </dev/null
 timeout 120 python3 test/test-k8s-first-build.py </dev/null
+timeout 60 uv run --no-project --with pyyaml python test/test-k8s-smoke.py </dev/null
 KYVERNO_CLI=~/.local/bin/kyverno timeout 300 python3 test/test-k8s-fence.py </dev/null
 timeout 2400 bash test/kind-fence.sh </dev/null
 ```

@@ -48,15 +48,14 @@ Tested on the first-choice clusters:
 | `kubectl auth whoami` | Fails: the cluster does not serve the SelfSubjectReview API. `k8s-check` reads the name from the client certificate instead |
 | Write on clusters marked read only in the profile | Denied |
 
-The bot never installs anything cluster-scoped. Everything that writes goes through `scripts/k8s-guard` (see `k8s-guard.md`).
+Write only to authorized resources in the pre-made namespace. Follow the runbook for the cluster and workload.
 
 ## The namespace
 
-The bot cannot create namespaces, so the owner pre-makes one per writable cluster, with a fixed name that starts with the profile's `namespace_prefix`. It carries two labels, and a third once ops enroll it in the lease fence:
+The bot cannot create namespaces, so the owner pre-makes one per writable cluster, with a fixed name that starts with the profile's `namespace_prefix`. It carries two labels:
 
 - `dynamo.nvidia.com/developer: <developer>`
 - `dynamo.nvidia.com/developer-agent-rbac: "true"`
-- `dynamo.nvidia.com/agent-lease-fence: "true"`: set by ops after they install the two fence policies and read the webhook configuration (`k8s-guard.md`, "The fence policy"). The bot cannot set it, and a claim refuses `namespace_not_enrolled` without it.
 
 A cluster policy then gives the bot admin rights and DynamoGraphDeployment rights inside it. To find it, read only:
 
@@ -65,17 +64,9 @@ kubectl --context <ctx> get ns -l dynamo.nvidia.com/developer=<developer>
 kubectl --context <ctx> -n <ns> get rolebindings      # expect two bindings
 ```
 
-Rules while the namespace is shared by all tasks:
+The pre-made namespace is the write boundary. On a cluster without an enforced fence, use the runbook's lease-free RBAC path. Skip lease commands and submit only Jobs that request zero GPUs.
 
-- One task at a time per cluster. Take the lease first; the lease is the claim.
-- Teardown removes the objects your task made. It never deletes the namespace, and nothing may delete it: the bot cannot make a new one.
-- Do not touch objects you did not make.
-
-The profiles name it as `[bot] premade_namespace`. `k8s-guard ns create` refuses with `namespace_create_denied` and names `k8s-guard -n <premade> ns claim`, which takes a `k8s-leases` lease on it: the lease is the claim, and teardown deletes the lease's objects, never the namespace (`k8s-guard.md`, "A claimed namespace").
-
-Known gap: `k8s-leases` refuses claims (`enforcement_unhealthy`) until the fence enforces: ops install the two policies (`agent-lease-fence` and `agent-lease-fence-canary`), set the label, run the audit window, and switch the main policy to Enforce. Until then no task can deploy into the pre-made namespace through the guard, except a trial claim the owner approved. Do not write through a different path. Stop and tell the owner.
-
-The bot cannot read the cluster's webhook configuration, so the probe cannot see a webhook list that Kyverno empties and restores between two probes (5 s apart). On kind the emptied window lasted about 10 s. Checking the configuration's generation would need a cluster-scoped read the bot does not have.
+Coordinate use of the shared namespace. Remove only the objects your task created and leave the namespace in place.
 
 ## The key
 
@@ -88,11 +79,134 @@ The bot cannot read the cluster's webhook configuration, so the probe cannot see
 
 ## Images
 
-Build images with `k8s-guard build run` in the pre-made namespace under a claim. Use native arm64 and amd64 builds. Publish the index with `build index` under the amd64 claim. Tag images with the source commit. Never use `latest`. The runbook's Images section gives the first-run checks, timing records and teardown.
+The guard-based image-publishing workflow requires an enforced fence. See the runbook for `k8s-guard build run` in the pre-made namespace. Use native arm64 and amd64 builds. Publish the index with `build index` under the amd64 claim. Tag images with the source commit. Never use `latest`. The runbook's Images section gives the first-run checks, timing records and teardown.
 
 For a private clone, `secret git --repo <owner>/<repo>` reads `op://Fleet/<owner>-<repo> deploy key/private key`. The item holds a read-only key in OpenSSH format. `secret ngc` makes `nvcr-pull` from `op://Fleet/NGC Pull Key/credential`. A missing pull key returns `secret_unavailable`.
 
 The build uses `nvcr-push`. Use `secret ngc-push --exposure-accepted` only after the owner records approval of the PAT exposure. The guard removes the build Secret during claim teardown.
+
+### AKS smoke build
+
+Build x86_64 (`linux/amd64`) natively in `dynamo-aks-dev` because its nodes are x86_64 and the spark-p gate image is arm64.
+
+The steward runs the smoke Job in the pre-made namespace recorded in the measured AKS profile. The operator kubeconfig applies the narrow Role and requests the launcher token. The generated launcher kubeconfig submits the Job using namespace RBAC. The Pod runs as its own unbound ServiceAccount with token mounting disabled.
+
+The smoke is CPU-only. It writes and reads 64 MiB in a native rootless BuildKit step, exports an OCI image to `emptyDir` and logs the digest.
+
+The launcher can expose any Secret in this namespace through Job creation and Pod log reads, within the bot's existing rights.
+
+Use the namespace from that profile for `SMOKE_NAMESPACE`. For example, `agent-namespace` stands in for that name.
+
+Set `C` to the direct AKS context. Set `OPERATOR_KUBECONFIG` to an authorized kubeconfig that can read the namespace CA and request ServiceAccount tokens. The launcher requires the generated `SMOKE_KUBECONFIG` file. Its explicit `--kubeconfig` selects the launcher identity even if `KUBECONFIG` points to Teleport.
+
+Check the namespace's `pod-security.kubernetes.io/enforce` label before submitting. Baseline and Restricted reject the unconfined seccomp and AppArmor profiles the builder uses. [Kubernetes Pod Security Standards](https://kubernetes.io/docs/concepts/security/pod-security-standards/)
+
+```bash
+kubectl --kubeconfig "${OPERATOR_KUBECONFIG:?set the namespace operator kubeconfig}" \
+  --context "${C:?set the AKS context}" \
+  get namespace "${SMOKE_NAMESPACE:?set the pre-made AKS namespace}" --show-labels
+```
+
+Apply [rbac.yaml](../smoke/rbac.yaml) from the dotfiles checkout with the authorized operator kubeconfig.
+
+```bash
+kubectl --kubeconfig "${OPERATOR_KUBECONFIG:?set the namespace operator kubeconfig}" \
+  --context "${C:?set the AKS context}" -n "${SMOKE_NAMESPACE:?set the pre-made AKS namespace}" \
+  apply -f dot_agents/skills/k8s-clusters/smoke/rbac.yaml
+```
+
+From the dotfiles checkout, set `SMOKE_KUBECONFIG` to a new file path. The launcher authenticates as `gdl-build-smoke` with a TokenRequest bearer token requested for 20 minutes. The generated kubeconfig pins `certificate-authority-data` from `kube-root-ca.crt` and uses mode `0600`.
+
+```bash
+(
+  set +x
+  set -euo pipefail
+  : "${OPERATOR_KUBECONFIG:?set the namespace operator kubeconfig}"
+  : "${SMOKE_KUBECONFIG:?set the ServiceAccount kubeconfig}"
+  namespace="${SMOKE_NAMESPACE:?set the pre-made AKS namespace}"
+  umask 077
+  set -o noclobber
+  operator=(kubectl --kubeconfig "$OPERATOR_KUBECONFIG" --context "$C")
+  ca=$("${operator[@]}" -n "$namespace" get configmap kube-root-ca.crt -o json |
+    jq -er '.data["ca.crt"] |
+      if type == "string" and length > 0 then @base64
+      else error("kube-root-ca.crt is missing ca.crt") end')
+  cluster=$("${operator[@]}" config view --minify -o json |
+    jq -ce --arg ca "$ca" '.clusters[0] |
+      select(.name and (.cluster.server | startswith("https://"))) |
+      {name, cluster: {server: .cluster.server, "certificate-authority-data": $ca}}')
+  config=$("${operator[@]}" -n "$namespace" \
+    create token gdl-build-smoke --duration=20m |
+    jq -Rsec --argjson cluster "$cluster" --arg namespace "$namespace" '
+      sub("[\r\n]+$"; "") |
+      if length == 0 then error("missing launcher token") else
+        {apiVersion: "v1", kind: "Config",
+         clusters: [$cluster], users: [{name: "launcher", user: {token: .}}],
+         contexts: [{name: "aks-smoke", context: {
+           cluster: $cluster.name, user: "launcher", namespace: $namespace}}],
+         "current-context": "aks-smoke"}
+      end')
+  printf '%s\n' "$config" > "$SMOKE_KUBECONFIG"
+)
+```
+
+Use the launcher kubeconfig for both admission validation and submission.
+
+```bash
+(
+  set -eu
+  job=dot_agents/skills/k8s-clusters/smoke/job.yaml
+  smoke=(kubectl --kubeconfig "${SMOKE_KUBECONFIG:?set the ServiceAccount kubeconfig}" --context aks-smoke -n "${SMOKE_NAMESPACE:?set the pre-made AKS namespace}")
+  "${smoke[@]}" create --dry-run=server -f "$job"
+  "${smoke[@]}" create -f "$job"
+)
+```
+
+Poll with the launcher kubeconfig:
+
+```bash
+kubectl --kubeconfig "${SMOKE_KUBECONFIG:?set the ServiceAccount kubeconfig}" \
+  --context aks-smoke -n "${SMOKE_NAMESPACE:?set the pre-made AKS namespace}" get pods \
+  -l batch.kubernetes.io/job-name=gdl-build-smoke
+```
+
+Once its container starts, set `pod` to its name and stream its logs. The Job's deadline can delete the Pod and its logs.
+
+```bash
+(
+  set -o pipefail
+  kubectl --kubeconfig "${SMOKE_KUBECONFIG:?set the ServiceAccount kubeconfig}" \
+    --context aks-smoke -n "${SMOKE_NAMESPACE:?set the pre-made AKS namespace}" logs --follow "pod/${pod:?set the smoke Pod name}" -c build |
+    tee gdl-build-smoke.log
+)
+```
+
+Check the Job status while the Job object is still present.
+
+```bash
+kubectl --kubeconfig "${SMOKE_KUBECONFIG:?set the ServiceAccount kubeconfig}" \
+  --context aks-smoke -n "${SMOKE_NAMESPACE:?set the pre-made AKS namespace}" get job gdl-build-smoke -o yaml
+```
+
+Require `Complete=True`, `buildkit-smoke-ok`, and `containerimage.digest`. Remove the launcher kubeconfig when done.
+
+If the token expires, a new request returns `Unauthorized`. Stop polling and record the smoke run as failed to verify. The Job can continue until its 600-second deadline, with a retry budget of zero.
+
+If the Pod never starts or the Job fails, read the events with the operator kubeconfig. A `FailedCreate` event on the Job can explain why there is no Pod. If there is a Pod, query events with its name too.
+
+```bash
+kubectl --kubeconfig "${OPERATOR_KUBECONFIG:?set the namespace operator kubeconfig}" \
+  --context "${C:?set the AKS context}" -n "${SMOKE_NAMESPACE:?set the pre-made AKS namespace}" get events \
+  --field-selector involvedObject.name=gdl-build-smoke
+```
+
+Validate the manifests from the checkout without cluster access:
+
+```bash
+timeout 60 kubeconform -strict -summary -kubernetes-version 1.30.0 \
+  dot_agents/skills/k8s-clusters/smoke
+timeout 60 uv run --no-project --with pyyaml python test/test-k8s-smoke.py
+```
 
 ## When something fails
 

@@ -1,0 +1,41 @@
+# The launcher Role covers Job submission, inspection and deletion. The operator has broader rights.
+# The Job controller creates Pods. The Pod runs as a separate account with no binding.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gdl-build-smoke
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gdl-build-smoke-pod
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gdl-build-smoke
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gdl-build-smoke
+# The ServiceAccount subject uses the binding namespace supplied with -n.
+subjects:
+  - kind: ServiceAccount
+    name: gdl-build-smoke
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gdl-build-smoke

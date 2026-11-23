@@ -7,18 +7,18 @@ description: Reach the team's shared Kubernetes GPU clusters as the agents' bot,
 
 The source of truth is the Linear document "Runbook: build and run on our Dynamo k8s clusters" on the WCEP initiative. Read it before any command against a cluster. It says which clusters we may use, which need the owner's word, and how to build, deploy, check and tear down. This skill adds only the commands. When the runbook and this skill disagree, the runbook wins.
 
-## Rules the commands enforce
+## Access rules
 
-- Use the agents' Teleport bot only: never the owner's `tsh` login, `~/.tsh`, or `~/.kube/config`.
+- Use the agents' Teleport bot for bot access. The AKS smoke uses the explicit operator and launcher kubeconfigs in the runbook. Keep agent commands away from the owner's `tsh` login, `~/.tsh`, or `~/.kube/config`.
 - Pass `--context` on every `kubectl` call. Never rely on the current context.
-- Make no write with plain `kubectl`. Writes go through `scripts/k8s-guard` only; its commands and rules are in `references/k8s-guard.md`.
+- On a cluster without an enforced fence, follow the runbook for namespace-scoped writes using RBAC. Jobs on that path request zero GPUs. The guard documentation describes the separate fenced workflow.
 - Astra changes go through `scripts/astra-guard` only; its commands and rules are in `references/astra-guard.md`.
 
 ## The bot
 
 How the bot works, how to set up a host, what it can and cannot do, the pre-made namespace, the key rules, and what to do when it fails are in `references/bot.md`. Read it before you set up a host or deploy.
 
-One known gap, tested: the bot cannot create namespaces, so `k8s-guard ns create` refuses `namespace_create_denied` and names `ns claim`, which claims the pre-made namespace with a lease. Claims stay off (`enforcement_unhealthy`) until the lease fence, two Kyverno policies ops install, enforces; `k8s-guard fence probe` says whether it is armed and, if not, why (`references/k8s-guard.md`, "The fence policy"). `kubectl auth whoami` is not served on these clusters, so `k8s-check` names the bot from its client certificate instead (the report says `"source": "certificate"`). To check access by hand, use `kubectl --context <ctx> get nodes`.
+The owner pre-makes the writable namespace. Get its name from the cluster profile. `kubectl auth whoami` is not served on these clusters, so `k8s-check` names the bot from its client certificate instead (the report says `"source": "certificate"`). To check access by hand, use `kubectl --context <ctx> get nodes`.
 
 ## Find stale deployments and GPU holds
 

@@ -1,0 +1,85 @@
+# Build x86_64 (linux/amd64) natively on AKS because its nodes are x86_64
+# and the spark-p gate image is arm64.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gdl-build-smoke
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: gdl-build-smoke-pod
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: demo.nvidia.com/same-node-imex
+                    operator: NotIn
+                    values: ["reserved"]
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: build
+          image: mirror.gcr.io/moby/buildkit:v0.23.2-rootless@sha256:cab936745de5d673465948f1e93ff4d6e372bbe33f218afd3314eba45a6f85a9
+          securityContext:
+            seccompProfile:
+              type: Unconfined
+            appArmorProfile:
+              type: Unconfined
+          env:
+            - name: BUILDKITD_FLAGS
+              value: --oci-worker-no-process-sandbox
+          command:
+            - sh
+            - -ec
+            - |
+              mkdir /workspace/src
+              cat > /workspace/src/Dockerfile <<'DOCKERFILE'
+              FROM mirror.gcr.io/moby/buildkit:v0.23.2-rootless@sha256:cab936745de5d673465948f1e93ff4d6e372bbe33f218afd3314eba45a6f85a9 AS probe
+              RUN test "$(uname -m)" = x86_64 \
+                  && dd if=/dev/zero of=/tmp/smoke-data bs=1M count=64 \
+                  && test "$(wc -c < /tmp/smoke-data)" -eq 67108864 \
+                  && rm /tmp/smoke-data \
+                  && printf 'buildkit-smoke-ok\n' | tee /tmp/buildkit-smoke-ok
+              FROM scratch
+              COPY --from=probe /tmp/buildkit-smoke-ok /buildkit-smoke-ok
+              DOCKERFILE
+              buildctl-daemonless.sh build --progress plain \
+                  --frontend dockerfile.v0 --opt platform=linux/amd64 \
+                  --local context=/workspace/src --local dockerfile=/workspace/src \
+                  --output type=oci,dest=/workspace/smoke.tar \
+                  --metadata-file /workspace/metadata.json
+              grep -E '"containerimage.digest":[[:space:]]*"sha256:[0-9a-f]{64}"' /workspace/metadata.json
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+              ephemeral-storage: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+              ephemeral-storage: 4Gi
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: buildkit-state
+              mountPath: /home/user/.local/share/buildkit
+      volumes:
+        - name: workspace
+          emptyDir: {}
+        - name: buildkit-state
+          emptyDir: {}
