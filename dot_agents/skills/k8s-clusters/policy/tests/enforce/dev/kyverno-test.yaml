@@ -1,0 +1,13 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: enforce-dev
+policies: [policy.yaml]
+resources: [resources.yaml]
+variables: values.yaml
+userinfo: userinfo.yaml
+results:
+  - {policy: agent-lease-fence, rule: bot-roots-need-the-open-lease-and-an-attempt, kind: Job, resources: [dev-a1a1a1a1a1a1-arm64-012345], result: pass}
+  - {policy: agent-lease-fence, rule: bot-roots-need-the-open-lease-and-an-attempt, kind: Job, resources: [dev-no-attempt], result: fail}
+  - {policy: agent-lease-fence, rule: pods-need-the-open-lease, kind: Pod, resources: [dev-owned], result: pass}
+  - {policy: agent-lease-fence, rule: pods-need-the-open-lease, kind: Pod, resources: [dev-bare], result: fail}

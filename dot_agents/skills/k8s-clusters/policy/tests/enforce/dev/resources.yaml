@@ -1,0 +1,50 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dev-a1a1a1a1a1a1-arm64-012345
+  namespace: dyntest-alice-agent
+  labels: {wcep.agent/lease: lse_test0001, wcep.agent/build: dev}
+  annotations: {wcep.agent/attempt: att_0123456789abcdef0123}
+spec:
+  template:
+    metadata:
+      labels: {wcep.agent/lease: lse_test0001, wcep.agent/build: dev}
+    spec:
+      restartPolicy: Never
+      containers: [{name: dev, image: registry.example.test/dev:1}]
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dev-no-attempt
+  namespace: dyntest-alice-agent
+  labels: {wcep.agent/lease: lse_test0001, wcep.agent/build: dev}
+spec:
+  template:
+    metadata:
+      labels: {wcep.agent/lease: lse_test0001, wcep.agent/build: dev}
+    spec:
+      restartPolicy: Never
+      containers: [{name: dev, image: registry.example.test/dev:1}]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dev-owned
+  namespace: dyntest-alice-agent
+  labels: {wcep.agent/lease: lse_test0001, wcep.agent/build: dev}
+  ownerReferences:
+    - apiVersion: batch/v1
+      kind: Job
+      name: dev-a1a1a1a1a1a1-arm64-012345
+      uid: 00000000-0000-4000-8000-000000000001
+      controller: true
+spec: {containers: [{name: dev, image: registry.example.test/dev:1}]}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dev-bare
+  namespace: dyntest-alice-agent
+  labels: {wcep.agent/lease: lse_test0001, wcep.agent/build: dev}
+spec: {containers: [{name: dev, image: registry.example.test/dev:1}]}

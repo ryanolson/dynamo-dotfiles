@@ -14,6 +14,10 @@ Usage (every command takes --context <kube context>; -n may come anywhere):
   k8s-guard -n <ns> build index --commit <40 hex> --image <name>
                                                                the manifest-list Job over both per-arch tags
   k8s-guard -n <ns> build delete <job>                         end a Job now, Pods included
+  k8s-guard -n <premade> dev run --image <name> --image-commit <40 hex> --digest sha256:<64 hex>
+                                  --repo <url> --commit <40 hex> [--arch ...]
+                                                               start a dev Job under this thread's claim
+  k8s-guard -n <premade> dev show <job>                        its state and pinned image digest, read only
   k8s-guard -n <ns> delete <kind>/<name>                       one object
   k8s-guard down <ns> [--uid <uid>] [--lease <id>]             delete the lease's DGDs, then the namespace
   k8s-guard expire <ns> [--uid <uid>] [--lease <id>]           scale the lease's DGDs to 0
@@ -55,10 +59,10 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from k8s_profiles import ProfileError, kubectl_env, load_profiles, prepare_bot_kubeconfig  # noqa: E402
 from k8s_guard_rules import (  # noqa: E402
-    ATTEMPT_ANNOTATION, DGD_KIND, GIT_SECRET, GITHUB_KNOWN_HOSTS, HOSTNAME_TOPOLOGY, KNOWN_HOSTS_CONFIGMAP,
-    LEASE_LABEL, LEASE_RECORD, NS_UID_LABEL, PUSH_SECRET, Refusal, admit, allocation, arch_arg,
+    ATTEMPT_ANNOTATION, BUILD_LABEL, DGD_KIND, GIT_SECRET, GITHUB_KNOWN_HOSTS, HOSTNAME_TOPOLOGY, KNOWN_HOSTS_CONFIGMAP,
+    LEASE_LABEL, LEASE_RECORD, NS_UID_LABEL, PULL_SECRET, PUSH_SECRET, Refusal, admit, allocation, arch_arg,
     budget_allocation, build_job, build_verdict, check_gpu_product, check_job, check_lease_label, check_one_node,
-    commit_arg, dgd_gpus, dockerfile_arg, git_secret_spec, gpu_pod_summary, image_arg, index_job, job_state,
+    commit_arg, dev_job, dgd_gpus, dockerfile_arg, git_secret_spec, gpu_pod_summary, image_arg, index_job, job_state,
     redact_build_log, repo_arg, repo_is_ssh, zero_patch, components)
 import k8s_fence_rules as fence  # noqa: E402
 from k8s_fence_rules import FENCE_LABEL, FENCE_RECORD, FenceError  # noqa: E402
@@ -2307,13 +2311,13 @@ def cmd_selftest_fences(g, a):
 # both per-arch tags. Every check runs on the rendered object and again on the server's dry-run
 # answer, so a webhook cannot add a field the guard did not render. No caller-supplied manifest.
 
-def create_job(g, ns, job, dry, timeout=KUBECTL_TIMEOUT):
+def create_job(g, ns, job, dry, timeout=KUBECTL_TIMEOUT, exists_hint=None):
     args = ['create', '-f', '-', '-n', ns, '-o', 'json'] + (['--dry-run=server'] if dry else [])
     rc, out, err = g.kc.run(*args, input=json.dumps(job), timeout=timeout)
     if rc != 0:
         if 'AlreadyExists' in err:
-            e = Refusal('job_exists', f'{job["kind"]}/{job["metadata"]["name"]} already exists in {ns}; '
-                                      '`k8s-guard build show` it, then `build delete` it')
+            hint = exists_hint or '`k8s-guard build show` it, then `build delete` it'
+            e = Refusal('job_exists', f'{job["kind"]}/{job["metadata"]["name"]} already exists in {ns}; {hint}')
             e.raw = err
             raise e
         raise kubectl_error(('create', 'job', job['metadata']['name']), rc, err)
@@ -2327,21 +2331,24 @@ def submit_job(g, ns, view, lease, slot, job, expect, charge):
     """Dry-run, admit, create as an attempt under the slot, and append one ledger line."""
     name = job['metadata']['name']
     lid = lease['lease_id']
+    hint = dev_job_hint(name) if expect['kind'] == 'dev' else None
     if get_object(g, ns, 'Job', name) is not None:
-        raise Refusal('job_exists', f'Job/{name} exists; `k8s-guard build show {name}` it, then `build delete` '
-                                    'it before another build of the same commit and arch')
+        raise Refusal('job_exists', f'Job/{name} exists; ' + (hint or
+                      f'`k8s-guard build show {name}` it, then `build delete` it before another build of the same '
+                      'commit and arch'))
     check_job(job, lid, expect, rendered=True)
     confirm_uid(g, ns, view.uid)
     if slot:
         slot.check()
-    check_job(create_job(g, ns, job, dry=True), lid, expect)
+    check_job(create_job(g, ns, job, dry=True, exists_hint=hint), lid, expect)
     confirm_uid(g, ns, view.uid)
     if slot:
         slot.check()
     attempt = job['metadata']['annotations'][ATTEMPT_ANNOTATION]
 
     def send():
-        return create_job(g, ns, job, dry=False, timeout=slot.timeout() if slot else APPLY_REQUEST_TIMEOUT + 15)
+        return create_job(g, ns, job, dry=False, timeout=slot.timeout() if slot else APPLY_REQUEST_TIMEOUT + 15,
+                          exists_hint=hint)
 
     if slot:
         slot.attempts.run(attempt, 'create', 'Job', name, None, None, send)
@@ -2352,17 +2359,21 @@ def submit_job(g, ns, view, lease, slot, job, expect, charge):
     return name
 
 
+def require_git_clone(g, ns, ssh):
+    if ssh and (get_object(g, ns, 'Secret', GIT_SECRET) is None
+                or get_object(g, ns, 'ConfigMap', KNOWN_HOSTS_CONFIGMAP) is None):
+        raise Refusal('secret_unavailable', f'the ssh source needs Secret/{GIT_SECRET} and '
+                                            f'ConfigMap/{KNOWN_HOSTS_CONFIGMAP}; run `k8s-guard -n {ns} secret '
+                                            'git --repo <owner>/<repo>` first')
+
+
 def build_prerequisites(g, ns, lease, ssh):
     if lease is None:
         raise Refusal('lease_required', f'{ns} has no live lease; a build Job runs under this thread\'s claim')
     if lease.get('trial'):
         raise Refusal('trial_build_refused', f'lease {lease["lease_id"]} is a trial claim: the fence is in Audit, so '
                                              'it runs no build, only a 0-GPU mocker')
-    if ssh and (get_object(g, ns, 'Secret', GIT_SECRET) is None
-                or get_object(g, ns, 'ConfigMap', KNOWN_HOSTS_CONFIGMAP) is None):
-        raise Refusal('secret_unavailable', f'the ssh source needs Secret/{GIT_SECRET} and '
-                                            f'ConfigMap/{KNOWN_HOSTS_CONFIGMAP}; run `k8s-guard -n {ns} secret '
-                                            'git --repo <owner>/<repo>` first')
+    require_git_clone(g, ns, ssh)
     if get_object(g, ns, 'Secret', PUSH_SECRET) is None:
         raise Refusal('secret_unavailable', f'the build pushes with Secret/{PUSH_SECRET}; run `k8s-guard -n {ns} '
                                             'secret ngc-push` first')
@@ -2461,6 +2472,92 @@ def cmd_build_delete(g, a):
         return {'deleted': f'Job/{name}', 'namespace': ns}
 
     return fenced(g, view, body)
+
+
+# --- dev Jobs ------------------------------------------------------------------------
+
+def dev_namespace(g):
+    if not g.premade or (g.namespace and g.namespace != g.premade):
+        raise Refusal('premade_required', 'dev Jobs need the pre-made namespace configured for this cluster')
+    return g.ns_name(g.premade)
+
+
+def dev_job_hint(name):
+    return f'use `k8s-guard dev show {name}` to inspect it or `k8s-guard delete job/{name}` to stop it'
+
+
+def cmd_dev_run(g, a):
+    g.require_writable()
+    if not re.fullmatch(r'sha256:[0-9a-f]{64}', a.digest):
+        raise Refusal('usage', '--digest must be sha256:<64 lowercase hex digits>', status=2)
+    repo = repo_arg(a.repo)
+    args = {'repo': repo, 'ssh': repo_is_ssh(repo), 'commit': commit_arg(a.commit), 'image': image_arg(a.image),
+            'image_commit': commit_arg(a.image_commit), 'arch': arch_arg(a.arch, g.profile), 'digest': a.digest}
+    ns, view = g.owned_claimed(dev_namespace(g))
+
+    def body(lease, slot):
+        if lease.get('trial'):
+            raise Refusal('trial_dev_refused', f'lease {lease["lease_id"]} is a trial claim and cannot run a dev Job')
+        require_git_clone(g, ns, args['ssh'])
+        if get_object(g, ns, 'Secret', PULL_SECRET) is None:
+            raise Refusal('secret_unavailable', f'dev run needs Secret/{PULL_SECRET}; run `k8s-guard -n {ns} secret ngc`')
+        lid = lease['lease_id']
+        jobs = labelled(g, ns, 'jobs.batch', lid)
+        if jobs is None:
+            raise Refusal('kubectl_error', f'dev run could not list the Jobs of lease {lid} in {ns}')
+        for job in jobs:
+            if labels_of(job).get(BUILD_LABEL) == 'dev' and job_state(job) in ('pending', 'running'):
+                name = job['metadata']['name']
+                raise Refusal('dev_exists', f'dev Job/{name} is unfinished; {dev_job_hint(name)}')
+        deadline = int((parse_time(lease['expires_at'], 'the lease expiry') - now()).total_seconds())
+        if deadline < 900:
+            raise Refusal('lease_too_short', 'dev run needs at least 900 seconds left on the lease')
+        identity = {'ns': ns, 'uid': view.uid, 'attempt': new_attempt_id()}
+        expect = dict(args, **identity, deadline=deadline)
+        job = dev_job(lease_id=lid, **expect)
+        return {'job': submit_job(g, ns, view, lease, slot, job, dict(expect, kind='dev'), max(int(lease['gpus']), 1))}
+
+    return fenced(g, view, body)
+
+
+def cmd_dev_show(g, a):
+    ns = dev_namespace(g)
+    name = a.name
+    if not DNS_SUBDOMAIN.fullmatch(name) or len(name) > 63:
+        raise Refusal('usage', f'{name!r} is not a Job name', status=2)
+    job = get_object(g, ns, 'Job', name)
+    if job is None:
+        raise Refusal('not_found', f'Job/{name} not found in {ns}')
+    if labels_of(job).get(BUILD_LABEL) != 'dev':
+        raise Refusal('not_dev_job', f'Job/{name} is not a dev Job')
+    spec = job['spec']
+    dev = next((c for c in spec['template']['spec']['containers'] if c.get('name') == 'dev'), {})
+    digest = (dev.get('image') or '').rpartition('@')[2]
+    if not re.fullmatch(r'sha256:[0-9a-f]{64}', digest):
+        raise Refusal('invalid_digest', f'Job/{name} has no pinned dev image digest')
+    state = job_state(job)
+    left = spec['activeDeadlineSeconds']
+    start = (job.get('status') or {}).get('startTime')
+    if start:
+        elapsed = (now() - parse_time(start, 'the Job start time')).total_seconds()
+        left = max(0, min(left, int(left - elapsed)))
+    result = {'job': name, 'state': state, 'digest': digest,
+              'deadline_left_seconds': 0 if state in ('succeeded', 'failed') else left}
+    lid = labels_of(job).get(LEASE_LABEL)
+    uid = job['metadata']['uid']
+    pods = labelled(g, ns, 'pods', lid)
+    if pods is None:
+        raise Refusal('kubectl_error', f'dev show could not list Pods in {ns}')
+    owned = [p for p in pods if any(r.get('controller') is True and r.get('kind') == 'Job' and r.get('uid') == uid
+                                  for r in p['metadata'].get('ownerReferences') or [])]
+    if owned:
+        pod = max(owned, key=lambda p: (p['metadata'].get('deletionTimestamp') is None,
+                                        p['metadata'].get('creationTimestamp', ''), p['metadata']['name']))
+        status = pod.get('status') or {}
+        dev_status = next((c for c in status.get('containerStatuses') or [] if c.get('name') == 'dev'), {})
+        result.update(pod_phase=status.get('phase'), node=(pod.get('spec') or {}).get('nodeName'),
+                      restart_count=dev_status.get('restartCount'))
+    return result
 
 
 # --- the fence commands -------------------------------------------------------------------------------
@@ -2612,6 +2709,10 @@ COMMANDS = {
     ('build', 'index'): (cmd_build_index, ((('--commit',), {'required': True}), (('--image',), {'required': True}))),
     ('build', 'show'): (cmd_build_show, ((('name',), {}),)),
     ('build', 'delete'): (cmd_build_delete, ((('name',), {}),)),
+    ('dev', 'run'): (cmd_dev_run, ((('--repo',), {'required': True}), (('--commit',), {'required': True}),
+                                   (('--image',), {'required': True}), (('--image-commit',), {'required': True}),
+                                   (('--digest',), {'required': True}), (('--arch',), {}))),
+    ('dev', 'show'): (cmd_dev_show, ((('name',), {}),)),
     ('apply',): (cmd_apply, ((('-f', '--filename'), {'required': True}),)),
     ('delete',): (cmd_delete, ((('target',), {}),)),
     ('down',): (cmd_down, TEARDOWN + ((('--fence-retired',), {}),)),

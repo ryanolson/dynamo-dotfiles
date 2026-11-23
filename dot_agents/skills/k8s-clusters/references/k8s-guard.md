@@ -17,6 +17,8 @@ Every command prints one JSON object on stdout. A refusal exits non-zero with `{
 | `-n <ns> build show <job>` | anyone | Read only. Prints the Job's state and the last 200 log lines, with credential-shaped strings redacted. A failed Job exits non-zero with `build_failed`, `tag_exists`, `registry_denied` or `registry_error`. |
 | `-n <ns> build index --commit <40 hex> --image <name>` | the namespace's thread, under its live lease | The manifest-list Job: `crane index append -t ...:<12 hex> -m ...:<12 hex>-amd64 -m ...:<12 hex>-arm64`, then `crane manifest` and `crane digest`. Runs under the still-live amd64 claim. |
 | `-n <ns> build delete <job>` | the namespace's thread, under its live lease | Deletes the Job with `propagationPolicy: Background`, so its Pods go with it. |
+| `-n <premade> dev run --image <name> --image-commit <40 hex> --digest sha256:<64 hex> --repo <url> --commit <40 hex> [--arch <arch>]` | the live claim's thread | Starts one dev Job under the lease fence. Prints `{"job": "<name>"}`. See "Dev Jobs". |
+| `-n <premade> dev show <job>` | anyone | Reads the dev Job's state, pinned image digest and seconds left on its deadline. Reports the Pod's phase, node and restart count when a Pod exists. |
 | `-n <ns> apply -f <file>` | the namespace's thread | Applies DGDs, ConfigMaps and ClusterIP Services, after the checks below. |
 | `-n <ns> delete <kind>/<name>` | the namespace's thread | Deletes one DGD, Job, ConfigMap, Service, Secret, PVC or PodCliqueSet, with its UID and `resourceVersion` as preconditions. A Job's delete carries `propagationPolicy: Background`. An object labelled with another lease is refused (`object_not_yours`); in a claimed namespace, so is one without this lease's label. The lease record, the model cache PVC and the pull secret are refused. Like `apply`, it takes the lease's slot, or needs a namespace that holds no GPUs. |
 | `down <ns> [--uid <uid>] [--lease <id>] [--fence-retired <url>]` | the namespace's thread, or anyone with teardown authority | Releases an active lease first (owner only). Deletes each DGD labelled with the lease being torn down: it reads the DGD again, checks that its UID is still the one the list gave and that its lease label still holds, then deletes it under that listed UID and the `resourceVersion` just read. A DGD that changed in between is left (`dgds_kept`), not deleted. Waits, at most `K8S_GUARD_DOWN_WAIT_SECONDS` (300), for every GPU pod in the namespace to go. Then deletes the namespace with its UID as a precondition, whatever is left, and reports `gpu_pods_left`. A namespace already being deleted gets no second delete (`terminating: true`). With no lease id (no `--lease` and no record) it deletes no DGD and says so in `dgds_skipped`. In a claimed namespace it never deletes the namespace: see "A claimed namespace". `--fence-retired` is exit 2 of "The fence policy". |
@@ -239,6 +241,18 @@ For an ssh `--repo`, the Job projects both into one volume at `/home/user/.ssh`,
 - a pod-template label without the lease (`lease_label_required`);
 - a Job whose output tag is not the commit's `<12 hex>-<arch>`, or does not push (`invalid_tag`);
 - an arch other than the profile's (`arch_mismatch`), a commit that is not 40 hex (`invalid_commit`), an image name it cannot tag (`invalid_image`).
+
+## Dev Jobs
+
+`dev run` needs the pre-made namespace, a live claim with an open fence gate, and at least 900 seconds left on the lease. Trial claims refuse with `trial_dev_refused`. Create `nvcr-pull` with `secret ngc`. For an SSH source, also create `git` and `git-known-hosts` with `secret git`.
+
+The guard pins the image at `nvcr.io/goirlvsxnepa/llm_nim/<image>:<image-commit's first 12 hex>-<arch>@<digest>`. The arch must match the cluster profile. The clone checks out the full `--commit` into `/work/src`, where the dev container runs `/usr/bin/tini -- sleep infinity`. Only the clone mounts the SSH key. The Pod disables service account token automount and uses no GPU or push secret.
+
+The Job and its Pod template carry the lease label and `wcep.agent/build: dev`. The Job name ends with the first six hex digits of the write attempt. Its deadline is the lease time left at launch and stays fixed after a lease extension. Kubernetes may remove the finished Job after 3,600 seconds.
+
+The guard checks the fixed Job template before submission and checks the server's dry-run response. It accepts the listed Kubernetes defaults and refuses other changes to the template. These checks cover the Job's Pod template. The Kubernetes controller creates the Pod in a separate admission request.
+
+An unfinished dev Job under the same lease causes `dev_exists`. Run `dev show <job>` to read its state. To stop it, run `delete job/<job>`. You can relaunch the same commit once its Job finishes. Claimed teardown deletes the lease's dev Jobs and waits for their Pods to leave.
 
 ## Budget
 

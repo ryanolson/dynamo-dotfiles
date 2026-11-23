@@ -4967,6 +4967,211 @@ class FenceCase(ClaimedCase):
         return [b['metadata']['labels']['wcep.agent/fence-probe'] for b in self.k8s.get('probe_bodies', [])]
 
 
+DEV_DIGEST = 'sha256:' + 'a' * 64
+DEV_REPO = 'https://github.com/owner/repo.git'
+
+
+def dev_argv(repo=DEV_REPO):
+    return ['--repo', repo, '--commit', COMMIT, '--image', 'gdl-dev', '--image-commit', COMMIT,
+            '--digest', DEV_DIGEST]
+
+
+class JobAdmissionSplit(unittest.TestCase):
+    def test_dev_job_passes_the_shared_admission(self):
+        code = """
+import k8s_guard_rules as rules
+args = dict(repo={repo!r}, commit={commit!r}, image='gdl-dev', image_commit={commit!r},
+            arch='arm64', digest={digest!r}, ssh=False, deadline=1200)
+job = rules.dev_job({ns!r}, 'uid-test', 'lse_test0001', 'att_12345678901234567890', **args)
+rules.check_job(job, 'lse_test0001', dict(args, kind='dev', ns={ns!r}, uid='uid-test',
+                                        attempt='att_12345678901234567890'), rendered=True)
+""".format(repo=DEV_REPO, commit=COMMIT, digest=DEV_DIGEST, ns=PREMADE)
+        p = subprocess.run(['python3', '-B', '-c', code], cwd=GUARD.parent,
+                           capture_output=True, text=True, timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+
+class DevRun(FenceCase):
+    def dev(self, *args):
+        return '--context', CTX, '-n', PREMADE, 'dev', *args
+
+    def pull_secret(self):
+        self.ok('--context', CTX, '-n', PREMADE, 'secret', 'ngc')
+
+    def launched(self, repo=DEV_REPO):
+        body = self.ok(*self.dev('run', *dev_argv(repo)))
+        return self.k8s['objects'][PREMADE]['Job/' + body['job']]
+
+    def test_claim_and_open_gate_are_required(self):
+        self.refused('namespace_not_claimed', *self.dev('run', *dev_argv()))
+        lid = self.claimed()
+        self.set_gate(lid, 'closing', self.bb['leases'][lid]['claim_seq'])
+        self.refused('fence_not_open', *self.dev('run', *dev_argv()))
+
+    def test_trial_and_missing_secrets_are_refused(self):
+        lid = self.claimed()
+        self.bb['leases'][lid]['trial'] = True
+        self.flush()
+        self.refused('trial_dev_refused', *self.dev('run', *dev_argv()))
+        self.bb['leases'][lid].pop('trial')
+        self.flush()
+        self.refused('secret_unavailable', *self.dev('run', *dev_argv()))
+        self.pull_secret()
+        self.refused('secret_unavailable', *self.dev('run', *dev_argv('git@github.com:owner/repo.git')))
+
+    def test_attempt_name_open_job_refusal_and_same_commit_relaunch(self):
+        lid = self.claimed()
+        self.pull_secret()
+        expires = datetime.fromisoformat(self.bb['leases'][lid]['expires_at'].replace('Z', '+00:00'))
+        before_run = datetime.now(timezone.utc)
+        job = self.launched()
+        after_run = datetime.now(timezone.utc)
+        deadline = job['spec']['activeDeadlineSeconds']
+        self.assertLessEqual(int((expires - after_run).total_seconds()), deadline)
+        self.assertLessEqual(deadline, int((expires - before_run).total_seconds()))
+        name = job['metadata']['name']
+        attempt = job['metadata']['annotations']['wcep.agent/attempt']
+        self.assertEqual(name, f'dev-{TAG}-arm64-{attempt[4:10]}')
+        self.assertEqual(job['metadata']['namespace'], PREMADE)
+        self.assertEqual(job['metadata']['labels'][LEASE_LABEL], lid)
+        self.assertEqual(job['spec']['ttlSecondsAfterFinished'], 3600)
+        self.assertEqual(pod_of(job)['imagePullSecrets'], [{'name': 'nvcr-pull'}])
+        before = len(self.writes())
+        error = self.refused('dev_exists', *self.dev('run', *dev_argv()))['error']
+        self.assertIn(f'dev show {name}', error)
+        self.assertIn(f'delete job/{name}', error)
+        self.assertEqual(len(self.writes()), before)
+        self.k8s['objects'][PREMADE]['Job/' + name]['status'] = {
+            'conditions': [{'type': 'Failed', 'status': 'True'}]}
+        self.flush()
+        def fix_attempt(hex_digits):
+            self.runner.write_text(RUNNER.replace('runpy.run_path(', 'import secrets\n'
+                                                  f'secrets.token_hex = lambda _: {hex_digits!r}\nrunpy.run_path(', 1))
+
+        fix_attempt(attempt.removeprefix('att_'))
+        collision = self.refused('job_exists', *self.dev('run', *dev_argv()))['error']
+        self.assertIn(f'dev show {name}', collision)
+        self.assertIn(f'delete job/{name}', collision)
+        self.assertEqual(len(self.writes()), before)
+        fix_attempt('f' * 20 if attempt[4:10] != 'ffffff' else '0' * 20)
+        self.assertNotEqual(self.launched()['metadata']['name'], name)
+
+    def test_server_defaults_and_ssh_clone(self):
+        self.claimed()
+        self.pull_secret()
+        self.ok('--context', CTX, '-n', PREMADE, 'secret', 'git', '--repo', 'owner/repo')
+        self.k8s['mutate'] = {'Job': {'spec': {
+            'suspend': False, 'parallelism': 1, 'completions': 1, 'completionMode': 'NonIndexed',
+            'manualSelector': False, 'podReplacementPolicy': 'TerminatingOrFailed',
+            'selector': {'matchLabels': {'batch.kubernetes.io/controller-uid': 'dry-run-uid'}},
+            'template': {'metadata': {'creationTimestamp': None, 'labels': {'controller-uid': 'dry-run-uid',
+                                                                            'batch.kubernetes.io/controller-uid':
+                                                                                'dry-run-uid'}},
+                         'spec': {'schedulerName': 'default-scheduler', 'dnsPolicy': 'ClusterFirst'}},
+        }}}
+        self.flush()
+        pod = pod_of(self.launched('git@github.com:owner/repo.git'))
+        clone, = pod['initContainers']
+        main, = pod['containers']
+        self.assertIn('git clone "$REPO" /work/src', clone['command'][-1])
+        self.assertIn('git-ssh', [m['name'] for m in clone['volumeMounts']])
+        self.assertEqual([m['name'] for m in main['volumeMounts']], ['work', 'tmp'])
+        self.assertFalse(pod['automountServiceAccountToken'])
+        self.assertEqual(main['command'], ['/usr/bin/tini', '--', 'sleep', 'infinity'])
+
+    def test_short_lease_is_refused(self):
+        lid = self.claimed()
+        self.pull_secret()
+        self.bb['leases'][lid]['expires_at'] = iso_ms(hours_from_now(0.1))
+        self.flush()
+        self.refused('lease_too_short', *self.dev('run', *dev_argv()))
+
+    def test_job_dry_run_refuses_credential_and_lifecycle_mutations(self):
+        self.claimed()
+        self.pull_secret()
+        job = self.launched()
+        del self.k8s['objects'][PREMADE]['Job/' + job['metadata']['name']]
+        pod = pod_of(job)
+        before = len(self.writes())
+        changes = [
+            {'suspend': True},
+            {'parallelism': 2},
+            {'template': {'metadata': {'labels': {LEASE_LABEL: 'lse_wrong'}}}},
+            {'template': {'metadata': {'labels': {'wcep.agent/build': 'run'}}}},
+            {'template': {'spec': {'nodeName': 'wrong-node'}}},
+            {'template': {'spec': {'imagePullSecrets': [{'name': 'nvcr-push'}]}}},
+            {'template': {'spec': {'containers': pod['containers'] + [{'name': 'extra'}]}}},
+            {'template': {'spec': {'volumes': pod['volumes'] + [
+                {'name': 'push', 'secret': {'secretName': 'nvcr-push'}}]}}},
+            {'template': {'spec': {'automountServiceAccountToken': True}}},
+            {'template': {'spec': {'volumes': pod['volumes'] + [
+                {'name': 'token', 'projected': {'sources': [{'serviceAccountToken': {'path': 'token'}}]}}]}}},
+        ]
+        for extra in [
+            {'envFrom': [{'secretRef': {'name': 'nvcr-push'}}]},
+            {'env': [{'name': 'X', 'valueFrom': {'secretKeyRef': {'name': 'git', 'key': 'id_ed25519'}}}]},
+            {'args': ['bash']},
+            {'command': ['sleep', 'infinity']},
+            {'image': 'nvcr.io/goirlvsxnepa/llm_nim/gdl-dev:latest'},
+            {'image': f'registry.example.test/dev@{DEV_DIGEST}'},
+            {'resources': {'limits': {'nvidia.com/gpu': 1}}},
+            {'resources': {'requests': {'cpu': '8'}, 'limits': {'cpu': '16'}}},
+            {'securityContext': {'allowPrivilegeEscalation': True}},
+            {'securityContext': {'allowPrivilegeEscalation': False, 'capabilities': {'add': ['SYS_ADMIN']}}},
+        ]:
+            changes.append({'template': {'spec': {'containers': [dict(pod['containers'][0], **extra)]}}})
+        for change in changes:
+            with self.subTest(change=change):
+                self.k8s['mutate'] = {'Job': {'spec': change}}
+                self.flush()
+                self.refused('field_refused', *self.dev('run', *dev_argv()))
+                self.assertEqual(len(self.writes()), before)
+
+    def test_show_reports_state_digest_and_its_own_pod(self):
+        lid = self.claimed()
+        self.pull_secret()
+        job = self.launched()
+        name = job['metadata']['name']
+        status = self.ok(*self.dev('show', name))
+        self.assertEqual((status['state'], status['digest']), ('pending', DEV_DIGEST))
+        self.k8s['objects'][PREMADE]['Job/' + name]['status'] = {
+            'active': 1, 'startTime': iso_ms(hours_from_now(-0.1))}
+        for uid in ('wrong-job', job['metadata']['uid']):
+            self.add_pod({'metadata': {'name': f'{name}-{uid}', 'labels': {LEASE_LABEL: lid, 'job-name': name},
+                                       'ownerReferences': [{'kind': 'Job', 'controller': True, 'uid': uid}]},
+                          'spec': {'nodeName': uid}, 'status': {'phase': 'Running',
+                              'containerStatuses': [{'name': 'dev', 'restartCount': 0}]}}, ns=PREMADE)
+        before = len(self.writes())
+        status = self.ok(*self.dev('show', name))
+        self.assertEqual((status['state'], status['pod_phase'], status['node'], status['restart_count']),
+                         ('running', 'Running', job['metadata']['uid'], 0))
+        self.assertLess(status['deadline_left_seconds'], job['spec']['activeDeadlineSeconds'])
+        self.assertEqual(len(self.writes()), before)
+
+    def test_show_refuses_a_missing_or_non_dev_job(self):
+        self.refused('not_found', *self.dev('show', 'missing'))
+        self.add_obj({'apiVersion': 'batch/v1', 'kind': 'Job',
+                      'metadata': {'name': 'a-build', 'labels': {'wcep.agent/build': 'run'}}}, ns=PREMADE)
+        self.refused('not_dev_job', *self.dev('show', 'a-build'))
+
+    def test_claimed_teardown_removes_the_dev_job_and_its_pod(self):
+        lid = self.claimed()
+        self.pull_secret()
+        job = self.launched()
+        name = job['metadata']['name']
+        self.add_pod({'metadata': {'name': f'{name}-pod', 'labels': {LEASE_LABEL: lid, 'job-name': name}},
+                      'spec': {'containers': [container(0)]}, 'status': {'phase': 'Running'}}, ns=PREMADE)
+        self.bb['leases'][lid]['state'] = 'releasing'
+        self.flush()
+        rc, body, _ = self.teardown('down', lid)
+        self.assertEqual(rc, 0, body)
+        self.assertTrue(body['complete'], body)
+        self.assertIn('Job/' + name, body['deleted'])
+        self.assertEqual(self.k8s['pods'][PREMADE], [])
+        [delete] = [d for d in self.k8s['raw_delete_bodies'] if '/jobs/' in d['path']]
+        self.assertEqual(delete['body']['propagationPolicy'], 'Background')
+
+
 class FenceProbe(FenceCase):
     EXPECT = {  # state: (canary, mode, scope, armed)
         'armed': ('finegrained', 'enforcing', 'finegrained', True),

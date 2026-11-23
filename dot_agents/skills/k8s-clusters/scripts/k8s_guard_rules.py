@@ -485,6 +485,7 @@ BUILDKIT_IMAGE = ('mirror.gcr.io/moby/buildkit:v0.23.2-rootless'
 CRANE_IMAGE = ('gcr.io/go-containerregistry/crane/debug:v0.20.3'
                '@sha256:94f61956845714bea3b788445454ae4827f49a90dcd9dac28255c4cccb6220ad')
 PUSH_SECRET = 'nvcr-push'
+PULL_SECRET = 'nvcr-pull'
 GIT_SECRET = 'git'
 KNOWN_HOSTS_CONFIGMAP = 'git-known-hosts'
 # The ed25519 host key GitHub publishes (https://api.github.com/meta, ssh_keys). No accept-new: a
@@ -519,6 +520,9 @@ esac
 
 CLONE_SCRIPT = ('git clone --filter=blob:none "$REPO" /src && cd /src && git checkout "$COMMIT" '
                 '&& test "$(git rev-parse HEAD)" = "$COMMIT"')
+DEV_CLONE_SCRIPT = ('git clone "$REPO" /work/src && cd /work/src && git checkout "$COMMIT" '
+                    '&& test "$(git rev-parse HEAD)" = "$COMMIT"')
+DEV_COMMAND = ['/usr/bin/tini', '--', 'sleep', 'infinity']
 GIT_SSH_COMMAND = ('ssh -i /home/user/.ssh/id_ed25519 -o IdentitiesOnly=yes '
                    '-o UserKnownHostsFile=/home/user/.ssh/known_hosts -o StrictHostKeyChecking=yes')
 
@@ -659,8 +663,20 @@ def _docker_config_mount():
     return {'name': 'docker-config', 'mountPath': '/home/user/.docker', 'readOnly': True}
 
 
-def _template(lease_id, pod):
-    return {'metadata': {'labels': {LEASE_LABEL: lease_id}}, 'spec': pod}
+def _git_ssh_volume():
+    return {'name': 'git-ssh', 'projected': {
+        'defaultMode': 0o400,
+        'sources': [{'secret': {'name': GIT_SECRET,
+                                'items': [{'key': 'id_ed25519', 'path': 'id_ed25519'}]}},
+                    {'configMap': {'name': KNOWN_HOSTS_CONFIGMAP,
+                                   'items': [{'key': 'known_hosts', 'path': 'known_hosts'}]}}]}}
+
+
+def _template(lease_id, pod, kind=None):
+    labels = {LEASE_LABEL: lease_id}
+    if kind:
+        labels[BUILD_LABEL] = kind
+    return {'metadata': {'labels': labels}, 'spec': pod}
 
 
 def build_job(ns, uid, lease_id, attempt, repo, commit, dockerfile, image, arch, ssh):
@@ -672,12 +688,7 @@ def build_job(ns, uid, lease_id, attempt, repo, commit, dockerfile, image, arch,
     clone_mounts = [{'name': 'src', 'mountPath': '/src'}]
     clone_env = [{'name': 'REPO', 'value': repo}, {'name': 'COMMIT', 'value': commit}]
     if ssh:
-        volumes.append({'name': 'git-ssh', 'projected': {
-            'defaultMode': 0o400,
-            'sources': [{'secret': {'name': GIT_SECRET,
-                                    'items': [{'key': 'id_ed25519', 'path': 'id_ed25519'}]}},
-                        {'configMap': {'name': KNOWN_HOSTS_CONFIGMAP,
-                                       'items': [{'key': 'known_hosts', 'path': 'known_hosts'}]}}]}})
+        volumes.append(_git_ssh_volume())
         clone_mounts.append({'name': 'git-ssh', 'mountPath': '/home/user/.ssh', 'readOnly': True})
         clone_env.append({'name': 'GIT_SSH_COMMAND', 'value': GIT_SSH_COMMAND})
     pod = {
@@ -747,6 +758,38 @@ def index_job(ns, uid, lease_id, attempt, image, commit, arch):
             'metadata': _metadata(name, ns, uid, lease_id, 'index', attempt),
             'spec': {'backoffLimit': 0, 'activeDeadlineSeconds': 1800, 'ttlSecondsAfterFinished': 86400,
                      'template': _template(lease_id, pod)}}
+
+
+def dev_job(ns, uid, lease_id, attempt, *, repo, commit, image, image_commit, arch, digest, ssh, deadline):
+    name = f'dev-{commit[:12]}-{arch}-{attempt[4:10]}'
+    security = {'allowPrivilegeEscalation': False, 'capabilities': {'drop': ['ALL']}}
+    volumes = [{'name': 'work', 'emptyDir': {'sizeLimit': '100Gi'}},
+               {'name': 'tmp', 'emptyDir': {'sizeLimit': '20Gi'}}]
+    clone_env = [{'name': 'REPO', 'value': repo}, {'name': 'COMMIT', 'value': commit}]
+    work_mount = {'name': 'work', 'mountPath': '/work'}
+    clone_mounts = [work_mount]
+    if ssh:
+        volumes.append(_git_ssh_volume())
+        clone_mounts.append({'name': 'git-ssh', 'mountPath': '/home/user/.ssh', 'readOnly': True})
+        clone_env.append({'name': 'GIT_SSH_COMMAND', 'value': GIT_SSH_COMMAND})
+    pod = {
+        'restartPolicy': 'Never', 'automountServiceAccountToken': False, 'enableServiceLinks': False,
+        'terminationGracePeriodSeconds': 10, 'imagePullSecrets': [{'name': PULL_SECRET}],
+        'securityContext': {'runAsUser': 1000, 'runAsGroup': 1000, 'fsGroup': 1000, 'runAsNonRoot': True,
+                            'seccompProfile': {'type': 'RuntimeDefault'}},
+        'nodeSelector': {ARCH_LABEL: arch}, 'volumes': volumes,
+        'initContainers': [{'name': 'clone', 'image': BUILDKIT_IMAGE, 'command': ['sh', '-c', DEV_CLONE_SCRIPT],
+                            'env': clone_env, 'volumeMounts': clone_mounts, 'securityContext': {**security},
+                            'resources': resources('1', '2Gi', '40Gi', '2', '4Gi', '80Gi')}],
+        'containers': [{'name': 'dev', 'image': f'{image_ref(image, image_commit, arch)}@{digest}',
+                        'command': list(DEV_COMMAND), 'workingDir': '/work/src', 'securityContext': security,
+                        'volumeMounts': [work_mount, {'name': 'tmp', 'mountPath': '/tmp'}],
+                        'resources': resources('8', '32Gi', '80Gi', '16', '64Gi', '120Gi')}],
+    }
+    return {'apiVersion': 'batch/v1', 'kind': 'Job',
+            'metadata': _metadata(name, ns, uid, lease_id, 'dev', attempt),
+            'spec': {'backoffLimit': 0, 'activeDeadlineSeconds': deadline, 'ttlSecondsAfterFinished': 3600,
+                     'template': _template(lease_id, pod, 'dev')}}
 
 
 def require_job_resources(container, where):
@@ -867,18 +910,89 @@ def check_index_pod(pod, expect):
             raise Refusal('field_refused', 'the index steps read the push credential at /home/user/.docker')
 
 
-def check_job(job, lease_id, expect, rendered=False):
-    """Admit a guard-rendered Job. The strict field allowlists run on our own template (`rendered`); the
-    checks that matter run on the server dry run's answer, so a webhook cannot add a way out."""
+def _check_job_identity(job, lease_id, kind):
     where = f'{job.get("kind")}/{((job.get("metadata") or {}).get("name"))}'
     if job.get('apiVersion') != 'batch/v1' or job.get('kind') != 'Job':
         raise Refusal('kind_refused', f'{where} is not a batch/v1 Job')
-    meta = job.get('metadata') or {}
-    labels = meta.get('labels') or {}
+    labels = (job.get('metadata') or {}).get('labels') or {}
     if labels.get(LEASE_LABEL) != lease_id:
         raise Refusal('lease_label_required', f'{where}: every object needs the label {LEASE_LABEL}={lease_id}')
-    if labels.get(BUILD_LABEL) != expect['kind']:
-        raise Refusal('field_refused', f'{where}: {BUILD_LABEL} must be {expect["kind"]}')
+    if labels.get(BUILD_LABEL) != kind:
+        raise Refusal('field_refused', f'{where}: {BUILD_LABEL} must be {kind}')
+    return where
+
+
+def _allow_defaults(actual, expected, defaults):
+    expected.update({key: value for key, value in defaults.items() if key in actual})
+
+
+def _dev_job_defaults(job, expected):
+    """Allow Kubernetes Job strategy, selector and Pod template defaults on the dry run."""
+    spec, want = job['spec'], expected['spec']
+    template, want_template = spec['template'], want['template']
+    pod, want_pod = template['spec'], want_template['spec']
+    _allow_defaults(spec, want, {'suspend': False, 'parallelism': 1, 'completions': 1,
+                                'completionMode': 'NonIndexed', 'manualSelector': False,
+                                'podReplacementPolicy': 'TerminatingOrFailed'})
+    job_uid = job['metadata'].get('uid')
+    if job_uid:
+        _allow_defaults(spec, want, {'selector': {'matchLabels': {'batch.kubernetes.io/controller-uid': job_uid}}})
+        labels = {'batch.kubernetes.io/controller-uid': job_uid, 'controller-uid': job_uid,
+                  'batch.kubernetes.io/job-name': job['metadata']['name'], 'job-name': job['metadata']['name']}
+        _allow_defaults(template['metadata']['labels'], want_template['metadata']['labels'], labels)
+    _allow_defaults(job['metadata'], expected['metadata'], {
+        'uid': job_uid, 'resourceVersion': job['metadata'].get('resourceVersion'),
+        'generation': job['metadata'].get('generation'), 'creationTimestamp': job['metadata'].get('creationTimestamp'),
+        'managedFields': job['metadata'].get('managedFields')})
+    _allow_defaults(template['metadata'], want_template['metadata'], {'creationTimestamp': None})
+    _allow_defaults(pod, want_pod, {'schedulerName': 'default-scheduler', 'dnsPolicy': 'ClusterFirst'})
+    for group in ('containers', 'initContainers'):
+        for actual, wanted in zip(pod[group], want_pod[group]):
+            _allow_defaults(actual, wanted, {'terminationMessagePath': '/dev/termination-log',
+                                             'terminationMessagePolicy': 'File', 'imagePullPolicy': 'IfNotPresent'})
+            _allow_defaults(actual.get('securityContext') or {}, wanted['securityContext'], {
+                'privileged': False, 'readOnlyRootFilesystem': False,
+                'seccompProfile': {'type': 'RuntimeDefault'}})
+
+
+def _check_dev_fields(actual, expected, where):
+    if type(actual) is type(expected):
+        if isinstance(expected, dict):
+            different = sorted(actual.keys() ^ expected.keys())
+            if different:
+                raise Refusal('field_refused', f'{where} has missing or unexpected fields: {", ".join(different)}')
+            for key, value in expected.items():
+                _check_dev_fields(actual[key], value, f'{where}.{key}')
+            return
+        if isinstance(expected, list) and len(actual) == len(expected):
+            for i, (got, want) in enumerate(zip(actual, expected)):
+                _check_dev_fields(got, want, f'{where}[{i}]')
+            return
+        if actual == expected:
+            return
+    raise Refusal('field_refused', f'{where} differs from the fixed dev Job template')
+
+
+def check_dev_job(job, lease_id, expect, rendered=False):
+    where = _check_job_identity(job, lease_id, 'dev')
+    args = {key: value for key, value in expect.items() if key != 'kind'}
+    expected = dev_job(lease_id=lease_id, **args)
+    try:
+        pod = job['spec']['template']['spec']
+        walk_forbidden(pod, where + '.spec.template.spec', allow_default_scheduler=not rendered)
+        if not rendered:
+            _dev_job_defaults(job, expected)
+    except (AttributeError, KeyError, TypeError):
+        raise Refusal('field_refused', f'{where} has a malformed dev Job template')
+    for key in ('metadata', 'spec'):
+        _check_dev_fields(job[key], expected[key], f'{where}.{key}')
+
+
+def check_job(job, lease_id, expect, rendered=False):
+    """Admit a guard-rendered Job and check the server's dry-run response."""
+    if expect['kind'] == 'dev':
+        return check_dev_job(job, lease_id, expect, rendered)
+    where = _check_job_identity(job, lease_id, expect['kind'])
     spec = job.get('spec') or {}
     if rendered:
         check_keys(spec, JOB_SPEC, where + '.spec')
