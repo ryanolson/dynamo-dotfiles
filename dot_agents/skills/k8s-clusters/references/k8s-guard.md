@@ -352,6 +352,7 @@ The tests use fakes. The first run on a cluster must confirm these, and run `sel
 
 ```bash
 timeout 600 python3 test/test-k8s-guard.py </dev/null
+timeout 120 python3 test/test-k8s-first-build.py </dev/null
 KYVERNO_CLI=~/.local/bin/kyverno timeout 300 python3 test/test-k8s-fence.py </dev/null   # Kyverno CLI v1.15.2
 timeout 2400 bash test/kind-fence.sh </dev/null   # the dev host only: kind, helm and the chart images
 ```

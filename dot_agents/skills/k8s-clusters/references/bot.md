@@ -88,7 +88,11 @@ The bot cannot read the cluster's webhook configuration, so the probe cannot see
 
 ## Images
 
-Images go to the owner's NGC organisation on `nvcr.io`, tagged with the source commit, never `latest`. Log in with a throwaway `DOCKER_CONFIG` fed by `fleet secret get`, and delete it after the push. Pull with a pull secret made by `k8s-guard secret ngc`. The runbook's section "Images" has the steps and the open items.
+Build images with `k8s-guard build run` in the pre-made namespace under a claim. Use native arm64 and amd64 builds. Publish the index with `build index` under the amd64 claim. Tag images with the source commit. Never use `latest`. The runbook's Images section gives the first-run checks, timing records and teardown.
+
+For a private clone, `secret git --repo <owner>/<repo>` reads `op://Fleet/<owner>-<repo> deploy key/private key`. The item holds a read-only key in OpenSSH format. `secret ngc` makes `nvcr-pull` from `op://Fleet/NGC Pull Key/credential`. A missing pull key returns `secret_unavailable`.
+
+The build uses `nvcr-push`. Use `secret ngc-push --exposure-accepted` only after the owner records approval of the PAT exposure. The guard removes the build Secret during claim teardown.
 
 ## When something fails
 

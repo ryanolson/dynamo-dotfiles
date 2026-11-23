@@ -104,7 +104,7 @@ After a change to the rules or the script, run the mutation check too. It breaks
 timeout 1500 python3 test/k8s-sweep-mutations.py </dev/null
 ```
 
-The tests run the rules on made-up JSON, and run the script against the fakes of `test-k8s-guard.py`, with the real guard for `--enforce`. They render the units with chezmoi. Run the guard's suite too after a change to the shared fakes. Use the system `python3`: the profile renderer needs `os.memfd_create`, which uv's managed Python 3.14 lacks.
+The tests run the rules on made-up JSON, and run the script against the fakes of `test-k8s-guard.py`, with the real guard for `--enforce`. They render the units with chezmoi. After a change to the shared fakes, also run `test-k8s-guard.py` and `test-k8s-first-build.py`. Use the system `python3`: the profile renderer needs `os.memfd_create`, which uv's managed Python 3.14 lacks.
 
 ## Not proven without a cluster
 

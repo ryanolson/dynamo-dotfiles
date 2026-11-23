@@ -569,6 +569,7 @@ timeout 60 python3 test/test-k8s-render.py </dev/null
 
 ```bash
 timeout 600 python3 test/test-k8s-guard.py </dev/null
+timeout 120 python3 test/test-k8s-first-build.py </dev/null
 KYVERNO_CLI=~/.local/bin/kyverno timeout 300 python3 test/test-k8s-fence.py </dev/null
 timeout 2400 bash test/kind-fence.sh </dev/null
 ```
