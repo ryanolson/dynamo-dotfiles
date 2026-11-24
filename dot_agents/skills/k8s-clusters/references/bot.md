@@ -188,7 +188,7 @@ kubectl --kubeconfig "${SMOKE_KUBECONFIG:?set the ServiceAccount kubeconfig}" \
   --context aks-smoke -n "${SMOKE_NAMESPACE:?set the pre-made AKS namespace}" get job gdl-build-smoke -o yaml
 ```
 
-Require `Complete=True`, `buildkit-smoke-ok`, and `containerimage.digest`. Remove the launcher kubeconfig when done.
+Require `Complete=True`, `buildkit-smoke-ok`, and `containerimage.digest`. Remove the launcher kubeconfig when done. Keep the smoke ServiceAccounts, Role and RoleBinding installed for later runs.
 
 If the token expires, a new request returns `Unauthorized`. Stop polling and record the smoke run as failed to verify. The Job can continue until its 600-second deadline, with a retry budget of zero.
 
