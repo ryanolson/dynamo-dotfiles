@@ -1,0 +1,61 @@
+# The perf calibration Job: one Pod, Guaranteed QoS, a single node, the paired script.
+#
+# Fill the three marked values before the run:
+#   <node>                   the node to pin to (the booked window's node)
+#   <image>@sha256:<digest>  the x86 dev image, pinned
+#   <paired script>          the gb300 paired script's invocation, same build
+#
+# Run in a booked window (no GPU, no kind):
+#   kubectl -n dyntest-rolson-agent apply -f perf/calibration-job.yaml
+#   kubectl -n dyntest-rolson-agent logs -f job/perf-calibration
+#
+# The log holds:
+#   - /proc/stat before and after  -> the VM's steal (the hypervisor), not a neighbour
+#   - /sys/fs/cgroup/cpu.stat before and after -> the CFS throttling (nr_throttled,
+#     throttled_usec), the neighbours
+#   - cpuset.cpus.effective -> if it is the node's full CPU set, the pool is
+#     cpuManagerPolicy=none and the number is a lower bound; if it is 24 CPUs, the
+#     pool is static and the cores are exclusive
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: perf-calibration
+  namespace: dyntest-rolson-agent
+  labels:
+    app: perf-calibration
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 7200
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: perf-calibration
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/hostname: <node>
+      containers:
+        - name: perf
+          image: <image>@sha256:<digest>
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-euo", "pipefail", "-c"]
+          args:
+            - |
+              echo "== cpuset: $(cat /sys/fs/cgroup/cpuset.cpus.effective)"
+              echo "== before /proc/stat"; cat /proc/stat
+              echo "== before cpu.stat"; cat /sys/fs/cgroup/cpu.stat
+              echo "== run"
+              <paired script>
+              echo "== after /proc/stat"; cat /proc/stat
+              echo "== after cpu.stat"; cat /sys/fs/cgroup/cpu.stat
+              echo "== cpuset: $(cat /sys/fs/cgroup/cpuset.cpus.effective)"
+              echo "== image: <image>@sha256:<digest>"
+          resources:
+            requests:
+              cpu: "24"
+              memory: "48Gi"
+            limits:
+              cpu: "24"
+              memory: "48Gi"
