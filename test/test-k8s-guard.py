@@ -5005,6 +5005,32 @@ class UnfencedGpuSpend(GuardCase):
         self.assertEqual(body['code'], 'gpu_spend_deadline_invalid', body)
         self.assertEqual(self.writes(), [])
 
+    def test_spend_deadline_is_rechecked_after_the_dry_run(self):
+        start = '2026-01-01T00:00:00Z'
+        self.runner.write_text(RUNNER.replace("runpy.run_path(sys.argv[0], run_name='__main__')", f'''
+from datetime import datetime, timedelta
+from pathlib import Path
+guard = runpy.run_path(sys.argv[0])
+Guard = guard['Guard']
+get_namespace = Guard.get_namespace
+clock = datetime.fromisoformat({start!r}.replace('Z', '+00:00'))
+def read_namespace(self, name):
+    global clock
+    ns = get_namespace(self, name)
+    if '--dry-run=server' in Path(os.environ['FAKE_KUBECTL_LOG']).read_text():
+        clock += timedelta(minutes=15)
+    return ns
+Guard.get_namespace = read_namespace
+guard['main'].__globals__['now'] = lambda: clock
+sys.exit(guard['main']())
+''', 1))
+        rc, body, _ = self.apply(spend_job(namespace=PREMADE, recorded=True, start=start), ns=PREMADE)
+        self.assertEqual(rc, 1, body)
+        self.assertEqual(body.get('code'), 'gpu_spend_deadline_invalid', body)
+        self.assertIn('at most 900 seconds', body['error'])
+        self.assertEqual([c['flags'].get('--dry-run') for c in self.kubectl_calls()
+                          if c['pos'][:1] == ['create']], ['server'])
+
 
 class FenceCase(ClaimedCase):
     """The pre-made namespace enrolled in the fence (ops set the label), with the fence armed by default."""
