@@ -4985,6 +4985,7 @@ class UnfencedGpuSpend(GuardCase):
             ('gpu_spend_not_started', iso_ms(hours_from_now(1)), 1200),
             ('gpu_spend_deadline_invalid', None, None),
             ('gpu_spend_deadline_invalid', None, 1801),
+            ('gpu_spend_deadline_invalid', iso_ms(hours_from_now(-0.48)), 1200),
         ]
         for i, (code, start, deadline) in enumerate(cases):
             with self.subTest(code=code, deadline=deadline):

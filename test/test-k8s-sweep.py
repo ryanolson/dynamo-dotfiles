@@ -707,6 +707,18 @@ class Report(SweepCase):
         no_deadline = G.spend_job('no-deadline', namespace=premade, recorded=True)
         del no_deadline['spec']['activeDeadlineSeconds']
         self.add_obj(no_deadline, ns=premade, stamp=False)
+        start = G.iso_ms(G.hours_from_now(-0.4))
+        late = G.spend_job('late-start', namespace=premade, recorded=True, start=start)
+        late['status'] = {'startTime': G.iso_ms(G.hours_from_now(-0.05))}
+        self.add_obj(late, ns=premade, stamp=False)
+        early = G.spend_job('early-start', namespace=premade, recorded=True, start=start)
+        early['status'] = {'startTime': start}
+        self.add_obj(early, ns=premade, stamp=False)
+        pending = G.spend_job('late-pending', namespace=premade, recorded=True, start=start)
+        self.add_obj(pending, ns=premade, stamp=False)
+        active = dict(json.loads(early['metadata']['annotations']['wcep.agent/gpu-spend']), gpus=2)
+        self.add_pod(gpu_pod(dgd=None, name='recorded-direct',
+                             annotations={'wcep.agent/gpu-spend': json.dumps(active)}), ns=premade)
         annotations = expired['metadata']['annotations']
         child = gpu_pod(dgd=None, name='expired-pod')
         child['metadata']['ownerReferences'] = [
@@ -726,7 +738,10 @@ class Report(SweepCase):
         self.assertEqual(flags, {('Job/expired', 'gpu_spend_expired'), ('Pod/expired-pod', 'gpu_spend_expired'),
                                  ('Pod/expired-direct', 'gpu_spend_expired'), ('Job/over', 'gpu_spend_over_count'),
                                  ('Pod/bad-thread', 'gpu_spend_invalid'),
-                                 ('Job/no-deadline', 'gpu_spend_deadline_invalid')})
+                                 ('Pod/recorded-direct', 'gpu_spend_job_required'),
+                                 ('Job/no-deadline', 'gpu_spend_deadline_invalid'),
+                                 ('Job/late-start', 'gpu_spend_deadline_invalid'),
+                                 ('Job/late-pending', 'gpu_spend_deadline_invalid')})
         over = next(f for f in body['flags'] if f['kind'] == 'gpu_spend_over_count')
         self.assertEqual((over['gpus'], over['recorded_gpus']), (6, 4))
 

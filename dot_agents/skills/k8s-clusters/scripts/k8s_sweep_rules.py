@@ -93,16 +93,17 @@ def audit_gpu_spend(cluster, namespace, jobs, pods, now):
             except Refusal as e:
                 flags.append(flag(e.code, namespace, str(e), object=where, gpus=gpus))
                 continue
-            records.append({'object': where, **record})
-            if kind == 'Job' and meta.get('uid'):
-                recorded_jobs[meta['uid'], name] = record, start, end
-            if kind == 'Pod':
-                covered_pods.add(name)
+            if kind == 'Job':
+                records.append({'object': where, **record})
+                if meta.get('uid'):
+                    recorded_jobs[meta['uid'], name] = record, start, end
             try:
                 if not finished:
                     check_spend_window(where, start, end, now)
-                if kind == 'Job':
-                    check_spend_deadline(obj, where, record['max_hours'])
+                if kind == 'Pod':
+                    raise Refusal('gpu_spend_job_required', f'{where} must run under a Job with a GPU spend record.')
+                started = parse_time((obj.get('status') or {}).get('startTime'))
+                check_spend_deadline(obj, where, end, started or (start if finished else now))
             except Refusal as e:
                 flags.append(flag(e.code, namespace, str(e), object=where, gpus=gpus))
     for job_key, gpus in job_holds.items():

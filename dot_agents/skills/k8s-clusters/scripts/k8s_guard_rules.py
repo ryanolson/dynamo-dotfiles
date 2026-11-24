@@ -172,11 +172,12 @@ def check_spend_window(where, start, end, now):
         raise Refusal('gpu_spend_not_started', f'{where} has a GPU spend window that starts at {start.isoformat()}.')
 
 
-def check_spend_deadline(job, where, hours):
+def check_spend_deadline(job, where, end, starts_at):
     deadline = (job.get('spec') or {}).get('activeDeadlineSeconds')
-    if type(deadline) is not int or not 0 < deadline <= hours * 3600:
+    remaining = max(0, int((end - starts_at).total_seconds()))
+    if type(deadline) is not int or not 0 < deadline <= remaining:
         raise Refusal('gpu_spend_deadline_invalid', f'{where} needs a positive activeDeadlineSeconds at most '
-                      f'{int(hours * 3600)} for its GPU spend window.')
+                      f'{remaining} seconds to fit its GPU spend window.')
 
 
 def nodes_of(c, where):

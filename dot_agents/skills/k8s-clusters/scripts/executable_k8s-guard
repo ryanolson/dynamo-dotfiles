@@ -1510,8 +1510,9 @@ def apply_spend_job(g, ns, uid, job):
         if not gpus:
             raise Refusal('kind_refused', f'{where} must request GPUs to use the spend record path')
         record, start, end = gpu_spend(obj, where, gpus, g.cluster, ns, thread)
-        check_spend_window(where, start, end, now())
-        check_spend_deadline(obj, where, record['max_hours'])
+        checked_at = now()
+        check_spend_window(where, start, end, checked_at)
+        check_spend_deadline(obj, where, end, checked_at)
         if carries_probe_label(obj):
             raise Refusal('fence_probe_label_refused', f'{where} carries the reserved label {fence.PROBE_LABEL}')
         if spec.get('manualSelector') or spec.get('managedBy') not in (None, 'kubernetes.io/job-controller'):
@@ -1532,7 +1533,10 @@ def apply_spend_job(g, ns, uid, job):
     if ((current.get('metadata') or {}).get('uid') != uid or labels.get(FENCE_LABEL) == 'true'
             or labels.get(DEVELOPER_LABEL) != g.bot['developer'] or labels.get(AGENT_RBAC_LABEL) != 'true'):
         raise Refusal('namespace_changed', f'{ns} changed or was enrolled in the lease fence during the dry run')
-    check_spend_window(where, start, end, now())
+    checked_at = now()
+    check_spend_window(where, start, end, checked_at)
+    for obj in (job, dry):
+        check_spend_deadline(obj, where, end, checked_at)
     create_job(g, ns, job, dry=False, exists_hint=hint)
     g.record(ns, where, record['gpus'], 'up', uid=uid, gpu_spend=record)
     return {'applied': [where], 'namespace': ns, 'gpu_spend': record}

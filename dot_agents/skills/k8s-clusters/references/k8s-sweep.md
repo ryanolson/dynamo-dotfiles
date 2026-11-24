@@ -24,7 +24,7 @@ It also reads `bb k8s leases --all --json`, the host ledger (`${XDG_STATE_HOME:-
 For each namespace it reports the age, `wcep.agent/thread`, the expiry, the GPUs, the age of the oldest pod, and how many pods carry `gpu-reaper.nvidia.com/state: warned` (as a label or an annotation).
 
 - **GPUs** are the guard's allocation (`k8s_guard_rules.allocation`): for each DGD, the larger of its spec and its live pods, plus GPU pods that no DGD owns. Terminating pods count; finished pods do not.
-- **GPU spend** lists the [records](k8s-guard.md#gpu-spend-without-a-lease-fence) found on Jobs and Pods in the pre-made namespace without fence enrollment. The sweep matches a Job's Pods by controller UID and name and sums the GPUs of its unfinished Pods. It includes covered Pods in the GPU total and excludes them from the lease and orphan checks.
+- **GPU spend** lists the [records](k8s-guard.md#gpu-spend-without-a-lease-fence) found on Jobs in the pre-made namespace without fence enrollment. The sweep matches a Job's Pods by controller UID and name and sums the GPUs of its unfinished Pods. It includes covered Pods in the GPU total and excludes them from the lease and orphan checks.
 - **The expiry** is the guard's (`NsView.expires_at`): the record's `expires_at` when the record's `uid` is this namespace's, otherwise the creation annotation `wcep.agent/expires-at`. The pre-made namespace has none. The sweep does not wait for the later of the two, by the owner's ruling: a namespace whose lease has ended can be reclaimed even while its annotation still reads live, and the annotation is only the fallback for a namespace with no record for its UID.
 
 ## Flags
@@ -36,7 +36,8 @@ For each namespace it reports the age, `wcep.agent/thread`, the expiry, the GPUs
 | `gpu_pod_no_dgd` | A GPU pod whose `nvidia.com/dynamo-graph-deployment-name` label is missing or names a DGD that is not in the namespace. |
 | `gpu_spend_required` | A GPU Job or Pod needs a spend record. |
 | `gpu_spend_invalid` | A GPU Job or Pod has a spend record with invalid fields. |
-| `gpu_spend_deadline_invalid` | A GPU Job lacks a deadline within its recorded duration. |
+| `gpu_spend_deadline_invalid` | A GPU Job lacks a deadline, or the deadline extends past the spend window from the Job's start time. For a pending Job, the sweep uses the current time. |
+| `gpu_spend_job_required` | A standalone GPU Pod carries a record and needs to run under a Job. |
 | `gpu_spend_not_started` | An unfinished GPU Job or Pod is present before its window starts. |
 | `gpu_spend_expired` | A GPU Job or Pod is unfinished after its recorded window ends. |
 | `gpu_spend_over_count` | A Job's unfinished Pods request more GPUs than the Job's spend record. |

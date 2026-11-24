@@ -37,7 +37,7 @@ The commands for the namespace's thread (`lease acquire`, `secret`, `apply`, `de
 
 ## GPU spend without a lease fence
 
-For an approved GPU run in the profile's pre-made namespace, put the spend record in the Job manifest under `metadata.annotations`. The record stays on the Job. Use the same annotation on a standalone GPU Pod submitted through the runbook's RBAC path.
+For an approved GPU run in the profile's pre-made namespace, put the spend record in the Job manifest under `metadata.annotations`. The record stays on the Job.
 
 ```yaml
 metadata:
@@ -46,10 +46,19 @@ metadata:
       {"thread":"thr_example","gpus":4,"start":"2026-11-24T16:00:00Z","max_hours":0.5,
       "cluster":"lab-x86-qa","namespace":"dyntest-alice-agent"}
 spec:
-  activeDeadlineSeconds: 1800
+  activeDeadlineSeconds: 1200
+  template:
+    spec:
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-A100-SXM4-80GB
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
 ```
 
-Use the submitting BB thread ID, the cluster profile name, and the target namespace. Count GPU resources per Pod times Job parallelism, with a minimum of one Pod for a suspended Job. Set the RFC 3339 start time with a time zone. Set `max_hours` above zero and at most four hours. Set the Job's deadline to a positive whole number of seconds within that duration. For a standalone Pod, record its own GPU count.
+Use the submitting BB thread ID, the cluster profile name, and the target namespace. Set `gpus` to the number of requested devices per Pod times Job parallelism, with a minimum of one Pod for a suspended Job. Select full A100s or MIG slices with `nvidia.com/gpu.product` in the Pod template's `nodeSelector`. Set the RFC 3339 start time with a time zone. Set `max_hours` above zero and at most four hours. Set the Job's deadline to a positive whole number of seconds that fits in the time left in its window.
 
 Pass one `batch/v1` Job to `k8s-guard --context <ctx> -n <premade> apply -f <file>` during the recorded window. The guard uses this path when the namespace lacks `dynamo.nvidia.com/agent-lease-fence: "true"`. It checks the record and deadline before the first create request and checks the server dry run. Pick a new name for each run. The sweep checks the record, deadline, window and total live Pod GPUs, including for workloads submitted through the RBAC path.
 
