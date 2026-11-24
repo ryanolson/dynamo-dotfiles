@@ -60,6 +60,7 @@ from k8s_guard_rules import (  # noqa: E402
     ATTEMPT_ANNOTATION, BUILD_LABEL, DGD_KIND, GIT_SECRET, GITHUB_KNOWN_HOSTS, HOSTNAME_TOPOLOGY, KNOWN_HOSTS_CONFIGMAP,
     LABEL_VALUE, LEASE_LABEL, LEASE_RECORD, NS_UID_LABEL, PULL_SECRET, PUSH_SECRET, Refusal, admit, allocation, arch_arg,
     budget_allocation, build_job, build_verdict, check_gpu_product, check_job, check_lease_label, check_one_node,
+    check_spend_deadline, check_spend_window,
     commit_arg, dev_job, dgd_gpus, dockerfile_arg, git_secret_spec, gpu_pod_summary, gpu_spend, image_arg, index_job,
     job_gpus, job_state, redact_build_log, repo_arg, repo_is_ssh, walk_forbidden, zero_patch, components)
 import k8s_fence_rules as fence  # noqa: E402
@@ -1508,27 +1509,30 @@ def apply_spend_job(g, ns, uid, job):
         gpus = job_gpus(obj, where)
         if not gpus:
             raise Refusal('kind_refused', f'{where} must request GPUs to use the spend record path')
-        record = gpu_spend(obj, where, gpus, g.cluster, ns, thread)
+        record, start, end = gpu_spend(obj, where, gpus, g.cluster, ns, thread)
+        check_spend_window(where, start, end, now())
+        check_spend_deadline(obj, where, record['max_hours'])
         if carries_probe_label(obj):
             raise Refusal('fence_probe_label_refused', f'{where} carries the reserved label {fence.PROBE_LABEL}')
         if spec.get('manualSelector') or spec.get('managedBy') not in (None, 'kubernetes.io/job-controller'):
             raise Refusal('field_refused', f'{where} must use the Kubernetes Job controller and its default selector')
         walk_forbidden(spec, where + '.spec', allow_default_scheduler=dry)
-        return record
+        return record, start, end
 
-    record = check(job)
+    record, start, end = check(job)
     dry = create_job(g, ns, job, dry=True, exists_hint=hint)
     dry_meta = dry.get('metadata') or {}
     if (dry.get('apiVersion'), dry.get('kind'), dry_meta.get('name'), dry_meta.get('namespace')) != (
             'batch/v1', 'Job', name, ns):
         raise Refusal('kind_refused', f'the dry run changed the identity of {where}')
-    if check(dry, dry=True) != record:
+    if check(dry, dry=True)[0] != record:
         raise Refusal('gpu_spend_invalid', f'the dry run changed the GPU spend record for {where}')
     current = g.get_namespace(ns)
     labels = labels_of(current)
     if ((current.get('metadata') or {}).get('uid') != uid or labels.get(FENCE_LABEL) == 'true'
             or labels.get(DEVELOPER_LABEL) != g.bot['developer'] or labels.get(AGENT_RBAC_LABEL) != 'true'):
         raise Refusal('namespace_changed', f'{ns} changed or was enrolled in the lease fence during the dry run')
+    check_spend_window(where, start, end, now())
     create_job(g, ns, job, dry=False, exists_hint=hint)
     g.record(ns, where, record['gpus'], 'up', uid=uid, gpu_spend=record)
     return {'applied': [where], 'namespace': ns, 'gpu_spend': record}

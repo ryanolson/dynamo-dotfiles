@@ -3,15 +3,15 @@
 Pure functions over the JSON a server-side dry run returns and over listed pods. No I/O, so every rule
 is checkable without a cluster. Standard library only.
 """
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
-import math
 import posixpath
 import re
 import shlex
 
 GPU = 'nvidia.com/gpu'
 GPU_SPEND_ANNOTATION = 'wcep.agent/gpu-spend'
+MAX_SPEND_HOURS = 4
 LABEL_VALUE = re.compile(r'^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$')
 ARCH_LABEL = 'kubernetes.io/arch'
 DGD_KIND = 'DynamoGraphDeployment'
@@ -143,7 +143,8 @@ def gpu_spend(obj, where, gpus, cluster, namespace, thread=None):
         if record[key] != expected or (key == 'gpus' and type(record[key]) is not int):
             raise Refusal('gpu_spend_invalid', f'{problem}. Set {key} to {expected}.')
     owner = record['thread']
-    if not isinstance(owner, str) or not LABEL_VALUE.fullmatch(owner) or (thread is not None and owner != thread):
+    if (not isinstance(owner, str) or not owner.startswith('thr_') or not LABEL_VALUE.fullmatch(owner)
+            or (thread is not None and owner != thread)):
         raise Refusal('gpu_spend_invalid', f'{problem}. Set thread to the submitting BB thread ID.')
     start = record['start']
     if isinstance(start, str) and re.fullmatch(
@@ -155,9 +156,27 @@ def gpu_spend(obj, where, gpus, cluster, namespace, thread=None):
     if not isinstance(start, datetime):
         raise Refusal('gpu_spend_invalid', f'{problem}. Set start to an RFC 3339 timestamp with a time zone.')
     hours = record['max_hours']
-    if type(hours) not in (int, float) or hours <= 0 or (isinstance(hours, float) and not math.isfinite(hours)):
-        raise Refusal('gpu_spend_invalid', f'{problem}. Set max_hours to a positive finite number.')
-    return {key: record[key] for key in fields}
+    if type(hours) not in (int, float) or not 0 < hours <= MAX_SPEND_HOURS:
+        raise Refusal('gpu_spend_invalid', f'{problem}. Set max_hours above 0 and at most {MAX_SPEND_HOURS}.')
+    try:
+        end = start + timedelta(hours=hours)
+    except OverflowError:
+        raise Refusal('gpu_spend_invalid', f'{problem}. The window ends outside the timestamp range.')
+    return {key: record[key] for key in fields}, start, end
+
+
+def check_spend_window(where, start, end, now):
+    if now >= end:
+        raise Refusal('gpu_spend_expired', f'{where} has a GPU spend window that ended at {end.isoformat()}.')
+    if now < start:
+        raise Refusal('gpu_spend_not_started', f'{where} has a GPU spend window that starts at {start.isoformat()}.')
+
+
+def check_spend_deadline(job, where, hours):
+    deadline = (job.get('spec') or {}).get('activeDeadlineSeconds')
+    if type(deadline) is not int or not 0 < deadline <= hours * 3600:
+        raise Refusal('gpu_spend_deadline_invalid', f'{where} needs a positive activeDeadlineSeconds at most '
+                      f'{int(hours * 3600)} for its GPU spend window.')
 
 
 def nodes_of(c, where):

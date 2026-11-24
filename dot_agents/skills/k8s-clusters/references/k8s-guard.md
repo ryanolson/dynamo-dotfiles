@@ -45,11 +45,13 @@ metadata:
     wcep.agent/gpu-spend: >-
       {"thread":"thr_example","gpus":4,"start":"2026-11-24T16:00:00Z","max_hours":0.5,
       "cluster":"lab-x86-qa","namespace":"dyntest-alice-agent"}
+spec:
+  activeDeadlineSeconds: 1800
 ```
 
-Use the submitting BB thread ID, the cluster profile name, and the target namespace. Count GPU resources per Pod times Job parallelism, with a minimum of one Pod for a suspended Job. Use an RFC 3339 start time with a time zone and a positive number of hours for the maximum intended window. For a standalone Pod, record its own GPU count. The record captures planned spend.
+Use the submitting BB thread ID, the cluster profile name, and the target namespace. Count GPU resources per Pod times Job parallelism, with a minimum of one Pod for a suspended Job. Set the RFC 3339 start time with a time zone. Set `max_hours` above zero and at most four hours. Set the Job's deadline to a positive whole number of seconds within that duration. For a standalone Pod, record its own GPU count.
 
-Pass one `batch/v1` Job to `k8s-guard --context <ctx> -n <premade> apply -f <file>`. The guard uses this path when the namespace lacks `dynamo.nvidia.com/agent-lease-fence: "true"`. It checks the record before the first create request, checks it again on the server dry run, and creates the Job under its manifest name. Pick a new name for each run. The sweep reports the records and flags missing or invalid ones, including on workloads submitted through the RBAC path.
+Pass one `batch/v1` Job to `k8s-guard --context <ctx> -n <premade> apply -f <file>` during the recorded window. The guard uses this path when the namespace lacks `dynamo.nvidia.com/agent-lease-fence: "true"`. It checks the record and deadline before the first create request and checks the server dry run. Pick a new name for each run. The sweep checks the record, deadline, window and total live Pod GPUs, including for workloads submitted through the RBAC path.
 
 ## Identity and cluster
 
@@ -71,7 +73,7 @@ The expiry of a namespace is the record's `expires_at` when the record's `uid` m
 On our clusters the bot cannot create a namespace. Ops made one per cluster for it, named in the profiles as `[bot] premade_namespace`, with the labels `dynamo.nvidia.com/developer` and `dynamo.nvidia.com/developer-agent-rbac: "true"`. The bot cannot label, annotate or delete it, so nothing in the namespace can mark which task owns it. The `k8s-leases` plugin holds that instead: the lease's row in its database is the claim, the GPU charge and the completion.
 
 - `ns claim` reads the namespace and checks both labels. It keeps a request id in the thread ledger before it calls `bb k8s lease acquire --claim`, so a retry after a lost reply asks again with the same id and gets the same answer. Only `--gpus` and `--hours` are terms a retry must repeat: a namespace re-created since does not block it, and the claim is recorded against the UID the request named, so every write in it refuses `uid_mismatch` and the new namespace stays for on-call. A refusal of that retry is the answer the pending request was missing: the guard records it, then makes one fresh request. It names the namespace's latest lease (`bb k8s lease latest`) as the one this claim replaces. The plugin takes the owner from the calling thread, checks the exact profile name, both labels and the live UID on a host, and decides in one transaction. The same owner can adopt its own matching active lease after losing its ledger. Nobody else can, and a lease being torn down keeps the namespace.
-- Every owner command in the pre-made namespace needs this thread's claim, and the plugin's lease must be `active` and name this thread, cluster, namespace, UID and GPU type. The ledger line only points at the lease. With no claim there are no writes, CPU-only included (`namespace_not_claimed`). `wcep.agent/thread` is never read there.
+- Every write under the fence in the pre-made namespace needs this thread's claim. The lease must be `active` and match the thread, cluster, namespace, UID and GPU type. The ledger line points to the lease. For approved unfenced GPU Jobs, see [GPU spend without a lease fence](#gpu-spend-without-a-lease-fence).
 - Teardown takes only the plugin's word (`revoking` or `releasing`). The namespace keeps no expiry, so there is no offline teardown; with the plugin unreachable, `down` and `expire` refuse `lease_unavailable`.
 - The owner's `down` releases the lease and returns. The plugin then runs `down` on a host, which:
   0. probes the fence, closes its gate for this lease and `seq`, and reads it back ("The fence policy");

@@ -8,11 +8,13 @@ and its live pods, plus GPU pods no DGD owns. A namespace's expiry is the guard'
 (NsView.expires_at): the lease record's `expires_at` when the record names this namespace's
 UID, else the creation annotation. So the backstop never acts on an expiry the guard would refuse.
 """
+from collections import defaultdict
 from datetime import datetime, timedelta
 import json
 from pathlib import Path
 
-from k8s_guard_rules import DGD_NAME_LABEL, Refusal, allocation, gpu_spend, job_gpus, pod_spec_gpus, pod_gpus
+from k8s_guard_rules import (DGD_NAME_LABEL, Refusal, allocation, check_spend_deadline, check_spend_window,
+                             gpu_spend, job_gpus, job_state, pod_gpus, pod_spec_gpus)
 
 # expires-at plus this, and `k8s-guard down` deletes the namespace; before it, `expire` scales to 0.
 GRACE = timedelta(hours=1)
@@ -54,9 +56,10 @@ def effective_expiry(ns, record):
     return from_record or (meta.get('annotations') or {}).get(EXPIRES_ANNOTATION)
 
 
-def audit_gpu_spend(cluster, namespace, jobs, pods):
+def audit_gpu_spend(cluster, namespace, jobs, pods, now):
     """Read the Job record even when no Pod exists. Match children by controller UID."""
     records, flags, covered_pods, recorded_jobs = [], [], set(), {}
+    job_holds = defaultdict(int)
     for kind, objects in (('Job', jobs), ('Pod', pods)):
         for obj in sorted(objects, key=lambda o: o['metadata']['name']):
             meta = obj['metadata']
@@ -69,23 +72,45 @@ def audit_gpu_spend(cluster, namespace, jobs, pods):
                 continue
             if not gpus:
                 continue
+            finished = (job_state(obj) in ('succeeded', 'failed') if kind == 'Job'
+                        else (obj.get('status') or {}).get('phase') in FINISHED)
             if kind == 'Pod':
                 controller = next((ref for ref in meta.get('ownerReferences') or []
                                    if ref.get('kind') == 'Job' and ref.get('controller') is True), None)
-                job = recorded_jobs.get((controller.get('uid'), controller.get('name'))) if controller else None
-                if job and gpus <= job['gpus']:
+                job_key = (controller.get('uid'), controller.get('name')) if controller else None
+                if job_key in recorded_jobs:
+                    _, start, end = recorded_jobs[job_key]
+                    if not finished:
+                        job_holds[job_key] += gpus
+                        try:
+                            check_spend_window(where, start, end, now)
+                        except Refusal as e:
+                            flags.append(flag(e.code, namespace, str(e), object=where, gpus=gpus))
                     covered_pods.add(name)
                     continue
             try:
-                record = gpu_spend(obj, where, gpus, cluster, namespace)
+                record, start, end = gpu_spend(obj, where, gpus, cluster, namespace)
             except Refusal as e:
                 flags.append(flag(e.code, namespace, str(e), object=where, gpus=gpus))
                 continue
             records.append({'object': where, **record})
             if kind == 'Job' and meta.get('uid'):
-                recorded_jobs[meta['uid'], name] = record
+                recorded_jobs[meta['uid'], name] = record, start, end
             if kind == 'Pod':
                 covered_pods.add(name)
+            try:
+                if not finished:
+                    check_spend_window(where, start, end, now)
+                if kind == 'Job':
+                    check_spend_deadline(obj, where, record['max_hours'])
+            except Refusal as e:
+                flags.append(flag(e.code, namespace, str(e), object=where, gpus=gpus))
+    for job_key, gpus in job_holds.items():
+        recorded = recorded_jobs[job_key][0]['gpus']
+        where = f'Job/{job_key[1]}'
+        if gpus > recorded:
+            flags.append(flag('gpu_spend_over_count', namespace, f'{where} has {gpus} live Pod GPUs and records '
+                              f'{recorded}.', object=where, gpus=gpus, recorded_gpus=recorded))
     return records, flags, covered_pods
 
 

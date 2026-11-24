@@ -979,12 +979,12 @@ def lease_cm(ns, lease_id, uid, thread, expires_at):
             'data': {'lease_id': lease_id, 'expires_at': expires_at, 'thread': thread, 'uid': uid}}
 
 
-def spend_job(name='gpu-run', *, namespace, recorded=False, gpus=2, parallelism=2):
+def spend_job(name='gpu-run', *, namespace, recorded=False, gpus=2, parallelism=2, start=None):
     job = {'apiVersion': 'batch/v1', 'kind': 'Job', 'metadata': {'name': name},
-           'spec': {'parallelism': parallelism, 'template': {'spec': {
+           'spec': {'parallelism': parallelism, 'activeDeadlineSeconds': 1200, 'template': {'spec': {
                'restartPolicy': 'Never', 'containers': [container(gpus)]}}}}
     if recorded:
-        record = {'thread': ME, 'gpus': gpus * parallelism, 'start': '2026-11-24T16:00:00Z',
+        record = {'thread': ME, 'gpus': gpus * parallelism, 'start': start or iso_ms(hours_from_now(-0.01)),
                   'max_hours': 0.5, 'cluster': PROFILE, 'namespace': namespace}
         job['metadata']['annotations'] = {'wcep.agent/gpu-spend': json.dumps(record)}
     return job
@@ -4961,7 +4961,7 @@ class UnfencedGpuSpend(GuardCase):
 
     def test_spend_record_must_match_the_job_target_and_thread(self):
         for field, value in [('gpus', 2), ('cluster', 'other'), ('namespace', NS), ('thread', 'thr_other'),
-                             ('start', '2026-11-24T16:00:00'), ('max_hours', 0)]:
+                             ('start', '2026-11-24T16:00:00'), ('max_hours', 0), ('max_hours', 1e12)]:
             with self.subTest(field=field):
                 job = spend_job(namespace=PREMADE, recorded=True)
                 annotations = job['metadata']['annotations']
@@ -4977,6 +4977,31 @@ class UnfencedGpuSpend(GuardCase):
         self.assertEqual(rc, 1, body)
         self.assertEqual(body['code'], 'gpu_spend_invalid', body)
         self.assertIn('Set gpus to 6', body['error'])
+        self.assertEqual(self.writes(), [])
+
+    def test_spend_window_must_be_open_and_cap_the_job_deadline(self):
+        cases = [
+            ('gpu_spend_expired', '2001-01-01T00:00:00Z', 1200),
+            ('gpu_spend_not_started', iso_ms(hours_from_now(1)), 1200),
+            ('gpu_spend_deadline_invalid', None, None),
+            ('gpu_spend_deadline_invalid', None, 1801),
+        ]
+        for i, (code, start, deadline) in enumerate(cases):
+            with self.subTest(code=code, deadline=deadline):
+                job = spend_job(f'gpu-window-{i}', namespace=PREMADE, recorded=True, start=start)
+                if deadline is None:
+                    del job['spec']['activeDeadlineSeconds']
+                else:
+                    job['spec']['activeDeadlineSeconds'] = deadline
+                rc, body, _ = self.apply(job, ns=PREMADE)
+                self.assertEqual(rc, 1, body)
+                self.assertEqual(body['code'], code, body)
+        self.assertFalse([c for c in self.kubectl_calls() if c['pos'][:1] == ['create']])
+        self.k8s['mutate'] = {'Job': {'spec': {'activeDeadlineSeconds': 1801}}}
+        self.flush()
+        rc, body, _ = self.apply(spend_job(namespace=PREMADE, recorded=True), ns=PREMADE)
+        self.assertEqual(rc, 1, body)
+        self.assertEqual(body['code'], 'gpu_spend_deadline_invalid', body)
         self.assertEqual(self.writes(), [])
 
 

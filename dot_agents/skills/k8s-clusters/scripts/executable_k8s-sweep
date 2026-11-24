@@ -131,7 +131,7 @@ def read_namespaces(reader, bot, now, cluster, errors):
             pods = reader.json('get', 'pods', '-n', name, '-o', 'json').get('items') or []
             if name == premade and labels.get(FENCE_LABEL) != 'true':
                 jobs = reader.json('get', 'jobs.batch', '-n', name, '-o', 'json').get('items') or []
-                spend, spend_flags, covered_pods = rules.audit_gpu_spend(cluster, name, jobs, pods)
+                spend, spend_flags, covered_pods = rules.audit_gpu_spend(cluster, name, jobs, pods, now)
             try:
                 dgds = reader.json('get', DGD_RESOURCE, '-n', name, '-o', 'json').get('items') or []
             except reader.check.KubectlError as e:
