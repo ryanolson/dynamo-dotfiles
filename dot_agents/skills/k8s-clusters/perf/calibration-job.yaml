@@ -1,21 +1,22 @@
-# The perf calibration Job: one Pod, Guaranteed QoS, a single node, the paired script.
+# The perf noise-floor calibration Job: one Pod, Guaranteed QoS, a single node,
+# a self-contained synthetic loop. It is NOT a code comparison - the staged Rhino
+# builds are not in an image yet (the gated push is STRGT-1850's remaining half),
+# so this run buys exactly two things:
+#   1. the node's noise floor - is a 24-CPU Guaranteed Pod here quiet enough to book?
+#   2. the cpuset answer - is the pool cpuManagerPolicy=none (the full set) or static (24 CPUs)?
 #
-# Fill the three marked values before the run:
-#   <node>                   the node to pin to (the booked window's node)
-#   <image>@sha256:<digest>  the x86 dev image, pinned
-#   <paired script>          the gb300 paired script's invocation, same build
+# Fill before the run:
+#   <node>   a node that is NOT the imex-tainted one; pinning is the point
 #
 # Run in a booked window (no GPU, no kind):
 #   kubectl -n dyntest-rolson-agent apply -f perf/calibration-job.yaml
 #   kubectl -n dyntest-rolson-agent logs -f job/perf-calibration
 #
 # The log holds:
-#   - /proc/stat before and after  -> the VM's steal (the hypervisor), not a neighbour
-#   - /sys/fs/cgroup/cpu.stat before and after -> the CFS throttling (nr_throttled,
-#     throttled_usec), the neighbours
-#   - cpuset.cpus.effective -> if it is the node's full CPU set, the pool is
-#     cpuManagerPolicy=none and the number is a lower bound; if it is 24 CPUs, the
-#     pool is static and the cores are exclusive
+#   - cpuset.cpus.effective  -> full set = policy none (lower bound only); 24 CPUs = static (exclusive)
+#   - /proc/stat before/after -> the VM's steal (the hypervisor), not a neighbour
+#   - /sys/fs/cgroup/cpu.stat before/after -> CFS throttling (nr_throttled, throttled_usec), the neighbours
+#   - two identical loop timings (run A, run B) -> the within-Pod variance
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -25,7 +26,7 @@ metadata:
     app: perf-calibration
 spec:
   backoffLimit: 0
-  activeDeadlineSeconds: 7200
+  activeDeadlineSeconds: 1800
   ttlSecondsAfterFinished: 86400
   template:
     metadata:
@@ -38,20 +39,27 @@ spec:
         kubernetes.io/hostname: <node>
       containers:
         - name: perf
-          image: <image>@sha256:<digest>
+          image: mirror.gcr.io/moby/buildkit:v0.23.2-rootless@sha256:cab936745de5d673465948f1e93ff4d6e372bbe33f218afd3314eba45a6f85a9
           imagePullPolicy: IfNotPresent
-          command: ["/bin/bash", "-euo", "pipefail", "-c"]
+          command: ["/bin/sh", "-c"]
           args:
             - |
+              set -eu
+              run_loop() {
+                n=20000000
+                i=0
+                while [ "$i" -lt "$n" ]; do i=$((i+1)); done
+              }
               echo "== cpuset: $(cat /sys/fs/cgroup/cpuset.cpus.effective)"
+              echo "== nproc: $(nproc)"
               echo "== before /proc/stat"; cat /proc/stat
               echo "== before cpu.stat"; cat /sys/fs/cgroup/cpu.stat
-              echo "== run"
-              <paired script>
+              echo "== run A"; time run_loop
+              echo "== run B"; time run_loop
               echo "== after /proc/stat"; cat /proc/stat
               echo "== after cpu.stat"; cat /sys/fs/cgroup/cpu.stat
               echo "== cpuset: $(cat /sys/fs/cgroup/cpuset.cpus.effective)"
-              echo "== image: <image>@sha256:<digest>"
+              echo "== image: mirror.gcr.io/moby/buildkit:v0.23.2-rootless@sha256:cab936745de5d673465948f1e93ff4d6e372bbe33f218afd3314eba45a6f85a9"
           resources:
             requests:
               cpu: "24"
