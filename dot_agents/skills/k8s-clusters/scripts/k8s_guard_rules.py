@@ -1,14 +1,18 @@
 """The admission rules of k8s-guard: what a manifest may hold, and how many GPUs a namespace holds.
 
 Pure functions over the JSON a server-side dry run returns and over listed pods. No I/O, so every rule
-is checkable without a cluster. k8s-guard is the only caller. Standard library only.
+is checkable without a cluster. Standard library only.
 """
+from datetime import datetime
 import json
+import math
 import posixpath
 import re
 import shlex
 
 GPU = 'nvidia.com/gpu'
+GPU_SPEND_ANNOTATION = 'wcep.agent/gpu-spend'
+LABEL_VALUE = re.compile(r'^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$')
 ARCH_LABEL = 'kubernetes.io/arch'
 DGD_KIND = 'DynamoGraphDeployment'
 DGD_VERSIONS = ('nvidia.com/v1alpha1', 'nvidia.com/v1beta1')
@@ -105,6 +109,55 @@ def replicas_of(c, where):
     if isinstance(r, bool) or not isinstance(r, int) or r < 0:
         raise Refusal('field_refused', f'{where}.replicas must be a whole number')
     return r
+
+
+def job_gpus(job, where):
+    spec = job.get('spec') or {}
+    per_pod = pod_spec_gpus((spec.get('template') or {}).get('spec'), where + '.spec.template.spec')
+    parallelism = quantity(spec.get('parallelism', 1), where + '.spec.parallelism')
+    return per_pod * max(1, parallelism)
+
+
+def gpu_spend(obj, where, gpus, cluster, namespace, thread=None):
+    """Check the spend record against the exact GPU count and target."""
+    annotations = (obj.get('metadata') or {}).get('annotations') or {}
+    target = f'{where} requests {gpus} GPUs in {cluster}/{namespace} without a lease fence.'
+    if GPU_SPEND_ANNOTATION not in annotations:
+        raise Refusal('gpu_spend_required', f'{target} Add the {GPU_SPEND_ANNOTATION} annotation with '
+                      'thread, gpus, start, max_hours, cluster and namespace.')
+
+    raw = annotations[GPU_SPEND_ANNOTATION]
+    try:
+        record = json.loads(raw) if isinstance(raw, str) else None
+    except ValueError:
+        record = None
+    problem = f'{target} Fix the {GPU_SPEND_ANNOTATION} annotation'
+    if not isinstance(record, dict):
+        raise Refusal('gpu_spend_invalid', f'{problem}. Use a JSON object.')
+
+    fields = ('thread', 'gpus', 'start', 'max_hours', 'cluster', 'namespace')
+    for key in fields:
+        if key not in record:
+            raise Refusal('gpu_spend_invalid', f'{problem}. Missing {key}.')
+    for key, expected in (('cluster', cluster), ('namespace', namespace), ('gpus', gpus)):
+        if record[key] != expected or (key == 'gpus' and type(record[key]) is not int):
+            raise Refusal('gpu_spend_invalid', f'{problem}. Set {key} to {expected}.')
+    owner = record['thread']
+    if not isinstance(owner, str) or not LABEL_VALUE.fullmatch(owner) or (thread is not None and owner != thread):
+        raise Refusal('gpu_spend_invalid', f'{problem}. Set thread to the submitting BB thread ID.')
+    start = record['start']
+    if isinstance(start, str) and re.fullmatch(
+            r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:[0-5]\d)', start):
+        try:
+            start = datetime.fromisoformat(start.replace('Z', '+00:00'))
+        except ValueError:
+            start = None
+    if not isinstance(start, datetime):
+        raise Refusal('gpu_spend_invalid', f'{problem}. Set start to an RFC 3339 timestamp with a time zone.')
+    hours = record['max_hours']
+    if type(hours) not in (int, float) or hours <= 0 or (isinstance(hours, float) and not math.isfinite(hours)):
+        raise Refusal('gpu_spend_invalid', f'{problem}. Set max_hours to a positive finite number.')
+    return {key: record[key] for key in fields}
 
 
 def nodes_of(c, where):

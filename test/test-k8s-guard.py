@@ -979,6 +979,17 @@ def lease_cm(ns, lease_id, uid, thread, expires_at):
             'data': {'lease_id': lease_id, 'expires_at': expires_at, 'thread': thread, 'uid': uid}}
 
 
+def spend_job(name='gpu-run', *, namespace, recorded=False, gpus=2, parallelism=2):
+    job = {'apiVersion': 'batch/v1', 'kind': 'Job', 'metadata': {'name': name},
+           'spec': {'parallelism': parallelism, 'template': {'spec': {
+               'restartPolicy': 'Never', 'containers': [container(gpus)]}}}}
+    if recorded:
+        record = {'thread': ME, 'gpus': gpus * parallelism, 'start': '2026-11-24T16:00:00Z',
+                  'max_hours': 0.5, 'cluster': PROFILE, 'namespace': namespace}
+        job['metadata']['annotations'] = {'wcep.agent/gpu-spend': json.dumps(record)}
+    return job
+
+
 class GuardCase(unittest.TestCase):
     """One temporary world per test: profiles, kubeconfigs, fakes, cluster state and lease state."""
 
@@ -4921,6 +4932,52 @@ state['clock_sleeps'] = clock.sleeps
 state_path.write_text(json.dumps(state))
 sys.exit(status)
 '''
+
+
+class UnfencedGpuSpend(GuardCase):
+    def setUp(self):
+        super().setUp()
+        self.profiles.write_text(self.profiles.read_text().replace(
+            '# premade_namespace = "dyntest-alice-agent"', f'premade_namespace = "{PREMADE}"'))
+        self.add_ns(PREMADE, ledger=False)
+
+    def test_gpu_job_requires_a_spend_record_before_submission(self):
+        rc, body, _ = self.apply(spend_job(namespace=PREMADE), ns=PREMADE)
+        self.assertEqual(rc, 1, body)
+        self.assertEqual(body['code'], 'gpu_spend_required', body)
+        self.assertEqual(body['error'], f'Job/gpu-run requests 4 GPUs in {PROFILE}/{PREMADE} without a lease fence. '
+                         'Add the wcep.agent/gpu-spend annotation with thread, gpus, start, max_hours, cluster and namespace.')
+        self.assertFalse([c for c in self.kubectl_calls() if c['pos'][:1] == ['create']])
+
+    def test_gpu_job_with_spend_record_is_created_without_a_lease(self):
+        job = spend_job(namespace=PREMADE, recorded=True)
+        rc, body, _ = self.apply(job, ns=PREMADE)
+        self.assertEqual(rc, 0, body)
+        self.assertEqual(body['gpu_spend'], json.loads(job['metadata']['annotations']['wcep.agent/gpu-spend']))
+        stored = self.k8s['objects'][PREMADE]['Job/gpu-run']
+        self.assertEqual(stored['metadata']['annotations'], job['metadata']['annotations'])
+        self.assertEqual(len(self.writes()), 1)
+        self.assertEqual(self.bb_calls(), [])
+
+    def test_spend_record_must_match_the_job_target_and_thread(self):
+        for field, value in [('gpus', 2), ('cluster', 'other'), ('namespace', NS), ('thread', 'thr_other'),
+                             ('start', '2026-11-24T16:00:00'), ('max_hours', 0)]:
+            with self.subTest(field=field):
+                job = spend_job(namespace=PREMADE, recorded=True)
+                annotations = job['metadata']['annotations']
+                record = json.loads(annotations['wcep.agent/gpu-spend'])
+                annotations['wcep.agent/gpu-spend'] = json.dumps(dict(record, **{field: value}))
+                rc, body, _ = self.apply(job, ns=PREMADE)
+                self.assertEqual(rc, 1, body)
+                self.assertEqual(body['code'], 'gpu_spend_invalid', body)
+                self.assertIn(field, body['error'])
+        self.k8s['mutate'] = {'Job': {'spec': {'parallelism': 3}}}
+        self.flush()
+        rc, body, _ = self.apply(spend_job(namespace=PREMADE, recorded=True), ns=PREMADE)
+        self.assertEqual(rc, 1, body)
+        self.assertEqual(body['code'], 'gpu_spend_invalid', body)
+        self.assertIn('Set gpus to 6', body['error'])
+        self.assertEqual(self.writes(), [])
 
 
 class FenceCase(ClaimedCase):

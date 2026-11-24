@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 import json
 from pathlib import Path
 
-from k8s_guard_rules import DGD_NAME_LABEL, Refusal, allocation, pod_gpus
+from k8s_guard_rules import DGD_NAME_LABEL, Refusal, allocation, gpu_spend, job_gpus, pod_spec_gpus, pod_gpus
 
 # expires-at plus this, and `k8s-guard down` deletes the namespace; before it, `expire` scales to 0.
 GRACE = timedelta(hours=1)
@@ -54,7 +54,42 @@ def effective_expiry(ns, record):
     return from_record or (meta.get('annotations') or {}).get(EXPIRES_ANNOTATION)
 
 
-def namespace_row(ns, record, dgds, pods, now, premade):
+def audit_gpu_spend(cluster, namespace, jobs, pods):
+    """Read the Job record even when no Pod exists. Match children by controller UID."""
+    records, flags, covered_pods, recorded_jobs = [], [], set(), {}
+    for kind, objects in (('Job', jobs), ('Pod', pods)):
+        for obj in sorted(objects, key=lambda o: o['metadata']['name']):
+            meta = obj['metadata']
+            name = meta['name']
+            where = f'{kind}/{name}'
+            try:
+                gpus = job_gpus(obj, where) if kind == 'Job' else pod_spec_gpus(obj.get('spec'), where + '.spec')
+            except Refusal as e:
+                flags.append(flag('gpu_spend_count_failed', namespace, str(e), object=where))
+                continue
+            if not gpus:
+                continue
+            if kind == 'Pod':
+                controller = next((ref for ref in meta.get('ownerReferences') or []
+                                   if ref.get('kind') == 'Job' and ref.get('controller') is True), None)
+                job = recorded_jobs.get((controller.get('uid'), controller.get('name'))) if controller else None
+                if job and gpus <= job['gpus']:
+                    covered_pods.add(name)
+                    continue
+            try:
+                record = gpu_spend(obj, where, gpus, cluster, namespace)
+            except Refusal as e:
+                flags.append(flag(e.code, namespace, str(e), object=where, gpus=gpus))
+                continue
+            records.append({'object': where, **record})
+            if kind == 'Job' and meta.get('uid'):
+                recorded_jobs[meta['uid'], name] = record
+            if kind == 'Pod':
+                covered_pods.add(name)
+    return records, flags, covered_pods
+
+
+def namespace_row(ns, record, dgds, pods, now, premade, covered_pods=frozenset()):
     """One namespace of ours: who owns it, when it ends, and the GPUs it holds."""
     meta = ns.get('metadata') or {}
     name = meta.get('name', '')
@@ -73,6 +108,7 @@ def namespace_row(ns, record, dgds, pods, now, premade):
     except Refusal as e:
         row['flags'].append(flag('count_failed', name, str(e)))
     owned = {(d.get('metadata') or {}).get('name') for d in dgds}
+    covered_gpus = 0
     for p in pods:
         pmeta = p.get('metadata') or {}
         if (p.get('status') or {}).get('phase') in FINISHED:
@@ -89,7 +125,12 @@ def namespace_row(ns, record, dgds, pods, now, premade):
             continue  # allocation() above already raised count_failed for it
         row['pod_gpus'] += gpus
         if gpus and (pmeta.get('labels') or {}).get(DGD_NAME_LABEL) not in owned:
-            row['orphan_gpu_pods'].append(pmeta.get('name', ''))
+            if pmeta.get('name') in covered_pods:
+                covered_gpus += gpus
+            else:
+                row['orphan_gpu_pods'].append(pmeta.get('name', ''))
+    if covered_gpus and row['gpus'] is not None:
+        row['lease_gpus'] = row['gpus'] - covered_gpus
     if row['orphan_gpu_pods']:
         names = row['orphan_gpu_pods']
         row['flags'].append(flag('gpu_pod_no_dgd', name, f'{len(names)} GPU pod(s) that no DGD owns: '
@@ -127,7 +168,7 @@ def match_leases(cluster, rows, leases, exists):
         active = [l for l in same if l['state'] == 'active']
         shown = active[0] if active else (same[0] if same else None)
         r['lease'] = lease_view(shown) if shown else {}
-        gpus = r['gpus']
+        gpus = r.get('lease_gpus', r['gpus'])
         if gpus and not active:
             others = [f'{l["lease_id"]} is {l["state"]}' for l in live if l['namespace'] == r['namespace']]
             new = flag('gpus_no_lease', r['namespace'], f'{gpus} GPUs held and no active lease'
@@ -316,6 +357,9 @@ def digest_table(report):
                      '' if r.get('age_hours') is None else f'{r["age_hours"]:.1f}h',
                      'claimed' if r.get('claimed') else (r.get('expires_at') or '-'), flags_cell(r.get('flags') or []),
                      f'{action["action"]}: {action["result"]}' if action else ''])
+        for spend in r.get('gpu_spend') or []:
+            rows.append(['GPU spend', r.get('cluster'), r['namespace'], spend['thread'], spend['gpus'], '-', '',
+                         f'{spend["start"]} + {spend["max_hours"]}h', spend['object'], ''])
     for f in report.get('stale_leases') or []:
         rows.append(['lease', f.get('cluster'), f['namespace'], f.get('thread'), f.get('gpus'),
                      f'{f["lease_id"]} {f.get("state")} {f.get("gpus")}', '', '', flags_cell([f]), ''])

@@ -637,6 +637,7 @@ class Report(SweepCase):
         ns = G.namespace(premade, ME, 'uid-pm')
         del ns['metadata']['annotations']['wcep.agent/expires-at']
         del ns['metadata']['labels']['wcep.agent/thread']
+        ns['metadata']['labels']['dynamo.nvidia.com/agent-lease-fence'] = 'true'
         self.k8s['namespaces'][premade] = ns
         self.k8s['objects'][premade] = {}
         self.k8s['pods'][premade] = [G.pod('w', 1, name='w-0')]
@@ -653,6 +654,37 @@ class Report(SweepCase):
         self.assertEqual(row['flags'], [])
         self.assertFalse([c for c in self.sweep_calls() if c['pos'][:3] == ['get', 'configmap', 'wcep-agent-lease']
                           and c['flags'].get('-n') == premade])
+
+    def test_unfenced_sweep_reports_unrecorded_jobs_and_pods_and_shows_valid_spend(self):
+        premade = PREFIX + 'agent'
+        self.profiles.write_text(self.profiles.read_text().replace(
+            '# premade_namespace = "dyntest-alice-agent"', f'premade_namespace = "{premade}"'))
+        self.add_ns(premade, ledger=False)
+        self.add_obj(G.spend_job('pending-job', namespace=premade), ns=premade, stamp=False)
+        self.add_obj(G.spend_job('recorded-job', namespace=premade, recorded=True), ns=premade, stamp=False)
+        self.add_obj(G.spend_job('cpu-job', namespace=premade, gpus=0), ns=premade, stamp=False)
+        self.add_pod(gpu_pod(dgd=None, name='bare-pod', phase='Pending'), ns=premade)
+        child = gpu_pod(dgd=None, name='recorded-pod')
+        child['metadata']['ownerReferences'] = [
+            {'kind': 'Job', 'name': 'recorded-job', 'uid': 'uid-recorded-job', 'controller': True}]
+        self.add_pod(child, ns=premade)
+        other = gpu_pod(dgd=None, name='wrong-owner')
+        other['metadata']['ownerReferences'] = [
+            {'kind': 'Job', 'name': 'recorded-job', 'uid': 'uid-previous-job', 'controller': True}]
+        self.add_pod(other, ns=premade)
+
+        rc, body, _ = self.sweep()
+        self.assertEqual(rc, 0, body)
+        flags = [f for f in body['flags'] if f['kind'] == 'gpu_spend_required']
+        self.assertEqual([(f['object'], f['gpus']) for f in flags],
+                         [('Job/pending-job', 4), ('Pod/bare-pod', 2), ('Pod/wrong-owner', 2)])
+        self.assertEqual(self.row(body, premade)['gpu_spend'], [
+            {'object': 'Job/recorded-job', 'thread': ME, 'gpus': 4, 'start': '2026-11-24T16:00:00Z',
+             'max_hours': 0.5, 'cluster': PROFILE, 'namespace': premade}])
+        digest = (self.state_home / 'k8s-sweep/digest.md').read_text()
+        for value in ('Job/pending-job', 'Pod/bare-pod', 'Job/recorded-job', '2026-11-24T16:00:00Z'):
+            self.assertIn(value, digest)
+        self.assert_sweep_only_reads()
 
     def test_expiry_matches_the_guards_inspect(self):
         # The record's expiry is earlier than the creation annotation; the sweep reads what the guard reads.

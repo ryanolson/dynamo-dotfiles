@@ -1,6 +1,6 @@
 # k8s-sweep
 
-`k8s-sweep` checks that the `k8s-leases` leases match what the clusters actually run. It reads every cluster in the profiles, reports our namespaces and what they hold, and flags GPU work that no lease covers, which means the guard was bypassed. With `--enforce` it is also the expiry backstop for when bb or the plugin is down. That is its only write, and it makes it through `k8s-guard`.
+`k8s-sweep` checks GPU workloads against leases and spend records. It reads the clusters in the profiles and reports our namespaces and what they hold. With `--enforce` it is also the expiry backstop for when bb or the plugin is down. It makes expiry writes through `k8s-guard`.
 
 ```bash
 export KUBECONFIG=<bot.kubeconfig from the profiles>
@@ -16,6 +16,7 @@ For each profile that is not `never`, with the bot's kubeconfig and the pinned k
 - the bot's identity (`auth whoami`, or the client certificate where that is not served). Any other identity stops that cluster;
 - our namespaces: `get namespaces -l dynamo.nvidia.com/developer=<[bot] developer>`, kept only when the name starts with `[bot] namespace_prefix`. A namespace without our label, or a person's namespace outside the bot's prefix, is ignored;
 - in each one, by `-n` and never with `-A`: its pods, its DGDs, and the lease record `wcep-agent-lease`. The pre-made namespace has no record and is not asked for one;
+- in the pre-made namespace without the fence enrollment label: its Jobs, including Jobs that have yet to create a Pod;
 - each namespace that a live lease or an open ledger entry names but the list did not show, read by name.
 
 It also reads `bb k8s leases --all --json`, the host ledger (`${XDG_STATE_HOME:-~/.local/state}/k8s-guard/ledger.jsonl`), and every thread ledger on the host (`~/.bb-machines/*/thread-storage/*/k8s-ledger.jsonl`, or each `--ledger-glob`).
@@ -23,6 +24,7 @@ It also reads `bb k8s leases --all --json`, the host ledger (`${XDG_STATE_HOME:-
 For each namespace it reports the age, `wcep.agent/thread`, the expiry, the GPUs, the age of the oldest pod, and how many pods carry `gpu-reaper.nvidia.com/state: warned` (as a label or an annotation).
 
 - **GPUs** are the guard's allocation (`k8s_guard_rules.allocation`): for each DGD, the larger of its spec and its live pods, plus GPU pods that no DGD owns. Terminating pods count; finished pods do not.
+- **GPU spend** lists the [records](k8s-guard.md#gpu-spend-without-a-lease-fence) found on Jobs and Pods in the pre-made namespace without fence enrollment. The sweep matches a Job's Pods by controller UID and name. It includes covered Pods in the GPU total and excludes them from the lease and orphan checks.
 - **The expiry** is the guard's (`NsView.expires_at`): the record's `expires_at` when the record's `uid` is this namespace's, otherwise the creation annotation `wcep.agent/expires-at`. The pre-made namespace has none. The sweep does not wait for the later of the two, by the owner's ruling: a namespace whose lease has ended can be reclaimed even while its annotation still reads live, and the annotation is only the fallback for a namespace with no record for its UID.
 
 ## Flags
@@ -32,12 +34,15 @@ For each namespace it reports the age, `wcep.agent/thread`, the expiry, the GPUs
 | `gpus_no_lease` | The namespace holds GPUs and no `active` lease matches its cluster, name and UID. A `revoking` or `releasing` lease does not cover it; the detail names that lease. |
 | `gpus_over_lease` | It holds more GPUs than its active lease grants. |
 | `gpu_pod_no_dgd` | A GPU pod whose `nvidia.com/dynamo-graph-deployment-name` label is missing or names a DGD that is not in the namespace. |
+| `gpu_spend_required` | A GPU Job or Pod needs a spend record. |
+| `gpu_spend_invalid` | A GPU Job or Pod has a spend record with invalid fields. |
+| `gpu_spend_count_failed` | The sweep could not count a Job's or Pod's GPU request. |
 | `lease_namespace_gone` | A live lease whose namespace is not found, or has another UID (it was re-created). The plugin should release it. |
 | `count_failed` | A GPU request in a form the guard cannot count. |
 | `namespace_recreated` | The ledger or the lease recorded another UID for this name. `--enforce` never touches it. |
 | `uid_unknown` | The namespace is past its expiry, but no ledger line on this host and no live lease records its UID. `--enforce` leaves it. |
 | `expiry_unreadable` | The expiry is not an RFC 3339 time with a time zone. |
-| `read_failed` | The namespace's pods, DGDs or lease record could not be read. Its row has no counts, and `--enforce` leaves it, because a lease record it did not read could hold a later expiry. The other namespaces on the cluster go on, and the run exits 1. |
+| `read_failed` | The namespace's Pods, Jobs, DGDs or lease record could not be read. Its row has no counts, and `--enforce` leaves it, because a lease record it did not read could hold a later expiry. The other namespaces on the cluster go on, and the run exits 1. |
 
 If bb cannot be read, the run reports `leases_unavailable` and raises no lease flag: a list it could not read is not an empty list. With `--json`, an unreachable bb prints its error envelope on stdout, so the sweep accepts only a JSON list. A stale-lease flag is raised only for a cluster that was read, and only for a namespace whose read by name succeeded.
 

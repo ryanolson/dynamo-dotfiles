@@ -64,7 +64,7 @@ kubectl --context <ctx> get ns -l dynamo.nvidia.com/developer=<developer>
 kubectl --context <ctx> -n <ns> get rolebindings      # expect two bindings
 ```
 
-The pre-made namespace is the write boundary. On a cluster without an enforced fence, use the runbook's lease-free RBAC path. Skip lease commands and submit only Jobs that request zero GPUs.
+The pre-made namespace is the write boundary. For the lease-free RBAC path, follow the runbook and skip lease commands. Before an approved GPU run, put the [spend record](k8s-guard.md#gpu-spend-without-a-lease-fence) on the Job.
 
 Coordinate use of the shared namespace. Remove only the objects your task created and leave the namespace in place.
 

@@ -11,8 +11,10 @@ The source of truth is the Linear document "Runbook: build and run on our Dynamo
 
 - Use the agents' Teleport bot for bot access. The AKS smoke uses the explicit operator and launcher kubeconfigs in the runbook. Keep agent commands away from the owner's `tsh` login, `~/.tsh`, or `~/.kube/config`.
 - Pass `--context` on every `kubectl` call. Never rely on the current context.
-- On a cluster without an enforced fence, follow the runbook for namespace-scoped writes using RBAC. Jobs on that path request zero GPUs. The guard documentation describes the separate fenced workflow.
+- On a cluster without an enforced fence, follow the runbook for namespace-scoped writes using RBAC.
 - Astra changes go through `scripts/astra-guard` only; its commands and rules are in `references/astra-guard.md`.
+
+`dynamo-aks-dev` and `dynamo-aks-exp` are fence-less. `dynamo-aks-dev` advertises 0 allocatable GPUs. `dynamo-aks-exp` advertises 24 allocatable A100 GPU resources (16 MIG `3g.40gb` slices and 8 full GPUs). Get approval for the run and record the spend on each Job that requests `nvidia.com/gpu` there. See the [GPU spend record](references/k8s-guard.md#gpu-spend-without-a-lease-fence) for the annotation that the guard and sweep check.
 
 ## The bot
 
@@ -46,7 +48,7 @@ export KUBECONFIG=<bot.kubeconfig from the profiles>
 ~/.agents/skills/k8s-clusters/scripts/k8s-sweep --text        # read only: every profile that is not `never`
 ```
 
-It lists our namespaces with their age, thread, expiry, GPUs, pod age and reaper warnings. It matches them against `bb k8s leases` and flags `gpus_no_lease`, `gpus_over_lease`, `gpu_pod_no_dgd` and `lease_namespace_gone`. It also lists ledger entries on the host that no `down` closed. Each run writes the table the steward's digest reads to `~/.local/state/k8s-sweep/digest.md`. `--enforce` is the backstop for when bb is down: after a namespace's expiry it runs `k8s-guard expire`, and one hour later `k8s-guard down`, with the UID the ledger recorded. It never writes with kubectl. Two user timers run the report every hour and `--enforce` every 15 minutes, on hosts with the bot. The rules, the flags and the units are in `references/k8s-sweep.md`.
+It lists our namespaces with their age, thread, expiry, GPUs, pod age and reaper warnings. It checks leases and reports GPU Jobs and Pods with missing or invalid spend records in the fence-less pre-made namespace. It also lists ledger entries on the host that no `down` closed. Each run writes the table the steward's digest reads to `~/.local/state/k8s-sweep/digest.md`. `--enforce` is the backstop for when bb is down: after a namespace's expiry it runs `k8s-guard expire`, and one hour later `k8s-guard down`, with the UID the ledger recorded. It never writes with kubectl. Two user timers run the report every hour and `--enforce` every 15 minutes, on hosts with the bot. The rules, the flags and the units are in `references/k8s-sweep.md`.
 
 ## Threat model
 

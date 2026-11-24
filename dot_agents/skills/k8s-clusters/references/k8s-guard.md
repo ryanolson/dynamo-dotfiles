@@ -1,6 +1,6 @@
 # k8s-guard
 
-`k8s-guard` is the only way agents write to a shared cluster. It wraps `kubectl`, runs as the agents' bot, and refuses any write outside our namespaces, our kinds, or our GPU lease. The cluster runbook in Linear says when to use each command. This file is the reference for what the guard checks.
+`k8s-guard` wraps `kubectl` and runs as the agents' bot. It checks that each write targets an allowed namespace and resource kind. GPU workloads need a lease or a spend record. The cluster runbook in Linear says when to use each command.
 
 Every command prints one JSON object on stdout. A refusal exits non-zero with `{"error": "...", "code": "..."}`. The code is stable; the message is for people.
 
@@ -19,7 +19,7 @@ Every command prints one JSON object on stdout. A refusal exits non-zero with `{
 | `-n <ns> build delete <job>` | the namespace's thread, under its live lease | Deletes the Job with `propagationPolicy: Background`, so its Pods go with it. |
 | `-n <premade> dev run --image <name> --image-commit <40 hex> --digest sha256:<64 hex> --repo <url> --commit <40 hex> [--arch <arch>]` | the live claim's thread | Starts one dev Job under the lease fence. Prints `{"job": "<name>"}`. See "Dev Jobs". |
 | `-n <premade> dev show <job>` | anyone | Reads the dev Job's state, pinned image digest and seconds left on its deadline. Reports the Pod's phase, node and restart count when a Pod exists. |
-| `-n <ns> apply -f <file>` | the namespace's thread | Applies DGDs, ConfigMaps and ClusterIP Services, after the checks below. |
+| `-n <ns> apply -f <file>` | the namespace's thread, or the thread named in the GPU spend record | Applies DGDs, ConfigMaps and ClusterIP Services. In the pre-made namespace without fence enrollment, it can also create one [GPU Job with a spend record](#gpu-spend-without-a-lease-fence). |
 | `-n <ns> delete <kind>/<name>` | the namespace's thread | Deletes one DGD, Job, ConfigMap, Service, Secret, PVC or PodCliqueSet, with its UID and `resourceVersion` as preconditions. A Job's delete carries `propagationPolicy: Background`. An object labelled with another lease is refused (`object_not_yours`); in a claimed namespace, so is one without this lease's label. The lease record, the model cache PVC and the pull secret are refused. Like `apply`, it takes the lease's slot, or needs a namespace that holds no GPUs. |
 | `down <ns> [--uid <uid>] [--lease <id>] [--fence-retired <url>]` | the namespace's thread, or anyone with teardown authority | Releases an active lease first (owner only). Deletes each DGD labelled with the lease being torn down: it reads the DGD again, checks that its UID is still the one the list gave and that its lease label still holds, then deletes it under that listed UID and the `resourceVersion` just read. A DGD that changed in between is left (`dgds_kept`), not deleted. Waits, at most `K8S_GUARD_DOWN_WAIT_SECONDS` (300), for every GPU pod in the namespace to go. Then deletes the namespace with its UID as a precondition, whatever is left, and reports `gpu_pods_left`. A namespace already being deleted gets no second delete (`terminating: true`). With no lease id (no `--lease` and no record) it deletes no DGD and says so in `dgds_skipped`. In a claimed namespace it never deletes the namespace: see "A claimed namespace". `--fence-retired` is exit 2 of "The fence policy". |
 | `expire <ns> [--uid <uid>] [--lease <id>]` | anyone with teardown authority | Sets every replica count of every DGD labelled with the lease being torn down to 0. With no lease id (no `--lease` and no record) it scales nothing and says so in `dgds_skipped`. |
@@ -34,6 +34,22 @@ Every command prints one JSON object on stdout. A refusal exits non-zero with `{
 Every command needs `--context`. `-n` can come anywhere.
 
 The commands for the namespace's thread (`lease acquire`, `secret`, `apply`, `delete`, `selftest fences`, and the owner's `down`) take the namespace from the thread's ledger, `$BB_THREAD_STORAGE/k8s-ledger.jsonl`. A given `-n` must be a namespace this thread created, and its UID must still be the one recorded. Without `-n`, the thread's only live namespace is used. The pre-made namespace is different: see "A claimed namespace". Everything else is refused, including `scale`, `patch`, `edit`, `replace`, `set`, `label`, `annotate`, `get`, and `-A`.
+
+## GPU spend without a lease fence
+
+For an approved GPU run in the profile's pre-made namespace, put the spend record in the Job manifest under `metadata.annotations`. The record stays on the Job. Use the same annotation on a standalone GPU Pod submitted through the runbook's RBAC path.
+
+```yaml
+metadata:
+  annotations:
+    wcep.agent/gpu-spend: >-
+      {"thread":"thr_example","gpus":4,"start":"2026-11-24T16:00:00Z","max_hours":0.5,
+      "cluster":"lab-x86-qa","namespace":"dyntest-alice-agent"}
+```
+
+Use the submitting BB thread ID, the cluster profile name, and the target namespace. Count GPU resources per Pod times Job parallelism, with a minimum of one Pod for a suspended Job. Use an RFC 3339 start time with a time zone and a positive number of hours for the maximum intended window. For a standalone Pod, record its own GPU count. The record captures planned spend.
+
+Pass one `batch/v1` Job to `k8s-guard --context <ctx> -n <premade> apply -f <file>`. The guard uses this path when the namespace lacks `dynamo.nvidia.com/agent-lease-fence: "true"`. It checks the record before the first create request, checks it again on the server dry run, and creates the Job under its manifest name. Pick a new name for each run. The sweep reports the records and flags missing or invalid ones, including on workloads submitted through the RBAC path.
 
 ## Identity and cluster
 
