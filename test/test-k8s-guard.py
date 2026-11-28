@@ -4941,6 +4941,19 @@ class UnfencedGpuSpend(GuardCase):
             '# premade_namespace = "dyntest-alice-agent"', f'premade_namespace = "{PREMADE}"'))
         self.add_ns(PREMADE, ledger=False)
 
+    def apply_spend(self, name='gpu-run'):
+        job = spend_job(name, namespace=PREMADE, recorded=True)
+        rc, body, _ = self.apply(job, ns=PREMADE)
+        self.assertEqual(rc, 0, body)
+        return self.k8s['objects'][PREMADE][f'Job/{name}']
+
+    def refuse_spend_delete(self, code, target='job/gpu-run', **env_kw):
+        before = self.ledger()
+        body = self.refused(code, '--context', CTX, '-n', PREMADE, 'delete', target, **env_kw)
+        self.assertFalse([call for call in self.writes() if call['pos'][:1] == ['delete']])
+        self.assertEqual(self.ledger(), before)
+        return body
+
     def test_gpu_job_requires_a_spend_record_before_submission(self):
         rc, body, _ = self.apply(spend_job(namespace=PREMADE), ns=PREMADE)
         self.assertEqual(rc, 1, body)
@@ -4958,6 +4971,132 @@ class UnfencedGpuSpend(GuardCase):
         self.assertEqual(stored['metadata']['annotations'], job['metadata']['annotations'])
         self.assertEqual(len(self.writes()), 1)
         self.assertEqual(self.bb_calls(), [])
+
+    def test_spend_apply_records_the_created_job_uid(self):
+        job = self.apply_spend()
+        [up] = self.ledger()
+        self.assertEqual(up.get('job_uid'), job['metadata']['uid'], up)
+        self.assertEqual(up['uid'], self.k8s['namespaces'][PREMADE]['metadata']['uid'])
+        self.assertEqual(up['direction'], 'up')
+
+    def test_spend_apply_records_the_job_when_create_reply_has_no_uid(self):
+        self.kubectl_path.write_text(FAKE_KUBECTL.replace(
+            "st['objects'][ns][key(obj)] = obj; save(); emit(obj)",
+            "st['objects'][ns][key(obj)] = obj; save(); del obj['metadata']['uid']; emit(obj)", 1))
+        rc, body, _ = self.apply(spend_job(namespace=PREMADE, recorded=True), ns=PREMADE)
+
+        self.assertEqual(rc, 1, body)
+        self.assertEqual(body.get('code'), 'job_uid_missing', body)
+        self.assertIn('Job/gpu-run', self.k8s['objects'][PREMADE])
+        [up] = self.ledger()
+        self.assertEqual((up['object'], up['direction'], up['gpus']), ('Job/gpu-run', 'up', 4))
+        self.assertNotIn('job_uid', up)
+        self.assertEqual(up['gpu_spend']['thread'], ME)
+
+    def test_spend_delete_removes_only_the_owned_job_and_its_pods(self):
+        other = spend_job('other', namespace=PREMADE, recorded=True)
+        self.add_obj(other, ns=PREMADE)
+        other_pod = {'metadata': {'name': 'other-0', 'labels': {'job-name': 'other'}}}
+        self.add_pod(other_pod, ns=PREMADE)
+        namespace = copy.deepcopy(self.k8s['namespaces'][PREMADE])
+        for alias in ('job', 'jobs', 'job.batch'):
+            with self.subTest(alias=alias):
+                name = f'gpu-run-{alias}'
+                job = self.apply_spend(name)
+                self.add_pod({'metadata': {'name': name + '-0', 'labels': {'job-name': name}}}, ns=PREMADE)
+                up = self.ledger()[-1]
+
+                body = self.ok('--context', CTX, '-n', PREMADE, 'delete', f'{alias}/{name}')
+
+                self.assertEqual(body, {'deleted': f'Job/{name}', 'namespace': PREMADE})
+                self.assertEqual(list(self.k8s['objects'][PREMADE]), ['Job/other'])
+                self.assertEqual(self.k8s['pods'][PREMADE], [other_pod])
+                self.assertEqual(self.k8s['namespaces'][PREMADE], namespace)
+                delete = self.k8s['raw_delete_bodies'][-1]
+                self.assertEqual(delete['path'], f'/apis/batch/v1/namespaces/{PREMADE}/jobs/{name}')
+                self.assertEqual(delete['body']['propagationPolicy'], 'Background')
+                self.assertEqual(delete['body']['preconditions'],
+                                 {key: job['metadata'][key] for key in ('uid', 'resourceVersion')})
+                down = self.ledger()[-1]
+                self.assertEqual(down['direction'], 'down')
+                for key in ('object', 'namespace', 'uid', 'gpus', 'gpu_spend'):
+                    self.assertEqual(down[key], up[key], key)
+        self.assertEqual(self.bb_calls(), [])
+
+    def test_spend_delete_refuses_another_thread(self):
+        self.apply_spend()
+        self.refuse_spend_delete('object_not_yours', thread='thr_other')
+
+    def test_spend_delete_refuses_a_job_with_no_up_line(self):
+        self.add_obj(spend_job(namespace=PREMADE, recorded=True), ns=PREMADE)
+        self.refuse_spend_delete('object_not_yours')
+
+    def test_spend_delete_refuses_a_changed_or_malformed_record(self):
+        job = self.apply_spend()
+        record = self.ledger()[-1]['gpu_spend']
+        annotations = job['metadata']['annotations']
+        for raw in (json.dumps(dict(record, max_hours=1)), '{', None):
+            with self.subTest(raw=raw):
+                if raw is None:
+                    del annotations['wcep.agent/gpu-spend']
+                else:
+                    annotations['wcep.agent/gpu-spend'] = raw
+                self.k8s['objects'][PREMADE]['Job/gpu-run'] = job
+                self.flush()
+                self.refuse_spend_delete('object_not_yours')
+
+    def test_spend_delete_accepts_extra_annotation_keys(self):
+        job = spend_job(namespace=PREMADE, recorded=True)
+        annotations = job['metadata']['annotations']
+        record = json.loads(annotations['wcep.agent/gpu-spend'])
+        annotations['wcep.agent/gpu-spend'] = json.dumps(dict(record, note='smoke'))
+        rc, body, _ = self.apply(job, ns=PREMADE)
+        self.assertEqual(rc, 0, body)
+        self.assertEqual(self.ledger()[-1]['gpu_spend'], record)
+
+        self.ok('--context', CTX, '-n', PREMADE, 'delete', 'job/gpu-run')
+        self.assertNotIn('Job/gpu-run', self.k8s['objects'][PREMADE])
+
+    def test_spend_delete_refuses_a_replacement_with_the_same_annotation(self):
+        job = self.apply_spend()
+        self.add_obj(job, ns=PREMADE, uid='replacement-job-uid')
+        self.refuse_spend_delete('object_not_yours')
+
+    def test_spend_delete_refuses_an_up_line_without_a_job_uid(self):
+        self.apply_spend()
+        [up] = self.ledger()
+        up.pop('job_uid', None)
+        (self.storage / 'k8s-ledger.jsonl').write_text(json.dumps(up) + '\n')
+        body = self.refuse_spend_delete('object_not_yours')
+        self.assertIn('Job UID', body['error'])
+
+    def test_spend_delete_refuses_a_closed_up_line(self):
+        self.apply_spend()
+        [up] = self.ledger()
+        with (self.storage / 'k8s-ledger.jsonl').open('a') as ledger:
+            ledger.write(json.dumps(dict(up, direction='down')) + '\n')
+        self.refuse_spend_delete('object_not_yours')
+
+    def test_spend_delete_refuses_a_recreated_namespace(self):
+        self.apply_spend()
+        self.add_ns(PREMADE, uid='replacement-namespace-uid', ledger=False)
+        self.refuse_spend_delete('object_not_yours')
+
+    def test_spend_delete_reports_a_missing_job(self):
+        self.apply_spend()
+        del self.k8s['objects'][PREMADE]['Job/gpu-run']
+        self.flush()
+        self.refuse_spend_delete('not_found')
+
+    def test_spend_delete_requires_a_claim_in_a_fenced_namespace(self):
+        self.apply_spend()
+        self.k8s['namespaces'][PREMADE]['metadata']['labels'][FENCE_LABEL] = 'true'
+        self.flush()
+        self.refuse_spend_delete('namespace_not_claimed')
+
+    def test_spend_delete_requires_a_claim_for_a_non_job(self):
+        self.add_obj({'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': 'test'}}, ns=PREMADE)
+        self.refuse_spend_delete('namespace_not_claimed', 'configmap/test')
 
     def test_spend_record_must_match_the_job_target_and_thread(self):
         for field, value in [('gpus', 2), ('cluster', 'other'), ('namespace', NS), ('thread', 'thr_other'),

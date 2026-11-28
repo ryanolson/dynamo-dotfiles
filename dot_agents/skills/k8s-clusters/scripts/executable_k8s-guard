@@ -1537,8 +1537,13 @@ def apply_spend_job(g, ns, uid, job):
     check_spend_window(where, start, end, checked_at)
     for obj in (job, dry):
         check_spend_deadline(obj, where, end, checked_at)
-    create_job(g, ns, job, dry=False, exists_hint=hint)
-    g.record(ns, where, record['gpus'], 'up', uid=uid, gpu_spend=record)
+    created = create_job(g, ns, job, dry=False, exists_hint=hint)
+    job_uid = (created.get('metadata') or {}).get('uid')
+    if not isinstance(job_uid, str) or not job_uid:
+        g.record(ns, where, record['gpus'], 'up', uid=uid, gpu_spend=record)
+        raise Refusal('job_uid_missing', f'{where} was created in {ns} but the reply has no Job UID. '
+                                         'Inspect the Job before starting another run.')
+    g.record(ns, where, record['gpus'], 'up', uid=uid, gpu_spend=record, job_uid=job_uid)
     return {'applied': [where], 'namespace': ns, 'gpu_spend': record}
 
 
@@ -1674,11 +1679,57 @@ def cmd_apply(g, a):
 def cmd_delete(g, a):
     g.require_writable()
     kind_text, _, name = a.target.partition('/')
-    if kind_text.lower() not in DELETABLE:
+    alias = kind_text.lower()
+    spend_target = g.premade and g.namespace == g.premade and alias in ('job', 'jobs', 'job.batch')
+    if alias not in DELETABLE and not spend_target:
         raise Refusal('kind_refused', f'{kind_text} is not a kind the guard deletes')
-    resource, kind = DELETABLE[kind_text.lower()]
     if not name or not DNS_SUBDOMAIN.match(name) or len(name) > 253:
         raise Refusal('usage', f'{a.target!r} is not <kind>/<name>', status=2)
+    if spend_target:
+        thread = g.require_thread()
+        ns = g.ns_name()
+        namespace = g.get_namespace(ns)
+        labels = labels_of(namespace)
+        if labels.get(FENCE_LABEL) != 'true':
+            uid = (namespace.get('metadata') or {}).get('uid')
+            if not uid or labels.get(DEVELOPER_LABEL) != g.bot['developer'] or labels.get(AGENT_RBAC_LABEL) != 'true':
+                raise Refusal('namespace_not_ours', f'{ns} lacks the bot namespace labels or UID')
+            where = f'Job/{name}'
+            line = next((entry for entry in reversed(g.ledger_lines())
+                         if entry.get('namespace') == ns and entry.get('uid') == uid
+                         and entry.get('object') == where and entry.get('direction') in ('up', 'down')), {})
+            record = line.get('gpu_spend')
+            gpus = line.get('gpus')
+            if (line.get('direction') != 'up' or not isinstance(record, dict) or record.get('thread') != thread
+                    or type(gpus) is not int or type(record.get('gpus')) is not int or record['gpus'] != gpus
+                    or type(record.get('max_hours')) not in (int, float)):
+                raise Refusal('object_not_yours', f'{where} has no open GPU spend entry for this thread in {ns}')
+            job_uid = line.get('job_uid')
+            if not isinstance(job_uid, str) or not job_uid:
+                raise Refusal('object_not_yours', f'{where} has no recorded Job UID. Check the run with the operator.')
+
+            def mine(live):
+                if (live.get('metadata') or {}).get('uid') != job_uid:
+                    return False
+                try:
+                    live_record, _, _ = gpu_spend(live, where, job_gpus(live, where), g.cluster, ns, thread)
+                except Refusal:
+                    return False
+                return live_record == record
+
+            job = get_object(g, ns, 'Job', name)
+            if job is None:
+                raise Refusal('not_found', f'{where} not found in {ns}')
+            if not mine(job):
+                raise Refusal('object_not_yours', f'{where} does not match the Job UID and GPU spend in the ledger')
+            if delete_owned(g, ns, job, mine) == 'gone':
+                raise Refusal('not_found', f'{where} not found in {ns}')
+            g.record(ns, where, gpus, 'down', uid=uid, gpu_spend=record)
+            return {'deleted': where, 'namespace': ns}
+
+    if alias not in DELETABLE:
+        raise Refusal('kind_refused', f'{kind_text} is not a kind the guard deletes')
+    resource, kind = DELETABLE[alias]
     protected = {('ConfigMap', LEASE_RECORD)}
     if g.profile.get('model_cache'):
         protected.add(('PersistentVolumeClaim', g.profile['model_cache']))
