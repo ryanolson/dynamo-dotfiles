@@ -45,6 +45,18 @@ Inside, plain `kubectl apply`, `helm` and an operator's own installer work as cl
 - Pods sync to the host namespace as `<pod>-x-<namespace>-x-<vCluster name>`. `kubectl logs` and `kubectl exec` work through the vCluster's kubeconfig.
 - Record each task's objects in the thread's ledger, as the runbook asks for host writes.
 
+## Run a DGD
+
+A DynamoGraphDeployment runs inside a vCluster that has the Dynamo platform in `dynamo-system` (the runbook's table says which ones do; `references/limits.md` says how to install it). Each deployment gets its own namespace inside the vCluster:
+
+1. `vk create namespace <task>`, named for the task.
+2. Model weights: see `references/limits.md`, "The host model cache is not a PVC inside". Put the volume in the DGD's pod template.
+3. `vk -n <task> apply -f dgd.yaml`. The operator creates a Deployment and Service per component; the pods sync to the host as `<pod>-x-<task>-x-<vCluster name>`.
+4. Query the frontend with `vk -n <task> port-forward svc/<dgd>-frontend :8000`.
+5. Tear down with `vk delete namespace <task> --wait=true`. Then, with the bot's kubeconfig, check the host namespace: no pod or PVC whose name contains `-x-<task>-x-` remains, and no pod there requests a GPU.
+
+A frontend-only DGD, with no GPU, is the check that the operator works: it reached Ready in about a minute.
+
 ## Rules
 
 - **No GPU pods** until the runbook's "Standing vClusters" section says GPU use is open. Until then a GPU pod needs the owner's go and a manual spend record on the issue: who ran it, how many GPUs, how long, and when the GPUs were released.
@@ -55,4 +67,4 @@ Inside, plain `kubectl apply`, `helm` and an operator's own installer work as cl
 
 ## What is not there
 
-`references/limits.md` lists what a standing vCluster does not provide today: the host's DGD CRD and operator, the host's model cache PVC, MNNVL device classes, and batch scheduler queues. Read it before planning a workload.
+`references/limits.md` lists what a standing vCluster does not provide today, and the workarounds: the host's Dynamo operator (install one inside), the host's model cache PVC (mount NFS inline, or seed a PVC), MNNVL device classes (none without a license), and batch scheduler queues. Read it before planning a workload.
