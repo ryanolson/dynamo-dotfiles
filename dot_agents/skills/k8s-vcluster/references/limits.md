@@ -17,7 +17,7 @@ Never mount the cache read-write from inside, and never create a host PV for it.
 
 ## No MNNVL
 
-The vCluster serves the DRA APIs (`deviceclasses`, `resourceclaims`, `resourceclaimtemplates`, `resourceslices`), but lists no DeviceClasses. Syncing DeviceClasses from the host, ResourceClaims and ResourceClaimTemplates to the host, and ComputeDomains to the host is off. So an MNNVL ComputeDomain or an IMEX channel cannot be claimed from inside. Those syncs, and pod patches, are licensed vCluster features: the standing vClusters run without a license, and the vCluster docs say a syncer configured with a licensed feature and no license refuses to start. Changing that is the owner's decision, not the bot's.
+The vCluster serves the DRA APIs (`deviceclasses`, `resourceclaims`, `resourceclaimtemplates`, `resourceslices`), but lists no DeviceClasses. Syncing DeviceClasses from the host, ResourceClaims and ResourceClaimTemplates to the host, and ComputeDomains to the host is off. So an MNNVL ComputeDomain or an IMEX channel cannot be claimed from inside. None of these syncs is available on the stock vCluster pro image the standing vClusters run. The vCluster docs list them, and pod patches, as licensed features, and say a syncer configured with a licensed feature and no license refuses to start. The standing vClusters run without a license. A custom-built control-plane image is another route. Either change is the owner's decision, not the bot's.
 
 ## Batch scheduler queues are bypassed
 

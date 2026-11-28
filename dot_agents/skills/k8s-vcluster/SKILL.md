@@ -67,4 +67,4 @@ A frontend-only DGD, with no GPU, is the check that the operator works: it reach
 
 ## What is not there
 
-`references/limits.md` lists what a standing vCluster does not provide today, and the workarounds: the host's Dynamo operator (install one inside), the host's model cache PVC (mount NFS inline, or seed a PVC), MNNVL device classes (none without a license), and batch scheduler queues. Read it before planning a workload.
+`references/limits.md` lists what a standing vCluster does not provide today, and the workarounds: the host's Dynamo operator (install one inside), the host's model cache PVC (mount NFS inline, or seed a PVC), MNNVL device classes (none on the stock image), and batch scheduler queues. Read it before planning a workload.
