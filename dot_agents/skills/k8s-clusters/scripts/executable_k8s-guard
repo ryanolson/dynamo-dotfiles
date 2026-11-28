@@ -18,7 +18,8 @@ Usage (every command takes --context <kube context>; -n may come anywhere):
                                   --repo <url> --commit <40 hex> [--arch ...]
                                                                start a dev Job under this thread's claim
   k8s-guard -n <premade> dev show <job>                        its state and pinned image digest, read only
-  k8s-guard -n <ns> delete <kind>/<name>                       one object
+  k8s-guard -n <ns> delete <kind>/<name>                       one object (--job-uid for unfenced Jobs)
+  k8s-guard -n <premade> close job/<name> [--job-uid <uid>]    close the spend entry for a gone Job
   k8s-guard down <ns> [--uid <uid>] [--lease <id>]             delete the lease's DGDs, then the namespace
   k8s-guard expire <ns> [--uid <uid>] [--lease <id>]           scale the lease's DGDs to 0
   k8s-guard extend <ns> [--uid <uid>] [--lease <id>]           copy the lease's expiry into the namespace
@@ -62,7 +63,7 @@ from k8s_guard_rules import (  # noqa: E402
     budget_allocation, build_job, build_verdict, check_gpu_product, check_job, check_lease_label, check_one_node,
     check_spend_deadline, check_spend_window,
     commit_arg, dev_job, dgd_gpus, dockerfile_arg, git_secret_spec, gpu_pod_summary, gpu_spend, image_arg, index_job,
-    job_gpus, job_state, redact_build_log, repo_arg, repo_is_ssh, walk_forbidden, zero_patch, components)
+    job_gpus, job_state, open_spend_jobs, redact_build_log, repo_arg, repo_is_ssh, walk_forbidden, zero_patch, components)
 import k8s_fence_rules as fence  # noqa: E402
 from k8s_fence_rules import FENCE_LABEL, FENCE_RECORD, FenceError  # noqa: E402
 
@@ -1676,6 +1677,71 @@ def cmd_apply(g, a):
     return fenced(g, view, body)
 
 
+def spend_namespace_uid(g, ns, namespace):
+    labels = labels_of(namespace)
+    uid = (namespace.get('metadata') or {}).get('uid')
+    if not uid or labels.get(DEVELOPER_LABEL) != g.bot['developer'] or labels.get(AGENT_RBAC_LABEL) != 'true':
+        raise Refusal('namespace_not_ours', f'{ns} lacks the bot namespace labels or UID')
+    return uid
+
+
+def select_spend_job(g, ns, uid, where, selector):
+    entries = ((line, None) for line in g.ledger_lines()
+               if line.get('namespace') == ns and line.get('uid') == uid and line.get('object') == where)
+    opened = open_spend_jobs(entries).get((g.thread, g.cluster, ns, uid, where), {})
+    if selector is None and len(opened) > 1:
+        choices = ', '.join(key if isinstance(key, str) else '(UID missing)' for key in opened)
+        raise Refusal('job_uid_required', f'{where} has several open spend entries. Pass --job-uid for one of: {choices}')
+    if selector is None and opened:
+        line, _ = next(iter(opened.values()))
+    else:
+        line, _ = opened.get(selector, ({}, None))
+    record, gpus = line.get('gpu_spend'), line.get('gpus')
+    if (not record or type(gpus) is not int or type(record.get('gpus')) is not int or record['gpus'] != gpus
+            or type(record.get('max_hours')) not in (int, float)):
+        raise Refusal('object_not_yours', f'{where} has no matching open GPU spend entry for this thread in {ns}')
+    job_uid = line.get('job_uid')
+    if not isinstance(job_uid, str) or not job_uid:
+        raise Refusal('object_not_yours', f'{where} has no recorded Job UID; ask the owner, '
+                                         "and let the Job's deadline end it.")
+    return line
+
+
+def finish_spend_job(g, line, gone=False):
+    ns, where = line['namespace'], line['object']
+    extra = {'reason': 'gone'} if gone else {}
+    g.record(ns, where, line['gpus'], 'down', uid=line['uid'], gpu_spend=line['gpu_spend'],
+             job_uid=line['job_uid'], **extra)
+    return {'closed' if gone else 'deleted': where, 'namespace': ns, **extra}
+
+
+def cmd_close(g, a):
+    kind, _, name = a.target.partition('/')
+    if kind.lower() != 'job' or not DNS_SUBDOMAIN.fullmatch(name) or len(name) > 253:
+        raise Refusal('usage', f'{a.target!r} is not job/<name>', status=2)
+    if not g.premade or g.namespace != g.premade:
+        raise Refusal('namespace_not_premade', 'name the pre-made namespace with -n')
+    g.require_thread()
+    ns = g.ns_name()
+    namespace = g.get_namespace(ns)
+    if labels_of(namespace).get(FENCE_LABEL) == 'true':
+        raise Refusal('namespace_fenced', f'{ns} is enrolled in the lease fence')
+    uid = spend_namespace_uid(g, ns, namespace)
+    where = f'Job/{name}'
+    entry = select_spend_job(g, ns, uid, where, a.job_uid)
+    job = get_object(g, ns, 'Job', name)
+    if job is not None:
+        live_uid = (job.get('metadata') or {}).get('uid')
+        if not isinstance(live_uid, str) or not live_uid:
+            raise Refusal('job_uid_missing', f'{where} has no UID in the server reply')
+        if live_uid == entry['job_uid']:
+            raise Refusal('job_running', f'{where} still exists. Use delete job/{name} --job-uid {live_uid} to stop it.')
+    namespace = g.get_namespace(ns)
+    if spend_namespace_uid(g, ns, namespace) != uid or labels_of(namespace).get(FENCE_LABEL) == 'true':
+        raise Refusal('namespace_changed', f'{ns} changed or was enrolled in the lease fence during close')
+    return finish_spend_job(g, entry, gone=True)
+
+
 def cmd_delete(g, a):
     g.require_writable()
     kind_text, _, name = a.target.partition('/')
@@ -1689,44 +1755,29 @@ def cmd_delete(g, a):
         thread = g.require_thread()
         ns = g.ns_name()
         namespace = g.get_namespace(ns)
-        labels = labels_of(namespace)
-        if labels.get(FENCE_LABEL) != 'true':
-            uid = (namespace.get('metadata') or {}).get('uid')
-            if not uid or labels.get(DEVELOPER_LABEL) != g.bot['developer'] or labels.get(AGENT_RBAC_LABEL) != 'true':
-                raise Refusal('namespace_not_ours', f'{ns} lacks the bot namespace labels or UID')
+        if labels_of(namespace).get(FENCE_LABEL) != 'true':
+            uid = spend_namespace_uid(g, ns, namespace)
             where = f'Job/{name}'
-            line = next((entry for entry in reversed(g.ledger_lines())
-                         if entry.get('namespace') == ns and entry.get('uid') == uid
-                         and entry.get('object') == where and entry.get('direction') in ('up', 'down')), {})
-            record = line.get('gpu_spend')
-            gpus = line.get('gpus')
-            if (line.get('direction') != 'up' or not isinstance(record, dict) or record.get('thread') != thread
-                    or type(gpus) is not int or type(record.get('gpus')) is not int or record['gpus'] != gpus
-                    or type(record.get('max_hours')) not in (int, float)):
-                raise Refusal('object_not_yours', f'{where} has no open GPU spend entry for this thread in {ns}')
-            job_uid = line.get('job_uid')
-            if not isinstance(job_uid, str) or not job_uid:
-                raise Refusal('object_not_yours', f'{where} has no recorded Job UID. Check the run with the operator.')
+            entry = select_spend_job(g, ns, uid, where, a.job_uid)
 
             def mine(live):
-                if (live.get('metadata') or {}).get('uid') != job_uid:
+                if (live.get('metadata') or {}).get('uid') != entry['job_uid']:
                     return False
                 try:
                     live_record, _, _ = gpu_spend(live, where, job_gpus(live, where), g.cluster, ns, thread)
                 except Refusal:
                     return False
-                return live_record == record
+                return live_record == entry['gpu_spend']
 
             job = get_object(g, ns, 'Job', name)
             if job is None:
                 raise Refusal('not_found', f'{where} not found in {ns}')
             if not mine(job):
                 raise Refusal('object_not_yours', f'{where} does not match the Job UID and GPU spend in the ledger')
-            if delete_owned(g, ns, job, mine) == 'gone':
-                raise Refusal('not_found', f'{where} not found in {ns}')
-            g.record(ns, where, gpus, 'down', uid=uid, gpu_spend=record)
-            return {'deleted': where, 'namespace': ns}
+            return finish_spend_job(g, entry, gone=delete_owned(g, ns, job, mine) == 'gone')
 
+    if a.job_uid is not None:
+        raise Refusal('usage', '--job-uid is for unfenced GPU Job deletion', status=2)
     if alias not in DELETABLE:
         raise Refusal('kind_refused', f'{kind_text} is not a kind the guard deletes')
     resource, kind = DELETABLE[alias]
@@ -2825,7 +2876,8 @@ COMMANDS = {
                                    (('--digest',), {'required': True}), (('--arch',), {}))),
     ('dev', 'show'): (cmd_dev_show, ((('name',), {}),)),
     ('apply',): (cmd_apply, ((('-f', '--filename'), {'required': True}),)),
-    ('delete',): (cmd_delete, ((('target',), {}),)),
+    ('delete',): (cmd_delete, ((('target',), {}), (('--job-uid',), {}))),
+    ('close',): (cmd_close, ((('target',), {}), (('--job-uid',), {}))),
     ('down',): (cmd_down, TEARDOWN + ((('--fence-retired',), {}),)),
     ('expire',): (cmd_expire, TEARDOWN),
     ('extend',): (cmd_extend, TEARDOWN),

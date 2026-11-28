@@ -118,6 +118,32 @@ def job_gpus(job, where):
     return per_pod * max(1, parallelism)
 
 
+def open_spend_jobs(lines):
+    """Open spend entries by (thread, cluster, namespace, namespace UID, object).
+
+    Each entry retains its sources. A down without a Job UID names the preceding up for that key.
+    """
+    opened, latest = {}, {}
+    for index, (line, sources) in enumerate(lines):
+        key = tuple(line.get(field) for field in ('thread', 'cluster', 'namespace', 'uid', 'object'))
+        if not all(isinstance(value, str) and value for value in key) or not key[-1].startswith('Job/'):
+            continue
+        record = line.get('gpu_spend')
+        if not isinstance(record, dict) or record.get('thread') != key[0]:
+            continue
+        uid = line.get('job_uid')
+        job_key = uid if isinstance(uid, str) and uid else None
+        if line.get('direction') == 'up':
+            # A line without a Job UID identifies only this ledger event.
+            if job_key is None:
+                job_key = index
+            latest[key] = job_key
+            opened.setdefault(key, {})[job_key] = (line, sources)
+        elif line.get('direction') == 'down' and key in opened:
+            opened[key].pop(latest[key] if job_key is None else job_key, None)
+    return opened
+
+
 def gpu_spend(obj, where, gpus, cluster, namespace, thread=None):
     """Check the spend record against the exact GPU count and target."""
     annotations = (obj.get('metadata') or {}).get('annotations') or {}

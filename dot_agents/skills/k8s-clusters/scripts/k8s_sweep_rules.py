@@ -12,9 +12,10 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 import json
 from pathlib import Path
+import shlex
 
 from k8s_guard_rules import (DGD_NAME_LABEL, Refusal, allocation, check_spend_deadline, check_spend_window,
-                             gpu_spend, job_gpus, job_state, pod_gpus, pod_spec_gpus)
+                             gpu_spend, job_gpus, job_state, open_spend_jobs, pod_gpus, pod_spec_gpus)
 
 # expires-at plus this, and `k8s-guard down` deletes the namespace; before it, `expire` scales to 0.
 GRACE = timedelta(hours=1)
@@ -291,12 +292,13 @@ def open_ledger(pairs, ended):
     A namespace opens on `up` with `created` and closes on `down` with `deleted`: `expire` also
     writes `down`, without deleting, so its line closes nothing. A claim opens on `claim` and closes
     on its `Claim/<ns>` `down`. An entry whose lease k8s-leases reports released or torn down is
-    closed too: its teardown may have run, and been recorded, on another host. Object lines and the
-    sweep's own `Sweep/<ns>` lines open nothing.
+    closed too: its teardown may have run, and been recorded, on another host. Spend Jobs stay open
+    until a `down` closes their entry. Other objects and the sweep's own lines open nothing.
     """
     opened = {}
     leases_of = {}
-    for line, sources in _ledger_lines(pairs):
+    lines = _ledger_lines(pairs)
+    for line, sources in lines:
         obj, direction = line['object'], line.get('direction')
         cluster, ns, uid, lease = line.get('cluster'), line.get('namespace'), line.get('uid'), line.get('lease')
         if lease and uid:
@@ -324,7 +326,38 @@ def open_ledger(pairs, ended):
         if e['kind'] == 'namespace' and leases_of.get((e['cluster'], e['namespace'], e['uid']), set()) & ended:
             continue
         out.append(e)
+    for jobs in open_spend_jobs(lines).values():
+        for job_key, (line, sources) in jobs.items():
+            job_uid = job_key if isinstance(job_key, str) else None
+            out.append({'kind': 'spend_job', 'cluster': line['cluster'], 'namespace': line['namespace'],
+                        'uid': line['uid'], 'job_uid': job_uid, 'object': line['object'],
+                        'thread': line['thread'], 'gpus': line.get('gpus'), 'lease': None,
+                        'since': line.get('time'), 'sources': sources,
+                        'reason': 'cluster_not_read' if job_uid else 'job_uid_missing'})
     return out
+
+
+def check_spend_entry(entry, uid, jobs, inventory_reason, context):
+    name = entry['object'].removeprefix('Job/')
+    if uid is None:
+        entry['reason'] = 'namespace_gone'
+    elif uid != entry['uid']:
+        entry['reason'] = 'namespace_recreated'
+    elif inventory_reason:
+        entry['reason'] = inventory_reason
+    elif name in jobs and not jobs[name]:
+        entry['reason'] = 'job_uid_unreadable'
+    else:
+        del entry['reason']
+        job_uid = entry['job_uid']
+        entry['exists'] = jobs.get(name) == job_uid
+        if not entry['exists']:
+            namespace = entry['namespace']
+            action = shlex.join(['k8s-guard', '--context', context, '-n', namespace, 'close',
+                                 f'job/{name}', '--job-uid', job_uid])
+            entry['flag'] = flag('spend_job_unclosed', namespace, f'{entry["object"]} is gone',
+                                 cluster=entry['cluster'], object=entry['object'], thread=entry['thread'],
+                                 job_uid=job_uid, gpus=entry['gpus'], action=action)
 
 
 def bb_env(environ, home):
@@ -391,9 +424,19 @@ def digest_table(report):
                      f'{f["lease_id"]} {f.get("state")} {f.get("gpus")}', '', '', flags_cell([f]), ''])
     for e in report.get('open_ledger') or []:
         exists = {True: 'it still exists', False: 'it is gone', None: 'not read'}[e.get('exists')]
-        rows.append(['ledger', e.get('cluster'), e.get('namespace'), e.get('thread'), '', e.get('lease') or '-',
+        detail = f'open_{e["kind"]}: no down in {", ".join(e.get("sources") or [])}; {exists}'
+        action = ''
+        if e['kind'] == 'spend_job':
+            detail = f'{e["object"]} ({e["job_uid"] or "no UID"}): {detail}'
+            if e.get('reason'):
+                detail += f' ({e["reason"]})'
+            if e.get('flag'):
+                detail += f' ({e["flag"]["kind"]})'
+                action = e['flag']['action']
+        rows.append(['ledger', e.get('cluster'), e.get('namespace'), e.get('thread'), e.get('gpus', ''),
+                     e.get('lease') or '-',
                      f'since {e.get("since") or "?"}', '',
-                     f'open_{e["kind"]}: no down in {", ".join(e.get("sources") or [])}; {exists}', ''])
+                     detail, action])
     lines = [head, '']
     if rows:
         lines.append('| ' + ' | '.join(COLUMNS) + ' |')

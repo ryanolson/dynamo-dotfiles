@@ -630,6 +630,117 @@ class Report(SweepCase):
         got = sorted((e['namespace'], e['thread'], e['exists']) for e in body['open_ledger'])
         self.assertEqual(got, [(NS, ME, True), (PREFIX + '9-old', OTHER, False)])
 
+    def add_spend_job(self):
+        premade = G.PREMADE
+        self.profiles.write_text(self.profiles.read_text().replace(
+            '# premade_namespace = "dyntest-alice-agent"', f'premade_namespace = "{premade}"'))
+        if premade not in self.k8s['namespaces']:
+            self.add_ns(premade, ledger=False)
+        rc, body, _ = self.apply(G.spend_job(namespace=premade, recorded=True), ns=premade)
+        self.assertEqual(rc, 0, body)
+        return self.ledger()[-1]
+
+    def spend_flags(self, body):
+        return [f for f in body['flags'] if f['kind'] == 'spend_job_unclosed']
+
+    def test_spend_ledger_reports_the_open_job_while_it_runs(self):
+        up = self.add_spend_job()
+        rc, body, _ = self.sweep()
+        self.assertEqual(rc, 0, body)
+        self.assertEqual(len(body['open_ledger']), 1, body['open_ledger'])
+        [entry] = body['open_ledger']
+        self.assertEqual((entry['object'], entry['job_uid'], entry['exists']), ('Job/gpu-run', up['job_uid'], True))
+        self.assertEqual(entry['sources'], ['host', 'thr_alpha1'])
+        self.assertEqual(self.spend_flags(body), [])
+        digest = (self.state_home / 'k8s-sweep/digest.md').read_text()
+        self.assertTrue(any('Job/gpu-run' in line and 'it still exists' in line for line in digest.splitlines()))
+        self.assert_sweep_only_reads()
+
+    def test_spend_ledger_flags_a_gone_job_and_names_its_close_command(self):
+        up = self.add_spend_job()
+        del self.k8s['objects'][G.PREMADE]['Job/gpu-run']
+        self.flush()
+        writes = self.writes()
+        rc, body, _ = self.sweep('--enforce')
+        self.assertEqual(rc, 0, body)
+        self.assertEqual(len(body['open_ledger']), 1, body['open_ledger'])
+        [entry] = body['open_ledger']
+        self.assertIs(entry['exists'], False)
+        [flag] = self.spend_flags(body)
+        action = f'k8s-guard --context {CTX} -n {G.PREMADE} close job/gpu-run --job-uid {up["job_uid"]}'
+        self.assertEqual((flag['object'], flag['job_uid'], flag['action']), ('Job/gpu-run', up['job_uid'], action))
+        digest = (self.state_home / 'k8s-sweep/digest.md').read_text()
+        self.assertTrue(any('spend_job_unclosed' in line and action in line for line in digest.splitlines()))
+        self.assertEqual(self.writes(), writes)
+        self.assertEqual(self.guard_calls(), [])
+        self.assert_sweep_only_reads()
+
+    def test_spend_ledger_keeps_older_job_open_when_uidless_down_closes_the_latest(self):
+        self.add_spend_job()
+        del self.k8s['objects'][G.PREMADE]['Job/gpu-run']
+        self.flush()
+        self.add_spend_job()
+        old, current = self.ledger()
+
+        rc, body, _ = self.sweep()
+        self.assertEqual(rc, 0, body)
+        self.assertEqual({e['job_uid']: e['exists'] for e in body['open_ledger']},
+                         {old['job_uid']: False, current['job_uid']: True})
+
+        down = dict(current, direction='down')
+        del down['job_uid']
+        for path in (self.storage / 'k8s-ledger.jsonl', self.state_home / 'k8s-guard/ledger.jsonl'):
+            with path.open('a') as ledger:
+                ledger.write(json.dumps(down) + '\n')
+        del self.k8s['objects'][G.PREMADE]['Job/gpu-run']
+        self.flush()
+        rc, body, _ = self.sweep()
+        self.assertEqual(rc, 0, body)
+        self.assertEqual([e['job_uid'] for e in body['open_ledger']], [old['job_uid']])
+
+    def test_spend_ledger_lists_an_older_up_without_judging_liveness(self):
+        up = self.add_spend_job()
+        del up['job_uid']
+        for path in (self.storage / 'k8s-ledger.jsonl', self.state_home / 'k8s-guard/ledger.jsonl'):
+            path.write_text(json.dumps(up) + '\n')
+        del self.k8s['objects'][G.PREMADE]['Job/gpu-run']
+        self.flush()
+        rc, body, _ = self.sweep()
+        self.assertEqual(rc, 0, body)
+        self.assertEqual(len(body['open_ledger']), 1, body['open_ledger'])
+        [entry] = body['open_ledger']
+        self.assertIsNone(entry['exists'])
+        self.assertEqual(entry['reason'], 'job_uid_missing')
+        self.assertEqual(self.spend_flags(body), [])
+
+    def test_spend_ledger_leaves_liveness_unknown_without_its_namespace_inventory(self):
+        self.add_spend_job()
+        baseline = json.dumps(self.k8s)
+        premade = G.PREMADE
+        for reason in ('namespace_gone', 'namespace_recreated', 'namespace_fenced', 'job_inventory_unreadable'):
+            with self.subTest(reason=reason):
+                self.k8s = json.loads(baseline)
+                meta = self.k8s['namespaces'][premade]['metadata']
+                if reason == 'namespace_gone':
+                    del self.k8s['namespaces'][premade]
+                elif reason == 'namespace_recreated':
+                    meta['uid'] = 'uid-replaced'
+                elif reason == 'namespace_fenced':
+                    meta['labels'][G.FENCE_LABEL] = 'true'
+                else:
+                    self.k8s['forbid'] = [f'get jobs.batch -n {premade}']
+                self.flush()
+                rc, body, _ = self.sweep()
+                self.assertEqual(rc, int(reason == 'job_inventory_unreadable'), body)
+                self.assertEqual(len(body['open_ledger']), 1, body['open_ledger'])
+                [entry] = body['open_ledger']
+                self.assertIsNone(entry['exists'])
+                self.assertEqual(entry['reason'], reason)
+                self.assertEqual(self.spend_flags(body), [])
+                digest = (self.state_home / 'k8s-sweep/digest.md').read_text()
+                self.assertTrue(any('Job/gpu-run' in line and reason in line for line in digest.splitlines()))
+                self.assertNotIn(' close job/gpu-run ', digest)
+
     def test_the_premade_namespace_is_reported_as_claimed_and_matched_to_its_claim(self):
         premade = PREFIX + 'agent'
         self.profiles.write_text(self.profiles.read_text().replace(

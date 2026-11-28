@@ -42,6 +42,7 @@ For each namespace it reports the age, `wcep.agent/thread`, the expiry, the GPUs
 | `gpu_spend_expired` | A GPU Job or Pod is unfinished after its recorded window ends. |
 | `gpu_spend_over_count` | A Job's unfinished Pods request more GPUs than the Job's spend record. |
 | `gpu_spend_count_failed` | The sweep could not count a Job's or Pod's GPU request. |
+| `spend_job_unclosed` | The recorded Job UID is gone from the same unfenced pre-made namespace. The applying thread can run the `close` command shown in the report. |
 | `lease_namespace_gone` | A live lease whose namespace is not found, or has another UID (it was re-created). The plugin should release it. |
 | `count_failed` | A GPU request in a form the guard cannot count. |
 | `namespace_recreated` | The ledger or the lease recorded another UID for this name. `--enforce` never touches it. |
@@ -52,6 +53,8 @@ For each namespace it reports the age, `wcep.agent/thread`, the expiry, the GPUs
 If bb cannot be read, the run reports `leases_unavailable` and raises no lease flag: a list it could not read is not an empty list. With `--json`, an unreachable bb prints its error envelope on stdout, so the sweep accepts only a JSON list. A stale-lease flag is raised only for a cluster that was read, and only for a namespace whose read by name succeeded.
 
 **Open ledger entries** use the guard's own rule (`Guard.ledger_namespaces`). A `Namespace/<ns>` line `up` with `created` opens an entry. A `down` with `deleted` for the same UID closes it. `expire` also writes `down`, but without `deleted`, so it closes nothing. A `Claim/<ns>` line `claim` opens an entry for its lease, and a `Claim/<ns>` `down` for that lease closes it. An entry whose lease the plugin reports `released` or `torn-down` is closed too, because its teardown may have been recorded on another host. `--all` lists only the latest 200 leases, so an entry from an older lease can show as open again. A host keeps each line in its own ledger and in the thread's, so identical lines count once, with both sources named.
+
+Each unfenced Job spend entry stays open until its `down` line. A `down` without a Job UID closes the latest preceding `up` for the same thread, cluster, namespace UID and Job name. The sweep lists each open entry and checks its recorded UID against the Job inventory. If the Job is gone, the row shows `spend_job_unclosed` and a `close` command with that UID. The sweep never runs that command. If the entry lacks a Job UID, the namespace changed or is fenced, or the inventory is unreadable, the row shows why liveness is unknown.
 
 ## --enforce
 
@@ -81,7 +84,7 @@ Each run replaces `${XDG_STATE_HOME:-~/.local/state}/k8s-sweep/report.json` and 
 |---|---|---|---|---|---|---|---|---|---|
 | `namespace` | profile | name | `wcep.agent/thread` | allocation, `?` if uncounted | `<id> <state> <gpus>`, `-` none, `?` bb unread | namespace age | expiry or `claimed` | `kind: detail; ...` | `expire: ok`, `down: lease_active`, ... |
 | `lease` | | its namespace | its thread | its GPUs | the stale lease | | | `lease_namespace_gone: ...` | |
-| `ledger` | | | the thread | | its lease | `since <time>` | | `open_namespace` or `open_claim`, the ledgers, and whether it still exists | |
+| `ledger` | | | the thread | Job spend, if any | its lease | `since <time>` | | Open namespace, claim or spend Job, the source ledgers, and whether it still exists | For a gone spend Job, a `close` command for its UID |
 
 Each host writes its own table. A stale `checked_at` means that host's timer has stopped.
 

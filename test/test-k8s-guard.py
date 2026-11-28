@@ -5098,6 +5098,114 @@ class UnfencedGpuSpend(GuardCase):
         self.add_obj({'apiVersion': 'v1', 'kind': 'ConfigMap', 'metadata': {'name': 'test'}}, ns=PREMADE)
         self.refuse_spend_delete('namespace_not_claimed', 'configmap/test')
 
+    def spend_job_command(self, verb, *extra):
+        return ('--context', CTX, '-n', PREMADE, verb, 'job/gpu-run', *extra)
+
+    def assert_spend_closed(self, up):
+        down = self.ledger()[-1]
+        self.assertEqual((down['direction'], down['reason']), ('down', 'gone'))
+        for key in ('object', 'namespace', 'uid', 'job_uid', 'gpus', 'gpu_spend'):
+            self.assertEqual(down[key], up[key], key)
+
+    def test_spend_delete_closes_a_job_gone_during_delete(self):
+        self.apply_spend()
+        [up] = self.ledger()
+        self.kubectl_path.write_text(FAKE_KUBECTL.replace(
+            "    interfere(k, 'delete')\n", "    st['objects'][ns].pop(k); save()\n", 1))
+
+        body = self.ok(*self.spend_job_command('delete'))
+
+        self.assertEqual(body, {'closed': 'Job/gpu-run', 'namespace': PREMADE, 'reason': 'gone'})
+        self.assert_spend_closed(up)
+        self.assertEqual([c['pos'][0] for c in self.writes()], ['create', 'delete'])
+
+    def test_spend_close_records_a_missing_job_without_a_cluster_write(self):
+        self.apply_spend()
+        [up] = self.ledger()
+        del self.k8s['objects'][PREMADE]['Job/gpu-run']
+        self.flush()
+        writes = self.writes()
+
+        body = self.ok(*self.spend_job_command('close'))
+
+        self.assertEqual(body, {'closed': 'Job/gpu-run', 'namespace': PREMADE, 'reason': 'gone'})
+        self.assert_spend_closed(up)
+        self.assertEqual(self.writes(), writes)
+
+    def test_spend_close_refuses_a_live_job(self):
+        self.apply_spend()
+        before, writes = self.ledger(), self.writes()
+        body = self.refused('job_running', *self.spend_job_command('close'))
+        self.assertIn('delete job/gpu-run', body['error'])
+        self.assertEqual(self.ledger(), before)
+        self.assertEqual(self.writes(), writes)
+
+    def test_spend_close_refuses_another_threads_entry(self):
+        self.apply_spend()
+        before, writes = self.ledger(), self.writes()
+        self.refused('object_not_yours', *self.spend_job_command('close'), thread='thr_other')
+        self.assertEqual(self.ledger(), before)
+        self.assertEqual(self.writes(), writes)
+
+    def test_spend_close_refuses_an_entry_without_a_job_uid(self):
+        self.apply_spend()
+        [up] = self.ledger()
+        del up['job_uid']
+        (self.storage / 'k8s-ledger.jsonl').write_text(json.dumps(up) + '\n')
+        del self.k8s['objects'][PREMADE]['Job/gpu-run']
+        self.flush()
+        writes = self.writes()
+        self.refused('object_not_yours', *self.spend_job_command('close'))
+        self.assertEqual(self.ledger(), [up])
+        self.assertEqual(self.writes(), writes)
+
+    def test_spend_close_refuses_a_recreated_namespace(self):
+        self.apply_spend()
+        before, writes = self.ledger(), self.writes()
+        del self.k8s['objects'][PREMADE]['Job/gpu-run']
+        self.add_ns(PREMADE, uid='replacement-namespace-uid', ledger=False)
+        self.refused('object_not_yours', *self.spend_job_command('close'))
+        self.assertEqual(self.ledger(), before)
+        self.assertEqual(self.writes(), writes)
+
+    def test_spend_close_requires_a_uid_for_two_open_entries(self):
+        self.apply_spend()
+        del self.k8s['objects'][PREMADE]['Job/gpu-run']
+        self.flush()
+        job = self.apply_spend()
+        old, current = self.ledger()
+        writes = self.writes()
+
+        body = self.refused('job_uid_required', *self.spend_job_command('close'))
+        for up in (old, current):
+            self.assertIn(up['job_uid'], body['error'])
+        self.refused('object_not_yours', *self.spend_job_command('close', '--job-uid', 'wrong-uid'))
+        self.refused('job_running', *self.spend_job_command('close', '--job-uid', current['job_uid']))
+        self.assertEqual(self.ledger(), [old, current])
+
+        self.ok(*self.spend_job_command('close', '--job-uid', old['job_uid']))
+
+        self.assert_spend_closed(old)
+        self.refused('job_running', *self.spend_job_command('close'))
+        self.assertEqual(self.k8s['objects'][PREMADE]['Job/gpu-run'], job)
+        self.assertEqual(self.writes(), writes)
+
+    def test_spend_delete_requires_a_uid_for_two_open_entries(self):
+        self.apply_spend()
+        del self.k8s['objects'][PREMADE]['Job/gpu-run']
+        self.flush()
+        self.apply_spend()
+        old, current = self.ledger()
+
+        self.refuse_spend_delete('job_uid_required')
+        self.refused('object_not_yours', *self.spend_job_command('delete', '--job-uid', old['job_uid']))
+        self.assertFalse([c for c in self.writes() if c['pos'][:1] == ['delete']])
+        self.ok(*self.spend_job_command('delete', '--job-uid', current['job_uid']))
+
+        self.assertEqual(self.ledger()[-1]['job_uid'], current['job_uid'])
+        self.ok(*self.spend_job_command('close'))
+        self.assert_spend_closed(old)
+
     def test_spend_record_must_match_the_job_target_and_thread(self):
         for field, value in [('gpus', 2), ('cluster', 'other'), ('namespace', NS), ('thread', 'thr_other'),
                              ('start', '2026-11-24T16:00:00'), ('max_hours', 0), ('max_hours', 1e12)]:

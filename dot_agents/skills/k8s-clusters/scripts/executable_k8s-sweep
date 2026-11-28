@@ -45,6 +45,7 @@ from k8s_profiles import ProfileError, load_profiles  # noqa: E402
 
 DGD_RESOURCE = 'dynamographdeployments.nvidia.com'
 LEASE_RECORD = 'wcep-agent-lease'
+AGENT_RBAC_LABEL = 'dynamo.nvidia.com/developer-agent-rbac'
 NO_CRD = "doesn't have a resource type"
 DNS_LABEL = re.compile(r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
 BB_TIMEOUT = 30
@@ -122,15 +123,25 @@ def read_namespaces(reader, bot, now, cluster, errors):
     prefix, premade = bot['namespace_prefix'], bot.get('premade_namespace')
     listed = reader.json('get', 'namespaces', '-l', f'{rules.DEVELOPER_LABEL}={bot["developer"]}', '-o', 'json')
     ours = [n for n in listed.get('items') or [] if ((n.get('metadata') or {}).get('name') or '').startswith(prefix)]
-    rows = []
+    rows, job_uids, job_inventory_reason = [], {}, 'namespace_unreadable'
     for ns in sorted(ours, key=lambda n: n['metadata']['name']):
         name = ns['metadata']['name']
         labels = ns['metadata'].get('labels') or {}
         spend, spend_flags, covered_pods = [], [], set()
+        if name == premade:
+            if labels.get(FENCE_LABEL) == 'true':
+                job_inventory_reason = 'namespace_fenced'
+            elif labels.get(AGENT_RBAC_LABEL) != 'true':
+                job_inventory_reason = 'namespace_not_ours'
+            else:
+                job_inventory_reason = 'job_inventory_unreadable'
         try:
             pods = reader.json('get', 'pods', '-n', name, '-o', 'json').get('items') or []
             if name == premade and labels.get(FENCE_LABEL) != 'true':
                 jobs = reader.json('get', 'jobs.batch', '-n', name, '-o', 'json').get('items') or []
+                if job_inventory_reason == 'job_inventory_unreadable':
+                    job_uids = {j['metadata']['name']: j['metadata'].get('uid') for j in jobs}
+                    job_inventory_reason = None
                 spend, spend_flags, covered_pods = rules.audit_gpu_spend(cluster, name, jobs, pods, now)
             try:
                 dgds = reader.json('get', DGD_RESOURCE, '-n', name, '-o', 'json').get('items') or []
@@ -149,7 +160,7 @@ def read_namespaces(reader, bot, now, cluster, errors):
             row['gpu_spend'] = spend
         row['flags'].extend(spend_flags)
         rows.append(row)
-    return rows
+    return rows, job_uids, job_inventory_reason
 
 
 def read_leases(env):
@@ -272,7 +283,7 @@ def sweep_cluster(check, profiles, cluster, leases, known, entries, args, now, r
     prof, bot = profiles['clusters'][cluster], profiles['bot']
     reader = Reader(check, bot, prof['context'])
     reader.verify_bot(bot)
-    rows = read_namespaces(reader, bot, now, cluster, report['errors'])
+    rows, job_uids, job_inventory_reason = read_namespaces(reader, bot, now, cluster, report['errors'])
     listed = {r['namespace']: r['uid'] for r in rows}
     wanted = {l['namespace'] for l in leases or [] if l['cluster'] == cluster and l['state'] in rules.LIVE}
     wanted |= {e['namespace'] for e in entries if e['cluster'] == cluster and isinstance(e['namespace'], str)}
@@ -304,13 +315,24 @@ def sweep_cluster(check, profiles, cluster, leases, known, entries, args, now, r
     for e in entries:
         if e['cluster'] != cluster:
             continue
+        spend_entry = e['kind'] == 'spend_job'
+        if spend_entry:
+            if not e['job_uid']:
+                continue
+            if e['namespace'] != bot.get('premade_namespace'):
+                e['reason'] = 'namespace_not_premade'
+                continue
+            e['reason'] = 'namespace_unreadable'
         if e['namespace'] in listed:
             uid = listed[e['namespace']]
         elif e['namespace'] in exists:
             uid = exists[e['namespace']]
         else:
             continue  # not read (outside the prefix, or its read failed): not judged
-        e['exists'] = uid == e['uid'] if e['kind'] == 'namespace' else uid is not None
+        if spend_entry:
+            rules.check_spend_entry(e, uid, job_uids, job_inventory_reason, prof['context'])
+        else:
+            e['exists'] = uid == e['uid'] if e['kind'] == 'namespace' else uid is not None
     report['namespaces'] += rows
     report['stale_leases'] += [f for f in flags if f['kind'] == 'lease_namespace_gone']
 
@@ -344,7 +366,8 @@ def main(argv=None):
               'enforced': [], 'errors': []}
 
     def finish():
-        report['flags'] = [f for r in report['namespaces'] for f in r['flags']] + report['stale_leases']
+        report['flags'] = ([f for r in report['namespaces'] for f in r['flags']] + report['stale_leases']
+                           + [e['flag'] for e in report['open_ledger'] if 'flag' in e])
         write_outputs(report)
         print(rules.digest_table(report) if args.text else json.dumps(report, indent=2), end='' if args.text else '\n')
         return 1 if report['errors'] else 0
