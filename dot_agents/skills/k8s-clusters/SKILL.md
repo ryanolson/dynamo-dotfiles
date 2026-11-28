@@ -16,6 +16,8 @@ The source of truth is the Linear document "Runbook: build and run on our Dynamo
 
 `dynamo-aks-dev` and `dynamo-aks-exp` are fence-less. `dynamo-aks-dev` advertises 0 allocatable GPUs. `dynamo-aks-exp` advertises 24 allocatable A100 GPU resources (16 MIG `3g.40gb` slices and 8 full GPUs). Get approval for the run and record the spend on each Job that requests `nvidia.com/gpu` there. See the [GPU spend record](references/k8s-guard.md#gpu-spend-without-a-lease-fence) for the annotation that the guard and sweep check.
 
+To work inside the owner's standing vClusters (CRDs, operators and other cluster-scoped objects, kept off the host), read the `k8s-vcluster` skill.
+
 ## The bot
 
 How the bot works, how to set up a host, what it can and cannot do, the pre-made namespace, the key rules, and what to do when it fails are in `references/bot.md`. Read it before you set up a host or deploy.

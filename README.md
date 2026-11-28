@@ -152,6 +152,7 @@ Installed skills:
 | `hot-paths` | Profile-backed register of hot code paths: a guard benchmark and noise band per path, markers in the code, speedups from the register |
 | `repo-skills` | Copies personal skills into public `ai-dynamo` repos and reports drift both ways; skips `ryanolson` and `NVIDIA-dev` repos |
 | `k8s-clusters` | Points to the Linear cluster runbook; cluster profiles in an uncommitted `~/.config/k8s-clusters/profiles.toml`; `k8s-check`, a read-only access check as the agents' bot that prints JSON |
+| `k8s-vcluster` | Works inside the owner's standing vClusters as the agents' bot: reads the vCluster's kubeconfig Secret, port-forwards to its API, and applies CRDs and operators there without touching the host |
 | `sgc-thread` | Starts a Stargate Command thread: read the Charter and change log, work from a Linear issue if one exists, report on it, ask decisions with `bb sgc ask` |
 
 Sources: [`ai-dynamo/rhino`](https://github.com/ai-dynamo/rhino),

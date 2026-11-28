@@ -1,0 +1,4 @@
+interface:
+  display_name: "Kubernetes vClusters"
+  short_description: "Work inside the owner's standing vClusters as the agents' bot: connect, then apply CRDs and operators without touching the host."
+  default_prompt: "Use $k8s-vcluster to connect to the standing vCluster on this cluster."
